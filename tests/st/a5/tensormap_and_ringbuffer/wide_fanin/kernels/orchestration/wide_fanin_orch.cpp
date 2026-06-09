@@ -64,61 +64,67 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     LOG_INFO_V0("[wide_fanin_orch] case_id=%llu", static_cast<unsigned long long>(case_id));
 
     if (case_id == 1) {
-        // WideFaninBarrier: K=15 fanin from tensormap only.
-        //
-        // Constraint: consumer tensor args = 15 INPUT + 1 INOUT(Y) = 16 = MAX_TENSOR_ARGS.
-        // Any additional add_input would exceed the limit.
-        static constexpr int32_t N = 15;
+        Tensor x0  = from_tensor_arg(orch_args.tensor(0));
+        Tensor x1  = from_tensor_arg(orch_args.tensor(1));
+        Tensor x2  = from_tensor_arg(orch_args.tensor(2));
+        Tensor x3  = from_tensor_arg(orch_args.tensor(3));
+        Tensor x4  = from_tensor_arg(orch_args.tensor(4));
+        Tensor x5  = from_tensor_arg(orch_args.tensor(5));
+        Tensor x6  = from_tensor_arg(orch_args.tensor(6));
+        Tensor x7  = from_tensor_arg(orch_args.tensor(7));
+        Tensor x8  = from_tensor_arg(orch_args.tensor(8));
+        Tensor x9  = from_tensor_arg(orch_args.tensor(9));
+        Tensor x10 = from_tensor_arg(orch_args.tensor(10));
+        Tensor x11 = from_tensor_arg(orch_args.tensor(11));
+        Tensor x12 = from_tensor_arg(orch_args.tensor(12));
+        Tensor x13 = from_tensor_arg(orch_args.tensor(13));
+        Tensor x14 = from_tensor_arg(orch_args.tensor(14));
+        Tensor ext_Y = from_tensor_arg(orch_args.tensor(15));
 
-        Tensor producers[N];
-        for (int32_t i = 0; i < N; i++) {
-            producers[i] = from_tensor_arg(orch_args.tensor(i));
-        }
-        Tensor ext_Y = from_tensor_arg(orch_args.tensor(N));
-
-        // Submit N independent producers.
-        for (int32_t i = 0; i < N; i++) {
+        // Submit 15 independent producers.
+        Tensor prods[] = {x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14};
+        for (int32_t i = 0; i < 15; i++) {
             Arg p_args;
-            p_args.add_inout(producers[i]);
+            p_args.add_inout(prods[i]);
             rt_submit_aic_task(FUNC_WRITE_CONST, p_args);
         }
-        // Consumer: all N producer tensors as INPUT, Y as INOUT.
-        // Each add_input creates one tensormap fanin edge to the corresponding
-        // producer.  N=15 lookups -> K=15 fanin from tensormap alone.
+        // Consumer: all 15 producer tensors as INPUT, Y as INOUT.
         {
             Arg c_args;
-            c_args.add_input(producers[0], producers[1], producers[2], producers[3], producers[4], producers[5],
-                             producers[6], producers[7], producers[8], producers[9], producers[10], producers[11],
-                             producers[12], producers[13], producers[14]);
+            c_args.add_input(x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14);
             c_args.add_inout(ext_Y);
             rt_submit_aic_task(FUNC_COPY_FIRST, c_args);
         }
     } else if (case_id == 2) {
-        // ExplicitDepWideFanin: K=16 explicit deps + K=1 tensormap = K=17 total.
-        //
-        // Consumer uses the primitive Arg API's set_dependencies(ptr, count)
-        // to bypass ArgWithDeps<16>'s capacity cap.  16 explicit deps on all
-        // producer IDs + 1 tensormap edge from add_input(X_0) = 17 fanin.
-        static constexpr int32_t N = 16;
+        Tensor x0  = from_tensor_arg(orch_args.tensor(0));
+        Tensor x1  = from_tensor_arg(orch_args.tensor(1));
+        Tensor x2  = from_tensor_arg(orch_args.tensor(2));
+        Tensor x3  = from_tensor_arg(orch_args.tensor(3));
+        Tensor x4  = from_tensor_arg(orch_args.tensor(4));
+        Tensor x5  = from_tensor_arg(orch_args.tensor(5));
+        Tensor x6  = from_tensor_arg(orch_args.tensor(6));
+        Tensor x7  = from_tensor_arg(orch_args.tensor(7));
+        Tensor x8  = from_tensor_arg(orch_args.tensor(8));
+        Tensor x9  = from_tensor_arg(orch_args.tensor(9));
+        Tensor x10 = from_tensor_arg(orch_args.tensor(10));
+        Tensor x11 = from_tensor_arg(orch_args.tensor(11));
+        Tensor x12 = from_tensor_arg(orch_args.tensor(12));
+        Tensor x13 = from_tensor_arg(orch_args.tensor(13));
+        Tensor x14 = from_tensor_arg(orch_args.tensor(14));
+        Tensor x15 = from_tensor_arg(orch_args.tensor(15));
+        Tensor ext_Y = from_tensor_arg(orch_args.tensor(16));
 
-        Tensor producers[N];
-        for (int32_t i = 0; i < N; i++) {
-            producers[i] = from_tensor_arg(orch_args.tensor(i));
-        }
-        Tensor ext_Y = from_tensor_arg(orch_args.tensor(N));
-
-        // Submit N independent producers and collect their task IDs.
-        PTO2TaskId producer_ids[N];
-        for (int32_t i = 0; i < N; i++) {
+        Tensor prods[] = {x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15};
+        PTO2TaskId producer_ids[16];
+        for (int32_t i = 0; i < 16; i++) {
             Arg p_args;
-            p_args.add_inout(producers[i]);
+            p_args.add_inout(prods[i]);
             producer_ids[i] = rt_submit_aic_task(FUNC_WRITE_CONST, p_args).task_id();
         }
-        // Consumer: 16 explicit deps (primitive Arg, not ArgWithDeps) + 1 input.
         {
             Arg c_args;
-            c_args.set_dependencies(producer_ids, N);
-            c_args.add_input(producers[0]);
+            c_args.set_dependencies(producer_ids, 16);
+            c_args.add_input(x0);
             c_args.add_inout(ext_Y);
             rt_submit_aic_task(FUNC_COPY_FIRST, c_args);
         }
