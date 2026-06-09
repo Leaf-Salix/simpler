@@ -193,6 +193,7 @@ struct PTO2OrchProfilingData {
     // Fanin dedup instrumentation (always-on counters, gated by PTO2_ORCH_PROFILING)
     int64_t fanin_dedup_max;    // Peak K seen in a single append_fanin_or_fail call
     int64_t fanin_dedup_total;  // Total append_fanin_or_fail calls across all submits
+    uint64_t contains_cycle;    // Total cycles spent inside contains()
 };
 
 PTO2OrchProfilingData orchestrator_get_profiling();

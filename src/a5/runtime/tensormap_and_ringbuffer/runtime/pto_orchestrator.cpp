@@ -109,6 +109,7 @@ uint64_t g_orch_scope_end_atomic_count = 0;
 // Fanin dedup instrumentation: peak K + total call count
 static int64_t g_orch_fanin_dedup_max = 0;
 static int64_t g_orch_fanin_dedup_total = 0;
+static uint64_t g_orch_contains_cycle = 0;
 // Cycle accumulation feeds the per-sub-step `g_orch_*_cycle` cumulatives
 // printed in the cold-path log. Per-sub-step swim-lane phase records were
 // dropped; the per-submit envelope record (CYCLE_COUNT_ORCH_SUBMIT_RECORD)
@@ -250,9 +251,18 @@ static bool append_fanin_or_fail(
         if (k > g_orch_fanin_dedup_max) g_orch_fanin_dedup_max = k;
     }
 #endif
+#if PTO2_ORCH_PROFILING
+    uint64_t _ct0 = get_sys_cnt_aicpu();
+    bool _found = fanin_builder->contains(prod_state);
+    g_orch_contains_cycle += (get_sys_cnt_aicpu() - _ct0);
+    if (_found) {
+        return true;
+    }
+#else
     if (fanin_builder->contains(prod_state)) {
         return true;
     }
+#endif
 
     if (fanin_builder->count < PTO2_FANIN_INLINE_CAP) {
         fanin_builder->inline_slots[fanin_builder->count++] = prod_state;
@@ -913,8 +923,8 @@ void PTO2OrchestratorState::mark_done() {
 #if PTO2_ORCH_PROFILING
     if (g_orch_fanin_dedup_total > 0) {
         LOG_INFO_V5(
-            "=== [FaninDedup] max_K=%" PRId64 " total_calls=%" PRId64 " ===", g_orch_fanin_dedup_max,
-            g_orch_fanin_dedup_total
+            "=== [FaninDedup] max_K=%" PRId64 " total_calls=%" PRId64 " contains_cycles=%" PRIu64 " ===",
+            g_orch_fanin_dedup_max, g_orch_fanin_dedup_total, g_orch_contains_cycle
         );
     }
 #endif
@@ -945,6 +955,7 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
     d.scope_end_atomic_count = g_orch_scope_end_atomic_count;
     d.fanin_dedup_max = g_orch_fanin_dedup_max;
     d.fanin_dedup_total = g_orch_fanin_dedup_total;
+    d.contains_cycle = g_orch_contains_cycle;
 
     // Reset
     g_orch_sync_cycle = g_orch_alloc_cycle = g_orch_args_cycle = 0;
@@ -959,6 +970,7 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
     g_orch_scope_end_atomic_count = 0;
     g_orch_fanin_dedup_max = 0;
     g_orch_fanin_dedup_total = 0;
+    g_orch_contains_cycle = 0;
     return d;
 }
 #endif
