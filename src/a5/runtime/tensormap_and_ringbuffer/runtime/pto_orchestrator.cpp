@@ -106,6 +106,9 @@ uint64_t g_orch_fanin_wait_cycle = 0;
 uint64_t g_orch_alloc_atomic_count = 0;
 uint64_t g_orch_args_atomic_count = 0;
 uint64_t g_orch_scope_end_atomic_count = 0;
+// Fanin dedup instrumentation: peak K + total call count
+static int64_t g_orch_fanin_dedup_max = 0;
+static int64_t g_orch_fanin_dedup_total = 0;
 // Cycle accumulation feeds the per-sub-step `g_orch_*_cycle` cumulatives
 // printed in the cold-path log. Per-sub-step swim-lane phase records were
 // dropped; the per-submit envelope record (CYCLE_COUNT_ORCH_SUBMIT_RECORD)
@@ -239,6 +242,14 @@ struct PTO2FaninBuilder {
 static bool append_fanin_or_fail(
     PTO2OrchestratorState *orch, PTO2TaskSlotState *prod_state, PTO2FaninBuilder *fanin_builder, uint8_t ring_id
 ) {
+    // Record dedup K before checking (fanin_builder->count = candidates already accumulated)
+#if PTO2_ORCH_PROFILING
+    {
+        int64_t k = fanin_builder->count;
+        g_orch_fanin_dedup_total++;
+        if (k > g_orch_fanin_dedup_max) g_orch_fanin_dedup_max = k;
+    }
+#endif
     if (fanin_builder->contains(prod_state)) {
         return true;
     }
@@ -899,6 +910,14 @@ void PTO2OrchestratorState::mark_done() {
             );
         }
     }
+#if PTO2_ORCH_PROFILING
+    if (g_orch_fanin_dedup_total > 0) {
+        LOG_INFO_V0(
+            "=== [FaninDedup] max_K=%" PRId64 " total_calls=%" PRId64 " ===", g_orch_fanin_dedup_max,
+            g_orch_fanin_dedup_total
+        );
+    }
+#endif
     orch->sm_header->orchestrator_done.store(1, std::memory_order_release);
     orch->scope_tasks_size = 0;
     orch->scope_stack_top = -1;
@@ -924,6 +943,8 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
     d.alloc_atomic_count = g_orch_alloc_atomic_count;
     d.args_atomic_count = g_orch_args_atomic_count;
     d.scope_end_atomic_count = g_orch_scope_end_atomic_count;
+    d.fanin_dedup_max = g_orch_fanin_dedup_max;
+    d.fanin_dedup_total = g_orch_fanin_dedup_total;
 
     // Reset
     g_orch_sync_cycle = g_orch_alloc_cycle = g_orch_args_cycle = 0;
@@ -936,6 +957,8 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
     g_orch_alloc_atomic_count = 0;
     g_orch_args_atomic_count = 0;
     g_orch_scope_end_atomic_count = 0;
+    g_orch_fanin_dedup_max = 0;
+    g_orch_fanin_dedup_total = 0;
     return d;
 }
 #endif

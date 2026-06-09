@@ -189,6 +189,9 @@ struct PTO2OrchProfilingData {
     uint64_t alloc_atomic_count;
     uint64_t args_atomic_count;
     uint64_t scope_end_atomic_count;
+    // Fanin dedup instrumentation (always-on counters, gated by PTO2_ORCH_PROFILING)
+    int64_t fanin_dedup_max;    // Peak K seen in a single append_fanin_or_fail call
+    int64_t fanin_dedup_total;  // Total append_fanin_or_fail calls across all submits
 };
 
 PTO2OrchProfilingData orchestrator_get_profiling();
