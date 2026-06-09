@@ -644,6 +644,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 "Thread %d:   avg/task       : %.3fus", thread_idx,
                 p.submit_count > 0 ? cycles_to_us(total) / p.submit_count : 0.0
             );
+            LOG_INFO_V9(
+                "Thread %d:   fanin_dedup    : max_K=%" PRId64 " total_calls=%" PRId64 "", thread_idx,
+                p.fanin_dedup_max, p.fanin_dedup_total
+            );
 
 #if PTO2_TENSORMAP_PROFILING
             PTO2TensorMapProfilingData tp = pto2_tensormap_get_profiling();

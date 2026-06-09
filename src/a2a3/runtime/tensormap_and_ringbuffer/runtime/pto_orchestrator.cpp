@@ -919,7 +919,7 @@ void PTO2OrchestratorState::mark_done() {
     }
 #if PTO2_ORCH_PROFILING
     if (g_orch_fanin_dedup_total > 0) {
-        LOG_INFO_V0(
+        LOG_INFO_V5(
             "=== [FaninDedup] max_K=%" PRId64 " total_calls=%" PRId64 " ===", g_orch_fanin_dedup_max,
             g_orch_fanin_dedup_total
         );
