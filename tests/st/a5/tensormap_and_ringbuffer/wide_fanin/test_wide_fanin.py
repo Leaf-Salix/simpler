@@ -67,6 +67,12 @@ class TestWideFanin(SceneTestCase):
                 "source": "../dummy_task/kernels/aic/kernel_copy_first.cpp",
                 "core_type": "aic",
             },
+            {
+                "func_id": 2,
+                "name": "COPY_FIRST_TO_LAST",
+                "source": "kernels/aic/kernel_copy_first_to_last.cpp",
+                "core_type": "aic",
+            },
         ],
     }
 
@@ -88,13 +94,12 @@ class TestWideFanin(SceneTestCase):
     def generate_args(self, params):
         """Build producer tensors + output tensor + scalar.
 
-        case=1: 15 producer tensors (x_0..x_14), 1 output (y), 1 scalar.
-        case=2: 16 producer tensors (x_0..x_15), 1 output (y), 1 scalar.
+        Both cases use 17 tensor slots (x_0..x_15, y) + 1 scalar = 18 args.
+        case=1 only uses x_0..x_14 + y (16 tensors); x_15 is unused but present.
         """
-        n_producers = 15 if params["case"] == 1 else 16
         tensors = [
             Tensor(f"x_{i}", torch.full((16,), INIT_VAL, dtype=torch.float32))
-            for i in range(n_producers)
+            for i in range(16)
         ]
         tensors.append(Tensor("y", torch.full((16,), INIT_VAL, dtype=torch.float32)))
         return TaskArgsBuilder(
