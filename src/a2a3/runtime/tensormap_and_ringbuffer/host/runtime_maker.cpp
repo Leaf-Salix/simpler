@@ -88,6 +88,13 @@ static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader
         LOG_WARN("Failed to copy PTO2 header from device");
         return 0;
     }
+    LOG_INFO_V0(
+        "[read_runtime_status] orch_done=%d fd_max=%" PRId64 " fd_total=%" PRId64 " fd_cyc=%" PRIu64,
+        host_header->orchestrator_done.load(std::memory_order_relaxed),
+        host_header->prof_fanin_dedup_max.load(std::memory_order_relaxed),
+        host_header->prof_fanin_dedup_total.load(std::memory_order_relaxed),
+        host_header->prof_contains_cycle.load(std::memory_order_relaxed)
+    );
 
     int32_t orch_error_code = host_header->orch_error_code.load(std::memory_order_relaxed);
     int32_t sched_error_code = host_header->sched_error_code.load(std::memory_order_relaxed);
