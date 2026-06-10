@@ -47,8 +47,8 @@
 #define CACHELINE_OUT 0
 #endif
 
-// Y is the 16th tensor arg (index 15): 15 INPUT + 1 INOUT
-static constexpr int32_t Y_IDX = 15;
+// Y is always the last tensor (slot 127 = N_PRODUCERS_MAX)
+static constexpr int32_t Y_IDX = 127;
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *in_tensor  = reinterpret_cast<__gm__ Tensor *>(args[0]);

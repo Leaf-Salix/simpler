@@ -9,6 +9,9 @@
 cmake_minimum_required(VERSION 3.16)
 project(cpu_sim_context CXX)
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 add_library(cpu_sim_context SHARED
     "${CMAKE_CURRENT_SOURCE_DIR}/cpu_sim_context.cpp"
 )
