@@ -606,13 +606,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // Print orchestrator profiling data
 #if PTO2_ORCH_PROFILING
             PTO2OrchProfilingData p = orchestrator_get_profiling();
-            // Write fanin dedup profiling to shared memory AND Runtime object.
-            // sm_header works on real hardware (host/AICPU share physical memory).
-            // Runtime object works on sim (same process, same memory).
-            if (rt->orchestrator.sm_header) {
-                rt->orchestrator.sm_header->prof_fanin_dedup_max.store(p.fanin_dedup_max, std::memory_order_relaxed);
-                rt->orchestrator.sm_header->prof_fanin_dedup_total.store(p.fanin_dedup_total, std::memory_order_relaxed);
-                rt->orchestrator.sm_header->prof_contains_cycle.store(p.contains_cycle, std::memory_order_relaxed);
+            // Fanin dedup profiling: LOG_ERROR is never filtered by CANN dlog,
+            // so this survives on real AICPU hardware where V9/V5 are suppressed.
+            if (p.fanin_dedup_total > 0) {
+                LOG_ERROR(
+                    "[FaninDedup-profiling] max_K=%" PRId64 " total_calls=%" PRId64 " contains_cycles=%" PRIu64,
+                    p.fanin_dedup_max, p.fanin_dedup_total, p.contains_cycle
+                );
             }
             runtime->set_prof_fanin_dedup(p.fanin_dedup_max, p.fanin_dedup_total, p.contains_cycle);
             uint64_t total =
