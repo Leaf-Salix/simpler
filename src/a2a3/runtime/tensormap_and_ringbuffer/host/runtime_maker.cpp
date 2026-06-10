@@ -430,9 +430,14 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
             LOG_INFO_V0("Graph output buffer: ptr=0x%" PRIx64 ", size=%" PRIu64, graph_out_ptr, graph_out_size);
         }
 #if PTO2_ORCH_PROFILING
-        int64_t fd_max = runtime->get_prof_fanin_dedup_max();
-        int64_t fd_total = runtime->get_prof_fanin_dedup_total();
-        uint64_t fd_cycles = runtime->get_prof_contains_cycle();
+        int64_t fd_max = host_header.prof_fanin_dedup_max.load(std::memory_order_relaxed);
+        int64_t fd_total = host_header.prof_fanin_dedup_total.load(std::memory_order_relaxed);
+        uint64_t fd_cycles = host_header.prof_contains_cycle.load(std::memory_order_relaxed);
+        if (fd_total == 0) {
+            fd_max = runtime->get_prof_fanin_dedup_max();
+            fd_total = runtime->get_prof_fanin_dedup_total();
+            fd_cycles = runtime->get_prof_contains_cycle();
+        }
         if (fd_total > 0) {
             LOG_INFO_V0(
                 "[FaninDedup] max_K=%" PRId64 " total_calls=%" PRId64 " contains_cycles=%" PRIu64,

@@ -599,6 +599,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // Print orchestrator profiling data
 #if PTO2_ORCH_PROFILING
             PTO2OrchProfilingData p = orchestrator_get_profiling();
+            if (rt->orchestrator.sm_header) {
+                rt->orchestrator.sm_header->prof_fanin_dedup_max.store(p.fanin_dedup_max, std::memory_order_relaxed);
+                rt->orchestrator.sm_header->prof_fanin_dedup_total.store(p.fanin_dedup_total, std::memory_order_relaxed);
+                rt->orchestrator.sm_header->prof_contains_cycle.store(p.contains_cycle, std::memory_order_relaxed);
+            }
             runtime->set_prof_fanin_dedup(p.fanin_dedup_max, p.fanin_dedup_total, p.contains_cycle);
             uint64_t total =
                 p.sync_cycle + p.alloc_cycle + p.args_cycle + p.lookup_cycle + p.insert_cycle + p.fanin_cycle;
