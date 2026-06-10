@@ -107,9 +107,12 @@ uint64_t g_orch_alloc_atomic_count = 0;
 uint64_t g_orch_args_atomic_count = 0;
 uint64_t g_orch_scope_end_atomic_count = 0;
 // Fanin dedup instrumentation: peak K + total call count
-static int64_t g_orch_fanin_dedup_max = 0;
-static int64_t g_orch_fanin_dedup_total = 0;
-static uint64_t g_orch_contains_cycle = 0;
+// Exported via extern "C" so the host can read them via dlsym after task completion.
+extern "C" {
+int64_t g_orch_fanin_dedup_max = 0;
+int64_t g_orch_fanin_dedup_total = 0;
+uint64_t g_orch_contains_cycle = 0;
+}
 // Cycle accumulation feeds the per-sub-step `g_orch_*_cycle` cumulatives
 // printed in the cold-path log. Per-sub-step swim-lane phase records were
 // dropped; the per-submit envelope record (CYCLE_COUNT_ORCH_SUBMIT_RECORD)
@@ -927,6 +930,11 @@ void PTO2OrchestratorState::mark_done() {
             g_orch_fanin_dedup_max, g_orch_fanin_dedup_total, g_orch_contains_cycle
         );
     }
+    // Write profiling to shared memory so the host can read it regardless of
+    // AICPU log filtering (CANN dlog suppresses V9 on real hardware).
+    orch->sm_header->prof_fanin_dedup_max.store(g_orch_fanin_dedup_max, std::memory_order_relaxed);
+    orch->sm_header->prof_fanin_dedup_total.store(g_orch_fanin_dedup_total, std::memory_order_relaxed);
+    orch->sm_header->prof_contains_cycle.store(g_orch_contains_cycle, std::memory_order_relaxed);
 #endif
     orch->sm_header->orchestrator_done.store(1, std::memory_order_release);
     orch->scope_tasks_size = 0;

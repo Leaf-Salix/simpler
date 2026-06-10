@@ -261,6 +261,12 @@ private:
     char device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
     char device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
 
+    // Fanin dedup profiling (written by AICPU, read by host after task completes).
+    // Unconditional because runtime.h doesn't include pto_runtime2_types.h.
+    int64_t prof_fanin_dedup_max_ = 0;
+    int64_t prof_fanin_dedup_total_ = 0;
+    uint64_t prof_contains_cycle_ = 0;
+
 public:
     /**
      * Constructor - zero-initialize all arrays
@@ -270,6 +276,15 @@ public:
     // =========================================================================
     // Performance Profiling
     // =========================================================================
+
+    int64_t get_prof_fanin_dedup_max() const { return prof_fanin_dedup_max_; }
+    int64_t get_prof_fanin_dedup_total() const { return prof_fanin_dedup_total_; }
+    uint64_t get_prof_contains_cycle() const { return prof_contains_cycle_; }
+    void set_prof_fanin_dedup(int64_t max_k, int64_t total, uint64_t cycles) {
+        prof_fanin_dedup_max_ = max_k;
+        prof_fanin_dedup_total_ = total;
+        prof_contains_cycle_ = cycles;
+    }
 
     // =========================================================================
     // Device orchestration (for AICPU thread 3)

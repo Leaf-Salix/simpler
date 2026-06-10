@@ -429,6 +429,18 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
         if (graph_out_ptr != 0) {
             LOG_INFO_V0("Graph output buffer: ptr=0x%" PRIx64 ", size=%" PRIu64, graph_out_ptr, graph_out_size);
         }
+#if PTO2_ORCH_PROFILING
+        // Read fanin dedup profiling from Runtime object (written by AICPU executor).
+        int64_t fd_max = runtime->get_prof_fanin_dedup_max();
+        int64_t fd_total = runtime->get_prof_fanin_dedup_total();
+        uint64_t fd_cycles = runtime->get_prof_contains_cycle();
+        if (fd_total > 0) {
+            LOG_INFO_V0(
+                "[FaninDedup] max_K=%" PRId64 " total_calls=%" PRId64 " contains_cycles=%" PRIu64,
+                fd_max, fd_total, fd_cycles
+            );
+        }
+#endif
     }
 
     if (skip_tensor_copy_back) {

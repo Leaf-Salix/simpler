@@ -606,6 +606,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // Print orchestrator profiling data
 #if PTO2_ORCH_PROFILING
             PTO2OrchProfilingData p = orchestrator_get_profiling();
+            // Store fanin dedup profiling in Runtime object so the host can
+            // read it after task completes. This avoids both the shared-memory
+            // split-address problem on sim and the CANN dlog filtering on hardware.
+            runtime->set_prof_fanin_dedup(p.fanin_dedup_max, p.fanin_dedup_total, p.contains_cycle);
             uint64_t total =
                 p.sync_cycle + p.alloc_cycle + p.args_cycle + p.lookup_cycle + p.insert_cycle + p.fanin_cycle;
             if (total == 0) total = 1;  // avoid div-by-zero

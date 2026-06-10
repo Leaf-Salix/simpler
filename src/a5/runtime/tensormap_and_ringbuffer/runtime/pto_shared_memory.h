@@ -139,6 +139,15 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     std::atomic<uint32_t> sched_error_bitmap;  // Bit X set = thread X had error
     std::atomic<int32_t> sched_error_code;     // Last scheduler error code (last-writer-wins)
     std::atomic<int32_t> sched_error_thread;   // Thread index of last error writer
+
+    // === ORCHESTRATOR PROFILING (AICPU → Host, written at mark_done) ===
+    // These fields let the host read profiling data without relying on
+    // AICPU-side log output (which is filtered by CANN dlog on real hardware).
+#if PTO2_ORCH_PROFILING
+    std::atomic<int64_t> prof_fanin_dedup_max;
+    std::atomic<int64_t> prof_fanin_dedup_total;
+    std::atomic<uint64_t> prof_contains_cycle;
+#endif
 };
 
 static_assert(
