@@ -10,14 +10,13 @@
  */
 
 /**
- * wide_fanin orchestration — stress fanin dedup at various K values.
+ * wide_fanin orchestration — stress fanin dedup via explicit deps at various K values.
  *
  * Scalar args: case_id (scalar 0), n_producers (scalar 1).
- * Tensor layout: x_0..x_63, y  (65 tensors, Y always at slot 64).
+ * Tensor layout: x_0..x_126, y  (128 tensors, Y always at slot 127).
  *
- * Case 1 (WideFaninK15):  N=15 producers, consumer reads all N + Y → K=N.
- * Case 2 (ExplicitDepK17): N=16 producers, consumer explicit deps(N) + 1 tensormap → K=N+1.
- * Case 3 (WideFaninK64):  N=64 producers, consumer reads all N + Y → K=N.
+ * Case 2 (ExplicitDepK17):  N=16 producers, consumer explicit deps(N) + 1 tensormap → K=N+1.
+ * Case 3 (WideFaninK64/128): N=64/127 producers, consumer explicit deps(N) + 1 tensormap → K=N+1.
  */
 
 #include <cstdint>
@@ -48,27 +47,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
     Tensor ext_Y = from_tensor_arg(orch_args.tensor(Y_SLOT));
 
-    if (case_id == 1) {
-        // K=15: 15 producers, consumer reads all 15 + Y (16 tensors, within MAX_TENSOR_ARGS).
-        std::vector<Tensor> prods;
-        prods.reserve(n);
-        for (int32_t i = 0; i < n; i++) {
-            prods.push_back(from_tensor_arg(orch_args.tensor(i)));
-        }
-        for (int32_t i = 0; i < n; i++) {
-            Arg p_args;
-            p_args.add_inout(prods[i]);
-            rt_submit_aic_task(FUNC_WRITE_CONST, p_args);
-        }
-        {
-            Arg c_args;
-            for (int32_t i = 0; i < n; i++) {
-                c_args.add_input(prods[i]);
-            }
-            c_args.add_inout(ext_Y);
-            rt_submit_aic_task(FUNC_COPY_FIRST_TO_LAST, c_args);
-        }
-    } else if (case_id == 2 || case_id == 3) {
+    if (case_id == 2 || case_id == 3) {
         // K=N+1 via explicit deps: N producers, consumer explicit deps(N) + 1 tensormap.
         std::vector<Tensor> prods;
         prods.reserve(n);

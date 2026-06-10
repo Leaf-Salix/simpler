@@ -9,13 +9,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """wide_fanin: stress-test the fanin dedup contains() scan at various K values.
 
-Case 1 (WideFaninK15):   15 producers → consumer reads all 15 + Y → K=15
-Case 2 (ExplicitDepK17): 16 producers → consumer explicit deps(16) + 1 tensormap → K=17
-Case 3 (WideFaninK64):   64 producers → consumer reads all 64 + Y → K=64
+Case 2 (ExplicitDepK17):  16 producers → consumer explicit deps(16) + 1 tensormap → K=17
+Case 3 (WideFaninK64):    64 producers → consumer explicit deps(64) + 1 tensormap → K=65
+Case 3 (ExplicitDepK128): 127 producers → consumer explicit deps(127) + 1 tensormap → K=128
 
-Tensor layout: x_0..x_63, y  (65 tensors total).
-  Y is always at slot 64 (the last tensor).
-  COPY_FIRST_TO_LAST kernel: reads args[0], writes args[Y_IDX].
+Tensor layout: x_0..x_126, y  (128 tensors total).
+  Y is always at slot 127 (N_PRODUCERS_MAX).
+  All cases use explicit deps (Arg::set_dependencies) + 1 tensormap edge.
 """
 
 import torch

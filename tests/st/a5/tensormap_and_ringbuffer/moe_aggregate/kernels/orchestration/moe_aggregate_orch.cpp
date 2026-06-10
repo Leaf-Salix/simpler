@@ -25,14 +25,14 @@
  *
  * K=2..15 (Aggregate, pure tensormap):
  *   K producers each write experts[i][0] = 42.0.
- *   Zero task writes Y[0] = 42.0 (WAR barrier via INOUT tensormap dep).
+ *   Dummy barrier on Y (tensormap dep, no kernel — no value written).
  *   Consumer aggregates: Y[0] = sum(experts[0..K-1][0]) via AGGREGATE.
  *   Tensor arg budget: K INPUT + 1 INOUT (at most 15 + 1 = 16 = MAX_TENSOR_ARGS).
  *   expect Y[0] = K * 42.0
  *
  * K=16 (Aggregate, two-phase):
  *   16 producers each write experts[i][0] = 42.0.
- *   Zero task writes Y[0] (WAR barrier).
+ *   Dummy barrier on Y (tensormap dep, no kernel).
  *   Phase 1: AGGREGATE(mode=0) sums experts[0..14] -> Y[0] = 630.0
  *     15 INPUT + 1 INOUT = 16 tensor args (at MAX_TENSOR_ARGS cap).
  *     explicit deps on producers[0..14] for scheduling.
@@ -43,6 +43,7 @@
  */
 
 #include <cstdint>
+#include <vector>
 
 #include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
 
@@ -66,13 +67,15 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     uint64_t k = orch_args.scalar(0);
     LOG_INFO_V0("[moe_aggregate_orch] K=%llu", static_cast<unsigned long long>(k));
 
-    Tensor experts[MAX_EXPERTS];
-    for (int32_t i = 0; i < MAX_EXPERTS; i++) {
-        experts[i] = from_tensor_arg(orch_args.tensor(i));
-    }
     Tensor ext_Y = from_tensor_arg(orch_args.tensor(MAX_EXPERTS));
 
-    PTO2TaskId producer_ids[MAX_EXPERTS];
+    // Use vector to keep Tensor objects alive (private default ctor prevents arrays).
+    std::vector<Tensor> experts;
+    experts.reserve(MAX_EXPERTS);
+    for (int32_t i = 0; i < MAX_EXPERTS; i++) {
+        experts.push_back(from_tensor_arg(orch_args.tensor(i)));
+    }
+    std::vector<PTO2TaskId> producer_ids(MAX_EXPERTS);
 
     // Submit K independent producers: each writes 42.0f to experts[i][0].
     for (uint64_t i = 0; i < k; i++) {
@@ -90,15 +93,16 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         c_args.add_inout(ext_Y);
         rt_submit_aic_task(FUNC_COPY_FIRST, c_args);
     } else {
-        // K>1: zero Y (WAR barrier), then aggregate K experts into Y.
+        // K>1: dummy barrier on Y (tensormap dep, no kernel), then aggregate.
         {
             Arg z_args;
             z_args.add_inout(ext_Y);
-            rt_submit_aic_task(FUNC_WRITE_CONST, z_args);
-            // WRITE_CONST writes 42.0f to Y[0]. AGGREGATE(mode=0) overwrites
-            // Y[0] with sum, so the 42.0 is lost. The zero_task is submitted
-            // so the consumer's add_inout(ext_Y) creates a tensormap dep,
-            // ensuring Y is not read while being written.
+            rt_submit_dummy_task(z_args);
+            // Dummy task registers Y in the tensormap as produced. The
+            // consumer's add_inout(ext_Y) creates a tensormap dep on this
+            // dummy, ensuring the consumer waits. No value is written to Y,
+            // so Y[0] stays at its initial value (INIT_VAL) for mode 0
+            // (overwrite) and mode 1 (additive).
         }
 
         if (k <= 15) {
@@ -126,7 +130,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 }
                 c_args.add_inout(ext_Y);
                 c_args.add_scalar(static_cast<uint64_t>(15));  // mode=0, k=15
-                c_args.set_dependencies(producer_ids, 15);
+                c_args.set_dependencies(producer_ids.data(), 15);
                 phase1_id = rt_submit_aic_task(FUNC_AGGREGATE, c_args).task_id();
             }
             // Phase 2: AGGREGATE(mode=1) adds experts[15] -> Y[0] += 42.0 = 672.0

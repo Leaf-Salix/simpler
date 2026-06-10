@@ -10,14 +10,13 @@
  */
 
 /**
- * Consumer kernel for wide_fanin case 1: copies args[0][0] -> args[15][0].
+ * Consumer kernel: copies args[0][0] -> args[Y_IDX][0].
  *
- * In wide_fanin case 1 the consumer submits 15 INPUT tensors (X_0..X_14)
- * followed by 1 INOUT tensor (Y).  The runtime packs them as:
- *   args[0]=X_0, args[1]=X_1, ..., args[14]=X_14, args[15]=Y
+ * Reads from the first tensor arg and writes to Y at fixed offset Y_IDX.
+ * Used by wide_fanin case 1 (15 INPUT + Y INOUT = 16 tensors).
  *
- * This kernel reads from the first input (X_0) and writes to the last
- * tensor (Y at fixed offset 15).
+ * NOTE: This kernel is kept for reference. Current wide_fanin cases 2/3 use
+ * explicit deps + COPY_FIRST instead.
  */
 
 #include <cstdint>

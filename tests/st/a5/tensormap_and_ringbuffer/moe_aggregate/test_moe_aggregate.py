@@ -21,18 +21,20 @@ Case K=1 (CopyFirst):
 
 Case K=8 (Aggregate):
   8 producers write experts[0..7][0] = 42.0.
-  Zero task writes Y[0] (barrier for INOUT ordering).
+  Dummy barrier on Y (tensormap dep, no kernel).
   Consumer aggregates: Y[0] = sum(experts[0..7][0]) = 336.0.
   expect Y[0] = 336.0
 
 Case K=15 (Aggregate, MAX_TENSOR_ARGS limit):
   15 producers write experts[0..14][0] = 42.0.
+  Dummy barrier on Y.
   Consumer aggregates: Y[0] = sum(experts[0..14][0]) = 630.0.
   15 INPUT + 1 INOUT = 16 tensor args (at MAX_TENSOR_ARGS cap).
   expect Y[0] = 630.0
 
 Case K=16 (Aggregate, explicit deps):
   16 producers write experts[0..15][0] = 42.0.
+  Dummy barrier on Y.
   Consumer uses set_dependencies(producer_ids, 16) + 1 tensormap edge = K=17.
   Consumer aggregates: Y[0] = sum(experts[0..15][0]) = 672.0.
   expect Y[0] = 672.0
