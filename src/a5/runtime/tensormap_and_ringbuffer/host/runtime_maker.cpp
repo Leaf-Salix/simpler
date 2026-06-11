@@ -89,6 +89,16 @@ static int32_t read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader *hos
         return 0;
     }
 
+#if PTO2_ORCH_PROFILING
+    LOG_INFO_V0(
+        "[read_runtime_status] orch_done=%d fd_max=%" PRId64 " fd_total=%" PRId64 " fd_cyc=%" PRIu64,
+        host_header->orchestrator_done.load(std::memory_order_relaxed),
+        host_header->prof_fanin_dedup_max.load(std::memory_order_relaxed),
+        host_header->prof_fanin_dedup_total.load(std::memory_order_relaxed),
+        host_header->prof_contains_cycle.load(std::memory_order_relaxed)
+    );
+#endif
+
     int32_t orch_error_code = host_header->orch_error_code.load(std::memory_order_relaxed);
     int32_t sched_error_code = host_header->sched_error_code.load(std::memory_order_relaxed);
     return runtime_status_from_error_codes(orch_error_code, sched_error_code);
