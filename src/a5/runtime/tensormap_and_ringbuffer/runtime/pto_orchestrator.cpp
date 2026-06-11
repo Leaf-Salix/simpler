@@ -932,9 +932,13 @@ void PTO2OrchestratorState::mark_done() {
     }
     // Write profiling to shared memory so the host can read it regardless of
     // AICPU log filtering (CANN dlog suppresses V9 on real hardware).
-    orch->sm_header->prof_fanin_dedup_max.store(g_orch_fanin_dedup_max, std::memory_order_relaxed);
-    orch->sm_header->prof_fanin_dedup_total.store(g_orch_fanin_dedup_total, std::memory_order_relaxed);
-    orch->sm_header->prof_contains_cycle.store(g_orch_contains_cycle, std::memory_order_relaxed);
+    // Use the values saved by orchestrator_get_profiling() (which resets globals).
+    extern int64_t s_saved_fanin_dedup_max;
+    extern int64_t s_saved_fanin_dedup_total;
+    extern uint64_t s_saved_contains_cycle;
+    orch->sm_header->prof_fanin_dedup_max.store(s_saved_fanin_dedup_max, std::memory_order_relaxed);
+    orch->sm_header->prof_fanin_dedup_total.store(s_saved_fanin_dedup_total, std::memory_order_relaxed);
+    orch->sm_header->prof_contains_cycle.store(s_saved_contains_cycle, std::memory_order_relaxed);
 #endif
     orch->sm_header->orchestrator_done.store(1, std::memory_order_release);
     orch->scope_tasks_size = 0;
@@ -964,6 +968,21 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
     d.fanin_dedup_max = g_orch_fanin_dedup_max;
     d.fanin_dedup_total = g_orch_fanin_dedup_total;
     d.contains_cycle = g_orch_contains_cycle;
+
+    // Write to sm_header BEFORE reset so the host can read via copy_from_device.
+    // mark_done() runs after this function, so sm_header must be populated here.
+    // We use a weak symbol lookup for sm_header since this is a free function;
+    // fall back to writing via the static orchestrator pointer captured at init.
+    // Actually, the simplest approach: write directly via the global sm_header
+    // pointer that the orchestrator stored. But we don't have it here.
+    // Instead, store in static vars that mark_done() will pick up.
+    // (The globals get reset below, so save to separate statics.)
+    static int64_t s_saved_fanin_dedup_max = 0;
+    static int64_t s_saved_fanin_dedup_total = 0;
+    static uint64_t s_saved_contains_cycle = 0;
+    s_saved_fanin_dedup_max = g_orch_fanin_dedup_max;
+    s_saved_fanin_dedup_total = g_orch_fanin_dedup_total;
+    s_saved_contains_cycle = g_orch_contains_cycle;
 
     // Reset
     g_orch_sync_cycle = g_orch_alloc_cycle = g_orch_args_cycle = 0;

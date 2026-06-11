@@ -936,9 +936,14 @@ void PTO2OrchestratorState::mark_done() {
             g_orch_fanin_dedup_max, g_orch_fanin_dedup_total, g_orch_contains_cycle
         );
     }
-    orch->sm_header->prof_fanin_dedup_max.store(g_orch_fanin_dedup_max, std::memory_order_relaxed);
-    orch->sm_header->prof_fanin_dedup_total.store(g_orch_fanin_dedup_total, std::memory_order_relaxed);
-    orch->sm_header->prof_contains_cycle.store(g_orch_contains_cycle, std::memory_order_relaxed);
+    // Write profiling to shared memory. Use values saved by orchestrator_get_profiling()
+    // (which resets the globals before mark_done() runs).
+    extern int64_t s_saved_fanin_dedup_max;
+    extern int64_t s_saved_fanin_dedup_total;
+    extern uint64_t s_saved_contains_cycle;
+    orch->sm_header->prof_fanin_dedup_max.store(s_saved_fanin_dedup_max, std::memory_order_relaxed);
+    orch->sm_header->prof_fanin_dedup_total.store(s_saved_fanin_dedup_total, std::memory_order_relaxed);
+    orch->sm_header->prof_contains_cycle.store(s_saved_contains_cycle, std::memory_order_relaxed);
 #endif
     orch->sm_header->orchestrator_done.store(1, std::memory_order_release);
     orch->scope_tasks_size = 0;
@@ -968,6 +973,14 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
     d.fanin_dedup_max = g_orch_fanin_dedup_max;
     d.fanin_dedup_total = g_orch_fanin_dedup_total;
     d.contains_cycle = g_orch_contains_cycle;
+
+    // Save before reset — mark_done() runs after this and needs the values.
+    static int64_t s_saved_fanin_dedup_max = 0;
+    static int64_t s_saved_fanin_dedup_total = 0;
+    static uint64_t s_saved_contains_cycle = 0;
+    s_saved_fanin_dedup_max = g_orch_fanin_dedup_max;
+    s_saved_fanin_dedup_total = g_orch_fanin_dedup_total;
+    s_saved_contains_cycle = g_orch_contains_cycle;
 
     // Reset
     g_orch_sync_cycle = g_orch_alloc_cycle = g_orch_args_cycle = 0;
