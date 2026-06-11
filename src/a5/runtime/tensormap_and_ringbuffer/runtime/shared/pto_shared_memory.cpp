@@ -145,6 +145,14 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     }
 
     header->orchestrator_done.store(0, std::memory_order_relaxed);
+#if PTO2_ORCH_PROFILING
+    // Sentinel values: if mark_done() is reached, these get overwritten with
+    // real profiling data. If the host reads these sentinels, mark_done() was
+    // never called (early exit / fatal / wrong code path).
+    header->prof_fanin_dedup_max.store(-999, std::memory_order_relaxed);
+    header->prof_fanin_dedup_total.store(-999, std::memory_order_relaxed);
+    header->prof_contains_cycle.store(0xDEADBEEF, std::memory_order_relaxed);
+#endif
 
     // Per-ring layout info
     uint64_t offset = PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
