@@ -112,6 +112,10 @@ int64_t g_orch_fanin_dedup_max = 0;
 int64_t g_orch_fanin_dedup_total = 0;
 uint64_t g_orch_contains_cycle = 0;
 }
+// Saved before orchestrator_get_profiling() resets globals (race condition fix)
+static int64_t s_saved_fanin_dedup_max = 0;
+static int64_t s_saved_fanin_dedup_total = 0;
+static uint64_t s_saved_contains_cycle = 0;
 // Cycle accumulation is unconditional under PTO2_ORCH_PROFILING (that's what
 // the flag is for) and feeds the per-sub-step `g_orch_*_cycle` cumulatives
 // printed in the cold-path log.
@@ -938,9 +942,6 @@ void PTO2OrchestratorState::mark_done() {
     }
     // Write profiling to shared memory. Use values saved by orchestrator_get_profiling()
     // (which resets the globals before mark_done() runs).
-    extern int64_t s_saved_fanin_dedup_max;
-    extern int64_t s_saved_fanin_dedup_total;
-    extern uint64_t s_saved_contains_cycle;
     orch->sm_header->prof_fanin_dedup_max.store(s_saved_fanin_dedup_max, std::memory_order_relaxed);
     orch->sm_header->prof_fanin_dedup_total.store(s_saved_fanin_dedup_total, std::memory_order_relaxed);
     orch->sm_header->prof_contains_cycle.store(s_saved_contains_cycle, std::memory_order_relaxed);
@@ -975,9 +976,6 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
     d.contains_cycle = g_orch_contains_cycle;
 
     // Save before reset — mark_done() runs after this and needs the values.
-    static int64_t s_saved_fanin_dedup_max = 0;
-    static int64_t s_saved_fanin_dedup_total = 0;
-    static uint64_t s_saved_contains_cycle = 0;
     s_saved_fanin_dedup_max = g_orch_fanin_dedup_max;
     s_saved_fanin_dedup_total = g_orch_fanin_dedup_total;
     s_saved_contains_cycle = g_orch_contains_cycle;
