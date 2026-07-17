@@ -25,9 +25,4 @@ echo "[remote-l4-npu] role=${SIMPLER_REMOTE_L4_NPU_ROLE}"
 echo "[remote-l4-npu] listening on ${SIMPLER_REMOTE_L4_NPU_HOST}:${SIMPLER_REMOTE_L4_NPU_PORT}"
 echo "[remote-l4-npu] device=${SIMPLER_REMOTE_L4_NPU_DEVICE}"
 
-if command -v task-submit >/dev/null 2>&1; then
-  exec task-submit --timeout 3600 --max-time 3600 --device "${SIMPLER_REMOTE_L4_NPU_DEVICE}" --run "${RUN_CMD}"
-fi
-
-echo "[remote-l4-npu] WARN: task-submit not found; running daemon without the NPU queue lock" >&2
 exec bash -lc "${RUN_CMD}"
