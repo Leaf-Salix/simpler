@@ -273,11 +273,10 @@ The runtime separates locally provable deadlocks from ordinary concurrent back-p
 
 - A single aligned output request exceeds the entire heap ring.
 - Scheduler dispatch is serial/gated, so a blocked orchestrator has no concurrent consumer that could reclaim space.
-- The head task is `COMPLETED`, every consumer reference is released, but its scope reference remains. Only the blocked orchestrator can execute `scope_end()`, so this is a structurally proven cycle.
 
 **Concurrent residual stall**:
 
-When the head still has unreleased consumers, freeing it would be incorrect because those consumers may still read its output. The allocator therefore continues to apply back-pressure. If the scheduler's global completion count also stops for the scheduler timeout budget, no core owns a running task, and `orchestrator_reclaim_waiting=1`, the scheduler emits its normal stall classification (`RUNNING_STALLED`, `READY_IDLE`, `DEP_DEADLOCK`, or `ORCH_STARVATION`) and latches `PTO2_ERROR_SCHEDULER_TIMEOUT`. The allocator observes that scheduler error and unwinds without replacing it with `PTO2_ERROR_HEAP_RING_DEADLOCK`.
+When dispatch runs concurrently, the allocator does not classify the mutable head state locally. This includes both unreleased consumers and a head that currently appears to wait only for its scope reference. Freeing either head would be incorrect, so the allocator continues to apply back-pressure. If the scheduler's global completion count also stops for the scheduler timeout budget, no core owns a running task, and `orchestrator_reclaim_waiting=1`, the scheduler emits its normal stall classification (`RUNNING_STALLED`, `READY_IDLE`, `DEP_DEADLOCK`, or `ORCH_STARVATION`) and latches `PTO2_ERROR_SCHEDULER_TIMEOUT`. The allocator observes that scheduler error and unwinds without replacing it with `PTO2_ERROR_HEAP_RING_DEADLOCK`.
 
 This preserves in-order reclamation: a task's heap storage is never reused before all consumer and scope references are released.
 

@@ -199,15 +199,6 @@ public:
                     clear_reclaim_wait();
                     return {-1, -1, nullptr, nullptr};
                 }
-                // Structural, immediate: if the head task is COMPLETED with
-                // every consumer released but its scope still open, only
-                // scope_end can free it and a blocked orchestrator can never
-                // call it -> provable deadlock now.
-                if (head_blocked_on_scope_end(last_alive)) {
-                    report_deadlock(output_size, blocked_on_heap, /*scope_gated=*/true);
-                    clear_reclaim_wait();
-                    return {-1, -1, nullptr, nullptr};
-                }
                 if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0) {
                     LOG_WARN(
                         "[TaskAllocator ring=%u] BLOCKED: tasks=%d/%d, heap_used=%" PRIu64 "/%" PRIu64

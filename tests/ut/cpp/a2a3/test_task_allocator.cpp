@@ -404,6 +404,51 @@ TEST_F(TaskAllocatorTest, ConcurrentBackpressureWaitsForSchedulerReclaim) {
     EXPECT_EQ(error_code.load(), PTO2_ERROR_NONE);
 }
 
+TEST_F(TaskAllocatorTest, ConcurrentScopeGatedHeadDefersToSchedulerWatchdog) {
+    std::vector<PTO2TaskSlotState> slot_states(WINDOW_SIZE);
+    allocator.init(
+        descriptors.data(), WINDOW_SIZE, &current_index, &last_alive, heap_buf, HEAP_SIZE, &error_code,
+        slot_states.data()
+    );
+
+    auto first = allocator.alloc(HEAP_SIZE);
+    ASSERT_FALSE(first.failed());
+
+    PTO2SharedMemoryHeader header{};
+    header.orch_error_code.store(PTO2_ERROR_NONE);
+    header.sched_error_code.store(PTO2_ERROR_NONE);
+    header.orchestrator_reclaim_waiting.store(0);
+
+    PTO2TaskSlotState &head = slot_states[0];
+    head.fanout_lock.store(0, std::memory_order_relaxed);
+    head.fanout_count = PTO2_FANOUT_SCOPE_BIT;
+    head.fanout_refcount.store(0, std::memory_order_relaxed);
+    head.task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+
+    std::atomic<bool> observed_wait{false};
+    std::thread scheduler_failure([&]() {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (header.orchestrator_reclaim_waiting.load(std::memory_order_acquire) == 0 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        observed_wait.store(
+            header.orchestrator_reclaim_waiting.load(std::memory_order_acquire) != 0, std::memory_order_release
+        );
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        header.sched_error_code.store(PTO2_ERROR_SCHEDULER_TIMEOUT, std::memory_order_release);
+    });
+
+    auto second = allocator.alloc(64, &header, /*scheduler_runs_concurrently=*/true);
+    scheduler_failure.join();
+
+    EXPECT_TRUE(observed_wait);
+    EXPECT_TRUE(second.failed());
+    EXPECT_EQ(error_code.load(), PTO2_ERROR_NONE);
+    EXPECT_EQ(header.sched_error_code.load(), PTO2_ERROR_SCHEDULER_TIMEOUT);
+    EXPECT_EQ(header.orchestrator_reclaim_waiting.load(), 0);
+}
+
 TEST_F(TaskAllocatorTest, SchedulerErrorUnwindsConcurrentBackpressureWithoutOrchError) {
     auto first = allocator.alloc(HEAP_SIZE);
     ASSERT_FALSE(first.failed());

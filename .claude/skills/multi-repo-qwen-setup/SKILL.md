@@ -153,11 +153,12 @@ Batch-16 256-token × 40-layer prefill on NPU is heavy. Two independent
 failures both surface as the generic `507018`/`507046` — **read the device
 log to tell them apart**:
 
-1. **Heap-exhausted deadlock** (default 256 MB ring): the open prefill scope's
-   live-set exceeds one ring → device log prints
-   `FATAL: Task Allocator Deadlock - Heap Exhausted! ... Provable head-of-line`.
-   Fix: raise the ring. batch-1 needs just over 256 MB; batch-16 needs the
-   prefill config `PTO2_RING_HEAP=4294967296 PTO2_RING_TASK_WINDOW=131072
+1. **Heap-pressure stall** (the default ring is 256 MB): if the open prefill
+   working set cannot make progress, concurrent dispatch reports it through the
+   scheduler watchdog (`TIMEOUT_EXIT ... orch_reclaim_waiting=1`), not the
+   allocator's `Provable head-of-line` message. Confirm a capacity problem with
+   scope stats and a controlled larger-ring comparison. Batch-16 uses
+   `PTO2_RING_HEAP=4294967296 PTO2_RING_TASK_WINDOW=131072
    PTO2_RING_DEP_POOL=131072` (heap, task-window, and dep-pool all scale with
    batch; default `task_window=16384` also overflows at batch-16).
 2. **Op-execute timeout** (slow/contended prefill): device log prints

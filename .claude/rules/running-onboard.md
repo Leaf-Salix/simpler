@@ -172,7 +172,7 @@ for the signature that actually fired:**
 
 | device-log signature | mechanism | note |
 | -------------------- | --------- | ---- |
-| `FATAL: Task Allocator Deadlock` / `Provable head-of-line` | locally proven task/heap allocation deadlock | Immediate only: request exceeds total heap, scheduler dispatch is gated, or `head_blocked_on_scope_end`. Concurrent no-reclaim alone is back-pressure, not proof. |
+| `FATAL: Task Allocator Deadlock` / `Provable head-of-line` | locally proven task/heap allocation deadlock | Immediate only: request exceeds total heap, or scheduler dispatch is serial/gated. In concurrent mode, including a scope-gated head, allocator no-reclaim is back-pressure and the scheduler watchdog owns stall classification. |
 | `TIMEOUT_EXIT ... orch_reclaim_waiting=1` | global scheduler stall while orchestration is blocked on task/heap reclaim | Scheduler progress watchdog: global completions frozen and no core owns a running task for the timeout budget. Inspect `sub_class=` and task-state counts. |
 | `FATAL: Fanin Spill Pool Deadlock` / `Dependency Pool Deadlock` / `TensorMap Entry Pool Deadlock` | auxiliary pool reclaim timeout | These pools currently retain the 500ms backstop (`PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES`). |
 | `Timeout (N cycles): producer/consumers ...` | **SPIN** wait on a specific producer/consumer | `pto_runtime2.cpp`. |
