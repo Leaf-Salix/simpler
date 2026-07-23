@@ -367,6 +367,97 @@ void SchedulerContext::log_shutdown_stall_snapshot(
     }
 }
 
+void SchedulerContext::log_reclaim_stall_snapshot() {
+    uint64_t mailbox_head = 0;
+    uint64_t mailbox_tail = 0;
+    if (rt_ != nullptr && rt_->aicore_mailbox != nullptr) {
+        mailbox_head = rt_->aicore_mailbox->head.load(std::memory_order_acquire);
+        mailbox_tail = rt_->aicore_mailbox->tail.load(std::memory_order_acquire);
+    }
+    int32_t async_busy = -1;
+    int32_t async_count = -1;
+    if (sched_->async_wait_list.try_lock()) {
+        async_busy = 0;
+        async_count = sched_->async_wait_list.count;
+        sched_->async_wait_list.unlock();
+    }
+    LOG_WARN(
+        "[RECLAIM_STALL] drain_pending=%d drain_attempt=%" PRIu64
+        " drain_elected=%d stage_go=%d stage_done=0x%x running_staged=%d "
+        "mailbox=%" PRIu64 "/%" PRIu64 " async_busy=%d async_count=%d",
+        drain_state_.sync_start_pending.load(std::memory_order_acquire),
+        drain_state_.drain_attempt.load(std::memory_order_acquire),
+        drain_state_.drain_worker_elected.load(std::memory_order_acquire),
+        drain_state_.drain_stage_go.load(std::memory_order_acquire),
+        drain_state_.drain_stage_done_mask.load(std::memory_order_acquire),
+        drain_state_.drain_running_staged.load(std::memory_order_acquire), mailbox_head, mailbox_tail, async_busy,
+        async_count
+    );
+
+    constexpr int32_t max_consumer_logs = 64;
+    for (int32_t head_ring_id = 0; head_ring_id < PTO2_MAX_RING_DEPTH; head_ring_id++) {
+        PTO2SharedMemoryRingHeader &head_ring = *sched_->ring_sched_states[head_ring_id].ring;
+        int32_t current = head_ring.fc.current_task_index.load(std::memory_order_acquire);
+        int32_t last_alive = head_ring.fc.last_task_alive.load(std::memory_order_acquire);
+        if (last_alive >= current) continue;
+
+        PTO2TaskSlotState &head = head_ring.get_slot_state_by_task_id(last_alive);
+        uint32_t fanout_count = head.fanout_count;
+        uint32_t fanout_refcount = head.fanout_refcount.load(std::memory_order_acquire);
+        LOG_WARN(
+            "[RECLAIM_STALL] HEAD ring=%d current=%d last_alive=%d state=%d consumers=%u/%u scope_released=%d "
+            "completion_done=%d",
+            head_ring_id, current, last_alive, static_cast<int32_t>(head.task_state.load(std::memory_order_acquire)),
+            fanout_refcount & ~PTO2_FANOUT_SCOPE_BIT, fanout_count & ~PTO2_FANOUT_SCOPE_BIT,
+            (fanout_refcount & PTO2_FANOUT_SCOPE_BIT) != 0,
+            (head.lifecycle_flags.load(std::memory_order_acquire) & PTO2_COMPLETION_DONE) != 0
+        );
+
+        int32_t matching_live_consumers = 0;
+        int32_t logged_consumers = 0;
+        for (int32_t consumer_ring_id = 0; consumer_ring_id < PTO2_MAX_RING_DEPTH; consumer_ring_id++) {
+            PTO2SharedMemoryRingHeader &consumer_ring = *sched_->ring_sched_states[consumer_ring_id].ring;
+            int32_t consumer_current = consumer_ring.fc.current_task_index.load(std::memory_order_acquire);
+            int32_t consumer_last_alive = consumer_ring.fc.last_task_alive.load(std::memory_order_acquire);
+            for (int32_t task_id = consumer_last_alive; task_id < consumer_current; task_id++) {
+                PTO2TaskSlotState &consumer = consumer_ring.get_slot_state_by_task_id(task_id);
+                if (consumer.payload == nullptr || consumer.payload->fanin_spill_pool == nullptr) continue;
+
+                bool references_head = false;
+                for_each_fanin_slot_state(*consumer.payload, [&](PTO2TaskSlotState *producer) {
+                    if (producer == &head) references_head = true;
+                });
+                if (!references_head) continue;
+
+                matching_live_consumers++;
+                if (logged_consumers >= max_consumer_logs) continue;
+                logged_consumers++;
+                PTO2TaskDescriptor *task = consumer.task;
+                int64_t task_raw = task != nullptr ? static_cast<int64_t>(task->task_id.raw) : -1;
+                LOG_WARN(
+                    "[RECLAIM_STALL] CONSUMER head_ring=%d head=%d ring=%d task=%" PRId64
+                    " state=%d flags=0x%x fanin=%d/%d subtasks=%d/%d next_block=%d/%d early_state=%u "
+                    "early_sync=0x%x",
+                    head_ring_id, last_alive, consumer_ring_id, task_raw,
+                    static_cast<int32_t>(consumer.task_state.load(std::memory_order_acquire)),
+                    static_cast<unsigned>(consumer.lifecycle_flags.load(std::memory_order_acquire)),
+                    consumer.fanin_refcount.load(std::memory_order_acquire), consumer.fanin_count,
+                    static_cast<int32_t>(consumer.completed_subtasks.load(std::memory_order_acquire)),
+                    static_cast<int32_t>(consumer.total_required_subtasks),
+                    static_cast<int32_t>(consumer.next_block_idx.load(std::memory_order_acquire)),
+                    static_cast<int32_t>(consumer.logical_block_num),
+                    static_cast<unsigned>(consumer.payload->early_dispatch_state.load(std::memory_order_acquire)),
+                    static_cast<unsigned>(consumer.payload->early_sync_drain_state.load(std::memory_order_acquire))
+                );
+            }
+        }
+        LOG_WARN(
+            "[RECLAIM_STALL] HEAD_SUMMARY ring=%d last_alive=%d matching_live_consumers=%d logged=%d", head_ring_id,
+            last_alive, matching_live_consumers, logged_consumers
+        );
+    }
+}
+
 SchedulerContext::StallClassification SchedulerContext::classify_stall_reason() const {
     StallClassification cls{};
     cls.stuck_task_id = -1;
@@ -460,6 +551,7 @@ int32_t SchedulerContext::handle_timeout_exit(
         header->sched_stall_detail.store(cls.detail, std::memory_order_release);
     }
     if (!completed_.exchange(true, std::memory_order_acq_rel)) {
+        log_reclaim_stall_snapshot();
         log_shutdown_stall_snapshot(thread_idx, idle_iterations, last_progress_count);
 #if SIMPLER_DFX
         // Capture the in-flight kernels' partial output before signalling the

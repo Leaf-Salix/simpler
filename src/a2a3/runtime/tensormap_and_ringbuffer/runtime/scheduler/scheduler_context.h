@@ -476,6 +476,8 @@ private:
         int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count
     );
 
+    __attribute__((noinline, cold)) void log_reclaim_stall_snapshot();
+
     // Reverse lookup: given a global core_id, find which scheduler thread's
     // tracker owns it. Returns -1 if not found. Linear scan — only used on
     // the cold diagnostic path.
