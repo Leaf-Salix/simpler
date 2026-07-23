@@ -977,6 +977,26 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
         int32_t orch_error_code = host_header.orch_error_code.load(std::memory_order_relaxed);
         int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
         LOG_RUNTIME_FAILURE(orch_error_code, sched_error_code, runtime_status);
+        if (orch_error_code == PTO2_ERROR_HEAP_RING_DEADLOCK || orch_error_code == PTO2_ERROR_FLOW_CONTROL_DEADLOCK) {
+            uint32_t fanout_count = host_header.orch_deadlock_fanout_count.load(std::memory_order_relaxed);
+            uint32_t fanout_refcount = host_header.orch_deadlock_fanout_refcount.load(std::memory_order_relaxed);
+            LOG_ERROR(
+                "PTO2 allocator fatal detail=%d ring=%d requested=%d current=%d last_alive=%d head_state=%d "
+                "consumers=%u/%u scope_released=%d scheduler_concurrent=%d heap_used=%" PRId64
+                " heap_available=%" PRId64,
+                host_header.orch_deadlock_detail.load(std::memory_order_relaxed),
+                host_header.orch_deadlock_ring.load(std::memory_order_relaxed),
+                host_header.orch_deadlock_requested.load(std::memory_order_relaxed),
+                host_header.orch_deadlock_current.load(std::memory_order_relaxed),
+                host_header.orch_deadlock_last_alive.load(std::memory_order_relaxed),
+                host_header.orch_deadlock_task_state.load(std::memory_order_relaxed),
+                fanout_refcount & ~PTO2_FANOUT_SCOPE_BIT, fanout_count & ~PTO2_FANOUT_SCOPE_BIT,
+                (fanout_refcount & PTO2_FANOUT_SCOPE_BIT) ? 1 : 0,
+                host_header.orch_deadlock_scheduler_concurrent.load(std::memory_order_relaxed),
+                host_header.orch_deadlock_heap_used.load(std::memory_order_relaxed),
+                host_header.orch_deadlock_heap_available.load(std::memory_order_relaxed)
+            );
+        }
         // A scheduler no-progress timeout (code 100) carries a device-classified
         // sub-reason + locators so the failure line is self-diagnosing without a
         // device-log dive. The full stall snapshot stays in the device log / plog.

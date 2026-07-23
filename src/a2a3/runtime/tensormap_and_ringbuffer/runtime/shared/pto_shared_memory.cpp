@@ -173,6 +173,17 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     header->sched_stall_orch_done.store(0, std::memory_order_relaxed);
     header->sched_stall_task_id.store(-1, std::memory_order_relaxed);
     header->sched_stall_core.store(-1, std::memory_order_relaxed);
+    header->orch_deadlock_detail.store(static_cast<int32_t>(PTO2OrchDeadlockDetail::None), std::memory_order_relaxed);
+    header->orch_deadlock_ring.store(-1, std::memory_order_relaxed);
+    header->orch_deadlock_requested.store(0, std::memory_order_relaxed);
+    header->orch_deadlock_current.store(0, std::memory_order_relaxed);
+    header->orch_deadlock_last_alive.store(0, std::memory_order_relaxed);
+    header->orch_deadlock_task_state.store(-1, std::memory_order_relaxed);
+    header->orch_deadlock_scheduler_concurrent.store(0, std::memory_order_relaxed);
+    header->orch_deadlock_fanout_count.store(0, std::memory_order_relaxed);
+    header->orch_deadlock_fanout_refcount.store(0, std::memory_order_relaxed);
+    header->orch_deadlock_heap_used.store(0, std::memory_order_relaxed);
+    header->orch_deadlock_heap_available.store(0, std::memory_order_relaxed);
 
     // No per-slot loop: prepare_task resets each slot when it allocates it, and
     // the scheduler only scans submitted task_ids [last_task_alive,

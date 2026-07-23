@@ -122,6 +122,13 @@ static_assert(
     "PTO2SharedMemoryRingHeader task_descriptors_offset layout drift"
 );
 
+enum class PTO2OrchDeadlockDetail : int32_t {
+    None = 0,
+    RequestExceedsHeap = 1,
+    DispatchGated = 2,
+    ScopeGated = 3,
+};
+
 /**
  * Shared memory header structure
  *
@@ -166,6 +173,20 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     std::atomic<int32_t> sched_stall_orch_done;    // orchestrator_done flag at timeout (0/1)
     std::atomic<int64_t> sched_stall_task_id;      // S1: stuck task_id (-1 if N/A)
     std::atomic<int32_t> sched_stall_core;         // S1: stuck core id (-1 if N/A)
+
+    // Allocator fatal snapshot. These fields occupy the header's trailing
+    // cache-line padding and are read only after orch_error_code is latched.
+    std::atomic<int32_t> orch_deadlock_detail;  // PTO2OrchDeadlockDetail
+    std::atomic<int32_t> orch_deadlock_ring;
+    std::atomic<int32_t> orch_deadlock_requested;
+    std::atomic<int32_t> orch_deadlock_current;
+    std::atomic<int32_t> orch_deadlock_last_alive;
+    std::atomic<int32_t> orch_deadlock_task_state;
+    std::atomic<int32_t> orch_deadlock_scheduler_concurrent;
+    std::atomic<uint32_t> orch_deadlock_fanout_count;
+    std::atomic<uint32_t> orch_deadlock_fanout_refcount;
+    std::atomic<int64_t> orch_deadlock_heap_used;
+    std::atomic<int64_t> orch_deadlock_heap_available;
 };
 
 static_assert(sizeof(PTO2SharedMemoryHeader) == 896, "PTO2SharedMemoryHeader layout drift");
@@ -180,6 +201,14 @@ static_assert(
 static_assert(
     offsetof(PTO2SharedMemoryHeader, sched_stall_task_id) == 832,
     "PTO2SharedMemoryHeader sched_stall_task_id layout drift"
+);
+static_assert(
+    offsetof(PTO2SharedMemoryHeader, orch_deadlock_detail) == 844,
+    "PTO2SharedMemoryHeader orch_deadlock_detail layout drift"
+);
+static_assert(
+    offsetof(PTO2SharedMemoryHeader, orch_deadlock_heap_available) == 888,
+    "PTO2SharedMemoryHeader orch_deadlock_heap_available layout drift"
 );
 
 // =============================================================================

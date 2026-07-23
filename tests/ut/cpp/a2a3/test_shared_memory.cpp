@@ -99,6 +99,13 @@ TEST_F(SharedMemoryTest, HeaderInitValues) {
     EXPECT_EQ(hdr->sched_stall_orch_done.load(), 0);
     EXPECT_EQ(hdr->sched_stall_task_id.load(), -1);
     EXPECT_EQ(hdr->sched_stall_core.load(), -1);
+    EXPECT_EQ(hdr->orch_deadlock_detail.load(), static_cast<int32_t>(PTO2OrchDeadlockDetail::None));
+    EXPECT_EQ(hdr->orch_deadlock_ring.load(), -1);
+    EXPECT_EQ(hdr->orch_deadlock_task_state.load(), -1);
+    EXPECT_EQ(hdr->orch_deadlock_fanout_count.load(), 0);
+    EXPECT_EQ(hdr->orch_deadlock_fanout_refcount.load(), 0);
+    EXPECT_EQ(hdr->orch_deadlock_heap_used.load(), 0);
+    EXPECT_EQ(hdr->orch_deadlock_heap_available.load(), 0);
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         auto &fc = hdr->rings[r].fc;

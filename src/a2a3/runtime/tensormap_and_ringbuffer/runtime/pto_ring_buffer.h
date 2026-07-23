@@ -127,7 +127,10 @@ public:
             output_size > 0 ? PTO2_ALIGN_UP(static_cast<uint64_t>(output_size), PTO2_ALIGN_SIZE) : 0;
 
         if (aligned_size > heap_size_) {
-            report_deadlock(output_size, /*heap_blocked=*/true, /*scope_gated=*/false);
+            report_deadlock(
+                output_size, /*heap_blocked=*/true, /*scope_gated=*/false, sm_header, scheduler_runs_concurrently,
+                /*observed_head=*/nullptr
+            );
             return {-1, -1, nullptr, nullptr};
         }
 
@@ -166,7 +169,11 @@ public:
             }
 
             if (!scheduler_runs_concurrently || sm_header == nullptr) {
-                report_deadlock(output_size, blocked_on_heap, /*scope_gated=*/head_blocked_on_scope_end(last_alive));
+                HeadStateSnapshot head = snapshot_head(last_alive);
+                report_deadlock(
+                    output_size, blocked_on_heap, /*scope_gated=*/head_blocked_on_scope_end(head), sm_header,
+                    scheduler_runs_concurrently, &head
+                );
                 return {-1, -1, nullptr, nullptr};
             }
             if (!wait_published) {
@@ -203,8 +210,12 @@ public:
                 // every consumer released but its scope still open, only
                 // scope_end can free it and a blocked orchestrator can never
                 // call it -> provable deadlock now.
-                if (head_blocked_on_scope_end(last_alive)) {
-                    report_deadlock(output_size, blocked_on_heap, /*scope_gated=*/true);
+                HeadStateSnapshot head = snapshot_head(last_alive);
+                if (head_blocked_on_scope_end(head)) {
+                    report_deadlock(
+                        output_size, blocked_on_heap, /*scope_gated=*/true, sm_header, scheduler_runs_concurrently,
+                        &head
+                    );
                     clear_reclaim_wait();
                     return {-1, -1, nullptr, nullptr};
                 }
@@ -405,12 +416,27 @@ private:
      * The COMPLETED guard is mandatory: a zero-consumer task has
      * refcount == 0 == (count & ~SCOPE_BIT) from birth, before it has run.
      */
-    bool head_blocked_on_scope_end(int32_t head_task_id) const {
-        if (slot_states_ == nullptr) return false;
+    struct HeadStateSnapshot {
+        int32_t task_id;
+        PTO2TaskState task_state;
+        uint32_t fanout_count;
+        uint32_t fanout_refcount;
+    };
+
+    HeadStateSnapshot snapshot_head(int32_t head_task_id) const {
+        HeadStateSnapshot snapshot{head_task_id, PTO2_TASK_CONSUMED, 0, 0};
+        if (slot_states_ == nullptr) return snapshot;
+
         PTO2TaskSlotState &h = slot_states_[head_task_id & window_mask_];
-        if (h.task_state.load(std::memory_order_acquire) != PTO2_TASK_COMPLETED) return false;
-        uint32_t rc = h.fanout_refcount.load(std::memory_order_acquire);
-        return rc == (h.fanout_count & ~PTO2_FANOUT_SCOPE_BIT);
+        snapshot.task_state = h.task_state.load(std::memory_order_acquire);
+        snapshot.fanout_count = h.fanout_count;
+        snapshot.fanout_refcount = h.fanout_refcount.load(std::memory_order_acquire);
+        return snapshot;
+    }
+
+    static bool head_blocked_on_scope_end(const HeadStateSnapshot &head) {
+        if (head.task_state != PTO2_TASK_COMPLETED) return false;
+        return head.fanout_refcount == (head.fanout_count & ~PTO2_FANOUT_SCOPE_BIT);
     }
 
     /**
@@ -418,13 +444,44 @@ private:
      * only on scope_end; otherwise the request is impossible or scheduler
      * dispatch is gated and cannot reclaim the blocked ring.
      */
-    void report_deadlock(int32_t requested_output_size, bool heap_blocked, bool scope_gated) {
-        int32_t last_alive = last_alive_ptr_->load(std::memory_order_acquire);
+    void report_deadlock(
+        int32_t requested_output_size, bool heap_blocked, bool scope_gated, PTO2SharedMemoryHeader *sm_header,
+        bool scheduler_runs_concurrently, const HeadStateSnapshot *observed_head
+    ) {
+        int32_t last_alive =
+            observed_head != nullptr ? observed_head->task_id : last_alive_ptr_->load(std::memory_order_acquire);
         int32_t active_tasks = local_task_id_ - last_alive;
         uint64_t htail = heap_tail_;
         uint64_t aligned_requested = requested_output_size > 0 ?
                                          PTO2_ALIGN_UP(static_cast<uint64_t>(requested_output_size), PTO2_ALIGN_SIZE) :
                                          0;
+        HeadStateSnapshot head = observed_head != nullptr ? *observed_head : snapshot_head(last_alive);
+
+        if (sm_header != nullptr) {
+            PTO2OrchDeadlockDetail detail = PTO2OrchDeadlockDetail::DispatchGated;
+            if (scope_gated) {
+                detail = PTO2OrchDeadlockDetail::ScopeGated;
+            } else if (aligned_requested > heap_size_) {
+                detail = PTO2OrchDeadlockDetail::RequestExceedsHeap;
+            }
+            sm_header->orch_deadlock_detail.store(static_cast<int32_t>(detail), std::memory_order_relaxed);
+            sm_header->orch_deadlock_ring.store(ring_id_, std::memory_order_relaxed);
+            sm_header->orch_deadlock_requested.store(requested_output_size, std::memory_order_relaxed);
+            sm_header->orch_deadlock_current.store(local_task_id_, std::memory_order_relaxed);
+            sm_header->orch_deadlock_last_alive.store(last_alive, std::memory_order_relaxed);
+            sm_header->orch_deadlock_task_state.store(static_cast<int32_t>(head.task_state), std::memory_order_relaxed);
+            sm_header->orch_deadlock_scheduler_concurrent.store(
+                scheduler_runs_concurrently ? 1 : 0, std::memory_order_relaxed
+            );
+            sm_header->orch_deadlock_fanout_count.store(head.fanout_count, std::memory_order_relaxed);
+            sm_header->orch_deadlock_fanout_refcount.store(head.fanout_refcount, std::memory_order_relaxed);
+            sm_header->orch_deadlock_heap_used.store(
+                static_cast<int64_t>(heap_used_bytes()), std::memory_order_relaxed
+            );
+            sm_header->orch_deadlock_heap_available.store(
+                static_cast<int64_t>(heap_available()), std::memory_order_relaxed
+            );
+        }
 
         LOG_ERROR("========================================");
         if (heap_blocked) {
@@ -458,13 +515,10 @@ private:
         }
         // Head-task state dump: what the reclaim watermark is actually waiting on.
         if (slot_states_ != nullptr) {
-            PTO2TaskSlotState &h = slot_states_[last_alive & window_mask_];
-            uint32_t fc = h.fanout_count;
-            uint32_t rc = h.fanout_refcount.load(std::memory_order_acquire);
             LOG_ERROR(
                 "  Head task %d: state=%d, consumers=%u/%u, scope_released=%d", last_alive,
-                static_cast<int>(h.task_state.load(std::memory_order_acquire)), rc & ~PTO2_FANOUT_SCOPE_BIT,
-                fc & ~PTO2_FANOUT_SCOPE_BIT, (rc & PTO2_FANOUT_SCOPE_BIT) ? 1 : 0
+                static_cast<int>(head.task_state), head.fanout_refcount & ~PTO2_FANOUT_SCOPE_BIT,
+                head.fanout_count & ~PTO2_FANOUT_SCOPE_BIT, (head.fanout_refcount & PTO2_FANOUT_SCOPE_BIT) ? 1 : 0
             );
         }
         LOG_ERROR("Solution:");

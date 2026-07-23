@@ -365,9 +365,15 @@ TEST_F(TaskAllocatorTest, AllocExactlyHeapSize) {
 }
 
 TEST_F(TaskAllocatorTest, AllocLargerThanHeap) {
-    auto r = allocator.alloc(HEAP_SIZE * 2);
+    PTO2SharedMemoryHeader header{};
+    auto r = allocator.alloc(HEAP_SIZE * 2, &header, /*scheduler_runs_concurrently=*/true);
     EXPECT_TRUE(r.failed()) << "Cannot allocate more than heap size";
     EXPECT_EQ(error_code.load(), PTO2_ERROR_HEAP_RING_DEADLOCK);
+    EXPECT_EQ(header.orch_deadlock_detail.load(), static_cast<int32_t>(PTO2OrchDeadlockDetail::RequestExceedsHeap));
+    EXPECT_EQ(header.orch_deadlock_requested.load(), HEAP_SIZE * 2);
+    EXPECT_EQ(header.orch_deadlock_scheduler_concurrent.load(), 1);
+    EXPECT_EQ(header.orch_deadlock_heap_used.load(), 0);
+    EXPECT_EQ(header.orch_deadlock_heap_available.load(), HEAP_SIZE);
 }
 
 TEST_F(TaskAllocatorTest, ConcurrentBackpressureWaitsForSchedulerReclaim) {
