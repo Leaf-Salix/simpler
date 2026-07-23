@@ -582,7 +582,7 @@ void SchedulerContext::check_running_cores_for_completion(
 bool SchedulerContext::enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t block_num) {
     int32_t expected = 0;
     if (!drain_state_.sync_start_pending.compare_exchange_strong(
-            expected, -1, std::memory_order_relaxed, std::memory_order_relaxed
+            expected, -1, std::memory_order_acquire, std::memory_order_relaxed
         )) {
         return false;  // Another thread already holds the drain slot.
     }
@@ -594,7 +594,7 @@ bool SchedulerContext::enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t b
     drain_state_.drain_stage_done_mask.store(0, std::memory_order_relaxed);
     drain_state_.drain_running_staged.store(0, std::memory_order_relaxed);
     uint64_t next_attempt = drain_state_.drain_attempt.load(std::memory_order_relaxed) + 1;
-    drain_state_.drain_attempt.store(next_attempt, std::memory_order_relaxed);
+    drain_state_.drain_attempt.store(next_attempt, std::memory_order_release);
     drain_diag_set_available(-1);
     drain_diag_begin();
     // Release store: all stores above are now visible to any thread that
@@ -894,6 +894,8 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
         drain_diag_set_phase(thread_idx, diag_epoch, DrainDiagPhase::StageGoWait, diag_task_id);
         while (drain_state_.drain_stage_go.load(std::memory_order_acquire) == 0) {
             if (is_completed()) return;
+            if (drain_state_.sync_start_pending.load(std::memory_order_acquire) == 0) return;
+            if (drain_state_.drain_attempt.load(std::memory_order_acquire) != drain_attempt) return;
             if (drain_state_.drain_worker_elected.load(std::memory_order_acquire) == 0) return;
             SPIN_WAIT_HINT();
         }
@@ -923,6 +925,7 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
         drain_diag_set_phase(thread_idx, diag_epoch, DrainDiagPhase::ReopenWait, diag_task_id);
         while (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
             if (is_completed()) return;
+            if (drain_state_.drain_attempt.load(std::memory_order_acquire) != drain_attempt) return;
             SPIN_WAIT_HINT();
         }
         drain_diag_set_phase(thread_idx, diag_epoch, DrainDiagPhase::Exit, diag_task_id);
@@ -945,16 +948,15 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
         );
     }
     // Clear drain state and reopen the gate FIRST, so the other threads resume immediately.
-    // Release fence sequences the seed + tracker mutations before every clear, so any thread
-    // that acquire-observes one of them (sync_start_pending==0 / drain_worker_elected==0) sees
-    // the seed. `slot_state` is a local holding the fa_fused slot (not drain_state_), so it stays
-    // valid for the propagate below even if a new drain reuses pending_task after reopen.
+    // Release fence sequences the seed + tracker mutations before sync_start_pending. The
+    // elected value remains published while the gate is open; the next drain owner resets it
+    // behind the -1 sentinel. Followers identify reopen by gate-open or attempt change.
+    // `slot_state` is a local holding the fa_fused slot (not drain_state_), so it stays valid for
+    // the propagate below even if a new drain reuses pending_task after reopen.
     std::atomic_thread_fence(std::memory_order_release);
-    drain_state_.drain_attempt.store(drain_attempt + 1, std::memory_order_release);
     drain_state_.pending_task.store(nullptr, std::memory_order_release);
     drain_state_.drain_stage_go.store(0, std::memory_order_relaxed);
     drain_state_.drain_stage_done_mask.store(0, std::memory_order_relaxed);
-    drain_state_.drain_worker_elected.store(0, std::memory_order_relaxed);
     drain_state_.sync_start_pending.store(0, std::memory_order_release);
 
     // Recheck after publishing the drain seed. The producer-side rendezvous check can race
