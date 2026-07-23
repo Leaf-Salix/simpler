@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <thread>
 
 #include "utils/device_arena.h"
 #include "scheduler/scheduler_types.h"
@@ -176,6 +177,28 @@ TEST_F(SchedulerStateTest, ConsumedIdempotent) {
 
     sched.check_and_handle_consumed(slot);
     EXPECT_EQ(slot.task_state.load(), PTO2_TASK_CONSUMED);
+}
+
+TEST_F(SchedulerStateTest, ConsumedTransitionCannotLoseRingAdvance) {
+    auto &ring_state = sched.ring_sched_states[0];
+    auto &ring = *ring_state.ring;
+    PTO2TaskSlotState &slot = ring.get_slot_state_by_task_id(0);
+    init_slot(slot, PTO2_TASK_COMPLETED, 0, 0);
+    ring.fc.current_task_index.store(1, std::memory_order_release);
+    ring_state.advance_lock.store(1, std::memory_order_release);
+
+    std::thread consumer([&]() {
+        sched.check_and_handle_consumed(slot);
+    });
+    while (slot.task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) {
+        std::this_thread::yield();
+    }
+
+    EXPECT_EQ(ring.fc.last_task_alive.load(std::memory_order_acquire), 0);
+    ring_state.advance_lock.store(0, std::memory_order_release);
+    consumer.join();
+
+    EXPECT_EQ(ring.fc.last_task_alive.load(std::memory_order_acquire), 1);
 }
 
 // =============================================================================
