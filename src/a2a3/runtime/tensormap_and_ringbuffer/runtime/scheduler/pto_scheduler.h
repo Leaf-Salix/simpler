@@ -584,18 +584,14 @@ struct PTO2SchedulerState {
         // advance_ring_pointers (and the reset_for_reuse it triggers) MUST run
         // outside fanout_lock: reset_for_reuse stores fanout_lock=0 and would
         // clobber a held lock. Safe here — the slot is CONSUMED and quiescent.
-        // Every successful CONSUMED transition must eventually scan the ring.
-        // A one-shot try-lock can lose the final transition if the current owner
-        // has already observed this slot as non-CONSUMED before we flip it.
+        // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
         int32_t expected_lock = 0;
-        while (!ring_sched_states[ring_id].advance_lock.compare_exchange_weak(
-            expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
-        )) {
-            expected_lock = 0;
-            SPIN_WAIT_HINT();
+        if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
+                expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
+            )) {
+            ring_sched_states[ring_id].advance_ring_pointers();
+            ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
         }
-        ring_sched_states[ring_id].advance_ring_pointers();
-        ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
     }
 
 #if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
@@ -626,18 +622,17 @@ struct PTO2SchedulerState {
         int32_t ring_id = slot_state.ring_id;
         // advance_ring_pointers + reset_for_reuse run outside fanout_lock (reset
         // stores fanout_lock=0). Safe — the slot is CONSUMED and quiescent.
+        // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
         int32_t expected_lock = 0;
-        while (!ring_sched_states[ring_id].advance_lock.compare_exchange_weak(
-            expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
-        )) {
-            atomic_count += 1;  // failed lock CAS
-            expected_lock = 0;
-            SPIN_WAIT_HINT();
+        if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
+                expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
+            )) {
+            ring_sched_states[ring_id].advance_ring_pointers();
+            ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
+            atomic_count += 2;  // try-lock CAS + unlock store
+        } else {
+            atomic_count += 1;  // failed try-lock CAS
         }
-        atomic_count += 1;  // successful lock CAS
-        ring_sched_states[ring_id].advance_ring_pointers();
-        ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
-        atomic_count += 1;  // unlock store
     }
 #endif
 
