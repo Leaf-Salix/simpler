@@ -30,6 +30,104 @@
 #include "runtime.h"
 #include "spin_hint.h"
 
+namespace {
+struct alignas(64) DrainThreadDiag {
+    std::atomic<uint64_t> epoch{0};
+    std::atomic<uint64_t> phase_enter_cycles{0};
+    std::atomic<uint64_t> stage_progress{0};
+    std::atomic<int64_t> task_id{-1};
+    std::atomic<int32_t> phase{static_cast<int32_t>(DrainDiagPhase::Inactive)};
+};
+
+std::atomic<uint64_t> g_drain_diag_epoch{0};
+std::atomic<int32_t> g_drain_diag_available{-1};
+std::atomic<SchedulerContext *> g_drain_diag_context{nullptr};
+DrainThreadDiag g_drain_thread_diag[MAX_AICPU_THREADS];
+
+const char *drain_diag_phase_name(DrainDiagPhase phase) {
+    switch (phase) {
+    case DrainDiagPhase::Inactive:
+        return "inactive";
+    case DrainDiagPhase::AckWait:
+        return "ack_wait";
+    case DrainDiagPhase::Election:
+        return "election";
+    case DrainDiagPhase::AvailabilityCheck:
+        return "availability_check";
+    case DrainDiagPhase::StageGoWait:
+        return "stage_go_wait";
+    case DrainDiagPhase::StageCores:
+        return "stage_cores";
+    case DrainDiagPhase::StageDoneWait:
+        return "stage_done_wait";
+    case DrainDiagPhase::ReopenWait:
+        return "reopen_wait";
+    case DrainDiagPhase::Exit:
+        return "exit";
+    }
+    return "invalid";
+}
+
+const char *drain_stage_diag_point_name(DrainStageDiagPoint point) {
+    switch (point) {
+    case DrainStageDiagPoint::None:
+        return "none";
+    case DrainStageDiagPoint::Claim:
+        return "claim";
+    case DrainStageDiagPoint::Prepare:
+        return "prepare";
+    case DrainStageDiagPoint::WriteBarrier:
+        return "wmb";
+    case DrainStageDiagPoint::Publish:
+        return "publish";
+    case DrainStageDiagPoint::StagedMask:
+        return "staged_mask";
+    case DrainStageDiagPoint::RecordPublished:
+        return "record_published";
+    }
+    return "invalid";
+}
+}  // namespace
+
+uint64_t drain_diag_begin() { return g_drain_diag_epoch.fetch_add(1, std::memory_order_acq_rel) + 1; }
+
+uint64_t drain_diag_current_epoch() { return g_drain_diag_epoch.load(std::memory_order_acquire); }
+
+void drain_diag_set_available(int32_t available) { g_drain_diag_available.store(available, std::memory_order_release); }
+
+void drain_diag_set_phase(int32_t thread_idx, uint64_t epoch, DrainDiagPhase phase, int64_t task_id) {
+    if (thread_idx < 0 || thread_idx >= MAX_AICPU_THREADS) return;
+    DrainThreadDiag &diag = g_drain_thread_diag[thread_idx];
+    if (phase == DrainDiagPhase::AckWait) {
+        diag.stage_progress.store(0, std::memory_order_relaxed);
+    }
+    diag.epoch.store(epoch, std::memory_order_relaxed);
+    diag.task_id.store(task_id, std::memory_order_relaxed);
+    diag.phase_enter_cycles.store(get_sys_cnt_aicpu(), std::memory_order_relaxed);
+    diag.phase.store(static_cast<int32_t>(phase), std::memory_order_release);
+}
+
+void drain_diag_set_stage_progress(
+    int32_t thread_idx, DrainStageDiagPoint point, int32_t claim_start, int32_t claim_count, int32_t item_index,
+    int32_t core_offset, int32_t handle_count
+) {
+    if (thread_idx < 0 || thread_idx >= MAX_AICPU_THREADS) return;
+    uint64_t packed = static_cast<uint8_t>(point);
+    packed |= static_cast<uint64_t>(static_cast<uint16_t>(claim_start + 1)) << 8;
+    packed |= static_cast<uint64_t>(static_cast<uint8_t>(claim_count)) << 24;
+    packed |= static_cast<uint64_t>(static_cast<uint8_t>(item_index + 1)) << 32;
+    packed |= static_cast<uint64_t>(static_cast<uint8_t>(core_offset + 1)) << 40;
+    packed |= static_cast<uint64_t>(static_cast<uint8_t>(handle_count)) << 48;
+    g_drain_thread_diag[thread_idx].stage_progress.store(packed, std::memory_order_release);
+}
+
+void drain_diag_bind_context(SchedulerContext *ctx) { g_drain_diag_context.store(ctx, std::memory_order_release); }
+
+extern "C" void pto2_log_drain_protocol_snapshot() {
+    SchedulerContext *ctx = g_drain_diag_context.load(std::memory_order_acquire);
+    if (ctx != nullptr) ctx->log_drain_protocol_snapshot();
+}
+
 // =============================================================================
 // Cold-path helpers for the main dispatch loop (noinline to reduce hot-loop icache)
 // =============================================================================
@@ -435,6 +533,79 @@ void SchedulerContext::log_scheduler_stall_snapshot(
     for (int32_t t = 0; t < thread_count; t++) {
         log_stall_diagnostics(t, total_tasks_, 0, completed_tasks_.load(std::memory_order_relaxed));
     }
+}
+
+void SchedulerContext::log_drain_protocol_snapshot() {
+    uint64_t now = get_sys_cnt_aicpu();
+    int32_t block_num = drain_state_.sync_start_pending.load(std::memory_order_acquire);
+    PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
+    int64_t task_id =
+        slot_state != nullptr && slot_state->task != nullptr ? static_cast<int64_t>(slot_state->task->task_id.raw) : -1;
+    int32_t shape_raw = -1;
+    int32_t gated = 0;
+    uint8_t core_mask = 0;
+    if (slot_state != nullptr && slot_state->task != nullptr) {
+        PTO2ResourceShape shape = slot_state->active_mask.to_shape();
+        shape_raw = static_cast<int32_t>(shape);
+        core_mask = slot_state->active_mask.core_mask();
+        gated =
+            slot_state->payload != nullptr && PTO2SchedulerState::owns_early_sync_drain(*slot_state->payload) ? 1 : 0;
+    }
+
+    LOG_WARN(
+        "[DRAIN_PROTOCOL epoch=%" PRIu64 "] task=%" PRId64 " block_num=%d shape=%d core_mask=0x%x gated=%d "
+        "available=%d ack=0x%x all_acked=0x%x elected=%d stage_go=%d stage_done=0x%x running_staged=%d "
+        "completed=%d/%d",
+        drain_diag_current_epoch(), task_id, block_num, shape_raw, static_cast<unsigned int>(core_mask), gated,
+        g_drain_diag_available.load(std::memory_order_acquire),
+        drain_state_.drain_ack_mask.load(std::memory_order_acquire), (1u << active_sched_threads_) - 1,
+        drain_state_.drain_worker_elected.load(std::memory_order_acquire),
+        drain_state_.drain_stage_go.load(std::memory_order_acquire),
+        drain_state_.drain_stage_done_mask.load(std::memory_order_acquire),
+        drain_state_.drain_running_staged.load(std::memory_order_acquire),
+        completed_tasks_.load(std::memory_order_acquire), total_tasks_
+    );
+
+    for (int32_t t = 0; t < active_sched_threads_; t++) {
+        DrainThreadDiag &diag = g_drain_thread_diag[t];
+        DrainDiagPhase phase = static_cast<DrainDiagPhase>(diag.phase.load(std::memory_order_acquire));
+        uint64_t stage_progress = diag.stage_progress.load(std::memory_order_acquire);
+        DrainStageDiagPoint point = static_cast<DrainStageDiagPoint>(stage_progress & 0xff);
+        int32_t claim_start = static_cast<int32_t>((stage_progress >> 8) & 0xffff) - 1;
+        int32_t claim_count = static_cast<int32_t>((stage_progress >> 24) & 0xff);
+        int32_t item_index = static_cast<int32_t>((stage_progress >> 32) & 0xff) - 1;
+        int32_t core_offset = static_cast<int32_t>((stage_progress >> 40) & 0xff) - 1;
+        int32_t handle_count = static_cast<int32_t>((stage_progress >> 48) & 0xff);
+        uint64_t entered = diag.phase_enter_cycles.load(std::memory_order_relaxed);
+        uint64_t age_us = entered == 0 || now < entered ? 0 : (now - entered) * 1000000 / PLATFORM_PROF_SYS_CNT_FREQ;
+        LOG_WARN(
+            "[DRAIN_PROTOCOL] THREAD thread=%d epoch=%" PRIu64 " phase=%s phase_age_us=%" PRIu64 " task=%" PRId64
+            " stage_point=%s claim=%d+%d item=%d core_offset=%d handles=%d",
+            t, diag.epoch.load(std::memory_order_relaxed), drain_diag_phase_name(phase), age_us,
+            diag.task_id.load(std::memory_order_relaxed), drain_stage_diag_point_name(point), claim_start, claim_count,
+            item_index, core_offset, handle_count
+        );
+    }
+
+    constexpr int32_t ring_id = PTO2_MAX_RING_DEPTH - 1;
+    if (sched_ == nullptr || sched_->sm_header == nullptr) return;
+    PTO2SharedMemoryRingHeader &ring = sched_->sm_header->rings[ring_id];
+    int32_t current = ring.fc.current_task_index.load(std::memory_order_acquire);
+    int32_t last_alive = ring.fc.last_task_alive.load(std::memory_order_acquire);
+    if (last_alive >= current) {
+        LOG_WARN("[DRAIN_PROTOCOL] RING ring=%d current=%d last_alive=%d head=none", ring_id, current, last_alive);
+        return;
+    }
+    PTO2TaskSlotState &head = ring.get_slot_state_by_task_id(last_alive);
+    uint32_t fanout_refcount = head.fanout_refcount.load(std::memory_order_acquire);
+    LOG_WARN(
+        "[DRAIN_PROTOCOL] RING ring=%d current=%d last_alive=%d head_state=%d consumers=%u/%u scope_released=%d "
+        "reclaim_waiting=%d",
+        ring_id, current, last_alive, static_cast<int32_t>(head.task_state.load(std::memory_order_acquire)),
+        fanout_refcount & ~PTO2_FANOUT_SCOPE_BIT, head.fanout_count & ~PTO2_FANOUT_SCOPE_BIT,
+        (fanout_refcount & PTO2_FANOUT_SCOPE_BIT) != 0,
+        sched_->sm_header->orchestrator_reclaim_waiting.load(std::memory_order_acquire)
+    );
 }
 
 void SchedulerContext::log_mailbox_stall_snapshot(
@@ -1458,6 +1629,8 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
 }
 
 void SchedulerContext::deinit() {
+    drain_diag_bind_context(nullptr);
+
     // Reset all per-core execution state
     for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
         core_exec_states_[i] = {};
@@ -1531,6 +1704,7 @@ void SchedulerContext::deinit() {
 void SchedulerContext::bind_runtime(PTO2Runtime *rt) {
     rt_ = rt;
     sched_ = &rt->scheduler;
+    drain_diag_bind_context(this);
 }
 
 void SchedulerContext::wait_for_orchestration_done_before_dispatch(Runtime *runtime, int32_t thread_idx) {

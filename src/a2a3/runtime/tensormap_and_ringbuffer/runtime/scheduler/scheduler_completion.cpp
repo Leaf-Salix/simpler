@@ -594,6 +594,8 @@ bool SchedulerContext::enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t b
     drain_state_.drain_stage_go.store(0, std::memory_order_relaxed);
     drain_state_.drain_stage_done_mask.store(0, std::memory_order_relaxed);
     drain_state_.drain_running_staged.store(0, std::memory_order_relaxed);
+    drain_diag_set_available(-1);
+    drain_diag_begin();
     // Release store: all stores above are now visible to any thread that
     // acquire-loads sync_start_pending and sees block_num > 0.
     drain_state_.sync_start_pending.store(block_num, std::memory_order_release);
@@ -653,6 +655,7 @@ SchedulerContext::drain_stage_cores(PTO2TaskSlotState *slot_state, int32_t block
         while (valid.has_value()) {
             int32_t avail = valid.count();
             int32_t start = 0;
+            drain_diag_set_stage_progress(thread_idx, DrainStageDiagPoint::Claim, -1, avail, -1, -1, 0);
             int32_t claim = slot_state->claim_block_range(block_num, avail, start);
             if (claim == 0) return;
 #if SIMPLER_DFX
@@ -669,6 +672,9 @@ SchedulerContext::drain_stage_cores(PTO2TaskSlotState *slot_state, int32_t block
             for (int32_t b = 0; b < claim; b++) {
                 if (b + 1 < claim) prefetch_block_dst(thread_idx, claimed[b + 1], is_mix);
                 auto core_offset = claimed[b];
+                drain_diag_set_stage_progress(
+                    thread_idx, DrainStageDiagPoint::Prepare, start, claim, b, core_offset, handle_count
+                );
                 if (shape == PTO2ResourceShape::MIX) {
                     running_staged += tracker.mix_cluster_idle_core_count(core_offset, core_mask);
                 }
@@ -676,6 +682,9 @@ SchedulerContext::drain_stage_cores(PTO2TaskSlotState *slot_state, int32_t block
                     thread_idx, core_offset, *slot_state, shape, to_pending, start + b, &handles[handle_count], gated
                 );
             }
+            drain_diag_set_stage_progress(
+                thread_idx, DrainStageDiagPoint::WriteBarrier, start, claim, claim, -1, handle_count
+            );
             wmb();
             uint64_t dispatch_ts = 0;
 #if SIMPLER_DFX
@@ -700,6 +709,9 @@ SchedulerContext::drain_stage_cores(PTO2TaskSlotState *slot_state, int32_t block
             // contention).
             uint64_t my_mask[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS] = {0};
             for (int i = 0; i < handle_count; i++) {
+                drain_diag_set_stage_progress(
+                    thread_idx, DrainStageDiagPoint::Publish, start, claim, i, handles[i].core_offset, handle_count
+                );
                 publish_subtask_to_core(handles[i], dispatch_ts, thread_idx);
                 if (gated) {
                     int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
@@ -711,6 +723,9 @@ SchedulerContext::drain_stage_cores(PTO2TaskSlotState *slot_state, int32_t block
             if (gated) {
                 for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
                     if (my_mask[w] != 0) {
+                        drain_diag_set_stage_progress(
+                            thread_idx, DrainStageDiagPoint::StagedMask, start, claim, w, -1, handle_count
+                        );
                         slot_state->payload->staged_core_mask[w].fetch_or(my_mask[w], std::memory_order_seq_cst);
                     }
                 }
@@ -724,6 +739,9 @@ SchedulerContext::drain_stage_cores(PTO2TaskSlotState *slot_state, int32_t block
                 );
             }
 #endif
+            drain_diag_set_stage_progress(
+                thread_idx, DrainStageDiagPoint::RecordPublished, start, claim, claim, -1, handle_count
+            );
             sched_->record_published_blocks(*slot_state, claim);
             // AIC/AIV running placement (whole block on idle cores); MIX running cores are
             // counted per-cluster above (mix_cluster_idle_core_count).
@@ -784,6 +802,11 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
     if (block_num == 0) return;
 
     uint32_t all_acked = (1u << active_sched_threads_) - 1;
+    uint64_t diag_epoch = drain_diag_current_epoch();
+    PTO2TaskSlotState *diag_slot = drain_state_.pending_task.load(std::memory_order_acquire);
+    int64_t diag_task_id =
+        diag_slot != nullptr && diag_slot->task != nullptr ? static_cast<int64_t>(diag_slot->task->task_id.raw) : -1;
+    drain_diag_set_phase(thread_idx, diag_epoch, DrainDiagPhase::AckWait, diag_task_id);
 
     // Ack barrier -- signal this thread has stopped dispatch.
     drain_state_.drain_ack_mask.fetch_or(1u << thread_idx, std::memory_order_release);
@@ -798,6 +821,7 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
         SPIN_WAIT_HINT();
     }
     // Election -- exactly one thread wins the CAS.
+    drain_diag_set_phase(thread_idx, diag_epoch, DrainDiagPhase::Election, diag_task_id);
     int32_t expected = 0;
     drain_state_.drain_worker_elected.compare_exchange_strong(
         expected, thread_idx + 1, std::memory_order_acquire, std::memory_order_relaxed
@@ -819,11 +843,13 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
             drain_state_.drain_worker_elected.store(0, std::memory_order_release);
             return;
         }
+        drain_diag_set_phase(thread_idx, diag_epoch, DrainDiagPhase::AvailabilityCheck, diag_task_id);
         PTO2ResourceShape shape = slot_state->active_mask.to_shape();
         // A gated drain may pre-stage onto pending slots too (idle+pending); the ready drain
         // needs block_num idle cores/clusters.
         int32_t available =
             count_global_available(shape, slot_state->active_mask.core_mask(), /*include_pending=*/gated);
+        drain_diag_set_available(available);
         if (available < block_num) {
             // Insufficient -- reset so all threads resume completion polling to free cores, then retry.
             drain_state_.drain_ack_mask.store(0, std::memory_order_release);
@@ -837,6 +863,7 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
     } else {
         // Non-elected: wait for the go signal, or bail if the elected thread reset (stale /
         // insufficient resources).
+        drain_diag_set_phase(thread_idx, diag_epoch, DrainDiagPhase::StageGoWait, diag_task_id);
         while (drain_state_.drain_stage_go.load(std::memory_order_acquire) == 0) {
             if (is_completed()) return;
             if (drain_state_.drain_worker_elected.load(std::memory_order_acquire) == 0) return;
@@ -848,6 +875,7 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
     }
 
     // Parallel stage this thread's own cores (CAS-claimed block indices), then mark done.
+    drain_diag_set_phase(thread_idx, diag_epoch, DrainDiagPhase::StageCores, diag_task_id);
 #if SIMPLER_DFX
     if (drain_prof) drain_acked_ts = get_sys_cnt_aicpu();  // pre-stage
 #endif
@@ -865,15 +893,18 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
         // sync_start_pending==0 (release/acquire) or drain_worker_elected==0 both synchronize
         // with the elected's finalize (its release fence sequences the seed before both stores),
         // so the running_slot_count seed is visible before this thread resumes completions.
+        drain_diag_set_phase(thread_idx, diag_epoch, DrainDiagPhase::ReopenWait, diag_task_id);
         while (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
             if (is_completed()) return;
             if (drain_state_.drain_worker_elected.load(std::memory_order_acquire) == 0) return;
             SPIN_WAIT_HINT();
         }
+        drain_diag_set_phase(thread_idx, diag_epoch, DrainDiagPhase::Exit, diag_task_id);
         return;
     }
 
     // Elected: wait for all threads to finish staging, then seed the rendezvous and reopen.
+    drain_diag_set_phase(thread_idx, diag_epoch, DrainDiagPhase::StageDoneWait, diag_task_id);
     while ((drain_state_.drain_stage_done_mask.load(std::memory_order_acquire) & all_acked) != all_acked) {
         if (is_completed()) return;
         SPIN_WAIT_HINT();
@@ -909,4 +940,5 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
         sched_->propagate_dispatch_fanin(*slot_state);
     }
     PTO2SchedulerState::finish_early_sync_drain(*slot_state->payload);
+    drain_diag_set_phase(thread_idx, diag_epoch, DrainDiagPhase::Exit, diag_task_id);
 }

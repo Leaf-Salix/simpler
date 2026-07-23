@@ -57,6 +57,8 @@
 // structural checks plus the scheduler's global progress watchdog instead.
 #define PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES (PLATFORM_PROF_SYS_CNT_FREQ / 2)  // 500 ms
 
+extern "C" __attribute__((weak)) void pto2_log_drain_protocol_snapshot();
+
 // =============================================================================
 // Task Allocator (unified task slot + heap buffer allocation)
 // =============================================================================
@@ -209,6 +211,9 @@ public:
                         static_cast<unsigned>(ring_id_), local_task_id_ - last_alive, window_size_, heap_used_bytes(),
                         heap_size_, heap_available(), heap_top_, blocked_on_heap ? "heap" : "task", spin_count
                     );
+                    if (pto2_log_drain_protocol_snapshot != nullptr) {
+                        pto2_log_drain_protocol_snapshot();
+                    }
                 }
             }
             SPIN_WAIT_HINT();
