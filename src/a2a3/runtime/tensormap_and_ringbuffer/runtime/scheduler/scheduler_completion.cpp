@@ -33,6 +33,59 @@
 
 namespace {
 inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
+inline constexpr uint64_t MAILBOX_WAIT_POLL_MASK = (1ULL << 20) - 1;
+}  // namespace
+
+uint64_t SchedulerContext::mailbox_full_wait_begin(
+    int32_t thread_idx, MailboxWaitKind kind, int32_t core_id, int64_t task_id, int32_t condition_index,
+    int32_t condition_count
+) {
+    uint64_t now = get_sys_cnt_aicpu();
+    MailboxThreadDiag &diag = mailbox_diag_[thread_idx];
+    diag.full_events++;
+    diag.core_id.store(core_id, std::memory_order_relaxed);
+    diag.task_id.store(task_id, std::memory_order_relaxed);
+    diag.condition_index.store(condition_index, std::memory_order_relaxed);
+    diag.condition_count.store(condition_count, std::memory_order_relaxed);
+    diag.wait_start_cycles.store(now, std::memory_order_relaxed);
+    diag.wait_kind.store(static_cast<int32_t>(kind), std::memory_order_release);
+    mailbox_waiter_mask_.fetch_or(1ULL << thread_idx, std::memory_order_release);
+    return now;
+}
+
+void SchedulerContext::mailbox_full_wait_poll(int32_t thread_idx, uint64_t wait_start_cycles, uint64_t spins) {
+    if ((spins & MAILBOX_WAIT_POLL_MASK) != 0) return;
+
+    uint64_t now = get_sys_cnt_aicpu();
+    if (now - wait_start_cycles < PLATFORM_PROF_SYS_CNT_FREQ) return;
+
+    uint64_t last_log = mailbox_last_stall_log_cycles_.load(std::memory_order_relaxed);
+    if (now - last_log < PLATFORM_PROF_SYS_CNT_FREQ ||
+        !mailbox_last_stall_log_cycles_.compare_exchange_strong(
+            last_log, now, std::memory_order_relaxed, std::memory_order_relaxed
+        )) {
+        return;
+    }
+    log_mailbox_stall_snapshot(thread_idx, wait_start_cycles, spins);
+}
+
+void SchedulerContext::mailbox_full_wait_end(int32_t thread_idx, uint64_t wait_start_cycles) {
+    MailboxThreadDiag &diag = mailbox_diag_[thread_idx];
+    uint64_t wait_cycles = get_sys_cnt_aicpu() - wait_start_cycles;
+    diag.max_full_wait_cycles = std::max(diag.max_full_wait_cycles, wait_cycles);
+    uint64_t previous = mailbox_waiter_mask_.fetch_and(~(1ULL << thread_idx), std::memory_order_acq_rel);
+    diag.wait_kind.store(static_cast<int32_t>(MailboxWaitKind::None), std::memory_order_release);
+    if ((previous & ~(1ULL << thread_idx)) == 0) {
+        mailbox_stall_snapshot_dumped_.store(false, std::memory_order_release);
+    }
+}
+
+void SchedulerContext::mailbox_note_drain(
+    int32_t thread_idx, uint64_t head_before, uint64_t tail_before, uint64_t tail_after
+) {
+    MailboxThreadDiag &diag = mailbox_diag_[thread_idx];
+    diag.max_occupancy = std::max(diag.max_occupancy, head_before - tail_before);
+    diag.pop_count += tail_after - tail_before;
 }
 
 // Pure function: read register result -> SlotTransition (no side effects).
@@ -139,9 +192,23 @@ void SchedulerContext::complete_slot_task(
             const PTO2TaskId token = slot_state.task->task_id;
             for (uint32_t i = 0; i < cond_count; ++i) {
                 volatile DeferredCompletionEntry *e = &deferred_slab->entries[i];
+                uint64_t full_wait_start = 0;
+                uint64_t full_wait_spins = 0;
                 while (!mailbox->try_push_condition(token, e->addr, e->expected_value, e->engine, e->completion_type)) {
+                    if (full_wait_start == 0) {
+                        full_wait_start = mailbox_full_wait_begin(
+                            thread_idx, MailboxWaitKind::Condition, core_id,
+                            static_cast<int64_t>(slot_state.task->task_id.raw), static_cast<int32_t>(i),
+                            static_cast<int32_t>(cond_count)
+                        );
+                    }
+                    full_wait_spins++;
                     sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
+                    mailbox_full_wait_poll(thread_idx, full_wait_start, full_wait_spins);
                     SPIN_WAIT_HINT();
+                }
+                if (full_wait_start != 0) {
+                    mailbox_full_wait_end(thread_idx, full_wait_start);
                 }
             }
             // Re-clear for the next reuse of this (core, buf) slot. Done here — on
@@ -165,9 +232,22 @@ void SchedulerContext::complete_slot_task(
     if (task_complete && slot_state.payload != nullptr && slot_state.has_any_subtask_deferred()) {
         // Some subtask of this task registered conditions; finish the
         // registration by handing the slot_state off to the consumer.
+        uint64_t full_wait_start = 0;
+        uint64_t full_wait_spins = 0;
         while (!mailbox->try_push_normal_done(slot_state.task->task_id, reinterpret_cast<uint64_t>(&slot_state))) {
+            if (full_wait_start == 0) {
+                full_wait_start = mailbox_full_wait_begin(
+                    thread_idx, MailboxWaitKind::NormalDone, core_id,
+                    static_cast<int64_t>(slot_state.task->task_id.raw), -1, -1
+                );
+            }
+            full_wait_spins++;
             sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
+            mailbox_full_wait_poll(thread_idx, full_wait_start, full_wait_spins);
             SPIN_WAIT_HINT();
+        }
+        if (full_wait_start != 0) {
+            mailbox_full_wait_end(thread_idx, full_wait_start);
         }
         defer_completion_to_consumer = true;
     }

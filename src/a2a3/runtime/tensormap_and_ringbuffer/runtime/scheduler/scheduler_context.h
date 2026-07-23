@@ -165,6 +165,30 @@ private:
     // sync_start drain coordination
     SyncStartDrainState drain_state_;
 
+    enum class MailboxWaitKind : int32_t {
+        None = 0,
+        Condition,
+        NormalDone,
+    };
+
+    struct alignas(64) MailboxThreadDiag {
+        std::atomic<int32_t> wait_kind{static_cast<int32_t>(MailboxWaitKind::None)};
+        std::atomic<int32_t> core_id{-1};
+        std::atomic<int64_t> task_id{-1};
+        std::atomic<int32_t> condition_index{-1};
+        std::atomic<int32_t> condition_count{0};
+        std::atomic<uint64_t> wait_start_cycles{0};
+        uint64_t full_events{0};
+        uint64_t max_full_wait_cycles{0};
+        uint64_t max_occupancy{0};
+        uint64_t pop_count{0};
+    };
+
+    MailboxThreadDiag mailbox_diag_[MAX_AICPU_THREADS];
+    std::atomic<uint64_t> mailbox_waiter_mask_{0};
+    std::atomic<uint64_t> mailbox_last_stall_log_cycles_{0};
+    std::atomic<bool> mailbox_stall_snapshot_dumped_{false};
+
 #if SIMPLER_DFX
     SchedL2SwimlaneCounters sched_l2_swimlane_[MAX_AICPU_THREADS];
     // Cached once at init() from get_l2_swimlane_level(), AFTER
@@ -439,6 +463,14 @@ private:
 #endif
     );
 
+    uint64_t mailbox_full_wait_begin(
+        int32_t thread_idx, MailboxWaitKind kind, int32_t core_id, int64_t task_id, int32_t condition_index,
+        int32_t condition_count
+    );
+    void mailbox_full_wait_poll(int32_t thread_idx, uint64_t wait_start_cycles, uint64_t spins);
+    void mailbox_full_wait_end(int32_t thread_idx, uint64_t wait_start_cycles);
+    void mailbox_note_drain(int32_t thread_idx, uint64_t head_before, uint64_t tail_before, uint64_t tail_after);
+
     static void promote_pending_to_running(CoreExecState &core);
     static void clear_running_slot(CoreExecState &core);
 
@@ -472,9 +504,12 @@ private:
     log_stall_diagnostics(int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count);
 
     __attribute__((noinline, cold)) void
-    log_scheduler_stall_snapshot(
-        const char *reason, int32_t trigger_thread_idx, uint64_t no_progress_cycles
-    );
+    log_scheduler_stall_snapshot(const char *reason, int32_t trigger_thread_idx, uint64_t no_progress_cycles);
+
+    __attribute__((noinline, cold)) void
+    log_mailbox_stall_snapshot(int32_t trigger_thread_idx, uint64_t wait_start_cycles, uint64_t spins);
+
+    __attribute__((noinline, cold)) void log_mailbox_diag_summary(int32_t thread_idx);
 
     __attribute__((noinline, cold)) void log_shutdown_stall_snapshot(
         int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count

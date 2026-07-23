@@ -382,9 +382,8 @@ void SchedulerContext::log_scheduler_stall_snapshot(
 
     for (int32_t s = 0; s < PTO2_NUM_RESOURCE_SHAPES; s++) {
         LOG_WARN(
-            "[SCHED_STALL reason=%s] QUEUE shape=%d ready=%" PRIu64 " ready_sync=%" PRIu64 " early=%" PRIu64,
-            reason, s, sched_->ready_queues[s].size(), sched_->ready_sync_queues[s].size(),
-            sched_->early_dispatch_queues[s].size()
+            "[SCHED_STALL reason=%s] QUEUE shape=%d ready=%" PRIu64 " ready_sync=%" PRIu64 " early=%" PRIu64, reason, s,
+            sched_->ready_queues[s].size(), sched_->ready_sync_queues[s].size(), sched_->early_dispatch_queues[s].size()
         );
     }
     LOG_WARN("[SCHED_STALL reason=%s] QUEUE dummy=%" PRIu64, reason, sched_->dummy_ready_queue.size());
@@ -436,6 +435,85 @@ void SchedulerContext::log_scheduler_stall_snapshot(
     for (int32_t t = 0; t < thread_count; t++) {
         log_stall_diagnostics(t, total_tasks_, 0, completed_tasks_.load(std::memory_order_relaxed));
     }
+}
+
+void SchedulerContext::log_mailbox_stall_snapshot(
+    int32_t trigger_thread_idx, uint64_t wait_start_cycles, uint64_t spins
+) {
+    uint64_t now = get_sys_cnt_aicpu();
+    AICoreCompletionMailbox *mailbox = rt_ != nullptr ? rt_->aicore_mailbox : nullptr;
+    uint64_t head = mailbox != nullptr ? mailbox->head.load(std::memory_order_acquire) : 0;
+    uint64_t tail = mailbox != nullptr ? mailbox->tail.load(std::memory_order_acquire) : 0;
+    int32_t async_count = -1;
+    int32_t async_busy = -1;
+    if (sched_ != nullptr) {
+        async_busy = sched_->async_wait_list.busy.load(std::memory_order_acquire);
+        if (sched_->async_wait_list.try_lock()) {
+            async_count = sched_->async_wait_list.count;
+            sched_->async_wait_list.unlock();
+            async_busy = 0;
+        }
+    }
+
+    PTO2SharedMemoryHeader *header = sched_ != nullptr ? sched_->sm_header : nullptr;
+    int32_t ring3_current = -1;
+    int32_t ring3_last_alive = -1;
+    int32_t reclaim_waiting = -1;
+    if (header != nullptr) {
+        ring3_current = header->rings[3].fc.current_task_index.load(std::memory_order_acquire);
+        ring3_last_alive = header->rings[3].fc.last_task_alive.load(std::memory_order_acquire);
+        reclaim_waiting = header->orchestrator_reclaim_waiting.load(std::memory_order_acquire);
+    }
+
+    uint64_t waiter_mask = mailbox_waiter_mask_.load(std::memory_order_acquire);
+    LOG_WARN(
+        "[MAILBOX_STALL trigger_thread=%d wait_us=%" PRIu64 " spins=%" PRIu64 "] "
+        "head=%" PRIu64 " tail=%" PRIu64 " occupancy=%" PRIu64 "/%u waiter_mask=0x%" PRIx64
+        " async_busy=%d async_count=%d completed=%d/%d ring3_current=%d ring3_last_alive=%d "
+        "orch_reclaim_waiting=%d",
+        trigger_thread_idx, (now - wait_start_cycles) * 1000000 / PLATFORM_PROF_SYS_CNT_FREQ, spins, head, tail,
+        head - tail, AICORE_COMPLETION_MAILBOX_CAPACITY, waiter_mask, async_busy, async_count,
+        completed_tasks_.load(std::memory_order_relaxed), total_tasks_, ring3_current, ring3_last_alive, reclaim_waiting
+    );
+
+    auto kind_name = [](int32_t kind) {
+        switch (static_cast<MailboxWaitKind>(kind)) {
+        case MailboxWaitKind::Condition:
+            return "condition";
+        case MailboxWaitKind::NormalDone:
+            return "normal_done";
+        case MailboxWaitKind::None:
+            return "none";
+        }
+        return "unknown";
+    };
+    int32_t thread_count = active_sched_threads_ > 0 ? active_sched_threads_ : aicpu_thread_num_;
+    for (int32_t t = 0; t < thread_count; t++) {
+        if ((waiter_mask & (1ULL << t)) == 0) continue;
+        MailboxThreadDiag &diag = mailbox_diag_[t];
+        uint64_t start = diag.wait_start_cycles.load(std::memory_order_relaxed);
+        int32_t kind = diag.wait_kind.load(std::memory_order_acquire);
+        LOG_WARN(
+            "[MAILBOX_STALL] WAITER thread=%d kind=%s core=%d task=%" PRId64 " condition=%d/%d wait_us=%" PRIu64, t,
+            kind_name(kind), diag.core_id.load(std::memory_order_relaxed), diag.task_id.load(std::memory_order_relaxed),
+            diag.condition_index.load(std::memory_order_relaxed), diag.condition_count.load(std::memory_order_relaxed),
+            start == 0 ? 0 : (now - start) * 1000000 / PLATFORM_PROF_SYS_CNT_FREQ
+        );
+    }
+
+    if (!mailbox_stall_snapshot_dumped_.exchange(true, std::memory_order_acq_rel)) {
+        log_scheduler_stall_snapshot("mailbox_full", trigger_thread_idx, now - wait_start_cycles);
+    }
+}
+
+void SchedulerContext::log_mailbox_diag_summary(int32_t thread_idx) {
+    MailboxThreadDiag &diag = mailbox_diag_[thread_idx];
+    LOG_INFO_V9(
+        "[MAILBOX_SUMMARY thread=%d] max_occupancy=%" PRIu64 "/%u full_events=%" PRIu64 " max_full_wait_us=%" PRIu64
+        " pop_count=%" PRIu64,
+        thread_idx, diag.max_occupancy, AICORE_COMPLETION_MAILBOX_CAPACITY, diag.full_events,
+        diag.max_full_wait_cycles * 1000000 / PLATFORM_PROF_SYS_CNT_FREQ, diag.pop_count
+    );
 }
 
 void SchedulerContext::log_shutdown_stall_snapshot(
@@ -1416,6 +1494,22 @@ void SchedulerContext::deinit() {
     total_tasks_ = 0;
     orchestrator_done_.store(false, std::memory_order_release);
     completed_.store(false, std::memory_order_release);
+    mailbox_waiter_mask_.store(0, std::memory_order_release);
+    mailbox_last_stall_log_cycles_.store(0, std::memory_order_release);
+    mailbox_stall_snapshot_dumped_.store(false, std::memory_order_release);
+    for (int32_t t = 0; t < MAX_AICPU_THREADS; t++) {
+        MailboxThreadDiag &diag = mailbox_diag_[t];
+        diag.wait_kind.store(static_cast<int32_t>(MailboxWaitKind::None), std::memory_order_relaxed);
+        diag.core_id.store(-1, std::memory_order_relaxed);
+        diag.task_id.store(-1, std::memory_order_relaxed);
+        diag.condition_index.store(-1, std::memory_order_relaxed);
+        diag.condition_count.store(0, std::memory_order_relaxed);
+        diag.wait_start_cycles.store(0, std::memory_order_relaxed);
+        diag.full_events = 0;
+        diag.max_full_wait_cycles = 0;
+        diag.max_occupancy = 0;
+        diag.pop_count = 0;
+    }
 
     // Reset core discovery and assignment state
     aic_count_ = 0;

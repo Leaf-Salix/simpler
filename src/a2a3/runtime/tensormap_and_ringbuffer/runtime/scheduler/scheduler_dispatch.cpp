@@ -1097,6 +1097,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
             (sched_->async_wait_list.count > 0 || rt_->aicore_mailbox->has_pending())) {
+            uint64_t mailbox_head_before = rt_->aicore_mailbox->head.load(std::memory_order_relaxed);
+            uint64_t mailbox_tail_before = rt_->aicore_mailbox->tail.load(std::memory_order_relaxed);
             AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
                 rt_->aicore_mailbox, sched_, deferred_release_slot_states, deferred_release_count,
                 PTO2_DEFERRED_RELEASE_CAP
@@ -1104,6 +1106,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 ,
                 thread_idx
 #endif
+            );
+            mailbox_note_drain(
+                thread_idx, mailbox_head_before, mailbox_tail_before,
+                rt_->aicore_mailbox->tail.load(std::memory_order_relaxed)
             );
             if (poll_result.error_code != PTO2_ERROR_NONE) {
                 int32_t expected = PTO2_ERROR_NONE;
@@ -1589,5 +1595,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     }
 #endif
 
+    log_mailbox_diag_summary(thread_idx);
     return timeout_rc != 0 ? timeout_rc : cur_thread_completed;
 }
