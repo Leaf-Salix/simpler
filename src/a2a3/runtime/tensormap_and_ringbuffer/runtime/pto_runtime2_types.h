@@ -452,7 +452,6 @@ static_assert(
 // head can only be released by scope_end, which a blocked orchestrator can
 // never reach -> provable deadlock.
 static constexpr uint32_t PTO2_FANOUT_SCOPE_BIT = 0x80000000u;
-static constexpr int32_t PTO2_DEBUG_FANOUT_CONSUMER_CAP = 32;
 
 enum PTO2TaskLifecycleFlag : uint8_t {
     PTO2_LIFECYCLE_FLAGS_NONE = 0,
@@ -480,13 +479,6 @@ struct alignas(64) PTO2TaskSlotState {
 
     // Fanout refcount (accessed with fanout_count in check_and_handle_consumed)
     std::atomic<uint32_t> fanout_refcount;  // Dynamic: low bits = released consumers, bit31 = scope released
-
-    // Diagnostic only: all claimed consumers, including late consumers that
-    // do not need a live fanout_head edge because the producer is already
-    // COMPLETED at wiring time. Updated under fanout_lock; never read by the
-    // scheduler for behavior.
-    std::atomic<int32_t> debug_fanout_consumer_count{0};
-    PTO2TaskSlotState *debug_fanout_consumers[PTO2_DEBUG_FANOUT_CONSUMER_CAP]{};
 
     // --- Per-slot constant, re-bound by orch::prepare_task each submit ---
     // Value is the same on every reuse (&task_payloads[slot] / &task_descriptors[slot]),
@@ -604,7 +596,6 @@ struct alignas(64) PTO2TaskSlotState {
         fanout_lock.store(0, std::memory_order_relaxed);
         fanout_count = PTO2_FANOUT_SCOPE_BIT;  // bit31 = owning-scope ref; consumers ++ into low bits
         fanout_head = nullptr;
-        debug_fanout_consumer_count.store(0, std::memory_order_relaxed);
         fanin_refcount.store(0, std::memory_order_relaxed);
         fanout_refcount.store(0, std::memory_order_relaxed);
         completed_subtasks.store(0, std::memory_order_relaxed);
@@ -665,16 +656,8 @@ struct alignas(64) PTO2TaskSlotState {
     }
 
     void unlock_fanout() { fanout_lock.store(0, std::memory_order_release); }
-
-    void debug_record_fanout_consumer(PTO2TaskSlotState *consumer) {
-        int32_t count = debug_fanout_consumer_count.load(std::memory_order_relaxed);
-        if (count < PTO2_DEBUG_FANOUT_CONSUMER_CAP) {
-            debug_fanout_consumers[count] = consumer;
-        }
-        debug_fanout_consumer_count.store(count + 1, std::memory_order_relaxed);
-    }
 };
 
-static_assert(sizeof(PTO2TaskSlotState) % 64 == 0);
+static_assert(sizeof(PTO2TaskSlotState) == 64);
 
 #endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_RUNTIME2_TYPES_H_
