@@ -578,8 +578,14 @@ static bool prepare_task(
         return false;
     }
 
-    out->alloc_result =
-        allocator.alloc(total_output_size, orch->sm_header, orch->scheduler_runs_concurrently, orch->scheduler);
+#if SIMPLER_DFX
+    out->alloc_result = allocator.alloc(
+        total_output_size, orch->sm_header, orch->scheduler_runs_concurrently, orch->scheduler,
+        pto2_log_heap_hol_consumers
+    );
+#else
+    out->alloc_result = allocator.alloc(total_output_size, orch->sm_header, orch->scheduler_runs_concurrently);
+#endif
     if (out->alloc_result.failed()) {
         orch->fatal = true;
         if (orch->sm_header->orch_error_code.load(std::memory_order_acquire) == PTO2_ERROR_NONE &&

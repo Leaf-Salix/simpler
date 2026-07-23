@@ -56,6 +56,7 @@
 #define PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES (PLATFORM_PROF_SYS_CNT_FREQ / 2)  // 500 ms
 
 struct PTO2SchedulerState;
+using PTO2HeapHolConsumerLogger = void (*)(PTO2SchedulerState *, uint8_t, int32_t);
 
 #if SIMPLER_DFX
 void pto2_log_heap_hol_consumers(PTO2SchedulerState *sched, uint8_t head_ring_id, int32_t head_task_id);
@@ -130,7 +131,7 @@ public:
      */
     PTO2TaskAllocResult alloc(
         int32_t output_size, PTO2SharedMemoryHeader *sm_header = nullptr, bool scheduler_runs_concurrently = false,
-        PTO2SchedulerState *scheduler = nullptr
+        PTO2SchedulerState *scheduler = nullptr, PTO2HeapHolConsumerLogger consumer_logger = nullptr
     ) {
         uint64_t aligned_size =
             output_size > 0 ? PTO2_ALIGN_UP(static_cast<uint64_t>(output_size), PTO2_ALIGN_SIZE) : 0;
@@ -195,7 +196,7 @@ public:
             update_heap_tail(last_alive);
 #if SIMPLER_DFX
             if (blocked_on_heap && local_task_id_ >= next_heap_hol_sample_task_id_) {
-                log_heap_hol_sample(last_alive, scheduler);
+                log_heap_hol_sample(last_alive, scheduler, consumer_logger);
                 next_heap_hol_sample_task_id_ = local_task_id_ + (1 << 17);
             }
 #endif
@@ -288,7 +289,9 @@ private:
     // =========================================================================
 
 #if SIMPLER_DFX
-    void log_heap_hol_sample(int32_t last_alive, PTO2SchedulerState *scheduler) const {
+    void log_heap_hol_sample(
+        int32_t last_alive, PTO2SchedulerState *scheduler, PTO2HeapHolConsumerLogger consumer_logger
+    ) const {
         if (slot_states_ == nullptr || local_task_id_ <= last_alive) return;
 
         int32_t pending = 0;
@@ -327,8 +330,8 @@ private:
             (head_fanout_refcount & PTO2_FANOUT_SCOPE_BIT) != 0, pending, completed, consumed, consumed_bytes,
             largest_consumed_bytes, heap_used_bytes(), heap_size_
         );
-        if (scheduler != nullptr && consumed_bytes >= 64 * 1024 * 1024) {
-            pto2_log_heap_hol_consumers(scheduler, ring_id_, last_alive);
+        if (consumer_logger != nullptr && scheduler != nullptr && consumed_bytes >= 64 * 1024 * 1024) {
+            consumer_logger(scheduler, ring_id_, last_alive);
         }
     }
 #endif
