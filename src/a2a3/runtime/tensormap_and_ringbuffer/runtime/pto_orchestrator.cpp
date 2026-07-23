@@ -637,8 +637,8 @@ void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
             orch->scheduler->ring_sched_states[ring_id].read_dep_pool_snapshot(dep_pool_tail, dep_pool_top);
         }
         scope_stats_begin(
-            ring_id, alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(), dep_pool_tail,
-            dep_pool_top, orch->tensor_map.current_used()
+            ring_id, alloc.task_tail(), alloc.task_head(), alloc.heap_reclaimed_offset(), alloc.heap_allocated_offset(),
+            dep_pool_tail, dep_pool_top, orch->tensor_map.current_used()
         );
     }
 #endif
@@ -666,8 +666,8 @@ void PTO2OrchestratorState::end_scope() {
             orch->scheduler->ring_sched_states[ring_id].read_dep_pool_snapshot(dep_pool_tail, dep_pool_top);
         }
         scope_stats_end(
-            ring_id, alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(), dep_pool_tail,
-            dep_pool_top, orch->tensor_map.current_used()
+            ring_id, alloc.task_tail(), alloc.task_head(), alloc.heap_reclaimed_offset(), alloc.heap_allocated_offset(),
+            dep_pool_tail, dep_pool_top, orch->tensor_map.current_used()
         );
     }
 #endif

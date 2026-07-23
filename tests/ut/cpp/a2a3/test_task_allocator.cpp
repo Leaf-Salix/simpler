@@ -17,12 +17,11 @@
  * The allocator has one caller (the orchestrator thread), while scheduler
  * threads concurrently advance its reclaim watermark and error channel.
  *
- * Design contracts (try_bump_heap):
+ * Design contracts:
  *
- * - Wrap-around guard uses `tail > alloc_size` (strict >).  When
- *   tail == alloc_size the wrap branch returns nullptr.  Allowing it
- *   would create top == tail (full/empty ambiguity).  Strict >
- *   sacrifices one quantum of capacity.
+ * - The bump-ring fast path keeps strict full/empty guards. On contiguous
+ *   space exhaustion, the allocator switches to explicit free extents, where
+ *   exact-fit allocations are unambiguous.
  *
  * - heap_available() returns max(at_end, at_begin), not the sum.
  *   A single allocation cannot split across the wrap boundary.
@@ -266,11 +265,7 @@ TEST_F(TaskAllocatorTest, HeapExactFitAtEnd) {
     EXPECT_EQ(static_cast<char *>(r2.packed_base), reinterpret_cast<char *>(heap_buf) + HEAP_SIZE - 64);
 }
 
-// Wrap guard `tail > alloc_size` uses strict > to prevent full/empty ambiguity.
-// If the allocation were allowed, heap_top would advance to alloc_size == tail,
-// making top == tail.  Because top == tail is the canonical "empty" state, the
-// ring could not distinguish "completely full" from "completely empty".
-TEST_F(TaskAllocatorTest, HeapWrapGuardRejectsTailEqualsAllocSize) {
+TEST_F(TaskAllocatorTest, ExtentFallbackAllowsWrapExactFit) {
     auto r1 = allocator.alloc(HEAP_SIZE);
     ASSERT_FALSE(r1.failed());
     EXPECT_EQ(allocator.heap_top(), HEAP_SIZE);
@@ -278,7 +273,8 @@ TEST_F(TaskAllocatorTest, HeapWrapGuardRejectsTailEqualsAllocSize) {
     consume_up_to(descriptors, last_alive, heap_buf, WINDOW_SIZE, 1, 64);
 
     auto r2 = allocator.alloc(64);
-    EXPECT_TRUE(r2.failed()) << "wrap guard must reject when tail == alloc_size (full/empty ambiguity)";
+    ASSERT_FALSE(r2.failed());
+    EXPECT_EQ(r2.packed_base, static_cast<void *>(heap_buf));
 }
 
 TEST_F(TaskAllocatorTest, HeapWrapAroundSuccess) {
@@ -293,8 +289,7 @@ TEST_F(TaskAllocatorTest, HeapWrapAroundSuccess) {
     EXPECT_EQ(allocator.heap_top(), 64u);
 }
 
-// Linear-gap guard `tail - top > alloc_size` uses strict > for the same reason.
-TEST_F(TaskAllocatorTest, HeapLinearGapGuardRejectsExactFit) {
+TEST_F(TaskAllocatorTest, ExtentFallbackAllowsLinearGapExactFit) {
     // Fill most of heap, leaving just 64 at end so next alloc wraps.
     auto r1 = allocator.alloc(HEAP_SIZE - 64);
     ASSERT_FALSE(r1.failed());
@@ -308,10 +303,13 @@ TEST_F(TaskAllocatorTest, HeapLinearGapGuardRejectsExactFit) {
 
     // Now top=128, tail=HEAP_SIZE-64 (top < tail)
     // gap = (HEAP_SIZE-64) - 128 = HEAP_SIZE-192
-    // Allocate exactly gap bytes: gap > alloc_size -> FALSE
+    // The bump-ring guard rejects this exact fit, then explicit extents can
+    // represent the now-empty gap without a full/empty sentinel ambiguity.
     uint64_t gap = (HEAP_SIZE - 64) - 128;
     auto r3 = allocator.alloc(gap);
-    EXPECT_TRUE(r3.failed()) << "linear-gap guard must reject exact fit (full/empty ambiguity)";
+    ASSERT_FALSE(r3.failed());
+    EXPECT_EQ(r3.packed_base, reinterpret_cast<char *>(heap_buf) + 128);
+    EXPECT_EQ(r3.packed_end, reinterpret_cast<char *>(heap_buf) + HEAP_SIZE - 64);
 }
 
 TEST_F(TaskAllocatorTest, HeapTopLessThanTailInsufficientSpace) {
@@ -375,6 +373,83 @@ TEST_F(TaskAllocatorTest, WrapPathWastedSpace) {
 
     uint64_t avail = allocator.heap_available();
     EXPECT_LT(avail, HEAP_SIZE) << "Wasted space at end reduces available capacity";
+}
+
+TEST_F(TaskAllocatorTest, ExtentFallbackRecoversWrapPadding) {
+    auto old_segment = allocator.alloc(3008);
+    ASSERT_FALSE(old_segment.failed());
+    consume_up_to(descriptors, last_alive, heap_buf, WINDOW_SIZE, 1, 3008);
+
+    auto wrapped = allocator.alloc(1152);
+    ASSERT_FALSE(wrapped.failed());
+    EXPECT_EQ(wrapped.packed_base, static_cast<void *>(heap_buf));
+
+    auto from_padding = allocator.alloc(2048);
+    ASSERT_FALSE(from_padding.failed());
+    EXPECT_EQ(from_padding.packed_base, reinterpret_cast<char *>(heap_buf) + 1152);
+    EXPECT_EQ(from_padding.packed_end, reinterpret_cast<char *>(heap_buf) + 3200);
+}
+
+TEST_F(TaskAllocatorTest, ReusesConsumedExtentBehindLiveHead) {
+    auto head = allocator.alloc(1024);
+    auto hole = allocator.alloc(2048);
+    auto tail = allocator.alloc(1024);
+    ASSERT_FALSE(head.failed());
+    ASSERT_FALSE(hole.failed());
+    ASSERT_FALSE(tail.failed());
+    EXPECT_EQ(allocator.heap_used_bytes(), HEAP_SIZE);
+
+    slot_states[head.slot].task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+    slot_states[hole.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
+    slot_states[tail.slot].task_state.store(PTO2_TASK_PENDING, std::memory_order_release);
+
+    auto reused = allocator.alloc(1024);
+    ASSERT_FALSE(reused.failed());
+    EXPECT_EQ(reused.packed_base, hole.packed_base);
+    EXPECT_EQ(allocator.heap_used_bytes(), 3072u);
+
+    slot_states[head.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
+    last_alive.store(2, std::memory_order_release);
+    auto probe = allocator.alloc(0);
+    ASSERT_FALSE(probe.failed());
+    EXPECT_EQ(allocator.heap_available(), 1024u) << "Previous task retirement must not free a reused live extent";
+    EXPECT_EQ(allocator.heap_used_bytes(), 2048u);
+
+    slot_states[reused.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
+    auto coalesced = allocator.alloc(3072);
+    ASSERT_FALSE(coalesced.failed());
+    EXPECT_EQ(coalesced.packed_base, head.packed_base);
+    EXPECT_EQ(coalesced.packed_end, tail.packed_base);
+    EXPECT_EQ(allocator.heap_used_bytes(), HEAP_SIZE);
+    EXPECT_EQ(allocator.heap_allocated_offset(), 0u);
+    EXPECT_EQ(allocator.heap_reclaimed_offset(), 0u);
+}
+
+TEST_F(TaskAllocatorTest, HeapCapacityDropsUnalignedTail) {
+    alignas(64) uint8_t unaligned_heap[1089]{};
+    allocator.init(
+        descriptors.data(), WINDOW_SIZE, &current_index, &last_alive, unaligned_heap, sizeof(unaligned_heap),
+        &error_code, slot_states.data()
+    );
+
+    EXPECT_EQ(allocator.heap_capacity(), 1088u);
+    auto full = allocator.alloc(1088);
+    ASSERT_FALSE(full.failed());
+    EXPECT_EQ(full.packed_base, static_cast<void *>(unaligned_heap));
+    EXPECT_EQ(full.packed_end, unaligned_heap + 1088);
+}
+
+TEST_F(TaskAllocatorTest, HeapBaseAlignsWithinPartition) {
+    alignas(64) uint8_t partition[1153]{};
+    allocator.init(
+        descriptors.data(), WINDOW_SIZE, &current_index, &last_alive, partition + 1, 1152, &error_code,
+        slot_states.data()
+    );
+
+    EXPECT_EQ(allocator.heap_capacity(), 1088u);
+    auto first = allocator.alloc(64);
+    ASSERT_FALSE(first.failed());
+    EXPECT_EQ(first.packed_base, partition + 64);
 }
 
 TEST_F(TaskAllocatorTest, AllocExactlyHeapSize) {

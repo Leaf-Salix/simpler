@@ -157,8 +157,6 @@ The orchestrator and schedulers communicate through a contiguous shared memory r
 | ----- | ------ | ------ | ------- |
 | `current_task_index` | Orchestrator | Scheduler | Next task ID to allocate (task ring head) |
 | `last_task_alive` | Scheduler | Orchestrator | Oldest still-active task (task ring tail) |
-| `heap_top` | Orchestrator | Scheduler | Heap ring allocation pointer |
-| `heap_tail` | Scheduler | Orchestrator | Heap ring reclamation pointer |
 | `orchestrator_done` | Orchestrator | Scheduler | Signals orchestration completion |
 | `orchestrator_reclaim_waiting` | Orchestrator | Scheduler | Orchestrator is blocked on task/heap reclaim before graph construction can finish |
 | `task_window_size` | Init | Both | Number of task slots (per-ring, in `PTO2SharedMemoryRingHeader`) |
@@ -212,18 +210,30 @@ else:
 
 ### 4.2 Heap Ring
 
-The heap ring manages output buffer allocation from a circular GM heap.
+The heap ring manages output buffer allocation from a per-ring GM heap.
 
-**Structure** (`PTO2HeapRing`):
+**Fast path**: Buffers are allocated contiguously from the orchestrator-local
+`heap_top`. When reaching the end, allocation wraps to the beginning if the
+FIFO `heap_tail` has advanced far enough. Buffers never straddle the physical
+heap boundary.
 
-- `base`: GM heap base address
-- `size`: total heap size (default 1 GB)
-- `top`: allocation pointer (local to orchestrator)
-- `tail_ptr`: pointer to `header->heap_tail` (updated by scheduler)
+**Pressure fallback**: If neither bump region can satisfy an allocation, the
+allocator switches that heap to explicit extent reclaim. It builds an
+address-ordered free list inside free heap blocks, collects every task whose
+state is `CONSUMED`, and coalesces adjacent extents. A live oldest task still
+blocks task-slot watermark advancement, but it no longer pins unrelated
+`CONSUMED` output buffers behind it.
 
-**Allocation**: Buffers are allocated contiguously from `top`. When reaching the end, allocation wraps to the beginning if `tail` has advanced far enough. Buffers never straddle the wrap-around boundary.
+The orchestrator is the only free-list writer. The scheduler only publishes
+`CONSUMED`; an acquire load of that state is the ownership handoff proving that
+all consumers and the owning scope have released the buffer. Each descriptor
+is cleared when its extent is collected, preventing a later watermark advance
+from releasing the same generation twice.
 
-**Reclamation**: When `last_task_alive` advances past a task, its `packed_buffer_end` is used to advance `heap_tail`, freeing the memory region.
+Scope stats use monotonic allocated/reclaimed byte counters rather than the
+physical bump cursors. `heap_end - heap_start` is the allocator-owned byte
+count: FIFO-pinned holes count as owned before extent fallback, then leave the
+count when the allocator makes them reusable.
 
 ### 4.3 Dependency List Pool
 
@@ -239,7 +249,10 @@ The ring buffer mechanism provides **flow control** between the orchestrator (pr
 
 **Task Ring back-pressure**: When `active_count = current_index - last_task_alive >= window_size - 1`, `PTO2TaskAllocator::alloc` spin-waits until the scheduler completes tasks and advances `last_task_alive`.
 
-**Heap Ring back-pressure**: When the heap has insufficient contiguous space, `PTO2TaskAllocator::alloc` spin-waits until the scheduler advances `heap_tail` past completed tasks' output buffers.
+**Heap back-pressure**: When the heap has insufficient contiguous space,
+`PTO2TaskAllocator::alloc` first collects safe `CONSUMED` extents. It
+spin-waits only when no free extent is large enough, periodically rescanning
+for newly consumed tasks while scheduler dispatch continues.
 
 While either task/heap wait is active under concurrent dispatch, the allocator publishes `orchestrator_reclaim_waiting=1`. It does not treat a fixed period without `last_task_alive` movement as proof of deadlock: a producer may remain legitimately live while its consumers execute. The scheduler owns the residual forward-progress timeout because it can observe all running cores and global task completions. The allocator clears the flag on successful reclaim or when either runtime error channel asks it to unwind.
 
