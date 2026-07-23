@@ -51,8 +51,6 @@
 #include "aicpu/scope_stats_collector_aicpu.h"
 #endif
 
-// Block notification interval (in spin counts)
-#define PTO2_BLOCK_NOTIFY_INTERVAL 10000
 // Auxiliary pool waits retain a wall-clock backstop. Task/heap allocation uses
 // structural checks plus the scheduler's global progress watchdog instead.
 #define PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES (PLATFORM_PROF_SYS_CNT_FREQ / 2)  // 500 ms
@@ -198,14 +196,6 @@ public:
                 if (orch_failed || sched_failed) {
                     clear_reclaim_wait();
                     return {-1, -1, nullptr, nullptr};
-                }
-                if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0) {
-                    LOG_WARN(
-                        "[TaskAllocator ring=%u] BLOCKED: tasks=%d/%d, heap_used=%" PRIu64 "/%" PRIu64
-                        ", heap_available=%" PRIu64 ", heap_cursor=%" PRIu64 ", on=%s, spins=%" PRIu64,
-                        static_cast<unsigned>(ring_id_), local_task_id_ - last_alive, window_size_, heap_used_bytes(),
-                        heap_size_, heap_available(), heap_top_, blocked_on_heap ? "heap" : "task", spin_count
-                    );
                 }
             }
             SPIN_WAIT_HINT();
