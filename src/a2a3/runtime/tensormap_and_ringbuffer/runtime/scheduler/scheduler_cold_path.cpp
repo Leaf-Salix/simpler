@@ -346,9 +346,7 @@ void SchedulerContext::log_stall_diagnostics(
     }
 }
 
-void SchedulerContext::log_scheduler_stall_snapshot(
-    const char *reason, int32_t trigger_thread_idx, uint64_t no_progress_cycles
-) {
+void SchedulerContext::log_drain_stall_snapshot(int32_t trigger_thread_idx, uint64_t no_progress_cycles) {
     int32_t block_num = drain_state_.sync_start_pending.load(std::memory_order_acquire);
     PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
     int64_t task_id = -1;
@@ -367,11 +365,11 @@ void SchedulerContext::log_scheduler_stall_snapshot(
     }
 
     LOG_WARN(
-        "[SCHED_STALL reason=%s trigger_thread=%d no_progress_us=%" PRIu64 "] "
+        "[DRAIN_STALL trigger_thread=%d no_progress_us=%" PRIu64 "] "
         "pending_task=%" PRId64 " block_num=%d shape=%d core_mask=0x%x gated=%d available=%d "
         "ack=0x%x elected=%d stage_go=%d stage_done=0x%x running_staged=%d completed=%d/%d",
-        reason, trigger_thread_idx, no_progress_cycles * 1000000 / PLATFORM_PROF_SYS_CNT_FREQ, task_id, block_num,
-        shape_raw, static_cast<unsigned int>(core_mask), gated, available,
+        trigger_thread_idx, no_progress_cycles * 1000000 / PLATFORM_PROF_SYS_CNT_FREQ, task_id, block_num, shape_raw,
+        static_cast<unsigned int>(core_mask), gated, available,
         drain_ack_mask_for_attempt(drain_state_.drain_attempt.load(std::memory_order_acquire)),
         drain_state_.drain_worker_elected.load(std::memory_order_relaxed),
         drain_state_.drain_stage_go.load(std::memory_order_relaxed),
@@ -382,12 +380,11 @@ void SchedulerContext::log_scheduler_stall_snapshot(
 
     for (int32_t s = 0; s < PTO2_NUM_RESOURCE_SHAPES; s++) {
         LOG_WARN(
-            "[SCHED_STALL reason=%s] QUEUE shape=%d ready=%" PRIu64 " ready_sync=%" PRIu64 " early=%" PRIu64,
-            reason, s, sched_->ready_queues[s].size(), sched_->ready_sync_queues[s].size(),
-            sched_->early_dispatch_queues[s].size()
+            "[DRAIN_STALL] QUEUE shape=%d ready=%" PRIu64 " ready_sync=%" PRIu64 " early=%" PRIu64, s,
+            sched_->ready_queues[s].size(), sched_->ready_sync_queues[s].size(), sched_->early_dispatch_queues[s].size()
         );
     }
-    LOG_WARN("[SCHED_STALL reason=%s] QUEUE dummy=%" PRIu64, reason, sched_->dummy_ready_queue.size());
+    LOG_WARN("[DRAIN_STALL] QUEUE dummy=%" PRIu64, sched_->dummy_ready_queue.size());
 
     int32_t thread_count = active_sched_threads_ > 0 ? active_sched_threads_ : aicpu_thread_num_;
     for (int32_t t = 0; t < thread_count; t++) {
@@ -398,9 +395,9 @@ void SchedulerContext::log_scheduler_stall_snapshot(
             if (core_exec_states_[core_ids[i]].pending_slot_state != nullptr) pending_slots++;
         }
         LOG_WARN(
-            "[SCHED_STALL reason=%s] TRACKER thread=%d clusters=%d mix_idle=%d mix_split=%d running_cores=%d "
+            "[DRAIN_STALL] TRACKER thread=%d clusters=%d mix_idle=%d mix_split=%d running_cores=%d "
             "pending_slots=%d",
-            reason, t, tracker.get_cluster_count(), tracker.count_mix_running_clusters(core_mask),
+            t, tracker.get_cluster_count(), tracker.count_mix_running_clusters(core_mask),
             tracker.count_mix_split_clusters(core_mask), tracker.get_all_running_cores().count(), pending_slots
         );
 
@@ -425,10 +422,10 @@ void SchedulerContext::log_scheduler_stall_snapshot(
                                      -1;
             if (running_id < 0 && pending_id < 0) continue;
             LOG_WARN(
-                "[SCHED_STALL reason=%s] CORE thread=%d core=%d running_task=%" PRId64 " running_fanin=%d/%d "
+                "[DRAIN_STALL] CORE thread=%d core=%d running_task=%" PRId64 " running_fanin=%d/%d "
                 "running_ed=%d pending_task=%" PRId64 " pending_fanin=%d/%d pending_ed=%d",
-                reason, t, core_id, running_id, running_fanin, running_fanin_total, running_ed, pending_id,
-                pending_fanin, pending_fanin_total, pending_ed
+                t, core_id, running_id, running_fanin, running_fanin_total, running_ed, pending_id, pending_fanin,
+                pending_fanin_total, pending_ed
             );
         }
     }
