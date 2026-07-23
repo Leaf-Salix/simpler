@@ -40,9 +40,30 @@ struct alignas(64) DrainThreadDiag {
 };
 
 std::atomic<uint64_t> g_drain_diag_epoch{0};
+std::atomic<uint64_t> g_drain_diag_attempt{0};
 std::atomic<int32_t> g_drain_diag_available{-1};
 std::atomic<SchedulerContext *> g_drain_diag_context{nullptr};
 DrainThreadDiag g_drain_thread_diag[MAX_AICPU_THREADS];
+
+struct DrainAttemptDiag {
+    std::atomic<uint64_t> retry_count{0};
+    std::atomic<uint64_t> stale_participant_count{0};
+    std::atomic<uint64_t> stale_winner_count{0};
+    std::atomic<uint64_t> last_retry_attempt{0};
+    std::atomic<uint64_t> last_retry_epoch{0};
+    std::atomic<int64_t> last_retry_task_id{-1};
+    std::atomic<int32_t> last_retry_thread{-1};
+    std::atomic<int32_t> last_retry_available{-1};
+    std::atomic<uint64_t> last_stale_entered_attempt{0};
+    std::atomic<uint64_t> last_stale_observed_attempt{0};
+    std::atomic<uint64_t> last_stale_epoch{0};
+    std::atomic<int64_t> last_stale_task_id{-1};
+    std::atomic<int32_t> last_stale_thread{-1};
+    std::atomic<int32_t> last_stale_cas_won{0};
+    std::atomic<int32_t> last_stale_owner{0};
+};
+
+DrainAttemptDiag g_drain_attempt_diag;
 
 const char *drain_diag_phase_name(DrainDiagPhase phase) {
     switch (phase) {
@@ -89,11 +110,45 @@ const char *drain_stage_diag_point_name(DrainStageDiagPoint point) {
 }
 }  // namespace
 
-uint64_t drain_diag_begin() { return g_drain_diag_epoch.fetch_add(1, std::memory_order_acq_rel) + 1; }
+uint64_t drain_diag_begin() {
+    g_drain_diag_attempt.fetch_add(1, std::memory_order_acq_rel);
+    return g_drain_diag_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
 
 uint64_t drain_diag_current_epoch() { return g_drain_diag_epoch.load(std::memory_order_acquire); }
 
+uint64_t drain_diag_current_attempt() { return g_drain_diag_attempt.load(std::memory_order_acquire); }
+
 void drain_diag_set_available(int32_t available) { g_drain_diag_available.store(available, std::memory_order_release); }
+
+void drain_diag_note_retry(int32_t thread_idx, uint64_t epoch, int64_t task_id, int32_t available) {
+    uint64_t attempt = g_drain_diag_attempt.fetch_add(1, std::memory_order_acq_rel) + 1;
+    g_drain_attempt_diag.retry_count.fetch_add(1, std::memory_order_relaxed);
+    g_drain_attempt_diag.last_retry_epoch.store(epoch, std::memory_order_relaxed);
+    g_drain_attempt_diag.last_retry_task_id.store(task_id, std::memory_order_relaxed);
+    g_drain_attempt_diag.last_retry_thread.store(thread_idx, std::memory_order_relaxed);
+    g_drain_attempt_diag.last_retry_available.store(available, std::memory_order_relaxed);
+    g_drain_attempt_diag.last_retry_attempt.store(attempt, std::memory_order_release);
+}
+
+void drain_diag_note_election(
+    int32_t thread_idx, uint64_t epoch, int64_t task_id, uint64_t entered_attempt, bool cas_won, int32_t observed_owner
+) {
+    uint64_t observed_attempt = g_drain_diag_attempt.load(std::memory_order_acquire);
+    if (entered_attempt == observed_attempt) return;
+
+    g_drain_attempt_diag.stale_participant_count.fetch_add(1, std::memory_order_relaxed);
+    if (cas_won) {
+        g_drain_attempt_diag.stale_winner_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    g_drain_attempt_diag.last_stale_entered_attempt.store(entered_attempt, std::memory_order_relaxed);
+    g_drain_attempt_diag.last_stale_observed_attempt.store(observed_attempt, std::memory_order_relaxed);
+    g_drain_attempt_diag.last_stale_epoch.store(epoch, std::memory_order_relaxed);
+    g_drain_attempt_diag.last_stale_task_id.store(task_id, std::memory_order_relaxed);
+    g_drain_attempt_diag.last_stale_thread.store(thread_idx, std::memory_order_relaxed);
+    g_drain_attempt_diag.last_stale_cas_won.store(cas_won ? 1 : 0, std::memory_order_relaxed);
+    g_drain_attempt_diag.last_stale_owner.store(observed_owner, std::memory_order_release);
+}
 
 void drain_diag_set_phase(int32_t thread_idx, uint64_t epoch, DrainDiagPhase phase, int64_t task_id) {
     if (thread_idx < 0 || thread_idx >= MAX_AICPU_THREADS) return;
@@ -564,6 +619,27 @@ void SchedulerContext::log_drain_protocol_snapshot() {
         drain_state_.drain_stage_done_mask.load(std::memory_order_acquire),
         drain_state_.drain_running_staged.load(std::memory_order_acquire),
         completed_tasks_.load(std::memory_order_acquire), total_tasks_
+    );
+    LOG_WARN(
+        "[DRAIN_PROTOCOL] ATTEMPT current=%" PRIu64 " retries=%" PRIu64 " stale_participants=%" PRIu64
+        " stale_winners=%" PRIu64 " last_retry={attempt=%" PRIu64 " epoch=%" PRIu64 " task=%" PRId64
+        " thread=%d available=%d} last_stale={entered=%" PRIu64 " observed=%" PRIu64 " epoch=%" PRIu64 " task=%" PRId64
+        " thread=%d cas_won=%d owner=%d}",
+        drain_diag_current_attempt(), g_drain_attempt_diag.retry_count.load(std::memory_order_acquire),
+        g_drain_attempt_diag.stale_participant_count.load(std::memory_order_acquire),
+        g_drain_attempt_diag.stale_winner_count.load(std::memory_order_acquire),
+        g_drain_attempt_diag.last_retry_attempt.load(std::memory_order_acquire),
+        g_drain_attempt_diag.last_retry_epoch.load(std::memory_order_relaxed),
+        g_drain_attempt_diag.last_retry_task_id.load(std::memory_order_relaxed),
+        g_drain_attempt_diag.last_retry_thread.load(std::memory_order_relaxed),
+        g_drain_attempt_diag.last_retry_available.load(std::memory_order_relaxed),
+        g_drain_attempt_diag.last_stale_entered_attempt.load(std::memory_order_relaxed),
+        g_drain_attempt_diag.last_stale_observed_attempt.load(std::memory_order_relaxed),
+        g_drain_attempt_diag.last_stale_epoch.load(std::memory_order_relaxed),
+        g_drain_attempt_diag.last_stale_task_id.load(std::memory_order_relaxed),
+        g_drain_attempt_diag.last_stale_thread.load(std::memory_order_relaxed),
+        g_drain_attempt_diag.last_stale_cas_won.load(std::memory_order_relaxed),
+        g_drain_attempt_diag.last_stale_owner.load(std::memory_order_acquire)
     );
 
     for (int32_t t = 0; t < active_sched_threads_; t++) {

@@ -803,6 +803,7 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
 
     uint32_t all_acked = (1u << active_sched_threads_) - 1;
     uint64_t diag_epoch = drain_diag_current_epoch();
+    uint64_t diag_attempt = drain_diag_current_attempt();
     PTO2TaskSlotState *diag_slot = drain_state_.pending_task.load(std::memory_order_acquire);
     int64_t diag_task_id =
         diag_slot != nullptr && diag_slot->task != nullptr ? static_cast<int64_t>(diag_slot->task->task_id.raw) : -1;
@@ -823,10 +824,12 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
     // Election -- exactly one thread wins the CAS.
     drain_diag_set_phase(thread_idx, diag_epoch, DrainDiagPhase::Election, diag_task_id);
     int32_t expected = 0;
-    drain_state_.drain_worker_elected.compare_exchange_strong(
+    bool election_won = drain_state_.drain_worker_elected.compare_exchange_strong(
         expected, thread_idx + 1, std::memory_order_acquire, std::memory_order_relaxed
     );
-    bool elected = drain_state_.drain_worker_elected.load(std::memory_order_relaxed) == thread_idx + 1;
+    int32_t observed_owner = drain_state_.drain_worker_elected.load(std::memory_order_relaxed);
+    drain_diag_note_election(thread_idx, diag_epoch, diag_task_id, diag_attempt, election_won, observed_owner);
+    bool elected = observed_owner == thread_idx + 1;
 
     PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
     // OWNER is acquired before the drain is published and persists through
@@ -852,6 +855,7 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
         drain_diag_set_available(available);
         if (available < block_num) {
             // Insufficient -- reset so all threads resume completion polling to free cores, then retry.
+            drain_diag_note_retry(thread_idx, diag_epoch, diag_task_id, available);
             drain_state_.drain_ack_mask.store(0, std::memory_order_release);
             drain_state_.drain_worker_elected.store(0, std::memory_order_release);
             return;
