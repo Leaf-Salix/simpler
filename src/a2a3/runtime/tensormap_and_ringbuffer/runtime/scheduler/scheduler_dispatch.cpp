@@ -1150,6 +1150,17 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
+            // A drain retry may keep taking this early continue for many
+            // iterations. Release completed consumers before entering the
+            // barrier so their producers are not pinned in this thread-local
+            // batch while the orchestrator waits for ring reclaim.
+            while (deferred_release_count > 0) {
+#if SIMPLER_SCHED_PROFILING
+                (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
+#else
+                sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
+#endif
+            }
 #if SIMPLER_DFX
             // The drain is otherwise a swimlane blind spot: the `continue` below skips
             // every phase record, and handle_drain_mode is uninstrumented. Time it here so
