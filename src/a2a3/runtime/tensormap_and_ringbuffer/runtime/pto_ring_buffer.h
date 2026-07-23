@@ -55,13 +55,6 @@
 // structural checks plus the scheduler's global progress watchdog instead.
 #define PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES (PLATFORM_PROF_SYS_CNT_FREQ / 2)  // 500 ms
 
-struct PTO2SchedulerState;
-using PTO2HeapHolConsumerLogger = void (*)(PTO2SchedulerState *, uint8_t, int32_t);
-
-#if SIMPLER_DFX
-void pto2_log_heap_hol_consumers(PTO2SchedulerState *sched, uint8_t head_ring_id, int32_t head_task_id);
-#endif
-
 // =============================================================================
 // Task Allocator (unified task slot + heap buffer allocation)
 // =============================================================================
@@ -111,9 +104,6 @@ public:
         heap_top_ = 0;
         heap_tail_ = 0;
         last_alive_seen_ = 0;
-#if SIMPLER_DFX
-        next_heap_hol_sample_task_id_ = 0;
-#endif
     }
 
     /**
@@ -129,10 +119,8 @@ public:
      * task/heap rings before orchestration completes
      * @return Allocation result; check failed() for errors
      */
-    PTO2TaskAllocResult alloc(
-        int32_t output_size, PTO2SharedMemoryHeader *sm_header = nullptr, bool scheduler_runs_concurrently = false,
-        PTO2SchedulerState *scheduler = nullptr, PTO2HeapHolConsumerLogger consumer_logger = nullptr
-    ) {
+    PTO2TaskAllocResult
+    alloc(int32_t output_size, PTO2SharedMemoryHeader *sm_header = nullptr, bool scheduler_runs_concurrently = false) {
         uint64_t aligned_size =
             output_size > 0 ? PTO2_ALIGN_UP(static_cast<uint64_t>(output_size), PTO2_ALIGN_SIZE) : 0;
 
@@ -194,12 +182,6 @@ public:
 #endif
             last_alive = last_alive_ptr_->load(std::memory_order_acquire);
             update_heap_tail(last_alive);
-#if SIMPLER_DFX
-            if (blocked_on_heap && local_task_id_ >= next_heap_hol_sample_task_id_) {
-                log_heap_hol_sample(last_alive, scheduler, consumer_logger);
-                next_heap_hol_sample_task_id_ = local_task_id_ + (1 << 17);
-            }
-#endif
             if (last_alive > prev_last_alive) {
                 // Reclaim advanced -> productive backpressure, not a deadlock.
                 spin_count = 0;
@@ -277,9 +259,6 @@ private:
     uint64_t heap_top_ = 0;        // Current heap allocation pointer
     uint64_t heap_tail_ = 0;       // Heap reclamation pointer (derived from consumed tasks)
     int32_t last_alive_seen_ = 0;  // last_task_alive at last heap_tail derivation
-#if SIMPLER_DFX
-    int32_t next_heap_hol_sample_task_id_ = 0;
-#endif
 
     // --- Shared ---
     std::atomic<int32_t> *error_code_ptr_ = nullptr;
@@ -287,54 +266,6 @@ private:
     // =========================================================================
     // Internal helpers
     // =========================================================================
-
-#if SIMPLER_DFX
-    void log_heap_hol_sample(
-        int32_t last_alive, PTO2SchedulerState *scheduler, PTO2HeapHolConsumerLogger consumer_logger
-    ) const {
-        if (slot_states_ == nullptr || local_task_id_ <= last_alive) return;
-
-        int32_t pending = 0;
-        int32_t completed = 0;
-        int32_t consumed = 0;
-        uint64_t consumed_bytes = 0;
-        uint64_t largest_consumed_bytes = 0;
-        for (int32_t task_id = last_alive; task_id < local_task_id_; ++task_id) {
-            int32_t slot = task_id & window_mask_;
-            PTO2TaskState state = slot_states_[slot].task_state.load(std::memory_order_acquire);
-            if (state == PTO2_TASK_PENDING) {
-                pending++;
-            } else if (state == PTO2_TASK_COMPLETED) {
-                completed++;
-            } else if (state == PTO2_TASK_CONSUMED) {
-                consumed++;
-                auto *base = static_cast<char *>(descriptors_[slot].packed_buffer_base);
-                auto *end = static_cast<char *>(descriptors_[slot].packed_buffer_end);
-                uint64_t bytes = static_cast<uint64_t>(end - base);
-                consumed_bytes += bytes;
-                largest_consumed_bytes = std::max(largest_consumed_bytes, bytes);
-            }
-        }
-
-        int32_t head_slot = last_alive & window_mask_;
-        PTO2TaskSlotState &head = slot_states_[head_slot];
-        int32_t head_state = static_cast<int32_t>(head.task_state.load(std::memory_order_acquire));
-        uint32_t head_fanout_count = head.fanout_count;
-        uint32_t head_fanout_refcount = head.fanout_refcount.load(std::memory_order_acquire);
-        LOG_WARN(
-            "[HEAP_HOL_SAMPLE] ring=%u current=%d last_alive=%d head_state=%d consumers=%u/%u scope_released=%d "
-            "pending=%d completed=%d consumed=%d consumed_bytes=%" PRIu64 " largest_hole=%" PRIu64 " heap_used=%" PRIu64
-            "/%" PRIu64,
-            static_cast<unsigned>(ring_id_), local_task_id_, last_alive, head_state,
-            head_fanout_refcount & ~PTO2_FANOUT_SCOPE_BIT, head_fanout_count & ~PTO2_FANOUT_SCOPE_BIT,
-            (head_fanout_refcount & PTO2_FANOUT_SCOPE_BIT) != 0, pending, completed, consumed, consumed_bytes,
-            largest_consumed_bytes, heap_used_bytes(), heap_size_
-        );
-        if (consumer_logger != nullptr && scheduler != nullptr && consumed_bytes >= 64 * 1024 * 1024) {
-            consumer_logger(scheduler, ring_id_, last_alive);
-        }
-    }
-#endif
 
     /**
      * Commit a task slot: bump local counter and publish to shared memory.
