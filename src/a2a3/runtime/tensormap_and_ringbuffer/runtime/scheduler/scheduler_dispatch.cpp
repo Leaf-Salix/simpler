@@ -981,10 +981,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // "now" so the first budget cycle starts when this thread does, not at
     // an undefined value.
     uint64_t last_progress_ts = get_sys_cnt_aicpu();
-    uint64_t drain_last_progress_ts = last_progress_ts;
-    int32_t drain_last_progress_count = completed_tasks_.load(std::memory_order_relaxed);
-    uint32_t drain_diag_iterations = 0;
-    bool drain_stall_dumped = false;
     // An idle worker may observe progress made by a sibling only through this
     // shared completion counter. Sample it on the existing cold error-check
     // cadence so a busy sibling refreshes the no-progress budget globally.
@@ -1154,21 +1150,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
-            // Diagnostic branch only: a pending drain bypasses the normal idle
-            // watchdog below, so sample global progress at a low cadence and
-            // emit one cold snapshot before the device-level AICPU timeout.
-            if ((++drain_diag_iterations & 0xffffu) == 0) {
-                int32_t drain_progress = completed_tasks_.load(std::memory_order_relaxed);
-                uint64_t now = get_sys_cnt_aicpu();
-                if (drain_progress != drain_last_progress_count) {
-                    drain_last_progress_count = drain_progress;
-                    drain_last_progress_ts = now;
-                } else if (thread_idx == 0 && !drain_stall_dumped &&
-                           now - drain_last_progress_ts >= PLATFORM_PROF_SYS_CNT_FREQ) {
-                    drain_stall_dumped = true;
-                    log_drain_stall_snapshot(thread_idx, now - drain_last_progress_ts);
-                }
-            }
 #if SIMPLER_DFX
             // The drain is otherwise a swimlane blind spot: the `continue` below skips
             // every phase record, and handle_drain_mode is uninstrumented. Time it here so
@@ -1192,10 +1173,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
             continue;
         }
-        drain_diag_iterations = 0;
-        drain_stall_dumped = false;
-        drain_last_progress_ts = get_sys_cnt_aicpu();
-        drain_last_progress_count = completed_tasks_.load(std::memory_order_relaxed);
 
         // Phase 3: Drain dummy ready queue (S0/S1/S2).
         //
