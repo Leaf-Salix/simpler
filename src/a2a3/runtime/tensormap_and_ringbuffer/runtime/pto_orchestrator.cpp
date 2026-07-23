@@ -509,6 +509,64 @@ static bool check_scope_can_accept_task(PTO2OrchestratorState *orch, PTO2TaskAll
     return false;
 }
 
+#if SIMPLER_DFX
+void pto2_log_heap_hol_consumers(PTO2SchedulerState *sched, uint8_t head_ring_id, int32_t head_task_id) {
+    PTO2SharedMemoryRingHeader &head_ring = *sched->ring_sched_states[head_ring_id].ring;
+    PTO2TaskSlotState &head = head_ring.get_slot_state_by_task_id(head_task_id);
+    PTO2TaskDescriptor *head_task = head.task;
+    if (head_task == nullptr || static_cast<int32_t>(head_task->task_id.local()) != head_task_id) {
+        LOG_WARN("[HEAP_HOL_CONSUMERS] ring=%u head=%d stale=1", static_cast<unsigned>(head_ring_id), head_task_id);
+        return;
+    }
+
+    int32_t matching = 0;
+    int32_t pending = 0;
+    int32_t completed = 0;
+    int32_t consumed = 0;
+    int32_t pending_ready = 0;
+    for (int32_t ring_id = 0; ring_id < PTO2_MAX_RING_DEPTH; ring_id++) {
+        PTO2SharedMemoryRingHeader &ring = *sched->ring_sched_states[ring_id].ring;
+        int32_t current = ring.fc.current_task_index.load(std::memory_order_acquire);
+        int32_t last_alive = ring.fc.last_task_alive.load(std::memory_order_acquire);
+        for (int32_t task_id = last_alive; task_id < current; task_id++) {
+            PTO2TaskSlotState &consumer = ring.get_slot_state_by_task_id(task_id);
+            PTO2TaskPayload *payload = consumer.payload;
+            if (payload == nullptr || payload->fanin_spill_pool == nullptr) continue;
+
+            bool references_head = false;
+            for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer) {
+                if (producer == &head) references_head = true;
+            });
+            if (!references_head) continue;
+
+            matching++;
+            PTO2TaskState state = consumer.task_state.load(std::memory_order_acquire);
+            if (state == PTO2_TASK_PENDING) {
+                pending++;
+                if (consumer.fanin_refcount.load(std::memory_order_acquire) >= consumer.fanin_count) {
+                    pending_ready++;
+                }
+            } else if (state == PTO2_TASK_COMPLETED) {
+                completed++;
+            } else if (state == PTO2_TASK_CONSUMED) {
+                consumed++;
+            }
+        }
+    }
+
+    uint32_t fanout_count = head.fanout_count;
+    uint32_t fanout_refcount = head.fanout_refcount.load(std::memory_order_acquire);
+    int32_t outstanding = static_cast<int32_t>(fanout_count & ~PTO2_FANOUT_SCOPE_BIT) -
+                          static_cast<int32_t>(fanout_refcount & ~PTO2_FANOUT_SCOPE_BIT);
+    LOG_WARN(
+        "[HEAP_HOL_CONSUMERS] ring=%u head=%d outstanding=%d matching_live=%d pending=%d pending_ready=%d "
+        "completed=%d consumed=%d scope_released=%d",
+        static_cast<unsigned>(head_ring_id), head_task_id, outstanding, matching, pending, pending_ready, completed,
+        consumed, (fanout_refcount & PTO2_FANOUT_SCOPE_BIT) != 0
+    );
+}
+#endif
+
 static bool prepare_task(
     PTO2OrchestratorState *orch, const L0TaskArgs &args, int32_t total_output_size, ActiveMask active_mask,
     TaskAttrs task_attrs, PTO2PreparedTask *out
@@ -520,7 +578,8 @@ static bool prepare_task(
         return false;
     }
 
-    out->alloc_result = allocator.alloc(total_output_size, orch->sm_header, orch->scheduler_runs_concurrently);
+    out->alloc_result =
+        allocator.alloc(total_output_size, orch->sm_header, orch->scheduler_runs_concurrently, orch->scheduler);
     if (out->alloc_result.failed()) {
         orch->fatal = true;
         if (orch->sm_header->orch_error_code.load(std::memory_order_acquire) == PTO2_ERROR_NONE &&
