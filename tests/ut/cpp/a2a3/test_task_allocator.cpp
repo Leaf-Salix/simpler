@@ -425,6 +425,47 @@ TEST_F(TaskAllocatorTest, ReusesConsumedExtentBehindLiveHead) {
     EXPECT_EQ(allocator.heap_reclaimed_offset(), 0u);
 }
 
+TEST_F(TaskAllocatorTest, ConcurrentBackpressureFindsConsumedExtentBehindLiveHead) {
+    auto head = allocator.alloc(1024);
+    auto hole = allocator.alloc(2048);
+    auto tail = allocator.alloc(1024);
+    ASSERT_FALSE(head.failed());
+    ASSERT_FALSE(hole.failed());
+    ASSERT_FALSE(tail.failed());
+
+    slot_states[head.slot].task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+    slot_states[hole.slot].task_state.store(PTO2_TASK_PENDING, std::memory_order_release);
+    slot_states[tail.slot].task_state.store(PTO2_TASK_PENDING, std::memory_order_release);
+
+    PTO2SharedMemoryHeader header{};
+    header.orch_error_code.store(PTO2_ERROR_NONE);
+    header.sched_error_code.store(PTO2_ERROR_NONE);
+    header.orchestrator_reclaim_waiting.store(0);
+    std::atomic<bool> observed_wait{false};
+    std::thread reclaimer([&]() {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (header.orchestrator_reclaim_waiting.load(std::memory_order_acquire) == 0 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        if (header.orchestrator_reclaim_waiting.load(std::memory_order_acquire) != 0) {
+            observed_wait.store(true, std::memory_order_release);
+            slot_states[hole.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
+        } else {
+            header.sched_error_code.store(PTO2_ERROR_SCHEDULER_TIMEOUT, std::memory_order_release);
+        }
+    });
+
+    auto reused = allocator.alloc(1024, &header, /*scheduler_runs_concurrently=*/true);
+    reclaimer.join();
+
+    EXPECT_TRUE(observed_wait.load(std::memory_order_acquire));
+    ASSERT_FALSE(reused.failed());
+    EXPECT_EQ(reused.packed_base, hole.packed_base);
+    EXPECT_EQ(last_alive.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(header.orchestrator_reclaim_waiting.load(std::memory_order_acquire), 0);
+}
+
 TEST_F(TaskAllocatorTest, HeapCapacityDropsUnalignedTail) {
     alignas(64) uint8_t unaligned_heap[1089]{};
     allocator.init(

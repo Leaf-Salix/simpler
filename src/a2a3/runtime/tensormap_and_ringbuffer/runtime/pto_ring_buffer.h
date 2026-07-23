@@ -109,6 +109,7 @@ public:
         last_alive_seen_ = initial_local_task_id;
         extent_reclaim_enabled_ = false;
         free_extents_ = nullptr;
+        largest_free_extent_ = 0;
         heap_allocated_bytes_ = 0;
         heap_reclaimed_bytes_ = 0;
         heap_allocated_offset_ = 0;
@@ -242,11 +243,7 @@ public:
 
     uint64_t heap_available() const {
         if (extent_reclaim_enabled_) {
-            uint64_t largest = 0;
-            for (FreeExtent *extent = free_extents_; extent != nullptr; extent = extent->next) {
-                largest = std::max(largest, extent->size);
-            }
-            return largest;
+            return largest_free_extent_;
         }
         uint64_t tail = heap_tail_;
         if (heap_top_ >= tail) {
@@ -294,6 +291,7 @@ private:
     int32_t last_alive_seen_ = 0;  // last_task_alive at last heap_tail derivation
     bool extent_reclaim_enabled_ = false;
     FreeExtent *free_extents_ = nullptr;
+    uint64_t largest_free_extent_ = 0;
     uint64_t heap_allocated_bytes_ = 0;
     uint64_t heap_reclaimed_bytes_ = 0;
     uint64_t heap_allocated_offset_ = 0;
@@ -402,6 +400,7 @@ private:
     void enable_extent_reclaim(int32_t last_alive) {
         extent_reclaim_enabled_ = true;
         free_extents_ = nullptr;
+        largest_free_extent_ = 0;
 
         if (heap_used_bytes() == 0) {
             insert_free_extent(heap_base_, heap_size_);
@@ -498,12 +497,14 @@ private:
             merged->size += cur->size;
             merged->next = cur->next;
         }
+        largest_free_extent_ = std::max(largest_free_extent_, merged->size);
     }
 
     void *try_extent_heap(uint64_t alloc_size) {
         if (alloc_size == 0) {
             return static_cast<char *>(heap_base_) + heap_top_;
         }
+        if (alloc_size > largest_free_extent_) return nullptr;
 
         FreeExtent *prev = nullptr;
         FreeExtent *cur = free_extents_;
@@ -514,7 +515,8 @@ private:
         if (cur == nullptr) return nullptr;
 
         auto *result = reinterpret_cast<char *>(cur);
-        if (cur->size == alloc_size) {
+        uint64_t extent_size = cur->size;
+        if (extent_size == alloc_size) {
             if (prev != nullptr) {
                 prev->next = cur->next;
             } else {
@@ -522,7 +524,7 @@ private:
             }
         } else {
             auto *remainder = reinterpret_cast<FreeExtent *>(result + alloc_size);
-            remainder->size = cur->size - alloc_size;
+            remainder->size = extent_size - alloc_size;
             remainder->next = cur->next;
             if (prev != nullptr) {
                 prev->next = remainder;
@@ -530,8 +532,19 @@ private:
                 free_extents_ = remainder;
             }
         }
+        if (extent_size == largest_free_extent_) {
+            largest_free_extent_ = find_largest_free_extent();
+        }
         record_heap_allocation(alloc_size);
         return result;
+    }
+
+    uint64_t find_largest_free_extent() const {
+        uint64_t largest = 0;
+        for (FreeExtent *extent = free_extents_; extent != nullptr; extent = extent->next) {
+            largest = std::max(largest, extent->size);
+        }
+        return largest;
     }
 
     void record_heap_allocation(uint64_t size) {

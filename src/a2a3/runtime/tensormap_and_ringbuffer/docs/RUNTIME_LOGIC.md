@@ -251,8 +251,9 @@ The ring buffer mechanism provides **flow control** between the orchestrator (pr
 
 **Heap back-pressure**: When the heap has insufficient contiguous space,
 `PTO2TaskAllocator::alloc` first collects safe `CONSUMED` extents. It
-spin-waits only when no free extent is large enough, periodically rescanning
-for newly consumed tasks while scheduler dispatch continues.
+spin-waits only when no free extent is large enough. A cached largest-extent
+size makes that check constant-time; periodic scans collect newly consumed
+tasks while scheduler dispatch continues.
 
 While either task/heap wait is active under concurrent dispatch, the allocator publishes `orchestrator_reclaim_waiting=1`. It does not treat a fixed period without `last_task_alive` movement as proof of deadlock: a producer may remain legitimately live while its consumers execute. The scheduler owns the residual forward-progress timeout because it can observe all running cores and global task completions. The allocator clears the flag on successful reclaim or when either runtime error channel asks it to unwind.
 
