@@ -61,13 +61,8 @@ enum class DrainStageDiagPoint : int32_t {
 
 uint64_t drain_diag_begin();
 uint64_t drain_diag_current_epoch();
-uint64_t drain_diag_current_attempt();
 void drain_diag_set_phase(int32_t thread_idx, uint64_t epoch, DrainDiagPhase phase, int64_t task_id);
 void drain_diag_set_available(int32_t available);
-void drain_diag_note_retry(int32_t thread_idx, uint64_t epoch, int64_t task_id, int32_t available);
-void drain_diag_note_election(
-    int32_t thread_idx, uint64_t epoch, int64_t task_id, uint64_t entered_attempt, bool cas_won, int32_t observed_owner
-);
 void drain_diag_set_stage_progress(
     int32_t thread_idx, DrainStageDiagPoint point, int32_t claim_start, int32_t claim_count, int32_t item_index,
     int32_t core_offset, int32_t handle_count
