@@ -536,9 +536,8 @@ struct alignas(64) SchedL2SwimlaneCounters {
 // When sync_start_pending != 0, all scheduler threads skip dispatch
 // (only process completions) until the drain worker finishes launching all blocks.
 struct alignas(64) SyncStartDrainState {
-    std::atomic<int32_t> sync_start_pending{0};    // 0=normal; -1=initializing; >0=active (value=block_num)
-    std::atomic<int32_t> drain_worker_elected{0};  // 0=none; >0: elected thread's (thread_idx+1)
-    std::atomic<uint32_t> drain_ack_mask{0};       // bit per thread; all-set = all threads reached ack barrier
+    std::atomic<int32_t> sync_start_pending{0};              // 0=normal; -1=initializing; >0=active (value=block_num)
+    std::atomic<int32_t> drain_worker_elected{0};            // 0=none; >0: elected thread's (thread_idx+1)
     std::atomic<PTO2TaskSlotState *> pending_task{nullptr};  // held task (not re-queued)
     std::atomic<uint64_t> drain_attempt{0};                  // incremented whenever an ack/election round is reset
     // Parallel staging: after the elected thread confirms global availability it sets
@@ -549,7 +548,7 @@ struct alignas(64) SyncStartDrainState {
     std::atomic<int32_t> drain_stage_go{0};          // 0=hold; 1=elected released parallel staging
     std::atomic<uint32_t> drain_stage_done_mask{0};  // bit per thread; all-set = all threads done staging
     std::atomic<int32_t> drain_running_staged{0};    // sum of running-slot cores staged (rendezvous seed)
-    int32_t _pad[5];
+    int32_t _pad[7];
 };
 static_assert(sizeof(SyncStartDrainState) == 64);
 

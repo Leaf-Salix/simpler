@@ -589,18 +589,28 @@ bool SchedulerContext::enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t b
     // We own the drain slot.  Store the task and reset the coordination flags before making
     // it visible.
     drain_state_.pending_task.store(slot_state, std::memory_order_release);
-    drain_state_.drain_ack_mask.store(0, std::memory_order_relaxed);
     drain_state_.drain_worker_elected.store(0, std::memory_order_relaxed);
     drain_state_.drain_stage_go.store(0, std::memory_order_relaxed);
     drain_state_.drain_stage_done_mask.store(0, std::memory_order_relaxed);
     drain_state_.drain_running_staged.store(0, std::memory_order_relaxed);
-    drain_state_.drain_attempt.fetch_add(1, std::memory_order_relaxed);
+    uint64_t next_attempt = drain_state_.drain_attempt.load(std::memory_order_relaxed) + 1;
+    drain_state_.drain_attempt.store(next_attempt, std::memory_order_relaxed);
     drain_diag_set_available(-1);
     drain_diag_begin();
     // Release store: all stores above are now visible to any thread that
     // acquire-loads sync_start_pending and sees block_num > 0.
     drain_state_.sync_start_pending.store(block_num, std::memory_order_release);
     return true;
+}
+
+uint32_t SchedulerContext::drain_ack_mask_for_attempt(uint64_t attempt) const {
+    uint32_t mask = 0;
+    for (int32_t t = 0; t < active_sched_threads_; t++) {
+        if (drain_ack_attempts_[t].load(std::memory_order_acquire) == attempt) {
+            mask |= 1u << t;
+        }
+    }
+    return mask;
 }
 
 // Count total available resources across all scheduler threads for a given shape.
@@ -769,7 +779,7 @@ SchedulerContext::drain_stage_cores(PTO2TaskSlotState *slot_state, int32_t block
 //
 // Protocol:
 //   1. Ack barrier: all threads signal they've stopped dispatch, spin until all acked.
-//      If this thread's ack bit gets cleared while waiting, a reset occurred -- return.
+//      Each ack carries the current attempt; an attempt change invalidates the old cohort.
 //   2. Election + availability: one thread wins the CAS. It checks global resources; if
 //      insufficient it resets ack/election so all threads resume completion polling to free
 //      cores, then retry. If sufficient it releases parallel staging (stage_go).
@@ -811,16 +821,16 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
         diag_slot != nullptr && diag_slot->task != nullptr ? static_cast<int64_t>(diag_slot->task->task_id.raw) : -1;
     drain_diag_set_phase(thread_idx, diag_epoch, DrainDiagPhase::AckWait, diag_task_id);
 
-    // Ack barrier -- signal this thread has stopped dispatch.
-    drain_state_.drain_ack_mask.fetch_or(1u << thread_idx, std::memory_order_release);
+    // Ack barrier -- signal this thread has stopped dispatch for this attempt.
+    drain_ack_attempts_[thread_idx].store(drain_attempt, std::memory_order_release);
 
     // Spin until all threads have acked.
-    // If our bit is cleared while waiting, elected reset due to insufficient resources.
+    // An attempt change invalidates every ack from the prior cohort.
     while (true) {
         if (is_completed()) return;
-        uint32_t ack = drain_state_.drain_ack_mask.load(std::memory_order_acquire);
+        if (drain_state_.drain_attempt.load(std::memory_order_acquire) != drain_attempt) return;
+        uint32_t ack = drain_ack_mask_for_attempt(drain_attempt);
         if ((ack & all_acked) == all_acked) break;
-        if ((ack & (1u << thread_idx)) == 0) return;
         SPIN_WAIT_HINT();
     }
     // Election -- exactly one thread wins the CAS.
@@ -852,9 +862,12 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
     if (elected) {
         if (slot_state == nullptr) {
             // pending_task observed null only when a concurrent drain completion already cleared
-            // it. Stale-elected: release the election lock and return. Do NOT clear drain_ack_mask
-            // / sync_start_pending -- a *new* drain run may already be accumulating acks.
-            drain_state_.drain_worker_elected.store(0, std::memory_order_release);
+            // it. Stale-elected: release our election lock and return. Do NOT clear
+            // sync_start_pending -- a new drain run may already be accumulating acks.
+            int32_t owner = thread_idx + 1;
+            drain_state_.drain_worker_elected.compare_exchange_strong(
+                owner, 0, std::memory_order_release, std::memory_order_relaxed
+            );
             return;
         }
         drain_diag_set_phase(thread_idx, diag_epoch, DrainDiagPhase::AvailabilityCheck, diag_task_id);
@@ -866,9 +879,8 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
         drain_diag_set_available(available);
         if (available < block_num) {
             // Insufficient -- reset so all threads resume completion polling to free cores, then retry.
-            drain_state_.drain_attempt.fetch_add(1, std::memory_order_acq_rel);
+            drain_state_.drain_attempt.store(drain_attempt + 1, std::memory_order_release);
             drain_diag_note_retry(thread_idx, diag_epoch, diag_task_id, available);
-            drain_state_.drain_ack_mask.store(0, std::memory_order_release);
             drain_state_.drain_worker_elected.store(0, std::memory_order_release);
             return;
         }
@@ -905,14 +917,12 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
     drain_state_.drain_stage_done_mask.fetch_or(1u << thread_idx, std::memory_order_release);
 
     if (!elected) {
-        // Non-elected: staging done; wait for the elected thread to reopen the gate. Exiting via
-        // sync_start_pending==0 (release/acquire) or drain_worker_elected==0 both synchronize
-        // with the elected's finalize (its release fence sequences the seed before both stores),
-        // so the running_slot_count seed is visible before this thread resumes completions.
+        // Non-elected: staging done; wait for the elected thread to reopen the gate.
+        // sync_start_pending==0 synchronizes with finalize, so the running_slot_count seed is
+        // visible before this thread resumes completions.
         drain_diag_set_phase(thread_idx, diag_epoch, DrainDiagPhase::ReopenWait, diag_task_id);
         while (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
             if (is_completed()) return;
-            if (drain_state_.drain_worker_elected.load(std::memory_order_acquire) == 0) return;
             SPIN_WAIT_HINT();
         }
         drain_diag_set_phase(thread_idx, diag_epoch, DrainDiagPhase::Exit, diag_task_id);
@@ -940,10 +950,10 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
     // the seed. `slot_state` is a local holding the fa_fused slot (not drain_state_), so it stays
     // valid for the propagate below even if a new drain reuses pending_task after reopen.
     std::atomic_thread_fence(std::memory_order_release);
+    drain_state_.drain_attempt.store(drain_attempt + 1, std::memory_order_release);
     drain_state_.pending_task.store(nullptr, std::memory_order_release);
     drain_state_.drain_stage_go.store(0, std::memory_order_relaxed);
     drain_state_.drain_stage_done_mask.store(0, std::memory_order_relaxed);
-    drain_state_.drain_ack_mask.store(0, std::memory_order_relaxed);
     drain_state_.drain_worker_elected.store(0, std::memory_order_relaxed);
     drain_state_.sync_start_pending.store(0, std::memory_order_release);
 

@@ -203,6 +203,7 @@ private:
 
     // sync_start drain coordination
     SyncStartDrainState drain_state_;
+    std::atomic<uint64_t> drain_ack_attempts_[MAX_AICPU_THREADS]{};
 
     enum class MailboxWaitKind : int32_t {
         None = 0,
@@ -519,6 +520,7 @@ private:
     );
 
     bool enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t block_num);
+    uint32_t drain_ack_mask_for_attempt(uint64_t attempt) const;
     int32_t count_global_available(PTO2ResourceShape shape, uint8_t core_mask, bool include_pending = false);
     // One thread's share of the drain: CAS-claim block indices and stage them onto THIS
     // thread's own cores (parallel with peers), returning the number of running-slot cores
