@@ -83,6 +83,7 @@ TEST_F(SharedMemoryTest, NotOwnerOfArenaBackedHandle) {
 TEST_F(SharedMemoryTest, HeaderInitValues) {
     auto *hdr = handle->header;
     EXPECT_EQ(hdr->orchestrator_done.load(), 0);
+    EXPECT_EQ(hdr->orchestrator_reclaim_waiting.load(), 0);
     EXPECT_EQ(hdr->orch_error_code.load(), 0);
     EXPECT_EQ(hdr->sched_error_bitmap.load(), 0);
     EXPECT_EQ(hdr->sched_error_code.load(), 0);

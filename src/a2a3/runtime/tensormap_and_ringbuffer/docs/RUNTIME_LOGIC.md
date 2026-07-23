@@ -160,6 +160,7 @@ The orchestrator and schedulers communicate through a contiguous shared memory r
 | `heap_top` | Orchestrator | Scheduler | Heap ring allocation pointer |
 | `heap_tail` | Scheduler | Orchestrator | Heap ring reclamation pointer |
 | `orchestrator_done` | Orchestrator | Scheduler | Signals orchestration completion |
+| `orchestrator_reclaim_waiting` | Orchestrator | Scheduler | Orchestrator is blocked on task/heap reclaim before graph construction can finish |
 | `task_window_size` | Init | Both | Number of task slots (per-ring, in `PTO2SharedMemoryRingHeader`) |
 | `heap_size` | Init | Both | Heap total size (per-ring, in `PTO2SharedMemoryRingHeader`) |
 | `task_descriptors_offset` | Init | Both | Offset to TaskDescriptor array in SM (per-ring) |
@@ -240,6 +241,8 @@ The ring buffer mechanism provides **flow control** between the orchestrator (pr
 
 **Heap Ring back-pressure**: When the heap has insufficient contiguous space, `PTO2TaskAllocator::alloc` spin-waits until the scheduler advances `heap_tail` past completed tasks' output buffers.
 
+While either task/heap wait is active under concurrent dispatch, the allocator publishes `orchestrator_reclaim_waiting=1`. It does not treat a fixed period without `last_task_alive` movement as proof of deadlock: a producer may remain legitimately live while its consumers execute. The scheduler owns the residual forward-progress timeout because it can observe all running cores and global task completions. The allocator clears the flag on successful reclaim or when either runtime error channel asks it to unwind.
+
 **TensorMap pool back-pressure**: Before STEP 4 registers a task's outputs, the orchestrator's `ensure_tensormap_capacity` reserves pool space for the inserts. When the shared entry pool is exhausted, it reclaims retired entries across all rings and spin-waits until reclaim actually frees entries, with a 500 ms wall-clock deadlock backstop (see Section 5.4).
 
 This back-pressure is essential for correctness with small ring sizes — for example, with `PTO2_RING_TASK_WINDOW=16` and 208 tasks, the orchestrator blocks ~192 times, each time waiting for the scheduler to drain completed tasks before continuing.
@@ -257,31 +260,26 @@ Orchestrator blocked on task_ring_alloc (ring full)
     → DEADLOCK
 ```
 
-The runtime detects this automatically by counting spin iterations in the allocation functions:
+The runtime separates locally provable deadlocks from ordinary concurrent back-pressure:
 
 **Periodic BLOCKED warnings** (every 10,000 spins):
 
 ```text
 [TaskRing] BLOCKED (Flow Control): current=208, last_alive=192, active=16/16 (100.0%), spins=10000
-[HeapRing] BLOCKED: requesting 4096 bytes, available=0, top=65536, tail=0, spins=10000
+[TaskAllocator ring=3] BLOCKED: tasks=771/16384, heap_used=1067941888/1073741824, on=heap, spins=10000
 ```
 
-**Deadlock detection** (after 100,000 spins with no progress):
+**Immediate allocator failures**:
 
-```text
-FATAL: Flow Control Deadlock Detected!
-Task Ring is FULL and no progress after 100000 spins.
-  - Active tasks:  16
-  - Window size:   16
-Root Cause:
-  Tasks cannot transition to CONSUMED state because fanout_count
-  includes 1 for the owning scope, and scope_end() requires the
-  orchestrator to continue — creating a circular dependency.
-Solution:
-  Recommended: 32 (at least 2x current active tasks)
-```
+- A single aligned output request exceeds the entire heap ring.
+- Scheduler dispatch is serial/gated, so a blocked orchestrator has no concurrent consumer that could reclaim space.
+- The head task is `COMPLETED`, every consumer reference is released, but its scope reference remains. Only the blocked orchestrator can execute `scope_end()`, so this is a structurally proven cycle.
 
-The FATAL message is logged to the device log and the process exits. The solution is to increase the ring size so that it can hold at least all tasks within the largest parallel scope. For example, if a scope submits 13 tasks, `task_window >= 14` is required (13 + 1 to distinguish full from empty).
+**Concurrent residual stall**:
+
+When the head still has unreleased consumers, freeing it would be incorrect because those consumers may still read its output. The allocator therefore continues to apply back-pressure. If the scheduler's global completion count also stops for the scheduler timeout budget, no core owns a running task, and `orchestrator_reclaim_waiting=1`, the scheduler emits its normal stall classification (`RUNNING_STALLED`, `READY_IDLE`, `DEP_DEADLOCK`, or `ORCH_STARVATION`) and latches `PTO2_ERROR_SCHEDULER_TIMEOUT`. The allocator observes that scheduler error and unwinds without replacing it with `PTO2_ERROR_HEAP_RING_DEADLOCK`.
+
+This preserves in-order reclamation: a task's heap storage is never reused before all consumer and scope references are released.
 
 **Sizing guideline**: `task_window_size` must be larger than the maximum number of tasks in any single `PTO2_SCOPE`. A safe choice is `2 × max_tasks_per_scope` or simply the default 65536 for production.
 
@@ -333,7 +331,7 @@ This uses the **per-task entry chain** (`task_entry_head[task_slot]`) — each t
 
 **Layer 3 — Back-Pressure on Pool Exhaustion** (blocking):
 
-Before STEP 4 inserts a task's outputs, `ensure_tensormap_capacity` checks the free list + bump region against the task's needed entry count. If short, it reclaims retired entries across all rings and blocks until reclaim frees enough entries. Progress is measured by entries actually freed, not by watermark movement — a ring can retire zero-output tasks, advancing `last_task_alive` without freeing any entry. A pool that frees nothing for a 500 ms wall-clock timeout is a genuine deadlock: it latches `PTO2_ERROR_TENSORMAP_OVERFLOW` and unwinds, matching the task allocator and fanin spill pool.
+Before STEP 4 inserts a task's outputs, `ensure_tensormap_capacity` checks the free list + bump region against the task's needed entry count. If short, it reclaims retired entries across all rings and blocks until reclaim frees enough entries. Progress is measured by entries actually freed, not by watermark movement — a ring can retire zero-output tasks, advancing `last_task_alive` without freeing any entry. This pool currently retains its own 500 ms wall-clock backstop and latches `PTO2_ERROR_TENSORMAP_OVERFLOW`; it is separate from the task/heap allocator policy above.
 
 This forms a back-pressure mechanism analogous to the Task Ring's flow control.
 

@@ -77,8 +77,8 @@ bool PTO2FaninPool::ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t neede
             if (error_code_ptr != nullptr && error_code_ptr->load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
                 return false;
             }
-            // Absolute-time backstop, matching the task allocator: stable across
-            // chips/contention, unlike a fixed spin count. get_sys_cnt_aicpu()
+            // Absolute-time auxiliary-pool backstop: stable across chips and
+            // contention, unlike a fixed spin count. get_sys_cnt_aicpu()
             // is a cheap cntvct_el0 read; the 1024-spin gate keeps fatal-flag
             // polling and timeout bookkeeping out of every reclaim spin.
             uint64_t now = get_sys_cnt_aicpu();

@@ -143,6 +143,7 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     }
 
     header->orchestrator_done.store(0, std::memory_order_relaxed);
+    header->orchestrator_reclaim_waiting.store(0, std::memory_order_relaxed);
 
     // Per-ring layout info
     uint64_t offset = PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
@@ -204,6 +205,7 @@ void PTO2SharedMemoryHandle::print_layout() {
         LOG_INFO_V0("  last_task_alive:  %d", h->rings[r].fc.last_task_alive.load(std::memory_order_acquire));
     }
     LOG_INFO_V0("orchestrator_done:  %d", h->orchestrator_done.load(std::memory_order_acquire));
+    LOG_INFO_V0("orchestrator_reclaim_waiting: %d", h->orchestrator_reclaim_waiting.load(std::memory_order_acquire));
     LOG_INFO_V0("Error state:");
     LOG_INFO_V0("  orch_error_code:    %d", h->orch_error_code.load(std::memory_order_relaxed));
     LOG_INFO_V0("  sched_error_bitmap: 0x%x", h->sched_error_bitmap.load(std::memory_order_relaxed));

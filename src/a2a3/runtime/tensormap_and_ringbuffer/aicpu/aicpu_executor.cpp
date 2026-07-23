@@ -663,6 +663,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 // Core counts come from cores_total_num_ (fixed 1 AIC : 2 AIV
                 // cluster ratio). On the decoupled path aic_count()/aiv_count() are
                 // not populated until after this SM reset, so they cannot be read here.
+                rt->orchestrator.scheduler_runs_concurrently = sched_thread_num_ > 0 && !serial_orch_sched_;
                 int32_t spike_total = sched_ctx_.cores_total_num();
                 runtime_finalize_after_wire(rt, spike_total / 3, (spike_total * 2) / 3);
 #if SIMPLER_DFX

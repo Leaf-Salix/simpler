@@ -519,9 +519,13 @@ static bool prepare_task(
         return false;
     }
 
-    out->alloc_result = allocator.alloc(total_output_size);
+    out->alloc_result = allocator.alloc(total_output_size, orch->sm_header, orch->scheduler_runs_concurrently);
     if (out->alloc_result.failed()) {
-        orch_mark_fatal(orch, PTO2_ERROR_HEAP_RING_DEADLOCK);
+        orch->fatal = true;
+        if (orch->sm_header->orch_error_code.load(std::memory_order_acquire) == PTO2_ERROR_NONE &&
+            orch->sm_header->sched_error_code.load(std::memory_order_acquire) == PTO2_ERROR_NONE) {
+            orch_mark_fatal(orch, PTO2_ERROR_HEAP_RING_DEADLOCK);
+        }
         return false;
     }
 
@@ -699,8 +703,8 @@ void PTO2OrchestratorState::end_scope() {
 // task/heap/fanin pools — retired tasks' entries free once last_task_alive
 // advances — so an exhausted pool is back-pressure, not a hard error. Reclaim
 // across all rings (entries from every ring share one pool); if still short,
-// spin until reclaim actually frees entries, with the same 500 ms wall-clock
-// backstop as the task allocator and fanin spill pool. A pool that stays full
+// spin until reclaim actually frees entries, with the auxiliary-pool 500 ms
+// wall-clock backstop also used by the fanin spill pool. A pool that stays full
 // (no entry freed) is a genuine deadlock: latch PTO2_ERROR_TENSORMAP_OVERFLOW
 // and bail. Returns false on deadlock or on a fatal already latched by another
 // party. Cold path — the fast path returns immediately when the pool has room.

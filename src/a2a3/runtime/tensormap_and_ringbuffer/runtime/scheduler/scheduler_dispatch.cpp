@@ -981,6 +981,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // "now" so the first budget cycle starts when this thread does, not at
     // an undefined value.
     uint64_t last_progress_ts = get_sys_cnt_aicpu();
+    // An idle worker may observe progress made by a sibling only through this
+    // shared completion counter. Sample it on the existing cold error-check
+    // cadence so a busy sibling refreshes the no-progress budget globally.
+    int32_t last_global_progress_count = completed_tasks_.load(std::memory_order_relaxed);
     // Per-device override latched once at worker init by simpler_aicpu_init
     // (InitArgs.scheduler_timeout_ms -> resident-SO global). 0 means no
     // override; fall back to the compile-time SCHEDULER_TIMEOUT_CYCLES.
@@ -1365,6 +1369,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         if (made_progress) {
             idle_iterations = 0;
             last_progress_ts = get_sys_cnt_aicpu();
+            last_global_progress_count = completed_tasks_.load(std::memory_order_relaxed);
         } else {
 #if SIMPLER_DFX
             uint64_t rel_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && deferred_release_count > 0) ?
@@ -1398,6 +1403,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0) {
                 LoopAction action = check_idle_fatal_error(thread_idx, header, runtime);
                 if (action == LoopAction::BREAK_LOOP) break;
+                int32_t global_progress_count = completed_tasks_.load(std::memory_order_relaxed);
+                if (global_progress_count != last_global_progress_count) {
+                    last_global_progress_count = global_progress_count;
+                    last_progress_ts = get_sys_cnt_aicpu();
+                }
             }
 
             if (idle_iterations % STALL_LOG_INTERVAL == 0) {
@@ -1407,12 +1417,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             //
             // 1. Self owns a RUNNING task — first-hand evidence the
             //    dispatch is stuck. Latch.
-            // 2. No thread anywhere owns a RUNNING task AND tasks remain
-            //    unfinished — the system is in a pre-dispatch / WAIT-only
-            //    deadlock (e.g. dependency cycle). Ownerless idle threads
-            //    are the only observers; let this one latch on the global
-            //    evidence (`completed_tasks_ < total_tasks_` and
-            //    `no_thread_owns_running_task()`).
+            // 2. No thread anywhere owns a RUNNING task AND either the final
+            //    task set remains unfinished or the orchestrator is blocked
+            //    waiting for scheduler-driven reclaim. The latter makes the
+            //    same global stall observable before orchestration can finish.
             //
             // Otherwise: a sibling thread owns a RUNNING task but hasn't
             // hit its own budget yet (typical distributed startup-skew
@@ -1421,9 +1429,28 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             // observability is preserved.
             if (get_sys_cnt_aicpu() - last_progress_ts > scheduler_timeout_cycles) {
                 bool self_owns = self_owns_running_task(thread_idx);
-                bool global_stuck = !self_owns && total_tasks_ > 0 &&
-                                    completed_tasks_.load(std::memory_order_relaxed) < total_tasks_ &&
-                                    no_thread_owns_running_task();
+                bool global_stuck = false;
+                if (!self_owns) {
+                    int32_t completed_before = completed_tasks_.load(std::memory_order_acquire);
+                    bool reclaim_waiting_before =
+                        header != nullptr && header->orchestrator_reclaim_waiting.load(std::memory_order_acquire) != 0;
+                    bool no_running_before = no_thread_owns_running_task();
+
+                    int32_t completed_after = completed_tasks_.load(std::memory_order_acquire);
+                    bool reclaim_waiting_after =
+                        header != nullptr && header->orchestrator_reclaim_waiting.load(std::memory_order_acquire) != 0;
+                    bool no_running_after = no_thread_owns_running_task();
+
+                    if (completed_after != last_global_progress_count) {
+                        last_global_progress_count = completed_after;
+                        last_progress_ts = get_sys_cnt_aicpu();
+                    } else {
+                        global_stuck = scheduler_global_stall_is_stable(
+                            last_global_progress_count, completed_before, completed_after, total_tasks_,
+                            reclaim_waiting_before, reclaim_waiting_after, no_running_before, no_running_after
+                        );
+                    }
+                }
                 if (self_owns || global_stuck) {
                     // Latch the error + emergency_shutdown, then break to the
                     // shared end-of-loop cleanup so the diagnostic buffers get

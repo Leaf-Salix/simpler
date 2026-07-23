@@ -133,6 +133,9 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
 
     // === GLOBAL FIELDS ===
     std::atomic<int32_t> orchestrator_done;  // Flag: orchestration complete
+    // Orchestrator is blocked waiting for scheduler-driven task/heap reclaim.
+    // Occupies the existing 4-byte padding before total_size.
+    std::atomic<int32_t> orchestrator_reclaim_waiting;
 
     // Total shared memory size (for validation)
     uint64_t total_size;
@@ -166,6 +169,10 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
 };
 
 static_assert(sizeof(PTO2SharedMemoryHeader) == 896, "PTO2SharedMemoryHeader layout drift");
+static_assert(
+    offsetof(PTO2SharedMemoryHeader, orchestrator_reclaim_waiting) == 772,
+    "PTO2SharedMemoryHeader orchestrator_reclaim_waiting layout drift"
+);
 static_assert(offsetof(PTO2SharedMemoryHeader, total_size) == 776, "PTO2SharedMemoryHeader total_size layout drift");
 static_assert(
     offsetof(PTO2SharedMemoryHeader, orch_error_code) == 784, "PTO2SharedMemoryHeader orch_error_code layout drift"

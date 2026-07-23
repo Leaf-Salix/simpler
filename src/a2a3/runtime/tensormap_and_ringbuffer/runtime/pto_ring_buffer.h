@@ -40,8 +40,8 @@
 
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
-#include "aicpu/device_time.h"       // get_sys_cnt_aicpu (deadlock wall-clock backstop)
-#include "common/platform_config.h"  // PLATFORM_PROF_SYS_CNT_FREQ (deadlock wall-clock)
+#include "aicpu/device_time.h"
+#include "common/platform_config.h"
 #include "common/unified_log.h"
 
 #if SIMPLER_DFX
@@ -53,11 +53,8 @@
 
 // Block notification interval (in spin counts)
 #define PTO2_BLOCK_NOTIFY_INTERVAL 10000
-// Heap/task deadlock is detected structurally (head task COMPLETED + all
-// consumers released + scope still open -> only scope_end can free it, which a
-// blocked orchestrator can never reach). This wall-clock value is only a
-// backstop for the residual case the structural test can't prove locally; it is
-// an ABSOLUTE TIME (not a spin count), so it is stable across chips/contention.
+// Auxiliary pool waits retain a wall-clock backstop. Task/heap allocation uses
+// structural checks plus the scheduler's global progress watchdog instead.
 #define PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES (PLATFORM_PROF_SYS_CNT_FREQ / 2)  // 500 ms
 
 // =============================================================================
@@ -118,20 +115,34 @@ public:
      * published to shared memory only on success. Since the orchestrator is
      * single-threaded, no CAS or fetch_add is needed — just check-then-commit.
      *
-     * @param output_size  Total packed output size in bytes (0 = no heap needed)
+     * @param output_size Total packed output size in bytes (0 = no heap needed)
+     * @param sm_header Shared progress/error state for concurrent back-pressure
+     * @param scheduler_runs_concurrently Whether scheduler workers can reclaim
+     * task/heap rings before orchestration completes
      * @return Allocation result; check failed() for errors
      */
-    PTO2TaskAllocResult alloc(int32_t output_size) {
+    PTO2TaskAllocResult
+    alloc(int32_t output_size, PTO2SharedMemoryHeader *sm_header = nullptr, bool scheduler_runs_concurrently = false) {
         uint64_t aligned_size =
             output_size > 0 ? PTO2_ALIGN_UP(static_cast<uint64_t>(output_size), PTO2_ALIGN_SIZE) : 0;
 
-        int spin_count = 0;
+        if (aligned_size > heap_size_) {
+            report_deadlock(output_size, /*heap_blocked=*/true, /*scope_gated=*/false);
+            return {-1, -1, nullptr, nullptr};
+        }
+
+        uint64_t spin_count = 0;
         int32_t prev_last_alive = last_alive_ptr_->load(std::memory_order_acquire);
         int32_t last_alive = prev_last_alive;
         update_heap_tail(last_alive);
         bool blocked_on_heap = false;
-        uint64_t block_cycle0 = 0;  // wall-clock anchor for the deadlock backstop
-        bool block_timing = false;  // false until the first no-reclaim-progress spin
+        bool wait_published = false;
+        auto clear_reclaim_wait = [&]() {
+            if (wait_published) {
+                sm_header->orchestrator_reclaim_waiting.store(0, std::memory_order_release);
+                wait_published = false;
+            }
+        };
 #if SIMPLER_ORCH_PROFILING
         uint64_t wait_start = 0;
         bool waiting = false;
@@ -143,6 +154,7 @@ public:
                 void *heap_ptr = try_bump_heap(aligned_size);
                 if (heap_ptr) {
                     int32_t task_id = commit_task();
+                    clear_reclaim_wait();
 #if SIMPLER_ORCH_PROFILING
                     record_wait(spin_count, wait_start, waiting);
 #endif
@@ -151,6 +163,15 @@ public:
                 blocked_on_heap = true;
             } else {
                 blocked_on_heap = false;
+            }
+
+            if (!scheduler_runs_concurrently || sm_header == nullptr) {
+                report_deadlock(output_size, blocked_on_heap, /*scope_gated=*/head_blocked_on_scope_end(last_alive));
+                return {-1, -1, nullptr, nullptr};
+            }
+            if (!wait_published) {
+                sm_header->orchestrator_reclaim_waiting.store(1, std::memory_order_release);
+                wait_published = true;
             }
 
             // Spin: wait for scheduler to advance last_task_alive
@@ -167,43 +188,30 @@ public:
                 // Reclaim advanced -> productive backpressure, not a deadlock.
                 spin_count = 0;
                 prev_last_alive = last_alive;
-                block_timing = false;
             } else if ((spin_count & 1023) == 0) {
-                // A fatal latched elsewhere breaks this otherwise-unbounded spin; the
-                // caller maps the failed alloc to orch_mark_fatal. Polled on the
-                // cold path only -- error_code_ptr_ is orch_error_code.
-                if (error_code_ptr_ != nullptr && error_code_ptr_->load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+                // The scheduler owns the progress watchdog while dispatch runs
+                // concurrently. Poll both error channels so its timeout can
+                // unwind this otherwise-unbounded back-pressure wait.
+                bool orch_failed =
+                    error_code_ptr_ != nullptr && error_code_ptr_->load(std::memory_order_acquire) != PTO2_ERROR_NONE;
+                bool sched_failed = sm_header->sched_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE;
+                if (orch_failed || sched_failed) {
+                    clear_reclaim_wait();
                     return {-1, -1, nullptr, nullptr};
                 }
-                // Reclaim watermark is stuck. Run the deadlock checks only once
-                // per 1024 spins to keep the hot reclaim loop tight:
-                // get_sys_cnt_aicpu() is a cheap cntvct_el0 read, while this
-                // block polls the fatal flag and head_blocked_on_scope_end()
-                // walks the head slot (1024 spins is far below the wall-clock
-                // timeout, so detection latency is unaffected).
-                // (1) Structural, immediate: if the head task is COMPLETED with
+                // Structural, immediate: if the head task is COMPLETED with
                 // every consumer released but its scope still open, only
                 // scope_end can free it and a blocked orchestrator can never
                 // call it -> provable deadlock now.
                 if (head_blocked_on_scope_end(last_alive)) {
                     report_deadlock(output_size, blocked_on_heap, /*scope_gated=*/true);
-                    return {-1, -1, nullptr, nullptr};
-                }
-                // (2) Wall-clock backstop for the residual case the local head
-                // test can't prove (e.g. a closed sibling whose consumer is
-                // deferred). Absolute time, not a spin count.
-                uint64_t now = get_sys_cnt_aicpu();
-                if (!block_timing) {
-                    block_cycle0 = now;
-                    block_timing = true;
-                } else if (now - block_cycle0 >= PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES) {
-                    report_deadlock(output_size, blocked_on_heap, /*scope_gated=*/false);
+                    clear_reclaim_wait();
                     return {-1, -1, nullptr, nullptr};
                 }
                 if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0) {
                     LOG_WARN(
                         "[TaskAllocator ring=%u] BLOCKED: tasks=%d/%d, heap_used=%" PRIu64 "/%" PRIu64
-                        ", heap_available=%" PRIu64 ", heap_cursor=%" PRIu64 ", on=%s, spins=%d",
+                        ", heap_available=%" PRIu64 ", heap_cursor=%" PRIu64 ", on=%s, spins=%" PRIu64,
                         static_cast<unsigned>(ring_id_), local_task_id_ - last_alive, window_size_, heap_used_bytes(),
                         heap_size_, heap_available(), heap_top_, blocked_on_heap ? "heap" : "task", spin_count
                     );
@@ -372,7 +380,7 @@ private:
     }
 
 #if SIMPLER_ORCH_PROFILING
-    void record_wait(int spin_count, uint64_t wait_start, bool waiting) {
+    void record_wait(uint64_t spin_count, uint64_t wait_start, bool waiting) {
         if (waiting) {
             extern uint64_t g_orch_alloc_wait_cycle;
             g_orch_alloc_wait_cycle += (get_sys_cnt_aicpu() - wait_start);
@@ -406,14 +414,17 @@ private:
     }
 
     /**
-     * Report deadlock with targeted diagnostics. scope_gated == true means the
-     * head-of-line structural test proved it (waiting only on scope_end);
-     * false means the wall-clock backstop fired.
+     * Report a locally provable deadlock. scope_gated means the head is waiting
+     * only on scope_end; otherwise the request is impossible or scheduler
+     * dispatch is gated and cannot reclaim the blocked ring.
      */
     void report_deadlock(int32_t requested_output_size, bool heap_blocked, bool scope_gated) {
         int32_t last_alive = last_alive_ptr_->load(std::memory_order_acquire);
         int32_t active_tasks = local_task_id_ - last_alive;
         uint64_t htail = heap_tail_;
+        uint64_t aligned_requested = requested_output_size > 0 ?
+                                         PTO2_ALIGN_UP(static_cast<uint64_t>(requested_output_size), PTO2_ALIGN_SIZE) :
+                                         0;
 
         LOG_ERROR("========================================");
         if (heap_blocked) {
@@ -426,11 +437,13 @@ private:
             LOG_ERROR("Head task %d COMPLETED, all consumers released, scope still open ->", last_alive);
             LOG_ERROR("only scope_end can free it and the orchestrator is blocked here.");
             LOG_ERROR("Provable head-of-line deadlock.");
-        } else {
+        } else if (aligned_requested > heap_size_) {
             LOG_ERROR(
-                "No reclaim progress for ~500 ms (%" PRIu64 " cycles wall clock).",
-                (uint64_t)PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES
+                "Requested output (%d bytes) exceeds the entire heap ring (%" PRIu64 " bytes).", requested_output_size,
+                heap_size_
             );
+        } else {
+            LOG_ERROR("Scheduler dispatch is not concurrent, so blocked orchestration cannot reclaim this ring.");
         }
         LOG_ERROR(
             "  Task ring %u: current=%d, last_alive=%d, active=%d/%d (%.1f%%)", static_cast<unsigned>(ring_id_),

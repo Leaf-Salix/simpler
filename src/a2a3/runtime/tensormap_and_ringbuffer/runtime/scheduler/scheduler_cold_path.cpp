@@ -372,9 +372,11 @@ SchedulerContext::StallClassification SchedulerContext::classify_stall_reason() 
     cls.stuck_task_id = -1;
     cls.stuck_core = -1;
     int32_t cnt_running = 0, cnt_ready = 0, cnt_waiting = 0;
+    int32_t submitted_tasks = 0;
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         PTO2SharedMemoryRingHeader &ring = *sched_->ring_sched_states[r].ring;
         int32_t ring_task_count = ring.fc.current_task_index.load(std::memory_order_relaxed);
+        submitted_tasks += ring_task_count;
         // Active task_ids live in [last_task_alive, current_task_index); slots wrap
         // (slot = task_id % window), so scanning from 0 re-reads each live slot once
         // per earlier task_id that mapped to it -- inflating the counts to O(history).
@@ -417,7 +419,7 @@ SchedulerContext::StallClassification SchedulerContext::classify_stall_reason() 
     cls.cnt_ready = cnt_ready;
     cls.cnt_waiting = cnt_waiting;
     cls.completed = completed_tasks_.load(std::memory_order_relaxed);
-    cls.total = total_tasks_;
+    cls.total = total_tasks_ > 0 ? total_tasks_ : submitted_tasks;
     cls.orch_done = orchestrator_done_ ? 1 : 0;
     cls.detail = classify_stall_detail(cnt_running, cnt_ready, cnt_waiting, cls.orch_done);
     return cls;
@@ -432,11 +434,15 @@ int32_t SchedulerContext::handle_timeout_exit(
 #endif
 ) {
     StallClassification cls = classify_stall_reason();
+    int32_t orchestrator_waiting =
+        header != nullptr ? header->orchestrator_reclaim_waiting.load(std::memory_order_acquire) : 0;
     LOG_ERROR(
         "[STALL thread=%d idle_iterations=%d] TIMEOUT_EXIT after_idle_iterations=%d sub_class=%s "
-        "completed=%d/%d running=%d ready=%d waiting=%d orch_done=%d stuck_task_id=%" PRId64 " stuck_core=%d",
+        "completed=%d/%d running=%d ready=%d waiting=%d orch_done=%d orch_reclaim_waiting=%d "
+        "stuck_task_id=%" PRId64 " stuck_core=%d",
         thread_idx, idle_iterations, idle_iterations, stall_detail_name(cls.detail), cls.completed, cls.total,
-        cls.cnt_running, cls.cnt_ready, cls.cnt_waiting, cls.orch_done, cls.stuck_task_id, cls.stuck_core
+        cls.cnt_running, cls.cnt_ready, cls.cnt_waiting, cls.orch_done, orchestrator_waiting, cls.stuck_task_id,
+        cls.stuck_core
     );
     // Only the thread that wins the code-100 latch publishes the detail/locators,
     // keeping the host-visible sub-class consistent with the latched code.

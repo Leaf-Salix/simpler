@@ -95,6 +95,9 @@ struct PTO2OrchestratorState {
     // Total core counts set once at executor init; used for submit-time deadlock detection.
     int32_t total_cluster_count{0};  // AIC cores = MIX clusters
     int32_t total_aiv_count{0};      // AIV cores (= 2 × clusters on standard hardware)
+    // True only when scheduler workers can reclaim task/heap rings while
+    // orchestration is still submitting tasks.
+    bool scheduler_runs_concurrently{false};
 #if SIMPLER_DFX
     // L2 swimlane_level copied from get_l2_swimlane_level().
     L2SwimlaneLevel l2_swimlane_level{L2SwimlaneLevel::DISABLED};

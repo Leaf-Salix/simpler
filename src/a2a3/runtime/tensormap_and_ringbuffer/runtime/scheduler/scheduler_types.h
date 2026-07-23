@@ -51,6 +51,20 @@ constexpr int32_t MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 constexpr int32_t STALL_LOG_INTERVAL = 480000;
 constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check orchestrator error every N idle iters
 
+static inline bool scheduler_global_stall_is_stable(
+    int32_t observed_completed, int32_t completed_before, int32_t completed_after, int32_t total_tasks,
+    bool reclaim_waiting_before, bool reclaim_waiting_after, bool no_running_before, bool no_running_after
+) {
+    if (completed_before != completed_after || completed_after != observed_completed) {
+        return false;
+    }
+    if (reclaim_waiting_before != reclaim_waiting_after) {
+        return false;
+    }
+    bool unfinished_final_graph = total_tasks > 0 && completed_after < total_tasks;
+    return (unfinished_final_graph || reclaim_waiting_after) && no_running_before && no_running_after;
+}
+
 // Wall-clock budget for declaring "no progress = scheduler timeout". Replaces
 // the per-thread iteration-count cap that once lived here as MAX_IDLE_ITERATIONS
 // for the fatal-latch decision; STALL_LOG_INTERVAL above keeps the per-thread

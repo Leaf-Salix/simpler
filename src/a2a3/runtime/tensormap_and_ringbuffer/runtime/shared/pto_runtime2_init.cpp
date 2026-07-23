@@ -480,6 +480,7 @@ bool PTO2OrchestratorState::reset_for_reuse(
     orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
     orch->total_cluster_count = 0;
     orch->total_aiv_count = 0;
+    orch->scheduler_runs_concurrently = false;
 #if SIMPLER_DFX
     orch->tasks_submitted = 0;
     orch->buffers_allocated = 0;

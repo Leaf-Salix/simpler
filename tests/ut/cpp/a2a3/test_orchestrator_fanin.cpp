@@ -11,8 +11,11 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "utils/device_arena.h"
@@ -141,6 +144,50 @@ TEST_F(OrchestratorFaninTest, SubmitPathHeapDeadlockLogReportsRingAndRealHeapSta
     EXPECT_NE(log.find("used=3072"), std::string::npos);
     EXPECT_NE(log.find("available=1024"), std::string::npos);
     EXPECT_EQ(log.find("PTO2_RING_HEAP=<pow2>"), std::string::npos);
+}
+
+TEST_F(OrchestratorFaninTest, SchedulerErrorIsNotOverwrittenByHeapError) {
+    std::vector<TensorCreateInfo> create_infos;
+    create_infos.reserve(2);
+    orch.scheduler_runs_concurrently = true;
+    orch.begin_scope();
+
+    L0TaskArgs first_args;
+    add_runtime_output_arg(first_args, create_infos, 1024);  // 4096 bytes
+    TaskOutputTensors first = orch.submit_dummy_task(first_args);
+    ASSERT_TRUE(first.task_id().is_valid());
+
+    auto &ring = sm_handle->header->rings[first.task_id().ring()];
+    auto &head = ring.get_slot_state_by_task_id(static_cast<int32_t>(first.task_id().local()));
+    head.task_state.store(PTO2_TASK_PENDING, std::memory_order_release);
+    head.fanout_count = PTO2_FANOUT_SCOPE_BIT + 1;
+    head.fanout_refcount.store(0, std::memory_order_release);
+
+    std::atomic<bool> observed_wait{false};
+    std::thread scheduler_failure([&]() {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (sm_handle->header->orchestrator_reclaim_waiting.load(std::memory_order_acquire) == 0 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        observed_wait.store(
+            sm_handle->header->orchestrator_reclaim_waiting.load(std::memory_order_acquire) != 0,
+            std::memory_order_release
+        );
+        sm_handle->header->sched_error_code.store(PTO2_ERROR_SCHEDULER_TIMEOUT, std::memory_order_release);
+    });
+
+    L0TaskArgs blocked_args;
+    add_runtime_output_arg(blocked_args, create_infos, 1);
+    TaskOutputTensors blocked = orch.submit_dummy_task(blocked_args);
+    scheduler_failure.join();
+
+    EXPECT_TRUE(observed_wait.load(std::memory_order_acquire));
+    EXPECT_FALSE(blocked.task_id().is_valid());
+    EXPECT_TRUE(orch.fatal);
+    EXPECT_EQ(sm_handle->header->orch_error_code.load(std::memory_order_acquire), PTO2_ERROR_NONE);
+    EXPECT_EQ(sm_handle->header->sched_error_code.load(std::memory_order_acquire), PTO2_ERROR_SCHEDULER_TIMEOUT);
+    EXPECT_EQ(sm_handle->header->orchestrator_reclaim_waiting.load(std::memory_order_acquire), 0);
 }
 
 // Regression for issue #1188: scope_tasks_cap must equal the real in-flight budget

@@ -23,6 +23,41 @@
 #include "scheduler/scheduler_types.h"
 #include "scheduler/pto_scheduler.h"
 
+TEST(SchedulerTimeoutDecisionTest, StableReclaimWaitWithoutRunningTaskIsStuck) {
+    EXPECT_TRUE(scheduler_global_stall_is_stable(
+        10, 10, 10, 0, /*reclaim_waiting_before=*/true, /*reclaim_waiting_after=*/true,
+        /*no_running_before=*/true, /*no_running_after=*/true
+    ));
+}
+
+TEST(SchedulerTimeoutDecisionTest, ConcurrentCompletionInvalidatesSnapshot) {
+    EXPECT_FALSE(scheduler_global_stall_is_stable(
+        10, 10, 11, 0, /*reclaim_waiting_before=*/true, /*reclaim_waiting_after=*/true,
+        /*no_running_before=*/true, /*no_running_after=*/true
+    ));
+}
+
+TEST(SchedulerTimeoutDecisionTest, ClearedReclaimWaitInvalidatesSnapshot) {
+    EXPECT_FALSE(scheduler_global_stall_is_stable(
+        10, 10, 10, 0, /*reclaim_waiting_before=*/true, /*reclaim_waiting_after=*/false,
+        /*no_running_before=*/true, /*no_running_after=*/true
+    ));
+}
+
+TEST(SchedulerTimeoutDecisionTest, RunningOwnerInvalidatesSnapshot) {
+    EXPECT_FALSE(scheduler_global_stall_is_stable(
+        10, 10, 10, 0, /*reclaim_waiting_before=*/true, /*reclaim_waiting_after=*/true,
+        /*no_running_before=*/true, /*no_running_after=*/false
+    ));
+}
+
+TEST(SchedulerTimeoutDecisionTest, StableUnfinishedFinalGraphIsStuck) {
+    EXPECT_TRUE(scheduler_global_stall_is_stable(
+        10, 10, 10, 20, /*reclaim_waiting_before=*/false, /*reclaim_waiting_after=*/false,
+        /*no_running_before=*/true, /*no_running_after=*/true
+    ));
+}
+
 class SchedulerStateTest : public ::testing::Test {
 protected:
     PTO2SchedulerState sched;

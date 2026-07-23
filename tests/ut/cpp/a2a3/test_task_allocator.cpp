@@ -14,9 +14,8 @@
  * Tests ring buffer allocation, heap bump logic, wrap-around, alignment,
  * task window flow control, and heap_available semantics.
  *
- * The allocator is single-threaded (orchestrator thread), so no concurrency
- * tests are needed. The unified PTO2TaskAllocator replaces the previous
- * separate PTO2HeapRing + PTO2TaskRing.
+ * The allocator has one caller (the orchestrator thread), while scheduler
+ * threads concurrently advance its reclaim watermark and error channel.
  *
  * Design contracts (try_bump_heap):
  *
@@ -38,9 +37,11 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <cstring>
 #include <set>
+#include <thread>
 #include <vector>
 
 #include "pto_ring_buffer.h"
@@ -367,6 +368,71 @@ TEST_F(TaskAllocatorTest, AllocLargerThanHeap) {
     auto r = allocator.alloc(HEAP_SIZE * 2);
     EXPECT_TRUE(r.failed()) << "Cannot allocate more than heap size";
     EXPECT_EQ(error_code.load(), PTO2_ERROR_HEAP_RING_DEADLOCK);
+}
+
+TEST_F(TaskAllocatorTest, ConcurrentBackpressureWaitsForSchedulerReclaim) {
+    auto first = allocator.alloc(HEAP_SIZE);
+    ASSERT_FALSE(first.failed());
+
+    PTO2SharedMemoryHeader header{};
+    header.orch_error_code.store(PTO2_ERROR_NONE);
+    header.sched_error_code.store(PTO2_ERROR_NONE);
+    header.orchestrator_reclaim_waiting.store(0);
+    std::atomic<bool> observed_wait{false};
+
+    std::thread reclaimer([&]() {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (header.orchestrator_reclaim_waiting.load(std::memory_order_acquire) == 0 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        if (header.orchestrator_reclaim_waiting.load(std::memory_order_acquire) != 0) {
+            observed_wait.store(true, std::memory_order_release);
+            consume_up_to(descriptors, last_alive, heap_buf, WINDOW_SIZE, 1, 128);
+        } else {
+            header.sched_error_code.store(PTO2_ERROR_SCHEDULER_TIMEOUT, std::memory_order_release);
+        }
+    });
+
+    auto second = allocator.alloc(64, &header, /*scheduler_runs_concurrently=*/true);
+    reclaimer.join();
+
+    EXPECT_TRUE(observed_wait.load(std::memory_order_acquire));
+    EXPECT_FALSE(second.failed());
+    EXPECT_EQ(second.packed_base, static_cast<void *>(heap_buf));
+    EXPECT_EQ(header.orchestrator_reclaim_waiting.load(), 0);
+    EXPECT_EQ(error_code.load(), PTO2_ERROR_NONE);
+}
+
+TEST_F(TaskAllocatorTest, SchedulerErrorUnwindsConcurrentBackpressureWithoutOrchError) {
+    auto first = allocator.alloc(HEAP_SIZE);
+    ASSERT_FALSE(first.failed());
+
+    PTO2SharedMemoryHeader header{};
+    header.orch_error_code.store(PTO2_ERROR_NONE);
+    header.sched_error_code.store(PTO2_ERROR_NONE);
+    header.orchestrator_reclaim_waiting.store(0);
+    std::atomic<bool> observed_wait{false};
+
+    std::thread scheduler_failure([&]() {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (header.orchestrator_reclaim_waiting.load(std::memory_order_acquire) == 0 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        observed_wait.store(
+            header.orchestrator_reclaim_waiting.load(std::memory_order_acquire) != 0, std::memory_order_release
+        );
+        header.sched_error_code.store(PTO2_ERROR_SCHEDULER_TIMEOUT, std::memory_order_release);
+    });
+
+    auto second = allocator.alloc(64, &header, /*scheduler_runs_concurrently=*/true);
+    scheduler_failure.join();
+
+    EXPECT_TRUE(observed_wait.load(std::memory_order_acquire));
+    EXPECT_TRUE(second.failed());
+    EXPECT_EQ(header.orchestrator_reclaim_waiting.load(), 0);
+    EXPECT_EQ(error_code.load(), PTO2_ERROR_NONE);
 }
 
 TEST_F(TaskAllocatorTest, TaskWindowSaturates) {
