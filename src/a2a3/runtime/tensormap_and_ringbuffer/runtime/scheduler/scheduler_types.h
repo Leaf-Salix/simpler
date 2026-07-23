@@ -91,6 +91,27 @@ constexpr int32_t STALL_DUMP_CORE_MAX = 8;
 constexpr int32_t PROGRESS_VERBOSE_THRESHOLD = 10;  // log every completion for the first N tasks
 constexpr int32_t PROGRESS_LOG_INTERVAL = 250;      // log every N completions after threshold
 
+enum class SchedulerDiagPhase : int32_t {
+    Uninitialized = 0,
+    LoopTop,
+    CompletionPoll,
+    CompleteSlot,
+    FanoutWalk,
+    MailboxPush,
+    AsyncPoll,
+    Drain,
+    Dummy,
+    DispatchReady,
+    EarlyDispatch,
+    Release,
+    Idle,
+    Exit,
+};
+
+void scheduler_diag_set_phase(
+    int32_t thread_idx, SchedulerDiagPhase phase, int32_t core_id = -1, int64_t task_id = -1
+);
+
 // =============================================================================
 // Control flow signal from cold-path helpers back to the main dispatch loop.
 // =============================================================================

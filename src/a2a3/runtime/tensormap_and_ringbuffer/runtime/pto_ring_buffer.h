@@ -57,6 +57,8 @@
 // structural checks plus the scheduler's global progress watchdog instead.
 #define PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES (PLATFORM_PROF_SYS_CNT_FREQ / 2)  // 500 ms
 
+extern "C" __attribute__((weak)) void pto2_log_scheduler_phase_snapshot();
+
 // =============================================================================
 // Task Allocator (unified task slot + heap buffer allocation)
 // =============================================================================
@@ -133,6 +135,7 @@ public:
 
         uint64_t spin_count = 0;
         uint64_t last_block_notify_ts = get_sys_cnt_aicpu();
+        bool scheduler_snapshot_logged = false;
         int32_t prev_last_alive = last_alive_ptr_->load(std::memory_order_acquire);
         int32_t last_alive = prev_last_alive;
         update_heap_tail(last_alive);
@@ -209,6 +212,10 @@ public:
                         static_cast<unsigned>(ring_id_), local_task_id_ - last_alive, window_size_, heap_used_bytes(),
                         heap_size_, heap_available(), heap_top_, blocked_on_heap ? "heap" : "task", spin_count
                     );
+                    if (!scheduler_snapshot_logged && pto2_log_scheduler_phase_snapshot != nullptr) {
+                        scheduler_snapshot_logged = true;
+                        pto2_log_scheduler_phase_snapshot();
+                    }
                 }
             }
             SPIN_WAIT_HINT();

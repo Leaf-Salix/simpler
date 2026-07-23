@@ -138,6 +138,10 @@ void SchedulerContext::complete_slot_task(
 
             const PTO2TaskId token = slot_state.task->task_id;
             for (uint32_t i = 0; i < cond_count; ++i) {
+                scheduler_diag_set_phase(
+                    thread_idx, SchedulerDiagPhase::MailboxPush, core_id,
+                    static_cast<int64_t>(slot_state.task->task_id.raw)
+                );
                 volatile DeferredCompletionEntry *e = &deferred_slab->entries[i];
                 while (!mailbox->try_push_condition(token, e->addr, e->expected_value, e->engine, e->completion_type)) {
                     sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
@@ -163,6 +167,10 @@ void SchedulerContext::complete_slot_task(
 #endif
 
     if (task_complete && slot_state.payload != nullptr && slot_state.has_any_subtask_deferred()) {
+        scheduler_diag_set_phase(
+            thread_idx, SchedulerDiagPhase::MailboxPush, core_id,
+            static_cast<int64_t>(slot_state.task->task_id.raw)
+        );
         // Some subtask of this task registered conditions; finish the
         // registration by handing the slot_state off to the consumer.
         while (!mailbox->try_push_normal_done(slot_state.task->task_id, reinterpret_cast<uint64_t>(&slot_state))) {
@@ -173,6 +181,10 @@ void SchedulerContext::complete_slot_task(
     }
 
     if (task_complete && !defer_completion_to_consumer) {
+        scheduler_diag_set_phase(
+            thread_idx, SchedulerDiagPhase::FanoutWalk, core_id,
+            static_cast<int64_t>(slot_state.task->task_id.raw)
+        );
 #if SIMPLER_DFX
         if (is_dump_args_enabled()) {
             dump_args_for_task<PTO2_SUBTASK_SLOT_COUNT>(
@@ -309,6 +321,11 @@ void SchedulerContext::check_running_cores_for_completion(
         int32_t bit_pos = running_core_states.pop_first();
         int32_t core_id = tracker.get_core_id_by_offset(bit_pos);
         CoreExecState &core = core_exec_states_[core_id];
+        int64_t running_task_id =
+            core.running_slot_state != nullptr && core.running_slot_state->task != nullptr ?
+                static_cast<int64_t>(core.running_slot_state->task->task_id.raw) :
+                -1;
+        scheduler_diag_set_phase(thread_idx, SchedulerDiagPhase::CompletionPoll, core_id, running_task_id);
 
         // Skip gated early-dispatch cores. A STAGED task is parked on this core
         // waiting for its doorbell — it physically cannot ACK/FIN yet, so
@@ -408,6 +425,10 @@ void SchedulerContext::check_running_cores_for_completion(
 
         // 1. Complete finished tasks (capture pointers before modifying core state)
         if (t.pending_done) {
+            scheduler_diag_set_phase(
+                thread_idx, SchedulerDiagPhase::CompleteSlot, core_id,
+                static_cast<int64_t>(core.pending_slot_state->task->task_id.raw)
+            );
             // Task-timing finish: latest FIN observation for a tagged task, folded
             // as max. Sampled after the rmb above and before complete_slot_task runs
             // fanin / deferred-completion (which may also clear pending_slot_state),
@@ -427,6 +448,10 @@ void SchedulerContext::check_running_cores_for_completion(
             cur_thread_completed++;
         }
         if (t.running_done) {
+            scheduler_diag_set_phase(
+                thread_idx, SchedulerDiagPhase::CompleteSlot, core_id,
+                static_cast<int64_t>(core.running_slot_state->task->task_id.raw)
+            );
             if (core.running_slot_state->task_attrs.is_timed()) {
                 aicpu_task_timing_finish(core.running_slot_state->task_attrs.timing_slot(), thread_idx);
             }
