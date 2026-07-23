@@ -58,7 +58,7 @@
 // blocked orchestrator can never reach). This wall-clock value is only a
 // backstop for the residual case the structural test can't prove locally; it is
 // an ABSOLUTE TIME (not a spin count), so it is stable across chips/contention.
-#define PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES (PLATFORM_PROF_SYS_CNT_FREQ / 2)  // 500 ms
+#define PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES (PLATFORM_PROF_SYS_CNT_FREQ * 5)  // 5 s diagnostic grace period
 
 // =============================================================================
 // Task Allocator (unified task slot + heap buffer allocation)
@@ -405,6 +405,251 @@ private:
         return rc == (h.fanout_count & ~PTO2_FANOUT_SCOPE_BIT);
     }
 
+    static int popcount_staged_cores(const PTO2TaskPayload *payload) {
+        if (payload == nullptr) return 0;
+        int staged = 0;
+        for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
+            staged += __builtin_popcountll(payload->staged_core_mask[w].load(std::memory_order_acquire));
+        }
+        return staged;
+    }
+
+    static void dump_consumer_snapshot(int32_t ordinal, PTO2TaskSlotState &consumer) {
+        PTO2TaskPayload *payload = consumer.payload;
+        int32_t consumer_ring = static_cast<int32_t>(consumer.ring_id);
+        int32_t consumer_local = -1;
+        uint64_t consumer_raw = UINT64_MAX;
+        if (consumer.task != nullptr) {
+            consumer_ring = static_cast<int32_t>(consumer.task->task_id.ring());
+            consumer_local = static_cast<int32_t>(consumer.task->task_id.local());
+            consumer_raw = consumer.task->task_id.raw;
+        }
+        uint8_t lifecycle = consumer.lifecycle_flags.load(std::memory_order_acquire);
+        int32_t fanin_ref = consumer.fanin_refcount.load(std::memory_order_acquire);
+        uint32_t fanout_ref = consumer.fanout_refcount.load(std::memory_order_acquire);
+        uint8_t early_state = payload == nullptr ? 0 : payload->early_dispatch_state.load(std::memory_order_acquire);
+        uint8_t launch_state =
+            payload == nullptr ? 0 : payload->early_dispatch_launch_state.load(std::memory_order_acquire);
+        uint8_t sync_drain = payload == nullptr ? 0 : payload->early_sync_drain_state.load(std::memory_order_acquire);
+        int32_t dispatch_fanin = payload == nullptr ? -1 : payload->dispatch_fanin.load(std::memory_order_acquire);
+        int32_t fanin_actual = payload == nullptr ? -1 : payload->fanin_actual_count;
+        int32_t published = payload == nullptr ? -1 : payload->published_block_count.load(std::memory_order_acquire);
+        int32_t running_slots = payload == nullptr ? -1 : payload->running_slot_count.load(std::memory_order_acquire);
+        LOG_ERROR(
+            "    [%02d] consumer ring=%d local=%d raw=%" PRIu64
+            " state=%d fanin=%d/%d ready=%d completed_flag=%d shape=%d sync=%d early=%d"
+            " ed_state=%u launch=%u drain=0x%x staged=%d running=%d dispatch_fanin=%d/%d"
+            " published=%d subtasks=%d/%d blocks=%d next=%d fanout=%u/%u scope=%d",
+            ordinal, consumer_ring, consumer_local, consumer_raw,
+            static_cast<int>(consumer.task_state.load(std::memory_order_acquire)), fanin_ref, consumer.fanin_count,
+            (lifecycle & PTO2_READY_CLAIMED) ? 1 : 0, (lifecycle & PTO2_COMPLETION_DONE) ? 1 : 0,
+            static_cast<int>(consumer.active_mask.to_shape()), consumer.task_attrs.requires_sync_start() ? 1 : 0,
+            consumer.task_attrs.allow_early_resolve() ? 1 : 0, static_cast<unsigned>(early_state),
+            static_cast<unsigned>(launch_state), static_cast<unsigned>(sync_drain), popcount_staged_cores(payload),
+            running_slots, dispatch_fanin, fanin_actual, published,
+            consumer.completed_subtasks.load(std::memory_order_acquire), consumer.total_required_subtasks,
+            consumer.logical_block_num, consumer.next_block_idx.load(std::memory_order_acquire),
+            fanout_ref & ~PTO2_FANOUT_SCOPE_BIT, consumer.fanout_count & ~PTO2_FANOUT_SCOPE_BIT,
+            (fanout_ref & PTO2_FANOUT_SCOPE_BIT) ? 1 : 0
+        );
+    }
+
+    static void dump_producer_snapshot(int32_t ordinal, PTO2TaskSlotState *producer) {
+        if (producer == nullptr) {
+            LOG_ERROR("        [p%02d] producer is null", ordinal);
+            return;
+        }
+        PTO2TaskPayload *payload = producer->payload;
+        int32_t producer_ring = static_cast<int32_t>(producer->ring_id);
+        int32_t producer_local = -1;
+        uint64_t producer_raw = UINT64_MAX;
+        if (producer->task != nullptr) {
+            producer_ring = static_cast<int32_t>(producer->task->task_id.ring());
+            producer_local = static_cast<int32_t>(producer->task->task_id.local());
+            producer_raw = producer->task->task_id.raw;
+        }
+        uint8_t lifecycle = producer->lifecycle_flags.load(std::memory_order_acquire);
+        int32_t fanin_ref = producer->fanin_refcount.load(std::memory_order_acquire);
+        uint32_t fanout_ref = producer->fanout_refcount.load(std::memory_order_acquire);
+        uint8_t early_state = payload == nullptr ? 0 : payload->early_dispatch_state.load(std::memory_order_acquire);
+        uint8_t launch_state =
+            payload == nullptr ? 0 : payload->early_dispatch_launch_state.load(std::memory_order_acquire);
+        int32_t dispatch_fanin = payload == nullptr ? -1 : payload->dispatch_fanin.load(std::memory_order_acquire);
+        int32_t fanin_actual = payload == nullptr ? -1 : payload->fanin_actual_count;
+        int32_t published = payload == nullptr ? -1 : payload->published_block_count.load(std::memory_order_acquire);
+        LOG_ERROR(
+            "        [p%02d] producer ring=%d local=%d raw=%" PRIu64
+            " state=%d fanin=%d/%d ready=%d completed_flag=%d shape=%d sync=%d early=%d"
+            " ed_state=%u launch=%u dispatch_fanin=%d/%d published=%d"
+            " subtasks=%d/%d blocks=%d next=%d fanout=%u/%u scope=%d",
+            ordinal, producer_ring, producer_local, producer_raw,
+            static_cast<int>(producer->task_state.load(std::memory_order_acquire)), fanin_ref, producer->fanin_count,
+            (lifecycle & PTO2_READY_CLAIMED) ? 1 : 0, (lifecycle & PTO2_COMPLETION_DONE) ? 1 : 0,
+            static_cast<int>(producer->active_mask.to_shape()), producer->task_attrs.requires_sync_start() ? 1 : 0,
+            producer->task_attrs.allow_early_resolve() ? 1 : 0, static_cast<unsigned>(early_state),
+            static_cast<unsigned>(launch_state), dispatch_fanin, fanin_actual, published,
+            producer->completed_subtasks.load(std::memory_order_acquire), producer->total_required_subtasks,
+            producer->logical_block_num, producer->next_block_idx.load(std::memory_order_acquire),
+            fanout_ref & ~PTO2_FANOUT_SCOPE_BIT, producer->fanout_count & ~PTO2_FANOUT_SCOPE_BIT,
+            (fanout_ref & PTO2_FANOUT_SCOPE_BIT) ? 1 : 0
+        );
+    }
+
+    static void dump_pending_producer_fanin_snapshot(int32_t producer_ordinal, PTO2TaskSlotState &producer) {
+        constexpr int kMaxProducerDump = 16;
+        PTO2TaskPayload *payload = producer.payload;
+        if (payload == nullptr) {
+            LOG_ERROR("          producer[p%02d] own fanin unavailable: payload=null", producer_ordinal);
+            return;
+        }
+        int32_t fanin_actual = payload->fanin_actual_count;
+        int32_t inline_count = std::min(fanin_actual, PTO2_FANIN_INLINE_CAP);
+        int32_t dumped = std::min(inline_count, kMaxProducerDump);
+        LOG_ERROR(
+            "          producer[p%02d] own fanin snapshot: fanin_ref=%d fanin_count=%d actual=%d dumped=%d"
+            " inline_cap=%d",
+            producer_ordinal, producer.fanin_refcount.load(std::memory_order_acquire), producer.fanin_count,
+            fanin_actual, dumped, PTO2_FANIN_INLINE_CAP
+        );
+        for (int32_t i = 0; i < dumped; i++) {
+            dump_producer_snapshot(i, payload->fanin_inline_slot_states[i]);
+        }
+        if (fanin_actual > kMaxProducerDump) {
+            LOG_ERROR(
+                "          producer[p%02d] own fanin dump truncated after %d producers.", producer_ordinal,
+                kMaxProducerDump
+            );
+        }
+        if (fanin_actual > PTO2_FANIN_INLINE_CAP) {
+            LOG_ERROR(
+                "          producer[p%02d] has %d spilled fanin producers not dumped by this fatal snapshot.",
+                producer_ordinal, fanin_actual - PTO2_FANIN_INLINE_CAP
+            );
+        }
+    }
+
+    static void dump_consumer_fanin_snapshot(int32_t consumer_ordinal, PTO2TaskSlotState &consumer) {
+        constexpr int kMaxProducerDump = 64;
+        PTO2TaskPayload *payload = consumer.payload;
+        if (payload == nullptr) {
+            LOG_ERROR("      consumer[%02d] fanin producers unavailable: payload=null", consumer_ordinal);
+            return;
+        }
+        int32_t fanin_actual = payload->fanin_actual_count;
+        int32_t inline_count = std::min(fanin_actual, PTO2_FANIN_INLINE_CAP);
+        LOG_ERROR(
+            "      consumer[%02d] fanin producer snapshot: fanin_ref=%d fanin_count=%d actual=%d dumped=%d"
+            " inline_cap=%d",
+            consumer_ordinal, consumer.fanin_refcount.load(std::memory_order_acquire), consumer.fanin_count,
+            fanin_actual, std::min(inline_count, kMaxProducerDump), PTO2_FANIN_INLINE_CAP
+        );
+        for (int32_t i = 0; i < inline_count && i < kMaxProducerDump; i++) {
+            PTO2TaskSlotState *producer = payload->fanin_inline_slot_states[i];
+            dump_producer_snapshot(i, producer);
+            if (producer != nullptr && producer->task_state.load(std::memory_order_acquire) == PTO2_TASK_PENDING) {
+                dump_pending_producer_fanin_snapshot(i, *producer);
+            }
+        }
+        if (fanin_actual > kMaxProducerDump) {
+            LOG_ERROR(
+                "      consumer[%02d] fanin dump truncated after %d producers.", consumer_ordinal, kMaxProducerDump
+            );
+        }
+        if (fanin_actual > PTO2_FANIN_INLINE_CAP) {
+            LOG_ERROR(
+                "      consumer[%02d] has %d spilled fanin producers not dumped by this lightweight fatal snapshot.",
+                consumer_ordinal, fanin_actual - PTO2_FANIN_INLINE_CAP
+            );
+        }
+    }
+
+    void dump_head_fanout_diagnostics(PTO2TaskSlotState &head) const {
+        constexpr int kMaxConsumerDump = 96;
+        PTO2DepListEntry *edge = head.fanout_head;
+        int32_t total = 0;
+        int32_t dumped = 0;
+        int32_t waiting_fanin = 0;
+        int32_t ready_claimed = 0;
+        int32_t completed = 0;
+        int32_t consumed = 0;
+        int32_t sync_start = 0;
+        int32_t early_staging = 0;
+        int32_t early_dispatched = 0;
+        int32_t launch_incomplete = 0;
+        int32_t subtasks_incomplete = 0;
+        int32_t no_task_ptr = 0;
+
+        LOG_ERROR(
+            "  Head fanout consumer snapshot (edge release is aggregate; individual release bits are not tracked):"
+        );
+        while (edge != nullptr) {
+            PTO2TaskSlotState *consumer = edge->slot_state;
+            if (consumer == nullptr) {
+                no_task_ptr++;
+                edge = edge->next;
+                total++;
+                continue;
+            }
+            total++;
+            PTO2TaskState state = consumer->task_state.load(std::memory_order_acquire);
+            if (consumer->fanin_refcount.load(std::memory_order_acquire) < consumer->fanin_count) waiting_fanin++;
+            uint8_t lifecycle = consumer->lifecycle_flags.load(std::memory_order_acquire);
+            if ((lifecycle & PTO2_READY_CLAIMED) != 0) ready_claimed++;
+            if (state == PTO2_TASK_COMPLETED) completed++;
+            if (state == PTO2_TASK_CONSUMED) consumed++;
+            if (consumer->task_attrs.requires_sync_start()) sync_start++;
+            PTO2TaskPayload *payload = consumer->payload;
+            if (payload != nullptr) {
+                uint8_t ed = payload->early_dispatch_state.load(std::memory_order_acquire);
+                uint8_t launch = payload->early_dispatch_launch_state.load(std::memory_order_acquire);
+                if (ed == PTO2_EARLY_DISPATCH_STAGING) early_staging++;
+                if (ed == PTO2_EARLY_DISPATCH_DISPATCHED) early_dispatched++;
+                if (ed == PTO2_EARLY_DISPATCH_DISPATCHED && launch != PTO2_EARLY_DISPATCH_LAUNCH_COMPLETE) {
+                    launch_incomplete++;
+                }
+            }
+            if (consumer->completed_subtasks.load(std::memory_order_acquire) < consumer->total_required_subtasks) {
+                subtasks_incomplete++;
+            }
+            if (dumped < kMaxConsumerDump) {
+                dump_consumer_snapshot(dumped, *consumer);
+                if (state != PTO2_TASK_CONSUMED) {
+                    dump_consumer_fanin_snapshot(dumped, *consumer);
+                }
+                dumped++;
+            }
+            edge = edge->next;
+        }
+        LOG_ERROR(
+            "  Head fanout summary: total_edges=%d dumped=%d waiting_fanin=%d ready_claimed=%d completed=%d"
+            " consumed=%d sync_start=%d early_staging=%d early_dispatched=%d launch_incomplete=%d"
+            " subtasks_incomplete=%d null_consumers=%d",
+            total, dumped, waiting_fanin, ready_claimed, completed, consumed, sync_start, early_staging,
+            early_dispatched, launch_incomplete, subtasks_incomplete, no_task_ptr
+        );
+        if (total > dumped) {
+            LOG_ERROR("  Head fanout dump truncated after %d consumers.", dumped);
+        }
+
+        int32_t claimed_total = head.debug_fanout_consumer_count.load(std::memory_order_relaxed);
+        int32_t claimed_dumped = std::min(claimed_total, PTO2_DEBUG_FANOUT_CONSUMER_CAP);
+        LOG_ERROR(
+            "  Head claimed consumer snapshot: total_claims=%d dumped=%d cap=%d", claimed_total, claimed_dumped,
+            PTO2_DEBUG_FANOUT_CONSUMER_CAP
+        );
+        for (int32_t i = 0; i < claimed_dumped; i++) {
+            PTO2TaskSlotState *consumer = head.debug_fanout_consumers[i];
+            if (consumer == nullptr) {
+                LOG_ERROR("    [%02d] claimed consumer is null", i);
+                continue;
+            }
+            dump_consumer_snapshot(i, *consumer);
+            if (consumer->task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) {
+                dump_consumer_fanin_snapshot(i, *consumer);
+            }
+        }
+    }
+
     /**
      * Report deadlock with targeted diagnostics. scope_gated == true means the
      * head-of-line structural test proved it (waiting only on scope_end);
@@ -453,6 +698,7 @@ private:
                 static_cast<int>(h.task_state.load(std::memory_order_acquire)), rc & ~PTO2_FANOUT_SCOPE_BIT,
                 fc & ~PTO2_FANOUT_SCOPE_BIT, (rc & PTO2_FANOUT_SCOPE_BIT) ? 1 : 0
             );
+            dump_head_fanout_diagnostics(h);
         }
         LOG_ERROR("Solution:");
         if (scope_gated) {
