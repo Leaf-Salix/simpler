@@ -268,11 +268,18 @@ private:
     // =========================================================================
 
     /**
-     * Commit a task slot: bump local counter and publish to shared memory.
-     * Must only be called after space check has passed.
+     * Commit a task slot and publish it to scheduler reclaim scans.
+     *
+     * Reclaimed slots deliberately retain CONSUMED until reuse. Mark the new
+     * generation PENDING before publishing current_task_index so a concurrent
+     * scan cannot mistake it for the previous generation and advance past it.
+     * No other scheduler path can discover the task before fanin wiring.
      */
     int32_t commit_task() {
         int32_t task_id = local_task_id_++;
+        if (slot_states_ != nullptr) {
+            slot_states_[task_id & window_mask_].task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
+        }
         current_index_ptr_->store(local_task_id_, std::memory_order_release);
         return task_id;
     }

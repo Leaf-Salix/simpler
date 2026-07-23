@@ -76,6 +76,7 @@ protected:
     static constexpr uint64_t HEAP_SIZE = 4096;
 
     std::vector<PTO2TaskDescriptor> descriptors;
+    std::vector<PTO2TaskSlotState> slot_states;
     alignas(64) uint8_t heap_buf[HEAP_SIZE]{};
     std::atomic<int32_t> current_index{0};
     std::atomic<int32_t> last_alive{0};
@@ -84,11 +85,15 @@ protected:
 
     void SetUp() override {
         descriptors.assign(WINDOW_SIZE, PTO2TaskDescriptor{});
+        slot_states = std::vector<PTO2TaskSlotState>(WINDOW_SIZE);
         std::memset(heap_buf, 0, sizeof(heap_buf));
         current_index.store(0);
         last_alive.store(0);
         error_code.store(PTO2_ERROR_NONE);
-        allocator.init(descriptors.data(), WINDOW_SIZE, &current_index, &last_alive, heap_buf, HEAP_SIZE, &error_code);
+        allocator.init(
+            descriptors.data(), WINDOW_SIZE, &current_index, &last_alive, heap_buf, HEAP_SIZE, &error_code,
+            slot_states.data()
+        );
     }
 };
 
@@ -118,6 +123,25 @@ TEST_F(TaskAllocatorTest, AllocNonZeroSize) {
         static_cast<char *>(result.packed_end) - static_cast<char *>(result.packed_base),
         static_cast<ptrdiff_t>(expected_aligned)
     );
+}
+
+TEST_F(TaskAllocatorTest, AllocPublishesPendingSlotBeforeCurrentIndex) {
+    slot_states[0].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_relaxed);
+    std::atomic<PTO2TaskState> observed_state{PTO2_TASK_CONSUMED};
+    std::thread observer([&]() {
+        while (current_index.load(std::memory_order_acquire) == 0) {
+            std::this_thread::yield();
+        }
+        observed_state.store(slot_states[0].task_state.load(std::memory_order_acquire), std::memory_order_release);
+    });
+
+    auto result = allocator.alloc(100);
+    observer.join();
+
+    ASSERT_FALSE(result.failed());
+    EXPECT_EQ(result.task_id, 0);
+    EXPECT_EQ(current_index.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(observed_state.load(std::memory_order_acquire), PTO2_TASK_PENDING);
 }
 
 TEST_F(TaskAllocatorTest, SequentialTaskIds) {

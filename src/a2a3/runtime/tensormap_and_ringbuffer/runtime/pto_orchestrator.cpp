@@ -538,9 +538,10 @@ static bool prepare_task(
     // Reset the fanout/fanin bookkeeping for this reuse. The allocator only
     // returns a slot whose previous occupant is CONSUMED and quiescent (alloc
     // spins until last_task_alive passes it; in-order reclaim + acquire load),
-    // and the slot is not published to any scheduler thread until the
-    // Orch-side wiring publish at the end of submit_task_common — so this reset
-    // is race-free. Doing it here (not relying on the scheduler's eager
+    // and marks task_state PENDING before publishing current_task_index. Reclaim
+    // may now inspect the state, but no dispatch path can discover the slot until
+    // Orch-side wiring, so this reset is race-free. Doing it here (not relying
+    // on the scheduler's eager
     // reset-after-CONSUMED, which only covers the contiguously-reclaimed tail)
     // makes every reused slot self-clean, which lets the per-boot SM init skip
     // its O(window) per-slot loop. bind_ring is slot-invariant but cheap to
@@ -572,7 +573,7 @@ static bool prepare_task(
     // Fields immutable after RingSchedState::init():
     //   ring_id
     // task_state left as CONSUMED by eager reset (safe for stale wait_for_tensor
-    // observers); set to PENDING here when orchestrator actually reuses the slot.
+    // observers); allocator commit set it to PENDING before publishing the slot.
     out->slot_state->task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
     int16_t block_num = args.launch_spec.block_num();
     out->slot_state->total_required_subtasks =
