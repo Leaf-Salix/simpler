@@ -442,6 +442,8 @@ bool PTO2OrchestratorState::reset_for_reuse(
     orch->gm_heap_size = total_heap_size;
     orch->fatal = false;
     orch->inline_completed_tasks = 0;
+    orch->dense_fanout_count = 0;
+    orch->dense_fanin_count = 0;
 
     uint32_t next_epoch = orch->fanin_seen_current_epoch + 1;
     if (next_epoch == 0) {

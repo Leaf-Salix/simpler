@@ -319,14 +319,15 @@ static bool append_fanin_or_fail(
     g_orch_args_atomic_count += claim ? 3 : 2;
 #endif
     // Dense-fanout diagnostic, emitted outside fanout_lock (no logging under the
-    // spinlock). The monotonic fanout_count++ crosses THRESHOLD+1 exactly once,
-    // so each dense producer warns exactly once and the AICPU hot path keeps a
-    // single predicted-not-taken branch on the common case.
+    // spinlock). Sample the first producer and summarize the full count at run
+    // end; large graphs can contain tens of thousands of dense producers.
     if (fanout_now == PTO2_DEP_DEGREE_WARN_THRESHOLD + 1) {
-        LOG_WARN(
-            "dense dependency: task ring=%u id=%u fanout>%d [orch submit]",
-            static_cast<unsigned>(producer_task_id.ring()), producer_task_id.local(), PTO2_DEP_DEGREE_WARN_THRESHOLD
-        );
+        if (orch->dense_fanout_count++ == 0) {
+            LOG_WARN(
+                "dense dependency sample: task ring=%u id=%u fanout>%d [orch submit]",
+                static_cast<unsigned>(producer_task_id.ring()), producer_task_id.local(), PTO2_DEP_DEGREE_WARN_THRESHOLD
+            );
+        }
     }
     // gone (stale/consumed) or an already-seen duplicate live producer: no new
     // fanin edge either way.
@@ -951,15 +952,16 @@ static TaskOutputTensors submit_task_common(
     int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
     // Store fanin metadata in payload for scheduler to iterate
     payload.fanin_actual_count = fanin_builder.count;
-    // Dense-fanin diagnostic: fanin_builder.count is finalized here and submit
-    // runs once per task, so each dense consumer warns exactly once. The check
-    // is > THRESHOLD (not == THRESHOLD+1): the count lands at its total here, so
-    // an == crossing test would miss a task that jumps straight past THRESHOLD+1.
+    // Dense-fanin diagnostic: sample the first dense consumer and summarize the
+    // full count at run end. The check is > THRESHOLD (not == THRESHOLD+1):
+    // the count lands at its total here.
     if (fanin_builder.count > PTO2_DEP_DEGREE_WARN_THRESHOLD) {
-        LOG_WARN(
-            "dense dependency: task ring=%u id=%u fanin>%d [orch submit]", static_cast<unsigned>(task_id.ring()),
-            task_id.local(), PTO2_DEP_DEGREE_WARN_THRESHOLD
-        );
+        if (orch->dense_fanin_count++ == 0) {
+            LOG_WARN(
+                "dense dependency sample: task ring=%u id=%u fanin>%d [orch submit]",
+                static_cast<unsigned>(task_id.ring()), task_id.local(), PTO2_DEP_DEGREE_WARN_THRESHOLD
+            );
+        }
     }
     payload.fanin_spill_start = fanin_builder.spill_start;
     payload.fanin_spill_pool = &fanin_builder.spill_pool;
@@ -1265,6 +1267,12 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
 
 void PTO2OrchestratorState::mark_done() {
     auto *orch = this;
+    if (orch->dense_fanout_count != 0 || orch->dense_fanin_count != 0) {
+        LOG_WARN(
+            "dense dependency summary: fanout_producers=%" PRIu64 " fanin_consumers=%" PRIu64, orch->dense_fanout_count,
+            orch->dense_fanin_count
+        );
+    }
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         int32_t total_tasks = orch->rings[r].task_allocator.active_count();
         if (total_tasks > 0) {

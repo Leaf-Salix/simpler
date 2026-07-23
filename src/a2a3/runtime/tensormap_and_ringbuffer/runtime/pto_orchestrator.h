@@ -118,6 +118,11 @@ struct PTO2OrchestratorState {
     // after orchestration finishes so shutdown/profiling totals remain closed.
     int64_t inline_completed_tasks{0};
 
+    // Dense dependency diagnostics are sampled once and summarized at run end.
+    // Logging every dense producer can dominate orchestration on large graphs.
+    uint64_t dense_fanout_count{0};
+    uint64_t dense_fanin_count{0};
+
     // === STATISTICS ===
 #if SIMPLER_DFX
     int64_t tasks_submitted;
