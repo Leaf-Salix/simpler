@@ -30,58 +30,6 @@
 #include "runtime.h"
 #include "spin_hint.h"
 
-namespace {
-struct alignas(64) SchedulerDiagState {
-    std::atomic<int32_t> phase{static_cast<int32_t>(SchedulerDiagPhase::Uninitialized)};
-    std::atomic<int32_t> core_id{-1};
-    std::atomic<int64_t> task_id{-1};
-};
-
-SchedulerDiagState g_scheduler_diag_state[MAX_AICPU_THREADS];
-
-const char *scheduler_diag_phase_name(SchedulerDiagPhase phase) {
-    switch (phase) {
-        case SchedulerDiagPhase::Uninitialized: return "uninitialized";
-        case SchedulerDiagPhase::LoopTop: return "loop_top";
-        case SchedulerDiagPhase::CompletionPoll: return "completion_poll";
-        case SchedulerDiagPhase::CompleteSlot: return "complete_slot";
-        case SchedulerDiagPhase::FanoutWalk: return "fanout_walk";
-        case SchedulerDiagPhase::MailboxPush: return "mailbox_push";
-        case SchedulerDiagPhase::AsyncPoll: return "async_poll";
-        case SchedulerDiagPhase::Drain: return "drain";
-        case SchedulerDiagPhase::Dummy: return "dummy";
-        case SchedulerDiagPhase::DispatchReady: return "dispatch_ready";
-        case SchedulerDiagPhase::EarlyDispatch: return "early_dispatch";
-        case SchedulerDiagPhase::Release: return "release";
-        case SchedulerDiagPhase::Idle: return "idle";
-        case SchedulerDiagPhase::Exit: return "exit";
-    }
-    return "invalid";
-}
-}  // namespace
-
-void scheduler_diag_set_phase(int32_t thread_idx, SchedulerDiagPhase phase, int32_t core_id, int64_t task_id) {
-    if (thread_idx < 0 || thread_idx >= MAX_AICPU_THREADS) return;
-    SchedulerDiagState &state = g_scheduler_diag_state[thread_idx];
-    state.core_id.store(core_id, std::memory_order_relaxed);
-    state.task_id.store(task_id, std::memory_order_relaxed);
-    state.phase.store(static_cast<int32_t>(phase), std::memory_order_relaxed);
-}
-
-extern "C" void pto2_log_scheduler_phase_snapshot() {
-    for (int32_t thread_idx = 0; thread_idx < MAX_AICPU_THREADS; thread_idx++) {
-        SchedulerDiagState &state = g_scheduler_diag_state[thread_idx];
-        SchedulerDiagPhase phase =
-            static_cast<SchedulerDiagPhase>(state.phase.load(std::memory_order_relaxed));
-        if (phase == SchedulerDiagPhase::Uninitialized) continue;
-        LOG_WARN(
-            "[SCHED_PHASE] thread=%d phase=%s core=%d task=%" PRId64, thread_idx,
-            scheduler_diag_phase_name(phase), state.core_id.load(std::memory_order_relaxed),
-            state.task_id.load(std::memory_order_relaxed)
-        );
-    }
-}
-
 // =============================================================================
 // Cold-path helpers for the main dispatch loop (noinline to reduce hot-loop icache)
 // =============================================================================

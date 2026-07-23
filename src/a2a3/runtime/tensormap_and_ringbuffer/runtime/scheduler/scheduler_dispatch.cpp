@@ -1004,7 +1004,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     }
 
     while (true) {
-        scheduler_diag_set_phase(thread_idx, SchedulerDiagPhase::LoopTop);
         if (completed_.load(std::memory_order_acquire)) {
             break;
         }
@@ -1039,7 +1038,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         bool try_completed = tracker.has_any_running_cores();
         if (try_completed) {
-            scheduler_diag_set_phase(thread_idx, SchedulerDiagPhase::CompletionPoll);
             check_running_cores_for_completion(
                 thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress,
                 deferred_release_slot_states, deferred_release_count
@@ -1099,7 +1097,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
             (sched_->async_wait_list.count > 0 || rt_->aicore_mailbox->has_pending())) {
-            scheduler_diag_set_phase(thread_idx, SchedulerDiagPhase::AsyncPoll);
             AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
                 rt_->aicore_mailbox, sched_, deferred_release_slot_states, deferred_release_count,
                 PTO2_DEFERRED_RELEASE_CAP
@@ -1161,7 +1158,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
-            scheduler_diag_set_phase(thread_idx, SchedulerDiagPhase::Drain);
             // Diagnostic branch only: a pending drain bypasses the normal idle
             // watchdog below, so sample global progress at a low cadence and
             // emit one cold snapshot before the device-level AICPU timeout.
@@ -1228,7 +1224,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // uses per-slot locks/atomics, so multiple scheduler threads can share
         // the dependency-only resolve work.
         if (thread_idx < 3) {
-            scheduler_diag_set_phase(thread_idx, SchedulerDiagPhase::Dummy);
             constexpr int DUMMY_DRAIN_BATCH = 8;
             PTO2TaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
             int dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH);
@@ -1336,7 +1331,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if SIMPLER_DFX
         uint64_t dispatch_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
-        scheduler_diag_set_phase(thread_idx, SchedulerDiagPhase::DispatchReady);
         dispatch_ready_tasks(thread_idx, tracker, pmu_active, made_progress, try_pushed);
 #if SIMPLER_DFX
         // Emit Dispatch IMMEDIATELY after dispatch_ready_tasks so its span
@@ -1377,7 +1371,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         bool early_dispatch_record = l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES;
         uint64_t early_dispatch_t0 = early_dispatch_record ? get_sys_cnt_aicpu() : 0;
 #endif
-        scheduler_diag_set_phase(thread_idx, SchedulerDiagPhase::EarlyDispatch);
         [[maybe_unused]] int32_t staged_count =
             try_early_dispatch(thread_idx, tracker, pmu_active, made_progress, try_pushed);
 #if SIMPLER_DFX
@@ -1420,7 +1413,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             last_progress_ts = get_sys_cnt_aicpu();
             last_global_progress_count = completed_tasks_.load(std::memory_order_relaxed);
         } else {
-            scheduler_diag_set_phase(thread_idx, SchedulerDiagPhase::Release);
 #if SIMPLER_DFX
             uint64_t rel_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && deferred_release_count > 0) ?
                                   get_sys_cnt_aicpu() :
@@ -1449,7 +1441,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
 #endif
             idle_iterations++;
-            scheduler_diag_set_phase(thread_idx, SchedulerDiagPhase::Idle);
 
             if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0) {
                 LoopAction action = check_idle_fatal_error(thread_idx, header, runtime);
@@ -1533,7 +1524,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
         }
     }
-    scheduler_diag_set_phase(thread_idx, SchedulerDiagPhase::Exit);
 
     // Drain any entries left in the deferred-release batch. The in-loop flush
     // only fires on idle iterations and on buffer-full; a loop exit while the
