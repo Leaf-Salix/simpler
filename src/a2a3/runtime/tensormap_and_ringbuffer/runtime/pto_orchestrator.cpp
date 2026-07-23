@@ -516,11 +516,7 @@ static bool log_heap_hol_consumers(PTO2SchedulerState *sched, uint8_t head_ring_
     if (!head_sched.advance_lock.compare_exchange_strong(
             expected, 1, std::memory_order_acquire, std::memory_order_relaxed
         )) {
-        LOG_ERROR(
-            "[HEAP_HOL] ring=%u head=%d snapshot=advance_lock_busy lock=%d", static_cast<unsigned>(head_ring_id),
-            head_task_id, expected
-        );
-        return true;
+        return false;
     }
 
     PTO2SharedMemoryRingHeader &head_ring = *head_sched.ring;
@@ -614,7 +610,7 @@ static bool log_heap_hol_consumers(PTO2SchedulerState *sched, uint8_t head_ring_
                 }
             });
             if (producer_pending > 0) {
-                LOG_ERROR(
+                LOG_WARN(
                     "[HEAP_HOL_FANIN] consumer_ring=%d consumer=%d pending_producers=%d first=%" PRId64
                     " fanin=%d/%d subtasks=%d/%d next_block=%d/%d flags=0x%x",
                     ring_id, task_id, producer_pending, first_pending_producer, first_pending_fanin_refcount,
@@ -622,7 +618,7 @@ static bool log_heap_hol_consumers(PTO2SchedulerState *sched, uint8_t head_ring_
                     first_pending_next_block, first_pending_logical_blocks, first_pending_flags
                 );
             }
-            LOG_ERROR(
+            LOG_WARN(
                 "[HEAP_HOL_CONSUMER] head=%d ring=%d task=%d state=%d fanin=%d/%d producers=%d/%d/%d "
                 "subtasks=%d/%d next_block=%d/%d flags=0x%x early_state=%u early_sync=0x%x",
                 head_task_id, ring_id, task_id, static_cast<int32_t>(state), fanin_refcount, consumer.fanin_count,
@@ -641,7 +637,7 @@ static bool log_heap_hol_consumers(PTO2SchedulerState *sched, uint8_t head_ring_
     int32_t outstanding = static_cast<int32_t>(fanout_count & ~PTO2_FANOUT_SCOPE_BIT) -
                           static_cast<int32_t>(fanout_refcount & ~PTO2_FANOUT_SCOPE_BIT);
     bool head_still_current = head_ring.fc.last_task_alive.load(std::memory_order_acquire) == head_task_id;
-    LOG_ERROR(
+    LOG_WARN(
         "[HEAP_HOL] ring=%u current=%d head=%d state=%d outstanding=%d matching_live=%d pending=%d "
         "pending_ready=%d completed=%d consumed=%d scope_released=%d logged_pending=%d head_still_current=%d "
         "heap_waiting=1",
