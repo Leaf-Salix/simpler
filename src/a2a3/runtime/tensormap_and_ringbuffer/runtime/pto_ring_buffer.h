@@ -132,6 +132,7 @@ public:
         }
 
         uint64_t spin_count = 0;
+        uint64_t last_block_notify_ts = get_sys_cnt_aicpu();
         int32_t prev_last_alive = last_alive_ptr_->load(std::memory_order_acquire);
         int32_t last_alive = prev_last_alive;
         update_heap_tail(last_alive);
@@ -199,7 +200,9 @@ public:
                     clear_reclaim_wait();
                     return {-1, -1, nullptr, nullptr};
                 }
-                if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0) {
+                uint64_t now = get_sys_cnt_aicpu();
+                if (now - last_block_notify_ts >= PLATFORM_PROF_SYS_CNT_FREQ) {
+                    last_block_notify_ts = now;
                     LOG_WARN(
                         "[TaskAllocator ring=%u] BLOCKED: tasks=%d/%d, heap_used=%" PRIu64 "/%" PRIu64
                         ", heap_available=%" PRIu64 ", heap_cursor=%" PRIu64 ", on=%s, spins=%" PRIu64,

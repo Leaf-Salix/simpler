@@ -985,6 +985,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     int32_t drain_last_progress_count = completed_tasks_.load(std::memory_order_relaxed);
     uint32_t drain_diag_iterations = 0;
     bool drain_stall_dumped = false;
+    uint64_t reclaim_last_progress_ts = last_progress_ts;
+    int32_t reclaim_last_progress_count = completed_tasks_.load(std::memory_order_relaxed);
+    uint32_t reclaim_diag_iterations = 0;
+    bool reclaim_stall_dumped = false;
     // An idle worker may observe progress made by a sibling only through this
     // shared completion counter. Sample it on the existing cold error-check
     // cadence so a busy sibling refreshes the no-progress budget globally.
@@ -1166,7 +1170,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 } else if (thread_idx == 0 && !drain_stall_dumped &&
                            now - drain_last_progress_ts >= PLATFORM_PROF_SYS_CNT_FREQ) {
                     drain_stall_dumped = true;
-                    log_drain_stall_snapshot(thread_idx, now - drain_last_progress_ts);
+                    log_scheduler_stall_snapshot("sync_start_drain", thread_idx, now - drain_last_progress_ts);
                 }
             }
 #if SIMPLER_DFX
@@ -1196,6 +1200,21 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         drain_stall_dumped = false;
         drain_last_progress_ts = get_sys_cnt_aicpu();
         drain_last_progress_count = completed_tasks_.load(std::memory_order_relaxed);
+
+        if ((++reclaim_diag_iterations & 0xfffu) == 0) {
+            int32_t reclaim_progress = completed_tasks_.load(std::memory_order_relaxed);
+            bool reclaim_waiting = header->orchestrator_reclaim_waiting.load(std::memory_order_acquire) != 0;
+            uint64_t now = get_sys_cnt_aicpu();
+            if (!reclaim_waiting || reclaim_progress != reclaim_last_progress_count) {
+                reclaim_last_progress_count = reclaim_progress;
+                reclaim_last_progress_ts = now;
+                reclaim_stall_dumped = false;
+            } else if (thread_idx == 0 && !reclaim_stall_dumped &&
+                       now - reclaim_last_progress_ts >= PLATFORM_PROF_SYS_CNT_FREQ) {
+                reclaim_stall_dumped = true;
+                log_scheduler_stall_snapshot("heap_reclaim", thread_idx, now - reclaim_last_progress_ts);
+            }
+        }
 
         // Phase 3: Drain dummy ready queue (S0/S1/S2).
         //
