@@ -104,6 +104,9 @@ public:
         heap_top_ = 0;
         heap_tail_ = 0;
         last_alive_seen_ = 0;
+#if SIMPLER_DFX
+        next_heap_hol_sample_task_id_ = 0;
+#endif
     }
 
     /**
@@ -182,6 +185,12 @@ public:
 #endif
             last_alive = last_alive_ptr_->load(std::memory_order_acquire);
             update_heap_tail(last_alive);
+#if SIMPLER_DFX
+            if (blocked_on_heap && local_task_id_ >= next_heap_hol_sample_task_id_) {
+                log_heap_hol_sample(last_alive);
+                next_heap_hol_sample_task_id_ = local_task_id_ + (1 << 17);
+            }
+#endif
             if (last_alive > prev_last_alive) {
                 // Reclaim advanced -> productive backpressure, not a deadlock.
                 spin_count = 0;
@@ -259,6 +268,9 @@ private:
     uint64_t heap_top_ = 0;        // Current heap allocation pointer
     uint64_t heap_tail_ = 0;       // Heap reclamation pointer (derived from consumed tasks)
     int32_t last_alive_seen_ = 0;  // last_task_alive at last heap_tail derivation
+#if SIMPLER_DFX
+    int32_t next_heap_hol_sample_task_id_ = 0;
+#endif
 
     // --- Shared ---
     std::atomic<int32_t> *error_code_ptr_ = nullptr;
@@ -266,6 +278,40 @@ private:
     // =========================================================================
     // Internal helpers
     // =========================================================================
+
+#if SIMPLER_DFX
+    void log_heap_hol_sample(int32_t last_alive) const {
+        if (slot_states_ == nullptr || local_task_id_ <= last_alive) return;
+
+        int32_t pending = 0;
+        int32_t completed = 0;
+        int32_t consumed = 0;
+        uint64_t consumed_bytes = 0;
+        for (int32_t task_id = last_alive; task_id < local_task_id_; ++task_id) {
+            int32_t slot = task_id & window_mask_;
+            PTO2TaskState state = slot_states_[slot].task_state.load(std::memory_order_acquire);
+            if (state == PTO2_TASK_PENDING) {
+                pending++;
+            } else if (state == PTO2_TASK_COMPLETED) {
+                completed++;
+            } else if (state == PTO2_TASK_CONSUMED) {
+                consumed++;
+                auto *base = static_cast<char *>(descriptors_[slot].packed_buffer_base);
+                auto *end = static_cast<char *>(descriptors_[slot].packed_buffer_end);
+                consumed_bytes += static_cast<uint64_t>(end - base);
+            }
+        }
+
+        int32_t head_slot = last_alive & window_mask_;
+        int32_t head_state = static_cast<int32_t>(slot_states_[head_slot].task_state.load(std::memory_order_acquire));
+        LOG_WARN(
+            "[HEAP_HOL_SAMPLE] ring=%u current=%d last_alive=%d head_state=%d pending=%d completed=%d consumed=%d "
+            "consumed_bytes=%" PRIu64 " heap_used=%" PRIu64 "/%" PRIu64,
+            static_cast<unsigned>(ring_id_), local_task_id_, last_alive, head_state, pending, completed, consumed,
+            consumed_bytes, heap_used_bytes(), heap_size_
+        );
+    }
+#endif
 
     /**
      * Commit a task slot: bump local counter and publish to shared memory.
