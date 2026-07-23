@@ -540,6 +540,7 @@ struct alignas(64) SyncStartDrainState {
     std::atomic<int32_t> drain_worker_elected{0};  // 0=none; >0: elected thread's (thread_idx+1)
     std::atomic<uint32_t> drain_ack_mask{0};       // bit per thread; all-set = all threads reached ack barrier
     std::atomic<PTO2TaskSlotState *> pending_task{nullptr};  // held task (not re-queued)
+    std::atomic<uint64_t> drain_attempt{0};                  // incremented whenever an ack/election round is reset
     // Parallel staging: after the elected thread confirms global availability it sets
     // stage_go, releasing every thread to stage its OWN cores concurrently (vs the old
     // single-thread serial fill). Each thread ORs its bit into stage_done_mask when it
@@ -548,7 +549,7 @@ struct alignas(64) SyncStartDrainState {
     std::atomic<int32_t> drain_stage_go{0};          // 0=hold; 1=elected released parallel staging
     std::atomic<uint32_t> drain_stage_done_mask{0};  // bit per thread; all-set = all threads done staging
     std::atomic<int32_t> drain_running_staged{0};    // sum of running-slot cores staged (rendezvous seed)
-    int32_t _pad[7];
+    int32_t _pad[5];
 };
 static_assert(sizeof(SyncStartDrainState) == 64);
 

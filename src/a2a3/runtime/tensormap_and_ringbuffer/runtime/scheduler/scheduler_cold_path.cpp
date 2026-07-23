@@ -609,10 +609,11 @@ void SchedulerContext::log_drain_protocol_snapshot() {
 
     LOG_WARN(
         "[DRAIN_PROTOCOL epoch=%" PRIu64 "] task=%" PRId64 " block_num=%d shape=%d core_mask=0x%x gated=%d "
-        "available=%d ack=0x%x all_acked=0x%x elected=%d stage_go=%d stage_done=0x%x running_staged=%d "
-        "completed=%d/%d",
+        "available=%d attempt=%" PRIu64 " ack=0x%x all_acked=0x%x elected=%d stage_go=%d stage_done=0x%x "
+        "running_staged=%d completed=%d/%d",
         drain_diag_current_epoch(), task_id, block_num, shape_raw, static_cast<unsigned int>(core_mask), gated,
         g_drain_diag_available.load(std::memory_order_acquire),
+        drain_state_.drain_attempt.load(std::memory_order_acquire),
         drain_state_.drain_ack_mask.load(std::memory_order_acquire), (1u << active_sched_threads_) - 1,
         drain_state_.drain_worker_elected.load(std::memory_order_acquire),
         drain_state_.drain_stage_go.load(std::memory_order_acquire),
@@ -1733,6 +1734,7 @@ void SchedulerContext::deinit() {
     drain_state_.sync_start_pending.store(0, std::memory_order_release);
     drain_state_.drain_worker_elected.store(0, std::memory_order_release);
     drain_state_.drain_ack_mask.store(0, std::memory_order_release);
+    drain_state_.drain_attempt.store(0, std::memory_order_release);
     drain_state_.drain_stage_go.store(0, std::memory_order_release);
     drain_state_.drain_stage_done_mask.store(0, std::memory_order_release);
     drain_state_.drain_running_staged.store(0, std::memory_order_release);

@@ -594,6 +594,7 @@ bool SchedulerContext::enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t b
     drain_state_.drain_stage_go.store(0, std::memory_order_relaxed);
     drain_state_.drain_stage_done_mask.store(0, std::memory_order_relaxed);
     drain_state_.drain_running_staged.store(0, std::memory_order_relaxed);
+    drain_state_.drain_attempt.fetch_add(1, std::memory_order_relaxed);
     drain_diag_set_available(-1);
     drain_diag_begin();
     // Release store: all stores above are now visible to any thread that
@@ -802,6 +803,7 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
     if (block_num == 0) return;
 
     uint32_t all_acked = (1u << active_sched_threads_) - 1;
+    uint64_t drain_attempt = drain_state_.drain_attempt.load(std::memory_order_acquire);
     uint64_t diag_epoch = drain_diag_current_epoch();
     uint64_t diag_attempt = drain_diag_current_attempt();
     PTO2TaskSlotState *diag_slot = drain_state_.pending_task.load(std::memory_order_acquire);
@@ -829,7 +831,16 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
     );
     int32_t observed_owner = drain_state_.drain_worker_elected.load(std::memory_order_relaxed);
     drain_diag_note_election(thread_idx, diag_epoch, diag_task_id, diag_attempt, election_won, observed_owner);
-    bool elected = observed_owner == thread_idx + 1;
+    if (drain_state_.drain_attempt.load(std::memory_order_acquire) != drain_attempt) {
+        if (election_won) {
+            int32_t owner = thread_idx + 1;
+            drain_state_.drain_worker_elected.compare_exchange_strong(
+                owner, 0, std::memory_order_release, std::memory_order_relaxed
+            );
+        }
+        return;
+    }
+    bool elected = election_won;
 
     PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
     // OWNER is acquired before the drain is published and persists through
@@ -855,6 +866,7 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
         drain_diag_set_available(available);
         if (available < block_num) {
             // Insufficient -- reset so all threads resume completion polling to free cores, then retry.
+            drain_state_.drain_attempt.fetch_add(1, std::memory_order_acq_rel);
             drain_diag_note_retry(thread_idx, diag_epoch, diag_task_id, available);
             drain_state_.drain_ack_mask.store(0, std::memory_order_release);
             drain_state_.drain_worker_elected.store(0, std::memory_order_release);
