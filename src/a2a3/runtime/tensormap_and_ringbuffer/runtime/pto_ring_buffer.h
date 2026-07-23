@@ -35,7 +35,6 @@
 #define PTO_RING_BUFFER_H
 
 #include <algorithm>
-#include <cassert>
 #include <inttypes.h>
 #include <type_traits>
 
@@ -122,20 +121,6 @@ public:
      */
     PTO2TaskAllocResult
     alloc(int32_t output_size, PTO2SharedMemoryHeader *sm_header = nullptr, bool scheduler_runs_concurrently = false) {
-        PTO2TaskAllocResult result = reserve(output_size, sm_header, scheduler_runs_concurrently);
-        if (!result.failed()) publish_reserved(result.task_id);
-        return result;
-    }
-
-    /**
-     * Reserve a task slot and heap range without publishing current_task_index.
-     *
-     * The orchestrator uses this form so a reused slot can be fully initialized
-     * as PENDING before the scheduler includes it in reclaim scans.
-     */
-    PTO2TaskAllocResult reserve(
-        int32_t output_size, PTO2SharedMemoryHeader *sm_header = nullptr, bool scheduler_runs_concurrently = false
-    ) {
         uint64_t aligned_size =
             output_size > 0 ? PTO2_ALIGN_UP(static_cast<uint64_t>(output_size), PTO2_ALIGN_SIZE) : 0;
 
@@ -217,12 +202,6 @@ public:
         }
     }
 
-    void publish_reserved(int32_t task_id) {
-        assert(task_id == local_task_id_ - 1);
-        assert(current_index_ptr_->load(std::memory_order_relaxed) == task_id);
-        current_index_ptr_->store(task_id + 1, std::memory_order_release);
-    }
-
     // =========================================================================
     // State queries
     // =========================================================================
@@ -288,8 +267,15 @@ private:
     // Internal helpers
     // =========================================================================
 
-    /** Reserve the next task id after both slot and heap checks have passed. */
-    int32_t commit_task() { return local_task_id_++; }
+    /**
+     * Commit a task slot: bump local counter and publish to shared memory.
+     * Must only be called after space check has passed.
+     */
+    int32_t commit_task() {
+        int32_t task_id = local_task_id_++;
+        current_index_ptr_->store(local_task_id_, std::memory_order_release);
+        return task_id;
+    }
 
     /**
      * Derive heap_tail_ from the last consumed task's packed_buffer_end.

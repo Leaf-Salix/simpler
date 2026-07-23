@@ -120,17 +120,6 @@ TEST_F(TaskAllocatorTest, AllocNonZeroSize) {
     );
 }
 
-TEST_F(TaskAllocatorTest, ReservedTaskIsPublishedOnlyAfterSlotInitialization) {
-    auto result = allocator.reserve(100);
-    ASSERT_FALSE(result.failed());
-    EXPECT_EQ(result.task_id, 0);
-    EXPECT_EQ(allocator.task_head(), 1);
-    EXPECT_EQ(current_index.load(std::memory_order_acquire), 0);
-
-    allocator.publish_reserved(result.task_id);
-    EXPECT_EQ(current_index.load(std::memory_order_acquire), 1);
-}
-
 TEST_F(TaskAllocatorTest, SequentialTaskIds) {
     int32_t prev_id = -1;
     for (int i = 0; i < 5; i++) {

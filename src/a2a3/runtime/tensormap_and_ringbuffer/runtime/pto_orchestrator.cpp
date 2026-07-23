@@ -520,7 +520,7 @@ static bool prepare_task(
         return false;
     }
 
-    out->alloc_result = allocator.reserve(total_output_size, orch->sm_header, orch->scheduler_runs_concurrently);
+    out->alloc_result = allocator.alloc(total_output_size, orch->sm_header, orch->scheduler_runs_concurrently);
     if (out->alloc_result.failed()) {
         orch->fatal = true;
         if (orch->sm_header->orch_error_code.load(std::memory_order_acquire) == PTO2_ERROR_NONE &&
@@ -538,9 +538,8 @@ static bool prepare_task(
     // Reset the fanout/fanin bookkeeping for this reuse. The allocator only
     // returns a slot whose previous occupant is CONSUMED and quiescent (alloc
     // spins until last_task_alive passes it; in-order reclaim + acquire load),
-    // and reserve() does not publish current_task_index. The slot remains
-    // invisible to scheduler reclaim until submit_task_common initializes and
-    // explicitly publishes it, so this reset
+    // and the slot is not published to any scheduler thread until the
+    // Orch-side wiring publish at the end of submit_task_common — so this reset
     // is race-free. Doing it here (not relying on the scheduler's eager
     // reset-after-CONSUMED, which only covers the contiguously-reclaimed tail)
     // makes every reused slot self-clean, which lets the per-boot SM init skip
@@ -1009,13 +1008,10 @@ static TaskOutputTensors submit_task_common(
 
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 
-    // === STEP 6: publish the initialized slot, then wire and publish readiness ===
+    // === STEP 6: wire on the orchestrator side and publish readiness ===
     // Zero-fanin tasks and tasks whose claimed producers are already completed
     // do not need fanout links or dep_pool entries. Tasks with live producers
     // allocate fanout links here before any scheduler thread can dispatch them.
-    // The current_task_index release-store publishes PENDING plus all descriptor
-    // and payload writes before reclaim can inspect this reused slot.
-    orch->rings[ring_id].task_allocator.publish_reserved(prepared.alloc_result.task_id);
     if (fanin_builder.count == 0) {
         cur_slot_state.fanin_count = 1;
         cur_slot_state.fanin_refcount.store(1, std::memory_order_release);
