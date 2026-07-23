@@ -552,4 +552,33 @@ struct alignas(64) SyncStartDrainState {
 };
 static_assert(sizeof(SyncStartDrainState) == 64);
 
+inline uint32_t sync_start_drain_ack_mask_for_attempt(
+    const std::atomic<uint64_t> *ack_attempts, int32_t thread_count, uint64_t attempt
+) {
+    uint32_t mask = 0;
+    for (int32_t t = 0; t < thread_count; t++) {
+        if (ack_attempts[t].load(std::memory_order_acquire) == attempt) {
+            mask |= 1u << t;
+        }
+    }
+    return mask;
+}
+
+inline bool sync_start_drain_try_elect(SyncStartDrainState &state, int32_t thread_idx, uint64_t attempt) {
+    int32_t expected = 0;
+    bool won = state.drain_worker_elected.compare_exchange_strong(
+        expected, thread_idx + 1, std::memory_order_acquire, std::memory_order_relaxed
+    );
+    if (state.drain_attempt.load(std::memory_order_acquire) == attempt) {
+        return won;
+    }
+    if (won) {
+        int32_t owner = thread_idx + 1;
+        state.drain_worker_elected.compare_exchange_strong(
+            owner, 0, std::memory_order_release, std::memory_order_relaxed
+        );
+    }
+    return false;
+}
+
 #endif  // SCHEDULER_TYPES_H

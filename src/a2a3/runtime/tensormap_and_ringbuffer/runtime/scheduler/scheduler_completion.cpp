@@ -521,16 +521,6 @@ bool SchedulerContext::enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t b
     return true;
 }
 
-uint32_t SchedulerContext::drain_ack_mask_for_attempt(uint64_t attempt) const {
-    uint32_t mask = 0;
-    for (int32_t t = 0; t < active_sched_threads_; t++) {
-        if (drain_ack_attempts_[t].load(std::memory_order_acquire) == attempt) {
-            mask |= 1u << t;
-        }
-    }
-    return mask;
-}
-
 // Count total available resources across all scheduler threads for a given shape.
 // include_pending adds each thread's pending-capable cores/clusters — used by the
 // gated (early) sync_start drain, which pre-stages onto idle running slots AND onto
@@ -725,25 +715,13 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
     while (true) {
         if (is_completed()) return;
         if (drain_state_.drain_attempt.load(std::memory_order_acquire) != drain_attempt) return;
-        uint32_t ack = drain_ack_mask_for_attempt(drain_attempt);
+        uint32_t ack = sync_start_drain_ack_mask_for_attempt(drain_ack_attempts_, active_sched_threads_, drain_attempt);
         if ((ack & all_acked) == all_acked) break;
         SPIN_WAIT_HINT();
     }
     // Election -- exactly one thread wins the CAS.
-    int32_t expected = 0;
-    drain_state_.drain_worker_elected.compare_exchange_strong(
-        expected, thread_idx + 1, std::memory_order_acquire, std::memory_order_relaxed
-    );
-    if (drain_state_.drain_attempt.load(std::memory_order_acquire) != drain_attempt) {
-        if (election_won) {
-            int32_t owner = thread_idx + 1;
-            drain_state_.drain_worker_elected.compare_exchange_strong(
-                owner, 0, std::memory_order_release, std::memory_order_relaxed
-            );
-        }
-        return;
-    }
-    bool elected = election_won;
+    bool elected = sync_start_drain_try_elect(drain_state_, thread_idx, drain_attempt);
+    if (!elected && drain_state_.drain_attempt.load(std::memory_order_acquire) != drain_attempt) return;
 
     PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
     // OWNER is acquired before the drain is published and persists through
