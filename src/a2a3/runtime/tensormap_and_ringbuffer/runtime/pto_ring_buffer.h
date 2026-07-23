@@ -55,9 +55,6 @@
 // structural checks plus the scheduler's global progress watchdog instead.
 #define PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES (PLATFORM_PROF_SYS_CNT_FREQ / 2)  // 500 ms
 
-struct PTO2SchedulerState;
-using PTO2HeapHolConsumerLogger = bool (*)(PTO2SchedulerState *, uint8_t, int32_t);
-
 // =============================================================================
 // Task Allocator (unified task slot + heap buffer allocation)
 // =============================================================================
@@ -117,10 +114,6 @@ public:
         heap_reclaimed_bytes_ = 0;
         heap_allocated_offset_ = 0;
         heap_reclaimed_offset_ = 0;
-#if SIMPLER_DFX
-        last_heap_hol_logged_head_ = initial_local_task_id - 1;
-        heap_hol_log_count_ = 0;
-#endif
     }
 
     /**
@@ -136,10 +129,8 @@ public:
      * task/heap rings before orchestration completes
      * @return Allocation result; check failed() for errors
      */
-    PTO2TaskAllocResult alloc(
-        int32_t output_size, PTO2SharedMemoryHeader *sm_header = nullptr, bool scheduler_runs_concurrently = false,
-        PTO2SchedulerState *scheduler = nullptr, PTO2HeapHolConsumerLogger consumer_logger = nullptr
-    ) {
+    PTO2TaskAllocResult
+    alloc(int32_t output_size, PTO2SharedMemoryHeader *sm_header = nullptr, bool scheduler_runs_concurrently = false) {
         uint64_t aligned_size =
             output_size > 0 ? PTO2_ALIGN_UP(static_cast<uint64_t>(output_size), PTO2_ALIGN_SIZE) : 0;
 
@@ -154,12 +145,6 @@ public:
         update_heap_tail(last_alive);
         bool blocked_on_heap = false;
         bool wait_published = false;
-#if SIMPLER_DFX
-        uint64_t no_reclaim_start = get_sys_cnt_aicpu();
-#else
-        (void)scheduler;
-        (void)consumer_logger;
-#endif
         auto clear_reclaim_wait = [&]() {
             if (wait_published) {
                 sm_header->orchestrator_reclaim_waiting.store(0, std::memory_order_release);
@@ -224,9 +209,6 @@ public:
                 // Reclaim advanced -> productive backpressure, not a deadlock.
                 spin_count = 0;
                 prev_last_alive = last_alive;
-#if SIMPLER_DFX
-                no_reclaim_start = get_sys_cnt_aicpu();
-#endif
             } else if ((spin_count & 1023) == 0) {
                 // The scheduler owns the progress watchdog while dispatch runs
                 // concurrently. Poll both error channels so its timeout can
@@ -239,17 +221,6 @@ public:
                     return {-1, -1, nullptr, nullptr};
                 }
             }
-#if SIMPLER_DFX
-            if (blocked_on_heap && consumer_logger != nullptr && scheduler != nullptr && heap_hol_log_count_ < 2 &&
-                last_alive != last_heap_hol_logged_head_ && (spin_count & 4095) == 0) {
-                uint64_t now = get_sys_cnt_aicpu();
-                if (now - no_reclaim_start >= PLATFORM_PROF_SYS_CNT_FREQ &&
-                    consumer_logger(scheduler, ring_id_, last_alive)) {
-                    last_heap_hol_logged_head_ = last_alive;
-                    heap_hol_log_count_++;
-                }
-            }
-#endif
             SPIN_WAIT_HINT();
         }
     }
@@ -325,10 +296,6 @@ private:
     uint64_t heap_reclaimed_bytes_ = 0;
     uint64_t heap_allocated_offset_ = 0;
     uint64_t heap_reclaimed_offset_ = 0;
-#if SIMPLER_DFX
-    int32_t last_heap_hol_logged_head_ = -1;
-    int32_t heap_hol_log_count_ = 0;
-#endif
 
     // --- Shared ---
     std::atomic<int32_t> *error_code_ptr_ = nullptr;
