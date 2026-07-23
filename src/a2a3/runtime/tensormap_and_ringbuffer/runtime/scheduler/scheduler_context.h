@@ -37,38 +37,6 @@ class Runtime;
 struct Handshake;
 struct PTO2Runtime;
 
-enum class DrainDiagPhase : int32_t {
-    Inactive = 0,
-    AckWait,
-    Election,
-    AvailabilityCheck,
-    StageGoWait,
-    StageCores,
-    StageDoneWait,
-    ReopenWait,
-    Exit,
-};
-
-enum class DrainStageDiagPoint : int32_t {
-    None = 0,
-    Claim,
-    Prepare,
-    WriteBarrier,
-    Publish,
-    StagedMask,
-    RecordPublished,
-};
-
-uint64_t drain_diag_begin();
-uint64_t drain_diag_current_epoch();
-void drain_diag_set_phase(int32_t thread_idx, uint64_t epoch, DrainDiagPhase phase, int64_t task_id);
-void drain_diag_set_available(int32_t available);
-void drain_diag_set_stage_progress(
-    int32_t thread_idx, DrainStageDiagPoint point, int32_t claim_start, int32_t claim_count, int32_t item_index,
-    int32_t core_offset, int32_t handle_count
-);
-void drain_diag_bind_context(class SchedulerContext *ctx);
-
 /**
  * SchedulerContext: owns all scheduler-side state and methods.
  *
@@ -168,8 +136,6 @@ public:
     bool is_completed() const { return completed_.load(std::memory_order_acquire); }
     int32_t completed_tasks_count() const { return completed_tasks_.load(std::memory_order_acquire); }
     bool orchestration_done() const { return orchestrator_done_.load(std::memory_order_relaxed); }
-
-    __attribute__((noinline, cold)) void log_drain_protocol_snapshot();
 
 private:
     // =========================================================================
