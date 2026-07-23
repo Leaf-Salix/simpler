@@ -466,61 +466,6 @@ TEST_F(TaskAllocatorTest, ConcurrentBackpressureFindsConsumedExtentBehindLiveHea
     EXPECT_EQ(header.orchestrator_reclaim_waiting.load(std::memory_order_acquire), 0);
 }
 
-TEST_F(TaskAllocatorTest, ConcurrentBackpressureCyclesThroughActiveWindow) {
-    constexpr int32_t window_size = 512;
-    constexpr int32_t task_count = 256;
-    constexpr int32_t consumed_task = 200;
-    alignas(64) uint8_t heap[task_count * 64]{};
-    std::vector<PTO2TaskDescriptor> large_descriptors(window_size);
-    std::vector<PTO2TaskSlotState> large_slot_states(window_size);
-    std::atomic<int32_t> large_current{0};
-    std::atomic<int32_t> large_last_alive{0};
-    std::atomic<int32_t> large_error{PTO2_ERROR_NONE};
-    PTO2TaskAllocator large_allocator;
-    large_allocator.init(
-        large_descriptors.data(), window_size, &large_current, &large_last_alive, heap, sizeof(heap), &large_error,
-        large_slot_states.data()
-    );
-
-    std::vector<PTO2TaskAllocResult> allocations;
-    allocations.reserve(task_count);
-    for (int32_t i = 0; i < task_count; i++) {
-        allocations.push_back(large_allocator.alloc(64));
-        ASSERT_FALSE(allocations.back().failed());
-    }
-
-    PTO2SharedMemoryHeader header{};
-    header.orch_error_code.store(PTO2_ERROR_NONE);
-    header.sched_error_code.store(PTO2_ERROR_NONE);
-    header.orchestrator_reclaim_waiting.store(0);
-    std::atomic<bool> observed_wait{false};
-    std::thread reclaimer([&]() {
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (header.orchestrator_reclaim_waiting.load(std::memory_order_acquire) == 0 &&
-               std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::yield();
-        }
-        if (header.orchestrator_reclaim_waiting.load(std::memory_order_acquire) != 0) {
-            observed_wait.store(true, std::memory_order_release);
-            large_slot_states[0].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
-            large_slot_states[consumed_task].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
-            large_slot_states[consumed_task + 1].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
-            large_last_alive.store(1, std::memory_order_release);
-        } else {
-            header.sched_error_code.store(PTO2_ERROR_SCHEDULER_TIMEOUT, std::memory_order_release);
-        }
-    });
-
-    auto reused = large_allocator.alloc(128, &header, /*scheduler_runs_concurrently=*/true);
-    reclaimer.join();
-
-    EXPECT_TRUE(observed_wait.load(std::memory_order_acquire));
-    ASSERT_FALSE(reused.failed());
-    EXPECT_EQ(reused.packed_base, allocations[consumed_task].packed_base);
-    EXPECT_EQ(large_last_alive.load(std::memory_order_acquire), 1);
-    EXPECT_EQ(header.orchestrator_reclaim_waiting.load(std::memory_order_acquire), 0);
-}
-
 TEST_F(TaskAllocatorTest, BestFitPreservesLargeExtentForLargeRequest) {
     auto large_hole = allocator.alloc(2048);
     auto separator = allocator.alloc(64);

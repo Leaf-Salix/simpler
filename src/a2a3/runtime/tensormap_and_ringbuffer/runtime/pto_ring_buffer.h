@@ -110,8 +110,6 @@ public:
         extent_reclaim_enabled_ = false;
         free_extents_ = nullptr;
         largest_free_extent_ = 0;
-        consumed_scan_cursor_ = initial_local_task_id;
-        consumed_scan_credit_ = 0;
         heap_allocated_bytes_ = 0;
         heap_reclaimed_bytes_ = 0;
         heap_allocated_offset_ = 0;
@@ -164,12 +162,8 @@ public:
                 void *heap_ptr = nullptr;
                 if (extent_reclaim_enabled_) {
                     heap_ptr = try_extent_heap(aligned_size);
-                    if (heap_ptr == nullptr) {
-                        if (scheduler_runs_concurrently) {
-                            collect_consumed_extents_batch(last_alive, local_task_id_);
-                        } else {
-                            collect_consumed_extents(last_alive, local_task_id_);
-                        }
+                    if (heap_ptr == nullptr && (spin_count & 255) == 0) {
+                        collect_consumed_extents(last_alive, local_task_id_);
                         heap_ptr = try_extent_heap(aligned_size);
                     }
                 } else {
@@ -269,9 +263,6 @@ public:
     uint64_t heap_allocated_offset() const { return heap_allocated_offset_; }
 
 private:
-    static constexpr int32_t CONSUMED_SCAN_BATCH = 64;
-    static constexpr uint64_t CONSUMED_SCAN_PERIOD = 256;
-
     struct FreeExtent {
         uint64_t size;
         FreeExtent *next;
@@ -301,8 +292,6 @@ private:
     bool extent_reclaim_enabled_ = false;
     FreeExtent *free_extents_ = nullptr;
     uint64_t largest_free_extent_ = 0;
-    int32_t consumed_scan_cursor_ = 0;
-    uint64_t consumed_scan_credit_ = 0;
     uint64_t heap_allocated_bytes_ = 0;
     uint64_t heap_reclaimed_bytes_ = 0;
     uint64_t heap_allocated_offset_ = 0;
@@ -429,8 +418,6 @@ private:
             );
         }
         collect_consumed_extents(last_alive, local_task_id_);
-        consumed_scan_cursor_ = last_alive;
-        consumed_scan_credit_ = 0;
     }
 
     uint64_t find_upper_segment_end(int32_t first_task_id) const {
@@ -455,29 +442,6 @@ private:
     void collect_consumed_extents(int32_t first_task_id, int32_t end_task_id) {
         if (slot_states_ == nullptr) return;
         for (int32_t task_id = first_task_id; task_id < end_task_id; task_id++) {
-            int32_t slot = task_id & window_mask_;
-            if (slot_states_[slot].task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) continue;
-            reclaim_descriptor(task_id, descriptors_[slot]);
-        }
-    }
-
-    void collect_consumed_extents_batch(int32_t first_task_id, int32_t end_task_id) {
-        if (slot_states_ == nullptr || first_task_id >= end_task_id) return;
-        int32_t active_count = end_task_id - first_task_id;
-        consumed_scan_credit_ += static_cast<uint64_t>(active_count);
-        int32_t scan_count =
-            static_cast<int32_t>(std::min<uint64_t>(CONSUMED_SCAN_BATCH, consumed_scan_credit_ / CONSUMED_SCAN_PERIOD));
-        scan_count = std::min(scan_count, active_count);
-        if (scan_count == 0) return;
-        consumed_scan_credit_ -= static_cast<uint64_t>(scan_count) * CONSUMED_SCAN_PERIOD;
-
-        if (consumed_scan_cursor_ < first_task_id || consumed_scan_cursor_ >= end_task_id) {
-            consumed_scan_cursor_ = first_task_id;
-        }
-
-        for (int32_t i = 0; i < scan_count; i++) {
-            int32_t task_id = consumed_scan_cursor_++;
-            if (consumed_scan_cursor_ >= end_task_id) consumed_scan_cursor_ = first_task_id;
             int32_t slot = task_id & window_mask_;
             if (slot_states_[slot].task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) continue;
             reclaim_descriptor(task_id, descriptors_[slot]);
