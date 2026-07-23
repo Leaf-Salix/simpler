@@ -220,9 +220,10 @@ heap boundary.
 **Pressure fallback**: If neither bump region can satisfy an allocation, the
 allocator switches that heap to explicit extent reclaim. It builds an
 address-ordered free list inside free heap blocks, collects every task whose
-state is `CONSUMED`, and coalesces adjacent extents. A live oldest task still
-blocks task-slot watermark advancement, but it no longer pins unrelated
-`CONSUMED` output buffers behind it.
+state is `CONSUMED`, coalesces adjacent extents, and selects the smallest
+extent that satisfies each allocation. A live oldest task still blocks
+task-slot watermark advancement, but it no longer pins unrelated `CONSUMED`
+output buffers behind it.
 
 The orchestrator is the only free-list writer. The scheduler only publishes
 `CONSUMED`; an acquire load of that state is the ownership handoff proving that

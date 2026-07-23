@@ -506,14 +506,21 @@ private:
         }
         if (alloc_size > largest_free_extent_) return nullptr;
 
+        FreeExtent *best = nullptr;
+        FreeExtent *best_prev = nullptr;
         FreeExtent *prev = nullptr;
-        FreeExtent *cur = free_extents_;
-        while (cur != nullptr && cur->size < alloc_size) {
+        for (FreeExtent *cur = free_extents_; cur != nullptr; cur = cur->next) {
+            if (cur->size >= alloc_size && (best == nullptr || cur->size < best->size)) {
+                best = cur;
+                best_prev = prev;
+                if (cur->size == alloc_size) break;
+            }
             prev = cur;
-            cur = cur->next;
         }
-        if (cur == nullptr) return nullptr;
+        if (best == nullptr) return nullptr;
 
+        FreeExtent *cur = best;
+        prev = best_prev;
         auto *result = reinterpret_cast<char *>(cur);
         uint64_t extent_size = cur->size;
         if (extent_size == alloc_size) {

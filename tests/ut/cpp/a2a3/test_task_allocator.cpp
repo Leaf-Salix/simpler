@@ -466,6 +466,30 @@ TEST_F(TaskAllocatorTest, ConcurrentBackpressureFindsConsumedExtentBehindLiveHea
     EXPECT_EQ(header.orchestrator_reclaim_waiting.load(std::memory_order_acquire), 0);
 }
 
+TEST_F(TaskAllocatorTest, BestFitPreservesLargeExtentForLargeRequest) {
+    auto large_hole = allocator.alloc(2048);
+    auto separator = allocator.alloc(64);
+    auto exact_hole = allocator.alloc(1024);
+    auto tail = allocator.alloc(960);
+    ASSERT_FALSE(large_hole.failed());
+    ASSERT_FALSE(separator.failed());
+    ASSERT_FALSE(exact_hole.failed());
+    ASSERT_FALSE(tail.failed());
+
+    slot_states[large_hole.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
+    slot_states[separator.slot].task_state.store(PTO2_TASK_PENDING, std::memory_order_release);
+    slot_states[exact_hole.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
+    slot_states[tail.slot].task_state.store(PTO2_TASK_PENDING, std::memory_order_release);
+
+    auto small = allocator.alloc(1024);
+    ASSERT_FALSE(small.failed());
+    EXPECT_EQ(small.packed_base, exact_hole.packed_base);
+
+    auto large = allocator.alloc(2048);
+    ASSERT_FALSE(large.failed());
+    EXPECT_EQ(large.packed_base, large_hole.packed_base);
+}
+
 TEST_F(TaskAllocatorTest, HeapCapacityDropsUnalignedTail) {
     alignas(64) uint8_t unaligned_heap[1089]{};
     allocator.init(
