@@ -63,10 +63,13 @@ extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count);
 
 namespace {
 
-HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
-    RuntimeTimeoutConfig order_defaults{
-        PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS
-    };
+HostRuntimeTimeoutConfig resolve_onboard_timeout_config(bool scope_stats_enabled = false) {
+    RuntimeTimeoutConfig order_defaults = apply_scope_stats_timeout_floor(
+        RuntimeTimeoutConfig{
+            PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS
+        },
+        scope_stats_enabled
+    );
     RuntimeTimeoutParseStatus parse_status;
     RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(order_defaults, &parse_status);
 
@@ -328,28 +331,46 @@ int DeviceRunnerBase::attach_current_thread(int device_id) {
     }
 
     if (device_id_ == -1) {
-        timeout_config_ = resolve_onboard_timeout_config();
-        configure_aicore_op_timeout();
+        HostRuntimeTimeoutConfig next = resolve_onboard_timeout_config();
+        rc = configure_aicore_op_timeout(next.op_execute_timeout_us);
+        if (rc != 0) {
+            return rc;
+        }
+        timeout_config_ = next;
     }
 
     device_id_ = device_id;
     return 0;
 }
 
-void DeviceRunnerBase::configure_aicore_op_timeout() {
+int DeviceRunnerBase::configure_aicore_op_timeout(uint64_t timeout_us) {
     uint64_t actual_timeout = 0;
-    int rc = aclrtSetOpExecuteTimeOutV2(timeout_config_.op_execute_timeout_us, &actual_timeout);
+    int rc = aclrtSetOpExecuteTimeOutV2(timeout_us, &actual_timeout);
     if (rc != 0) {
-        LOG_ERROR(
-            "aclrtSetOpExecuteTimeOutV2(%llu us) failed: %d", (unsigned long long)timeout_config_.op_execute_timeout_us,
-            rc
-        );
+        LOG_ERROR("aclrtSetOpExecuteTimeOutV2(%llu us) failed: %d", (unsigned long long)timeout_us, rc);
     } else {
         LOG_INFO_V0(
-            "aclrtSetOpExecuteTimeOutV2: requested=%llu us, actual=%llu us",
-            (unsigned long long)timeout_config_.op_execute_timeout_us, (unsigned long long)actual_timeout
+            "aclrtSetOpExecuteTimeOutV2: requested=%llu us, actual=%llu us", (unsigned long long)timeout_us,
+            (unsigned long long)actual_timeout
         );
     }
+    return rc;
+}
+
+int DeviceRunnerBase::configure_run_timeouts(bool scope_stats_enabled) {
+    HostRuntimeTimeoutConfig next = resolve_onboard_timeout_config(scope_stats_enabled);
+    // The scheduler override is latched by simpler_aicpu_init. Environment
+    // changes after device attach were never supported, so retain that value
+    // while refreshing only the host-controlled per-run budgets.
+    next.scheduler_timeout_ms = timeout_config_.scheduler_timeout_ms;
+    if (next.op_execute_timeout_us != timeout_config_.op_execute_timeout_us) {
+        int rc = configure_aicore_op_timeout(next.op_execute_timeout_us);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    timeout_config_ = next;
+    return 0;
 }
 
 int DeviceRunnerBase::ensure_device_initialized() {

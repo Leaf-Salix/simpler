@@ -221,6 +221,11 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         LOG_ERROR("ensure_device_initialized failed: %d", rc);
         return rc;
     }
+    rc = configure_run_timeouts(enable_scope_stats_);
+    if (rc != 0) {
+        LOG_ERROR("configure_run_timeouts failed: %d", rc);
+        return rc;
+    }
 
     ensure_device_wall_buffer();
 

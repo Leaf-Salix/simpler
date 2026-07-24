@@ -97,6 +97,53 @@ TEST(RuntimeTimeoutConfig, UnsetEnvKeepsDefaults) {
     EXPECT_EQ(validate_runtime_timeout_order(cfg), RuntimeTimeoutOrderStatus::OK);
 }
 
+TEST(RuntimeTimeoutConfig, ScopeStatsAppliesLargerDefaultFloor) {
+    RuntimeTimeoutConfig cfg = apply_scope_stats_timeout_floor(kDefaults, true);
+
+    EXPECT_EQ(cfg.op_execute_timeout_us, RUNTIME_TIMEOUT_SCOPE_STATS_OP_EXECUTE_US);
+    EXPECT_EQ(cfg.stream_sync_timeout_ms, RUNTIME_TIMEOUT_SCOPE_STATS_STREAM_SYNC_MS);
+    EXPECT_EQ(cfg.scheduler_timeout_ms, kDefaults.scheduler_timeout_ms);
+    EXPECT_EQ(validate_runtime_timeout_order(cfg), RuntimeTimeoutOrderStatus::OK);
+}
+
+TEST(RuntimeTimeoutConfig, ScopeStatsDisabledKeepsDefaults) {
+    RuntimeTimeoutConfig cfg = apply_scope_stats_timeout_floor(kDefaults, false);
+
+    EXPECT_EQ(cfg.op_execute_timeout_us, kDefaults.op_execute_timeout_us);
+    EXPECT_EQ(cfg.stream_sync_timeout_ms, kDefaults.stream_sync_timeout_ms);
+    EXPECT_EQ(cfg.scheduler_timeout_ms, kDefaults.scheduler_timeout_ms);
+}
+
+TEST(RuntimeTimeoutConfig, ScopeStatsDoesNotLowerExistingBudgets) {
+    constexpr RuntimeTimeoutConfig larger{120000000, 125000, 10000};
+    RuntimeTimeoutConfig cfg = apply_scope_stats_timeout_floor(larger, true);
+
+    EXPECT_EQ(cfg.op_execute_timeout_us, larger.op_execute_timeout_us);
+    EXPECT_EQ(cfg.stream_sync_timeout_ms, larger.stream_sync_timeout_ms);
+}
+
+TEST(RuntimeTimeoutConfig, ScopeStatsFloorCanReturnToProductionDefaults) {
+    RuntimeTimeoutConfig scope_cfg = apply_scope_stats_timeout_floor(kDefaults, true);
+    RuntimeTimeoutConfig normal_cfg = apply_scope_stats_timeout_floor(kDefaults, false);
+
+    EXPECT_EQ(scope_cfg.op_execute_timeout_us, RUNTIME_TIMEOUT_SCOPE_STATS_OP_EXECUTE_US);
+    EXPECT_EQ(scope_cfg.stream_sync_timeout_ms, RUNTIME_TIMEOUT_SCOPE_STATS_STREAM_SYNC_MS);
+    EXPECT_EQ(normal_cfg.op_execute_timeout_us, kDefaults.op_execute_timeout_us);
+    EXPECT_EQ(normal_cfg.stream_sync_timeout_ms, kDefaults.stream_sync_timeout_ms);
+}
+
+TEST(RuntimeTimeoutConfig, ExplicitEnvOverridesScopeStatsDefaults) {
+    ScopedUnsetTimeoutEnv env;
+    set_env_var(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV, "60000000");
+    set_env_var(SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV, "65000");
+    RuntimeTimeoutConfig scope_defaults = apply_scope_stats_timeout_floor(kDefaults, true);
+    RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(scope_defaults);
+
+    EXPECT_EQ(cfg.op_execute_timeout_us, 60000000u);
+    EXPECT_EQ(cfg.stream_sync_timeout_ms, 65000);
+    EXPECT_EQ(validate_runtime_timeout_order(cfg), RuntimeTimeoutOrderStatus::OK);
+}
+
 TEST(RuntimeTimeoutConfig, ValidEnvOverridesDefaults) {
     ScopedUnsetTimeoutEnv env;
     set_env_var(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV, "5000000");

@@ -564,14 +564,23 @@ protected:
     static void arena_free_trampoline(void *ctx, void *p) { static_cast<MemoryAllocator *>(ctx)->free(p); }
 
     /**
-     * Configure STARS op execution timeout (once per DeviceRunner lifetime).
+     * Configure the current STARS op execution timeout.
      *
-     * Called on first device attach to set the hardware-level AICore op
-     * execution timeout via `aclrtSetOpExecuteTimeOutV2`. The actual
-     * timeout may differ from the requested value due to hardware timer
-     * granularity.
+     * Called on first device attach and when a per-run diagnostic timeout
+     * budget changes. The actual timeout may differ from the requested value
+     * due to hardware timer granularity.
      */
-    void configure_aicore_op_timeout();
+    int configure_aicore_op_timeout(uint64_t timeout_us);
+
+    /**
+     * Refresh op/stream timeout budgets after applying the per-run CallConfig.
+     *
+     * Scope-stats runs receive a larger default budget. Environment overrides
+     * are resolved after that default is selected and therefore remain
+     * authoritative. Architectures that call this for every run also restore
+     * production defaults when a reused runner leaves scope-stats mode.
+     */
+    int configure_run_timeouts(bool scope_stats_enabled);
 
     /**
      * Load AICPU SO and initialize device args. Called from

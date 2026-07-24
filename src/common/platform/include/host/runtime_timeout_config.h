@@ -24,6 +24,12 @@ constexpr const char *SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV = "SIMPLER_OP_EXECUTE_TI
 constexpr const char *SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV = "SIMPLER_STREAM_SYNC_TIMEOUT_MS";
 constexpr const char *SIMPLER_SCHEDULER_TIMEOUT_MS_ENV = "SIMPLER_SCHEDULER_TIMEOUT_MS";
 
+// Scope tracing adds an event for every runtime scope enter/exit. Keep its
+// hardware watchdog above the measured full-graph diagnostic runtime while
+// preserving the shorter production defaults for runs without scope stats.
+constexpr uint64_t RUNTIME_TIMEOUT_SCOPE_STATS_OP_EXECUTE_US = 90000000;
+constexpr int32_t RUNTIME_TIMEOUT_SCOPE_STATS_STREAM_SYNC_MS = 95000;
+
 // Covers the host stream-sync window before the AICPU scheduler no-progress
 // timer is armed: cold kernel registration, orchestration SO dlopen, runtime
 // init, and AICore handshake. The host cannot know the later orchestration
@@ -54,6 +60,21 @@ struct RuntimeTimeoutParseStatus {
     bool scheduler_env_set{false};
     bool scheduler_valid{true};
 };
+
+inline RuntimeTimeoutConfig
+apply_scope_stats_timeout_floor(const RuntimeTimeoutConfig &defaults, bool scope_stats_enabled) {
+    if (!scope_stats_enabled) {
+        return defaults;
+    }
+    RuntimeTimeoutConfig cfg = defaults;
+    if (cfg.op_execute_timeout_us < RUNTIME_TIMEOUT_SCOPE_STATS_OP_EXECUTE_US) {
+        cfg.op_execute_timeout_us = RUNTIME_TIMEOUT_SCOPE_STATS_OP_EXECUTE_US;
+    }
+    if (cfg.stream_sync_timeout_ms < RUNTIME_TIMEOUT_SCOPE_STATS_STREAM_SYNC_MS) {
+        cfg.stream_sync_timeout_ms = RUNTIME_TIMEOUT_SCOPE_STATS_STREAM_SYNC_MS;
+    }
+    return cfg;
+}
 
 enum class RuntimeTimeoutOrderStatus {
     OK,
