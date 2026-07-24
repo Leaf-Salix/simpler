@@ -59,6 +59,7 @@ struct alignas(64) PTO2RingFlowControl {
 
     // === Cache Line 1: Written by Scheduler, Read by Orchestrator (for back-pressure) ===
     alignas(64) std::atomic<int32_t> last_task_alive;  // Task ring tail (oldest active task)
+    std::atomic<uint32_t> consumed_epoch;              // Changes whenever a task becomes CONSUMED
 
     // Per-boot SM reset. PTO2TaskAllocator::init() seeds its private
     // local_task_id_ from initial_local_task_id (default 0 in production)
@@ -70,6 +71,7 @@ struct alignas(64) PTO2RingFlowControl {
     void init() {
         current_task_index.store(0, std::memory_order_relaxed);
         last_task_alive.store(0, std::memory_order_relaxed);
+        consumed_epoch.store(0, std::memory_order_relaxed);
     }
 
     bool validate(PTO2SharedMemoryHandle *handle, int32_t ring_id) const;

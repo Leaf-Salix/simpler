@@ -148,6 +148,7 @@ TEST_F(SchedulerStateTest, ConsumedNotReady) {
 
     sched.check_and_handle_consumed(slot);
     EXPECT_EQ(slot.task_state.load(), PTO2_TASK_COMPLETED);
+    EXPECT_EQ(sm_handle->header->rings[0].fc.consumed_epoch.load(), 0u);
 }
 
 TEST_F(SchedulerStateTest, ConsumedTransition) {
@@ -157,6 +158,7 @@ TEST_F(SchedulerStateTest, ConsumedTransition) {
 
     sched.check_and_handle_consumed(slot);
     EXPECT_EQ(slot.task_state.load(), PTO2_TASK_CONSUMED);
+    EXPECT_EQ(sm_handle->header->rings[0].fc.consumed_epoch.load(), 1u);
 }
 
 TEST_F(SchedulerStateTest, ConsumedNotCompletedState) {
@@ -176,6 +178,7 @@ TEST_F(SchedulerStateTest, ConsumedIdempotent) {
 
     sched.check_and_handle_consumed(slot);
     EXPECT_EQ(slot.task_state.load(), PTO2_TASK_CONSUMED);
+    EXPECT_EQ(sm_handle->header->rings[0].fc.consumed_epoch.load(), 0u);
 }
 
 // =============================================================================

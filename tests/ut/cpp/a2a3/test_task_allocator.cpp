@@ -451,6 +451,7 @@ TEST_F(TaskAllocatorTest, ConcurrentBackpressureFindsConsumedExtentBehindLiveHea
         if (header.orchestrator_reclaim_waiting.load(std::memory_order_acquire) != 0) {
             observed_wait.store(true, std::memory_order_release);
             slot_states[hole.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
+            header.rings[0].fc.consumed_epoch.fetch_add(1, std::memory_order_release);
         } else {
             header.sched_error_code.store(PTO2_ERROR_SCHEDULER_TIMEOUT, std::memory_order_release);
         }

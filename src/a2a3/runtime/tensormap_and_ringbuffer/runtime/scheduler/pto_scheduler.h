@@ -576,6 +576,8 @@ struct PTO2SchedulerState {
         slot_state.unlock_fanout();
         if (!became_consumed) return;
 
+        ring_sched_states[slot_state.ring_id].ring->fc.consumed_epoch.fetch_add(1, std::memory_order_release);
+
 #if SIMPLER_SCHED_PROFILING
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -614,6 +616,9 @@ struct PTO2SchedulerState {
         slot_state.unlock_fanout();
         atomic_count += 1;  // unlock store
         if (!became_consumed) return;
+
+        ring_sched_states[slot_state.ring_id].ring->fc.consumed_epoch.fetch_add(1, std::memory_order_release);
+        atomic_count += 1;
 
 #if SIMPLER_SCHED_PROFILING
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);

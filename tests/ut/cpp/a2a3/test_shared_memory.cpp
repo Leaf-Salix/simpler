@@ -104,6 +104,7 @@ TEST_F(SharedMemoryTest, HeaderInitValues) {
         auto &fc = hdr->rings[r].fc;
         EXPECT_EQ(fc.current_task_index.load(), 0);
         EXPECT_EQ(fc.last_task_alive.load(), 0);
+        EXPECT_EQ(fc.consumed_epoch.load(), 0u);
     }
 }
 
