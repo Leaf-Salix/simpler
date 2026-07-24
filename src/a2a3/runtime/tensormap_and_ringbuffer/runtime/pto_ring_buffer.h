@@ -706,7 +706,8 @@ private:
             return;
         }
         uint64_t no_reclaim_cycles = get_sys_cnt_aicpu() - no_reclaim_progress_start;
-        bool task_milestone_reached = local_task_id_ >= (UINT64_C(1) << 20);
+        constexpr int32_t kTaskMilestone = 1 << 20;
+        bool task_milestone_reached = local_task_id_ >= kTaskMilestone;
         if (!task_milestone_reached && no_reclaim_cycles < PLATFORM_PROF_SYS_CNT_FREQ) return;
         heap_stall_reported_ = true;
 
