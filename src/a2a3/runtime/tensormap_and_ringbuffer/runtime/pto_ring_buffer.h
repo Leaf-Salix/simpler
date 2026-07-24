@@ -706,7 +706,8 @@ private:
             return;
         }
         uint64_t no_reclaim_cycles = get_sys_cnt_aicpu() - no_reclaim_progress_start;
-        if (no_reclaim_cycles < PLATFORM_PROF_SYS_CNT_FREQ) return;
+        bool task_milestone_reached = local_task_id_ >= (UINT64_C(1) << 20);
+        if (!task_milestone_reached && no_reclaim_cycles < PLATFORM_PROF_SYS_CNT_FREQ) return;
         heap_stall_reported_ = true;
 
         uint64_t free_bytes = 0;
@@ -785,13 +786,14 @@ private:
         PTO2TaskSlotState &head = slot_states_[last_alive & window_mask_];
         uint32_t head_refcount = head.fanout_refcount.load(std::memory_order_acquire);
         LOG_ERROR(
-            "[RING3_HEAP_STALL] task=%d last_alive=%d active=%d no_reclaim_cycles=%" PRIu64 " request=%" PRIu64
-            " used=%" PRIu64 " free=%" PRIu64 " largest=%" PRIu64 " extents=%" PRIu64,
-            local_task_id_, last_alive, local_task_id_ - last_alive, no_reclaim_cycles, aligned_requested,
-            heap_used_bytes(), free_bytes, largest_free_extent_, free_extent_count
+            "[RING3_HEAP_AUDIT] reason=%s task=%d last_alive=%d active=%d no_reclaim_cycles=%" PRIu64
+            " request=%" PRIu64 " used=%" PRIu64 " free=%" PRIu64 " largest=%" PRIu64 " extents=%" PRIu64,
+            task_milestone_reached ? "task_milestone" : "no_reclaim_1s", local_task_id_, last_alive,
+            local_task_id_ - last_alive, no_reclaim_cycles, aligned_requested, heap_used_bytes(), free_bytes,
+            largest_free_extent_, free_extent_count
         );
         LOG_ERROR(
-            "[RING3_HEAP_STALL] states pending=%" PRIu64 " completed=%" PRIu64 " consumed=%" PRIu64 " other=%" PRIu64
+            "[RING3_HEAP_AUDIT] states pending=%" PRIu64 " completed=%" PRIu64 " consumed=%" PRIu64 " other=%" PRIu64
             " live_buffers=%" PRIu64 " live_bytes=%" PRIu64 " consumed_live_buffers=%" PRIu64
             " consumed_live_bytes=%" PRIu64 " reclaimed_buffers=%" PRIu64 " descriptor_misses=%" PRIu64
             " invalid_buffers=%" PRIu64,
@@ -799,14 +801,14 @@ private:
             consumed_live_buffers, consumed_live_bytes, reclaimed_buffers, descriptor_misses, invalid_buffers
         );
         LOG_ERROR(
-            "[RING3_HEAP_STALL] bitmap leaf_pending=%" PRIu64 " summary_pending=%" PRIu64 " drains=%" PRIu64
+            "[RING3_HEAP_AUDIT] bitmap leaf_pending=%" PRIu64 " summary_pending=%" PRIu64 " drains=%" PRIu64
             " summary_seen=%" PRIu64 " leaf_seen=%" PRIu64 " reclaimed=%" PRIu64 " generation_miss=%" PRIu64
             " range_miss=%" PRIu64 " state_miss=%" PRIu64,
             pending_leaf_bits, pending_summary_bits, pending_collect_calls_, pending_summary_bits_, pending_leaf_bits_,
             pending_reclaimed_, pending_generation_misses_, pending_range_misses_, pending_state_misses_
         );
         LOG_ERROR(
-            "[RING3_HEAP_STALL] head=%d state=%d consumers=%u/%u scope_released=%d", last_alive,
+            "[RING3_HEAP_AUDIT] head=%d state=%d consumers=%u/%u scope_released=%d", last_alive,
             static_cast<int>(head.task_state.load(std::memory_order_acquire)), head_refcount & ~PTO2_FANOUT_SCOPE_BIT,
             head.fanout_count & ~PTO2_FANOUT_SCOPE_BIT, (head_refcount & PTO2_FANOUT_SCOPE_BIT) ? 1 : 0
         );
