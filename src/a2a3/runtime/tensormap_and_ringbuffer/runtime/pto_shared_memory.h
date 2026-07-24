@@ -96,25 +96,6 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2TaskDescriptor *task_descriptors;
     PTO2TaskPayload *task_payloads;
     PTO2TaskSlotState *slot_states;
-    std::atomic<uint64_t> *consumed_leaf;
-    std::atomic<uint64_t> *consumed_summary;
-
-    uint64_t consumed_leaf_words() const { return (task_window_size + 63) / 64; }
-
-    uint64_t consumed_summary_words() const { return (consumed_leaf_words() + 63) / 64; }
-
-    int publish_consumed(uint32_t local_task_id) {
-        uint64_t slot = local_task_id & static_cast<uint32_t>(task_window_mask);
-        uint64_t leaf_index = slot >> 6;
-        uint64_t leaf_bit = UINT64_C(1) << (slot & 63);
-        uint64_t old_leaf = consumed_leaf[leaf_index].fetch_or(leaf_bit, std::memory_order_release);
-        if (old_leaf != 0) return 1;
-
-        uint64_t summary_index = leaf_index >> 6;
-        uint64_t summary_bit = UINT64_C(1) << (leaf_index & 63);
-        consumed_summary[summary_index].fetch_or(summary_bit, std::memory_order_release);
-        return 2;
-    }
 
     int32_t get_slot_by_task_id(int32_t local_task_id) { return local_task_id & task_window_mask; }
 
@@ -135,7 +116,7 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     }
 };
 
-static_assert(sizeof(PTO2SharedMemoryRingHeader) == 256, "PTO2SharedMemoryRingHeader layout drift");
+static_assert(sizeof(PTO2SharedMemoryRingHeader) == 192, "PTO2SharedMemoryRingHeader layout drift");
 static_assert(
     offsetof(PTO2SharedMemoryRingHeader, task_descriptors_offset) == 152,
     "PTO2SharedMemoryRingHeader task_descriptors_offset layout drift"
@@ -187,17 +168,17 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     std::atomic<int32_t> sched_stall_core;         // S1: stuck core id (-1 if N/A)
 };
 
-static_assert(sizeof(PTO2SharedMemoryHeader) == 1152, "PTO2SharedMemoryHeader layout drift");
+static_assert(sizeof(PTO2SharedMemoryHeader) == 896, "PTO2SharedMemoryHeader layout drift");
 static_assert(
-    offsetof(PTO2SharedMemoryHeader, orchestrator_reclaim_waiting) == 1028,
+    offsetof(PTO2SharedMemoryHeader, orchestrator_reclaim_waiting) == 772,
     "PTO2SharedMemoryHeader orchestrator_reclaim_waiting layout drift"
 );
-static_assert(offsetof(PTO2SharedMemoryHeader, total_size) == 1032, "PTO2SharedMemoryHeader total_size layout drift");
+static_assert(offsetof(PTO2SharedMemoryHeader, total_size) == 776, "PTO2SharedMemoryHeader total_size layout drift");
 static_assert(
-    offsetof(PTO2SharedMemoryHeader, orch_error_code) == 1040, "PTO2SharedMemoryHeader orch_error_code layout drift"
+    offsetof(PTO2SharedMemoryHeader, orch_error_code) == 784, "PTO2SharedMemoryHeader orch_error_code layout drift"
 );
 static_assert(
-    offsetof(PTO2SharedMemoryHeader, sched_stall_task_id) == 1088,
+    offsetof(PTO2SharedMemoryHeader, sched_stall_task_id) == 832,
     "PTO2SharedMemoryHeader sched_stall_task_id layout drift"
 );
 
@@ -297,15 +278,14 @@ inline std::atomic<int32_t> *ring_last_task_alive_addr(void *sm_dev_base, int ri
     );
 }
 
-// Byte offsets (from the SM base) of one ring's segments. Every segment is
-// PTO2_ALIGN_UP-padded.
+// Byte offsets (from the SM base) of one ring's three segments. The per-ring
+// layout is: header, then for each ring descriptors -> payloads -> slot_states,
+// every segment PTO2_ALIGN_UP-padded.
 struct PTO2RingSegmentOffsets {
     uint64_t descriptors;
     uint64_t payloads;
     uint64_t slot_states;
-    uint64_t consumed_leaf;
-    uint64_t consumed_summary;
-    uint64_t end;
+    uint64_t end;  // offset just past this ring's slot_states (next ring's start; total SM size for the last ring)
 };
 
 // Single source of truth for the per-ring SM layout. Returns offsets (not
@@ -322,10 +302,6 @@ ring_segment_offsets(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], int 
         off += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
         off += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
         off += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
-        uint64_t leaf_words = (task_window_sizes[r] + 63) / 64;
-        uint64_t summary_words = (leaf_words + 63) / 64;
-        off += PTO2_ALIGN_UP(leaf_words * sizeof(std::atomic<uint64_t>), PTO2_ALIGN_SIZE);
-        off += PTO2_ALIGN_UP(summary_words * sizeof(std::atomic<uint64_t>), PTO2_ALIGN_SIZE);
     }
     PTO2RingSegmentOffsets o{};
     o.descriptors = off;
@@ -334,12 +310,6 @@ ring_segment_offsets(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], int 
     off += PTO2_ALIGN_UP(task_window_sizes[ring_id] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
     o.slot_states = off;
     off += PTO2_ALIGN_UP(task_window_sizes[ring_id] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
-    uint64_t leaf_words = (task_window_sizes[ring_id] + 63) / 64;
-    uint64_t summary_words = (leaf_words + 63) / 64;
-    o.consumed_leaf = off;
-    off += PTO2_ALIGN_UP(leaf_words * sizeof(std::atomic<uint64_t>), PTO2_ALIGN_SIZE);
-    o.consumed_summary = off;
-    off += PTO2_ALIGN_UP(summary_words * sizeof(std::atomic<uint64_t>), PTO2_ALIGN_SIZE);
     o.end = off;
     return o;
 }

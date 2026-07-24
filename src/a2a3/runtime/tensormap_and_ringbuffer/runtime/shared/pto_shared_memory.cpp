@@ -49,17 +49,15 @@ void PTO2SharedMemoryHandle::setup_pointers_per_ring(const uint64_t task_window_
     char *base = (char *)sm_base;
     header = (PTO2SharedMemoryHeader *)base;
 
-    // Per-ring arrays use offsets from the single source of truth
-    // (pto2_sm_layout::ring_segment_offsets), so this setup and the
-    // device-address helpers cannot drift.
+    // Per-ring descriptors / payloads / slot_states — offsets from the single
+    // source of truth (pto2_sm_layout::ring_segment_offsets), so this setup and
+    // the device-address helpers cannot drift.
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         auto off = pto2_sm_layout::ring_segment_offsets(task_window_sizes, r);
         auto &ring = header->rings[r];
         ring.task_descriptors = (PTO2TaskDescriptor *)(base + off.descriptors);
         ring.task_payloads = (PTO2TaskPayload *)(base + off.payloads);
         ring.slot_states = (PTO2TaskSlotState *)(base + off.slot_states);
-        ring.consumed_leaf = (std::atomic<uint64_t> *)(base + off.consumed_leaf);
-        ring.consumed_summary = (std::atomic<uint64_t> *)(base + off.consumed_summary);
     }
 }
 
@@ -148,19 +146,15 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     header->orchestrator_reclaim_waiting.store(0, std::memory_order_relaxed);
 
     // Per-ring layout info
+    uint64_t offset = PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        auto &ring = header->rings[r];
-        auto offsets = pto2_sm_layout::ring_segment_offsets(task_window_sizes, r);
-        ring.task_window_size = task_window_sizes[r];
-        ring.task_window_mask = static_cast<int32_t>(task_window_sizes[r] - 1);
-        ring.heap_size = heap_sizes[r];
-        ring.task_descriptors_offset = offsets.descriptors;
-        for (uint64_t i = 0; i < ring.consumed_leaf_words(); i++) {
-            ring.consumed_leaf[i].store(0, std::memory_order_relaxed);
-        }
-        for (uint64_t i = 0; i < ring.consumed_summary_words(); i++) {
-            ring.consumed_summary[i].store(0, std::memory_order_relaxed);
-        }
+        header->rings[r].task_window_size = task_window_sizes[r];
+        header->rings[r].task_window_mask = static_cast<int32_t>(task_window_sizes[r] - 1);
+        header->rings[r].heap_size = heap_sizes[r];
+        header->rings[r].task_descriptors_offset = offset;
+        offset += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
+        offset += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
+        offset += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
     }
 
     header->total_size = sm_size;
@@ -183,8 +177,7 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     // No per-slot loop: prepare_task resets each slot when it allocates it, and
     // the scheduler only scans submitted task_ids [last_task_alive,
     // current_task_index), so unsubmitted slots are never read. Per-boot reset
-    // clears the header and consumed notification bitmaps; per-slot state is
-    // set lazily at submit.
+    // is just the header fields above; per-slot state is set lazily at submit.
 }
 
 // =============================================================================
@@ -210,7 +203,6 @@ void PTO2SharedMemoryHandle::print_layout() {
         );
         LOG_INFO_V0("  current_task_idx: %d", h->rings[r].fc.current_task_index.load(std::memory_order_acquire));
         LOG_INFO_V0("  last_task_alive:  %d", h->rings[r].fc.last_task_alive.load(std::memory_order_acquire));
-        LOG_INFO_V0("  consumed_words:   %" PRIu64, h->rings[r].consumed_leaf_words());
     }
     LOG_INFO_V0("orchestrator_done:  %d", h->orchestrator_done.load(std::memory_order_acquire));
     LOG_INFO_V0("orchestrator_reclaim_waiting: %d", h->orchestrator_reclaim_waiting.load(std::memory_order_acquire));
@@ -227,24 +219,9 @@ bool PTO2SharedMemoryHandle::validate() {
     if (!header) return false;
 
     PTO2SharedMemoryHeader *h = header;
-    uintptr_t base = reinterpret_cast<uintptr_t>(sm_base);
-    if (sm_size > UINTPTR_MAX - base) return false;
-    uintptr_t end = base + sm_size;
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         if (!h->rings[r].fc.validate(this, r)) return false;
-        auto &ring = h->rings[r];
-        if (ring.task_window_size == 0) return false;
-        if (ring.consumed_leaf == nullptr || ring.consumed_summary == nullptr) return false;
-        uintptr_t leaf_begin = reinterpret_cast<uintptr_t>(ring.consumed_leaf);
-        uintptr_t summary_begin = reinterpret_cast<uintptr_t>(ring.consumed_summary);
-        uint64_t leaf_size = ring.consumed_leaf_words() * sizeof(std::atomic<uint64_t>);
-        uint64_t summary_size = ring.consumed_summary_words() * sizeof(std::atomic<uint64_t>);
-        if (leaf_size > UINTPTR_MAX - leaf_begin || summary_size > UINTPTR_MAX - summary_begin) return false;
-        if (leaf_begin < base || leaf_begin + leaf_size > end || summary_begin < base ||
-            summary_begin + summary_size > end)
-            return false;
-        if (leaf_begin % PTO2_ALIGN_SIZE != 0 || summary_begin % PTO2_ALIGN_SIZE != 0) return false;
     }
 
     return true;

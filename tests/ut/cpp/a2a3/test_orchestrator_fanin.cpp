@@ -131,7 +131,7 @@ TEST_F(OrchestratorFaninTest, SubmitPathHeapDeadlockLogReportsRingAndRealHeapSta
     head.task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
 
     L0TaskArgs blocked_args;
-    add_runtime_output_arg(blocked_args, create_infos, 512);  // 2048 bytes > largest free extent
+    add_runtime_output_arg(blocked_args, create_infos, 1);
     testing::internal::CaptureStderr();
     TaskOutputTensors blocked = orch.submit_dummy_task(blocked_args);
     std::string log = testing::internal::GetCapturedStderr();

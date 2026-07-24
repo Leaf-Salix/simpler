@@ -148,8 +148,6 @@ The orchestrator and schedulers communicate through a contiguous shared memory r
 │    PTO2TaskDescriptor[N]    │  N = task_window_size per ring
 │    PTO2TaskPayload[N]       │
 │    PTO2TaskSlotState[N]     │
-│    consumed leaf bitmap     │  one bit per task slot
-│    consumed summary bitmap  │  one bit per leaf word
 └─────────────────────────────┘
 ```
 
@@ -159,13 +157,13 @@ The orchestrator and schedulers communicate through a contiguous shared memory r
 | ----- | ------ | ------ | ------- |
 | `current_task_index` | Orchestrator | Scheduler | Next task ID to allocate (task ring head) |
 | `last_task_alive` | Scheduler | Orchestrator | Oldest still-active task (task ring tail) |
+| `heap_top` | Orchestrator | Scheduler | Heap ring allocation pointer |
+| `heap_tail` | Scheduler | Orchestrator | Heap ring reclamation pointer |
 | `orchestrator_done` | Orchestrator | Scheduler | Signals orchestration completion |
 | `orchestrator_reclaim_waiting` | Orchestrator | Scheduler | Orchestrator is blocked on task/heap reclaim before graph construction can finish |
 | `task_window_size` | Init | Both | Number of task slots (per-ring, in `PTO2SharedMemoryRingHeader`) |
 | `heap_size` | Init | Both | Heap total size (per-ring, in `PTO2SharedMemoryRingHeader`) |
 | `task_descriptors_offset` | Init | Both | Offset to TaskDescriptor array in SM (per-ring) |
-| `consumed_leaf` | Scheduler | Orchestrator | Per-slot notifications for newly `CONSUMED` tasks |
-| `consumed_summary` | Scheduler | Orchestrator | Non-empty leaf words, so reclaim work is proportional to notifications |
 | `total_size` | Init | Both | Total shared memory size |
 
 ### 3.2 Size Calculation
@@ -174,9 +172,7 @@ The orchestrator and schedulers communicate through a contiguous shared memory r
 total = ALIGN(Header)
       + Σ_ring [ ALIGN(window_size * sizeof(TaskDescriptor))
                + ALIGN(window_size * sizeof(TaskPayload))
-               + ALIGN(window_size * sizeof(TaskSlotState))
-               + ALIGN(ceil(window_size / 64) * sizeof(uint64_t))
-               + ALIGN(ceil(ceil(window_size / 64) / 64) * sizeof(uint64_t)) ]
+               + ALIGN(window_size * sizeof(TaskSlotState)) ]
 ```
 
 Alignment is 64 bytes (`PTO2_ALIGN_SIZE`).
@@ -216,35 +212,18 @@ else:
 
 ### 4.2 Heap Ring
 
-The heap ring manages output buffer allocation from a per-ring GM heap.
+The heap ring manages output buffer allocation from a circular GM heap.
 
-**Fast path**: Buffers are allocated contiguously from the orchestrator-local
-`heap_top`. When reaching the end, allocation wraps to the beginning if the
-FIFO `heap_tail` has advanced far enough. Buffers never straddle the physical
-heap boundary.
+**Structure** (`PTO2HeapRing`):
 
-**Pressure fallback**: If neither bump region can satisfy an allocation, the
-allocator switches that heap to explicit extent reclaim. It builds an
-address-ordered free list inside free heap blocks, performs one scan of the
-active task window, coalesces adjacent extents, and selects the smallest extent
-that satisfies each allocation. After that transition, each successful
-`COMPLETED -> CONSUMED` state change publishes its physical slot to a two-level
-bitmap. Under pressure, the allocator atomically drains only the non-empty leaf
-words identified by the summary bitmap. A live oldest task still blocks
-task-slot watermark advancement, but it no longer pins unrelated `CONSUMED`
-output buffers behind it.
+- `base`: GM heap base address
+- `size`: total heap size (default 1 GB)
+- `top`: allocation pointer (local to orchestrator)
+- `tail_ptr`: pointer to `header->heap_tail` (updated by scheduler)
 
-The orchestrator is the only free-list writer. The scheduler only publishes
-`CONSUMED` and its slot notification; an acquire load of that state is the
-ownership handoff proving that all consumers and the owning scope have released
-the buffer. Each descriptor is cleared when its extent is collected, preventing
-a later watermark advance or stale bitmap notification from releasing the same
-generation twice.
+**Allocation**: Buffers are allocated contiguously from `top`. When reaching the end, allocation wraps to the beginning if `tail` has advanced far enough. Buffers never straddle the wrap-around boundary.
 
-Scope stats use monotonic allocated/reclaimed byte counters rather than the
-physical bump cursors. `heap_end - heap_start` is the allocator-owned byte
-count: FIFO-pinned holes count as owned before extent fallback, then leave the
-count when the allocator makes them reusable.
+**Reclamation**: When `last_task_alive` advances past a task, its `packed_buffer_end` is used to advance `heap_tail`, freeing the memory region.
 
 ### 4.3 Dependency List Pool
 
@@ -260,12 +239,7 @@ The ring buffer mechanism provides **flow control** between the orchestrator (pr
 
 **Task Ring back-pressure**: When `active_count = current_index - last_task_alive >= window_size - 1`, `PTO2TaskAllocator::alloc` spin-waits until the scheduler completes tasks and advances `last_task_alive`.
 
-**Heap back-pressure**: When the heap has insufficient contiguous space,
-`PTO2TaskAllocator::alloc` first collects safe `CONSUMED` extents. It
-spin-waits only when no free extent is large enough. A cached largest-extent
-size makes that check constant-time; the two-level consumed bitmap makes
-steady-state collection proportional to newly consumed slots instead of the
-full active task window.
+**Heap Ring back-pressure**: When the heap has insufficient contiguous space, `PTO2TaskAllocator::alloc` spin-waits until the scheduler advances `heap_tail` past completed tasks' output buffers.
 
 While either task/heap wait is active under concurrent dispatch, the allocator publishes `orchestrator_reclaim_waiting=1`. It does not treat a fixed period without `last_task_alive` movement as proof of deadlock: a producer may remain legitimately live while its consumers execute. The scheduler owns the residual forward-progress timeout because it can observe all running cores and global task completions. The allocator clears the flag on successful reclaim or when either runtime error channel asks it to unwind.
 

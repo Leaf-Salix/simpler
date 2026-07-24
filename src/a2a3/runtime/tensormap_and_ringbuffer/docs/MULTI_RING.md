@@ -80,6 +80,8 @@ Per-ring flow control and per-ring layout info are grouped together:
 struct PTO2RingFlowControl {
     std::atomic<int32_t> current_task_index;  // task ring head
     std::atomic<int32_t> last_task_alive;     // task ring tail
+    std::atomic<uint64_t> heap_top;           // heap alloc pointer
+    std::atomic<uint64_t> heap_tail;          // heap reclaim pointer
 };
 
 struct alignas(64) PTO2SharedMemoryRingHeader {
@@ -95,8 +97,6 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2TaskDescriptor *task_descriptors;
     PTO2TaskPayload *task_payloads;
     PTO2TaskSlotState *slot_states;
-    std::atomic<uint64_t> *consumed_leaf;     // one bit per physical task slot
-    std::atomic<uint64_t> *consumed_summary;  // one bit per leaf word
 
     // Accessors (slot = local_id & task_window_mask)
     PTO2TaskDescriptor &get_task_by_slot(int32_t slot);
@@ -185,8 +185,7 @@ advance_ring_pointers(ring_id):  // protected by per-ring advance_lock
     sync_to_sm()  // release-store last_task_alive
 ```
 
-Per-ring try-locks in the scheduler state prevent concurrent scheduler threads
-from interleaving `last_task_alive` scans and publications within the same ring.
+Per-ring try-locks in the scheduler state prevent concurrent scheduler threads from interleaving heap_tail writes within the same ring.
 
 ### 5.2 Cross-Ring Dependencies
 

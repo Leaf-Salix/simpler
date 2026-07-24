@@ -16,7 +16,7 @@
  * 1. TaskAllocator - Unified task slot + output buffer allocation
  *    - Combines task ring (slot allocation) and heap ring (output buffer allocation)
  *    - Single spin-wait loop with unified back-pressure and deadlock detection
- *    - O(1) bump allocation with consumed-extent fallback under heap pressure
+ *    - O(1) bump allocation for both task slots and heap buffers
  *
  * 2. FaninPool - Fanin spill entry allocation
  *    - Ring buffer for spilled fanin entries
@@ -97,23 +97,13 @@ public:
         window_mask_ = window_size - 1;
         current_index_ptr_ = current_index_ptr;
         last_alive_ptr_ = last_alive_ptr;
-        uintptr_t raw_heap_base = reinterpret_cast<uintptr_t>(heap_base);
-        uintptr_t aligned_heap_base = PTO2_ALIGN_UP(raw_heap_base, PTO2_ALIGN_SIZE);
-        uint64_t alignment_prefix = static_cast<uint64_t>(aligned_heap_base - raw_heap_base);
-        heap_base_ = reinterpret_cast<void *>(aligned_heap_base);
-        heap_size_ = alignment_prefix < heap_size ? (heap_size - alignment_prefix) & ~(PTO2_ALIGN_SIZE - 1) : 0;
+        heap_base_ = heap_base;
+        heap_size_ = heap_size;
         error_code_ptr_ = error_code_ptr;
         local_task_id_ = initial_local_task_id;
         heap_top_ = 0;
         heap_tail_ = 0;
-        last_alive_seen_ = initial_local_task_id;
-        extent_reclaim_enabled_ = false;
-        free_extents_ = nullptr;
-        largest_free_extent_ = 0;
-        heap_allocated_bytes_ = 0;
-        heap_reclaimed_bytes_ = 0;
-        heap_allocated_offset_ = 0;
-        heap_reclaimed_offset_ = 0;
+        last_alive_seen_ = 0;
     }
 
     /**
@@ -157,41 +147,20 @@ public:
 #endif
 
         while (true) {
-            if ((spin_count & 255) == 0) {
-                // Check both resources; commit only if both available
-                if (local_task_id_ - last_alive + 1 < window_size_) {
-                    void *heap_ptr = nullptr;
-                    if (extent_reclaim_enabled_) {
-                        heap_ptr = try_extent_heap(aligned_size);
-                        if (heap_ptr == nullptr) {
-                            if (scheduler_runs_concurrently && sm_header != nullptr) {
-                                collect_consumed_extents_pending(*sm_header, last_alive, local_task_id_);
-                            } else {
-                                collect_consumed_extents(last_alive, local_task_id_);
-                            }
-                            heap_ptr = try_extent_heap(aligned_size);
-                        }
-                    } else {
-                        heap_ptr = try_bump_heap(aligned_size);
-                        if (heap_ptr == nullptr) {
-                            enable_extent_reclaim(last_alive);
-                            heap_ptr = try_extent_heap(aligned_size);
-                        }
-                    }
-                    if (heap_ptr) {
-                        int32_t task_id = commit_task(heap_ptr, static_cast<char *>(heap_ptr) + aligned_size);
-                        clear_reclaim_wait();
+            // Check both resources; commit only if both available
+            if (local_task_id_ - last_alive + 1 < window_size_) {
+                void *heap_ptr = try_bump_heap(aligned_size);
+                if (heap_ptr) {
+                    int32_t task_id = commit_task();
+                    clear_reclaim_wait();
 #if SIMPLER_ORCH_PROFILING
-                        record_wait(spin_count, wait_start, waiting);
+                    record_wait(spin_count, wait_start, waiting);
 #endif
-                        return {
-                            task_id, task_id & window_mask_, heap_ptr, static_cast<char *>(heap_ptr) + aligned_size
-                        };
-                    }
-                    blocked_on_heap = true;
-                } else {
-                    blocked_on_heap = false;
+                    return {task_id, task_id & window_mask_, heap_ptr, static_cast<char *>(heap_ptr) + aligned_size};
                 }
+                blocked_on_heap = true;
+            } else {
+                blocked_on_heap = false;
             }
 
             if (!scheduler_runs_concurrently || sm_header == nullptr) {
@@ -211,18 +180,13 @@ public:
                 waiting = true;
             }
 #endif
-            bool reclaim_advanced = false;
-            if ((spin_count & 255) == 0) {
-                last_alive = last_alive_ptr_->load(std::memory_order_acquire);
-                update_heap_tail(last_alive);
-                if (last_alive > prev_last_alive) {
-                    // Reclaim advanced -> productive backpressure, not a deadlock.
-                    spin_count = 0;
-                    prev_last_alive = last_alive;
-                    reclaim_advanced = true;
-                }
-            }
-            if (!reclaim_advanced && (spin_count & 1023) == 0) {
+            last_alive = last_alive_ptr_->load(std::memory_order_acquire);
+            update_heap_tail(last_alive);
+            if (last_alive > prev_last_alive) {
+                // Reclaim advanced -> productive backpressure, not a deadlock.
+                spin_count = 0;
+                prev_last_alive = last_alive;
+            } else if ((spin_count & 1023) == 0) {
                 // The scheduler owns the progress watchdog while dispatch runs
                 // concurrently. Poll both error channels so its timeout can
                 // unwind this otherwise-unbounded back-pressure wait.
@@ -255,9 +219,6 @@ public:
     int32_t window_size() const { return window_size_; }
 
     uint64_t heap_available() const {
-        if (extent_reclaim_enabled_) {
-            return largest_free_extent_;
-        }
         uint64_t tail = heap_tail_;
         if (heap_top_ >= tail) {
             uint64_t at_end = heap_size_ - heap_top_;
@@ -267,21 +228,17 @@ public:
         return tail - heap_top_;
     }
 
-    // Physical bump cursors freeze once explicit extent reclaim is enabled.
     uint64_t heap_top() const { return heap_top_; }
+    // Heap ring start: reclaim pointer (oldest byte still live). heap_top() is
+    // the end (next allocation). heap_top - heap_tail == heap_used_bytes().
     uint64_t heap_tail() const { return heap_tail_; }
     uint64_t heap_capacity() const { return heap_size_; }
-    uint64_t heap_used_bytes() const { return heap_allocated_bytes_ - heap_reclaimed_bytes_; }
-    uint64_t heap_reclaimed_offset() const { return heap_reclaimed_offset_; }
-    uint64_t heap_allocated_offset() const { return heap_allocated_offset_; }
+    uint64_t heap_used_bytes() const {
+        if (heap_size_ == 0) return 0;
+        return (heap_top_ + heap_size_ - heap_tail_) % heap_size_;
+    }
 
 private:
-    struct FreeExtent {
-        uint64_t size;
-        FreeExtent *next;
-    };
-    static_assert(sizeof(FreeExtent) <= PTO2_ALIGN_SIZE);
-
     // --- Task Ring ---
     PTO2TaskDescriptor *descriptors_ = nullptr;
     // Parallel to descriptors_, indexed by task_id & window_mask_. Read-only here,
@@ -302,13 +259,6 @@ private:
     uint64_t heap_top_ = 0;        // Current heap allocation pointer
     uint64_t heap_tail_ = 0;       // Heap reclamation pointer (derived from consumed tasks)
     int32_t last_alive_seen_ = 0;  // last_task_alive at last heap_tail derivation
-    bool extent_reclaim_enabled_ = false;
-    FreeExtent *free_extents_ = nullptr;
-    uint64_t largest_free_extent_ = 0;
-    uint64_t heap_allocated_bytes_ = 0;
-    uint64_t heap_reclaimed_bytes_ = 0;
-    uint64_t heap_allocated_offset_ = 0;
-    uint64_t heap_reclaimed_offset_ = 0;
 
     // --- Shared ---
     std::atomic<int32_t> *error_code_ptr_ = nullptr;
@@ -325,12 +275,8 @@ private:
      * scan cannot mistake it for the previous generation and advance past it.
      * No other scheduler path can discover the task before fanin wiring.
      */
-    int32_t commit_task(void *packed_buffer_base, void *packed_buffer_end) {
+    int32_t commit_task() {
         int32_t task_id = local_task_id_++;
-        PTO2TaskDescriptor &desc = descriptors_[task_id & window_mask_];
-        desc.task_id = PTO2TaskId::make(ring_id_, static_cast<uint32_t>(task_id));
-        desc.packed_buffer_base = packed_buffer_base;
-        desc.packed_buffer_end = packed_buffer_end;
         if (slot_states_ != nullptr) {
             slot_states_[task_id & window_mask_].task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
         }
@@ -338,25 +284,31 @@ private:
         return task_id;
     }
 
+    /**
+     * Derive heap_tail_ from the last consumed task's packed_buffer_end.
+     *
+     * Every task has a valid packed_buffer_end (equal to packed_buffer_base
+     * for zero-size allocations), so the last consumed task always determines
+     * the correct heap_tail — no backward scan needed.
+     */
     void update_heap_tail(int32_t last_alive) {
         if (last_alive <= last_alive_seen_) return;
-
-        for (int32_t task_id = last_alive_seen_; task_id < last_alive; task_id++) {
-            PTO2TaskDescriptor &desc = descriptors_[task_id & window_mask_];
-            if (extent_reclaim_enabled_) {
-                reclaim_descriptor(task_id, desc);
-            } else {
-                auto *base = static_cast<char *>(desc.packed_buffer_base);
-                auto *end = static_cast<char *>(desc.packed_buffer_end);
-                record_heap_reclaim(static_cast<uint64_t>(end - base));
-            }
-        }
-        if (!extent_reclaim_enabled_) {
-            PTO2TaskDescriptor &desc = descriptors_[(last_alive - 1) & window_mask_];
-            heap_tail_ =
-                static_cast<uint64_t>(static_cast<char *>(desc.packed_buffer_end) - static_cast<char *>(heap_base_));
-        }
         last_alive_seen_ = last_alive;
+
+        PTO2TaskDescriptor &desc = descriptors_[(last_alive - 1) & window_mask_];
+        uint64_t old_tail = heap_tail_;
+        heap_tail_ =
+            static_cast<uint64_t>(static_cast<char *>(desc.packed_buffer_end) - static_cast<char *>(heap_base_));
+#if SIMPLER_DFX
+        // Reclaim pointer moves forward monotonically in ring order; a decrease
+        // means it wrapped past heap_size_ (occupancy < heap_size_ guarantees at
+        // most one wrap per call). Report it so scope_stats can unroll.
+        if (is_scope_stats_enabled() && heap_tail_ < old_tail) {
+            scope_stats_note_heap_wrap(SCOPE_STATS_HEAP_SIDE_RECLAIM);
+        }
+#else
+        (void)old_tail;
+#endif
     }
 
     /**
@@ -384,6 +336,12 @@ private:
                 );
                 result = heap_base_;
                 heap_top_ = alloc_size;
+#if SIMPLER_DFX
+                // Allocation pointer just wrapped past heap_size_; report it so
+                // scope_stats can unroll the wrapping offset into a monotonic value.
+                // The collector attributes the wrap to the current scope's ring.
+                if (is_scope_stats_enabled()) scope_stats_note_heap_wrap(SCOPE_STATS_HEAP_SIDE_ALLOC);
+#endif
             } else {
                 LOG_DEBUG(
                     "try_bump_heap failed (top>=tail): top=%" PRIu64 ", tail=%" PRIu64 ", alloc=%" PRIu64
@@ -406,220 +364,7 @@ private:
             }
         }
 
-        record_heap_allocation(alloc_size);
         return result;
-    }
-
-    void enable_extent_reclaim(int32_t last_alive) {
-        extent_reclaim_enabled_ = true;
-        free_extents_ = nullptr;
-        largest_free_extent_ = 0;
-
-        if (heap_used_bytes() == 0) {
-            insert_free_extent(heap_base_, heap_size_);
-        } else if (heap_top_ >= heap_tail_) {
-            insert_free_extent(static_cast<char *>(heap_base_) + heap_top_, heap_size_ - heap_top_);
-            insert_free_extent(heap_base_, heap_tail_);
-        } else {
-            uint64_t upper_segment_end = find_upper_segment_end(last_alive);
-            insert_free_extent(
-                static_cast<char *>(heap_base_) + heap_top_, static_cast<uint64_t>(heap_tail_ - heap_top_)
-            );
-            insert_free_extent(
-                static_cast<char *>(heap_base_) + upper_segment_end,
-                static_cast<uint64_t>(heap_size_ - upper_segment_end)
-            );
-        }
-        collect_consumed_extents(last_alive, local_task_id_);
-    }
-
-    uint64_t find_upper_segment_end(int32_t first_task_id) const {
-        uint64_t upper_segment_end = heap_tail_;
-        auto *heap_begin = static_cast<char *>(heap_base_);
-        auto *heap_end = heap_begin + heap_size_;
-        for (int32_t task_id = first_task_id; task_id < local_task_id_; task_id++) {
-            PTO2TaskDescriptor &desc = descriptors_[task_id & window_mask_];
-            if (desc.task_id != PTO2TaskId::make(ring_id_, static_cast<uint32_t>(task_id))) continue;
-            auto *base = static_cast<char *>(desc.packed_buffer_base);
-            auto *end = static_cast<char *>(desc.packed_buffer_end);
-            if (base == nullptr || end == nullptr || base < heap_begin || end < base || end > heap_end) continue;
-            uint64_t base_offset = static_cast<uint64_t>(base - heap_begin);
-            uint64_t end_offset = static_cast<uint64_t>(end - heap_begin);
-            if (base_offset >= heap_tail_) {
-                upper_segment_end = std::max(upper_segment_end, end_offset);
-            }
-        }
-        return upper_segment_end;
-    }
-
-    void collect_consumed_extents(int32_t first_task_id, int32_t end_task_id) {
-        if (slot_states_ == nullptr) return;
-        for (int32_t task_id = first_task_id; task_id < end_task_id; task_id++) {
-            int32_t slot = task_id & window_mask_;
-            if (slot_states_[slot].task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) continue;
-            reclaim_descriptor(task_id, descriptors_[slot]);
-        }
-    }
-
-    void
-    collect_consumed_extents_pending(PTO2SharedMemoryHeader &sm_header, int32_t first_task_id, int32_t end_task_id) {
-        if (slot_states_ == nullptr) return;
-        PTO2SharedMemoryRingHeader &ring = sm_header.rings[ring_id_];
-        uint64_t leaf_words = ring.consumed_leaf_words();
-        for (uint64_t summary_index = 0; summary_index < ring.consumed_summary_words(); summary_index++) {
-            if (ring.consumed_summary[summary_index].load(std::memory_order_relaxed) == 0) continue;
-            uint64_t summary_bits = ring.consumed_summary[summary_index].exchange(0, std::memory_order_acq_rel);
-            while (summary_bits != 0) {
-                uint64_t leaf_index = summary_index * 64 + static_cast<uint64_t>(__builtin_ctzll(summary_bits));
-                summary_bits &= summary_bits - 1;
-                if (leaf_index >= leaf_words) continue;
-
-                uint64_t leaf_bits = ring.consumed_leaf[leaf_index].exchange(0, std::memory_order_acq_rel);
-                while (leaf_bits != 0) {
-                    int32_t slot =
-                        static_cast<int32_t>(leaf_index * 64 + static_cast<uint64_t>(__builtin_ctzll(leaf_bits)));
-                    leaf_bits &= leaf_bits - 1;
-                    if (slot >= window_size_) continue;
-
-                    PTO2TaskDescriptor &desc = descriptors_[slot];
-                    if (desc.task_id.ring() != ring_id_) continue;
-                    int32_t task_id = static_cast<int32_t>(desc.task_id.local());
-                    if (task_id < first_task_id || task_id >= end_task_id) continue;
-                    if (slot_states_[slot].task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) continue;
-                    reclaim_descriptor(task_id, desc);
-                }
-            }
-        }
-    }
-
-    void reclaim_descriptor(int32_t task_id, PTO2TaskDescriptor &desc) {
-        if (desc.task_id != PTO2TaskId::make(ring_id_, static_cast<uint32_t>(task_id))) return;
-        auto *base = static_cast<char *>(desc.packed_buffer_base);
-        auto *end = static_cast<char *>(desc.packed_buffer_end);
-        if (base == nullptr && end == nullptr) return;
-        auto *heap_begin = static_cast<char *>(heap_base_);
-        auto *heap_end = heap_begin + heap_size_;
-        if (base == nullptr || end == nullptr || base < heap_begin || end < base || end > heap_end) return;
-
-        desc.packed_buffer_base = nullptr;
-        desc.packed_buffer_end = nullptr;
-        uint64_t size = static_cast<uint64_t>(end - base);
-        if (size == 0) return;
-        insert_free_extent(base, size);
-        record_heap_reclaim(size);
-    }
-
-    void insert_free_extent(void *base, uint64_t size) {
-        if (size < sizeof(FreeExtent)) return;
-
-        auto *start = static_cast<char *>(base);
-        auto *end = start + size;
-        FreeExtent *prev = nullptr;
-        FreeExtent *cur = free_extents_;
-        while (cur != nullptr && reinterpret_cast<char *>(cur) < start) {
-            prev = cur;
-            cur = cur->next;
-        }
-
-        FreeExtent *merged = nullptr;
-        if (prev != nullptr && reinterpret_cast<char *>(prev) + prev->size == start) {
-            prev->size += size;
-            merged = prev;
-        } else {
-            auto *extent = reinterpret_cast<FreeExtent *>(start);
-            extent->size = size;
-            extent->next = cur;
-            if (prev != nullptr) {
-                prev->next = extent;
-            } else {
-                free_extents_ = extent;
-            }
-            merged = extent;
-        }
-
-        if (cur != nullptr && reinterpret_cast<char *>(cur) == end) {
-            merged->size += cur->size;
-            merged->next = cur->next;
-        }
-        largest_free_extent_ = std::max(largest_free_extent_, merged->size);
-    }
-
-    void *try_extent_heap(uint64_t alloc_size) {
-        if (alloc_size == 0) {
-            return static_cast<char *>(heap_base_) + heap_top_;
-        }
-        if (alloc_size > largest_free_extent_) return nullptr;
-
-        FreeExtent *best = nullptr;
-        FreeExtent *best_prev = nullptr;
-        FreeExtent *prev = nullptr;
-        for (FreeExtent *cur = free_extents_; cur != nullptr; cur = cur->next) {
-            if (cur->size >= alloc_size && (best == nullptr || cur->size < best->size)) {
-                best = cur;
-                best_prev = prev;
-                if (cur->size == alloc_size) break;
-            }
-            prev = cur;
-        }
-        if (best == nullptr) return nullptr;
-
-        FreeExtent *cur = best;
-        prev = best_prev;
-        auto *result = reinterpret_cast<char *>(cur);
-        uint64_t extent_size = cur->size;
-        if (extent_size == alloc_size) {
-            if (prev != nullptr) {
-                prev->next = cur->next;
-            } else {
-                free_extents_ = cur->next;
-            }
-        } else {
-            auto *remainder = reinterpret_cast<FreeExtent *>(result + alloc_size);
-            remainder->size = extent_size - alloc_size;
-            remainder->next = cur->next;
-            if (prev != nullptr) {
-                prev->next = remainder;
-            } else {
-                free_extents_ = remainder;
-            }
-        }
-        if (extent_size == largest_free_extent_) {
-            largest_free_extent_ = find_largest_free_extent();
-        }
-        record_heap_allocation(alloc_size);
-        return result;
-    }
-
-    uint64_t find_largest_free_extent() const {
-        uint64_t largest = 0;
-        for (FreeExtent *extent = free_extents_; extent != nullptr; extent = extent->next) {
-            largest = std::max(largest, extent->size);
-        }
-        return largest;
-    }
-
-    void record_heap_allocation(uint64_t size) {
-        heap_allocated_bytes_ += size;
-        heap_allocated_offset_ += size;
-        bool wrapped = heap_size_ != 0 && heap_allocated_offset_ >= heap_size_;
-        if (wrapped) heap_allocated_offset_ -= heap_size_;
-#if SIMPLER_DFX
-        if (wrapped && is_scope_stats_enabled()) scope_stats_note_heap_wrap(SCOPE_STATS_HEAP_SIDE_ALLOC);
-#else
-        (void)wrapped;
-#endif
-    }
-
-    void record_heap_reclaim(uint64_t size) {
-        heap_reclaimed_bytes_ += size;
-        heap_reclaimed_offset_ += size;
-        bool wrapped = heap_size_ != 0 && heap_reclaimed_offset_ >= heap_size_;
-        if (wrapped) heap_reclaimed_offset_ -= heap_size_;
-#if SIMPLER_DFX
-        if (wrapped && is_scope_stats_enabled()) scope_stats_note_heap_wrap(SCOPE_STATS_HEAP_SIDE_RECLAIM);
-#else
-        (void)wrapped;
-#endif
     }
 
 #if SIMPLER_ORCH_PROFILING
@@ -630,7 +375,7 @@ private:
         }
         {
             extern uint64_t g_orch_alloc_atomic_count;
-            g_orch_alloc_atomic_count += (spin_count >> 8) + 1;
+            g_orch_alloc_atomic_count += spin_count + 1;
         }
     }
 #endif

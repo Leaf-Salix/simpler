@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 #include <cstring>
 #include <limits>
+#include <vector>
 #include "pto_runtime2.h"
 #include "pto_runtime_status.h"
 #include "pto_shared_memory.h"
@@ -103,51 +104,7 @@ TEST_F(SharedMemoryTest, HeaderInitValues) {
         auto &fc = hdr->rings[r].fc;
         EXPECT_EQ(fc.current_task_index.load(), 0);
         EXPECT_EQ(fc.last_task_alive.load(), 0);
-        EXPECT_NE(hdr->rings[r].consumed_leaf, nullptr);
-        EXPECT_NE(hdr->rings[r].consumed_summary, nullptr);
-        EXPECT_EQ(hdr->rings[r].consumed_leaf[0].load(), 0u);
-        EXPECT_EQ(hdr->rings[r].consumed_summary[0].load(), 0u);
     }
-}
-
-TEST_F(SharedMemoryTest, ConsumedBitmapResetsAndIsolatesRings) {
-    auto &ring = handle->header->rings[2];
-    ASSERT_GT(ring.task_window_size, 4097u);
-    EXPECT_EQ(ring.publish_consumed(65), 2);
-    EXPECT_EQ(ring.publish_consumed(66), 1);
-    EXPECT_EQ(ring.publish_consumed(4097), 2);
-    EXPECT_EQ(ring.consumed_leaf[1].load(), 6u);
-    EXPECT_EQ(ring.consumed_leaf[64].load(), 2u);
-    EXPECT_EQ(ring.consumed_summary[0].load(), 2u);
-    EXPECT_EQ(ring.consumed_summary[1].load(), 1u);
-    EXPECT_EQ(handle->header->rings[0].consumed_summary[0].load(), 0u);
-
-    ASSERT_TRUE(handle->init(handle->sm_base, handle->sm_size, PTO2_TASK_WINDOW_SIZE, PTO2_HEAP_SIZE));
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        EXPECT_EQ(handle->header->rings[r].consumed_leaf[0].load(), 0u);
-        EXPECT_EQ(handle->header->rings[r].consumed_leaf[64].load(), 0u);
-        EXPECT_EQ(handle->header->rings[r].consumed_summary[0].load(), 0u);
-        EXPECT_EQ(handle->header->rings[r].consumed_summary[1].load(), 0u);
-    }
-}
-
-TEST_F(SharedMemoryTest, ConsumedBitmapPreservesPublishDuringDrain) {
-    auto &ring = handle->header->rings[0];
-    ASSERT_GT(ring.task_window_size, 66u);
-
-    EXPECT_EQ(ring.publish_consumed(65), 2);
-    EXPECT_EQ(ring.consumed_summary[0].exchange(0, std::memory_order_acq_rel), 2u);
-
-    // The drainer owns this leaf through the summary bit. A second publisher
-    // need not restore the summary because the pending leaf exchange sees both.
-    EXPECT_EQ(ring.publish_consumed(66), 1);
-    EXPECT_EQ(ring.consumed_summary[0].load(), 0u);
-    EXPECT_EQ(ring.consumed_leaf[1].exchange(0, std::memory_order_acq_rel), 6u);
-
-    // A publisher arriving after the leaf exchange observes an empty leaf and
-    // restores the summary bit for the next drain.
-    EXPECT_EQ(ring.publish_consumed(65), 2);
-    EXPECT_EQ(ring.consumed_summary[0].load(), 2u);
 }
 
 // =============================================================================
@@ -213,29 +170,17 @@ TEST(SharedMemoryLayout, RegionsNonOverlapping) {
     ASSERT_NE(h, nullptr);
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        auto &ring = h->header->rings[r];
-        uintptr_t desc_start = (uintptr_t)ring.task_descriptors;
+        uintptr_t desc_start = (uintptr_t)h->header->rings[r].task_descriptors;
         uintptr_t desc_end = desc_start + 64 * sizeof(PTO2TaskDescriptor);
-        uintptr_t payload_start = (uintptr_t)ring.task_payloads;
-        uintptr_t payload_end = payload_start + 64 * sizeof(PTO2TaskPayload);
-        uintptr_t slot_start = (uintptr_t)ring.slot_states;
-        uintptr_t slot_end = slot_start + 64 * sizeof(PTO2TaskSlotState);
-        uintptr_t leaf_start = (uintptr_t)ring.consumed_leaf;
-        uintptr_t leaf_end = leaf_start + ring.consumed_leaf_words() * sizeof(std::atomic<uint64_t>);
-        uintptr_t summary_start = (uintptr_t)ring.consumed_summary;
+        uintptr_t payload_start = (uintptr_t)h->header->rings[r].task_payloads;
 
         EXPECT_GE(payload_start, desc_end) << "Ring " << r << ": payload region should not overlap descriptors";
-        EXPECT_GE(slot_start, payload_end) << "Ring " << r << ": slot region should not overlap payloads";
-        EXPECT_GE(leaf_start, slot_end) << "Ring " << r << ": consumed leaf should not overlap slots";
-        EXPECT_GE(summary_start, leaf_end) << "Ring " << r << ": consumed summary should not overlap leaf";
     }
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH - 1; r++) {
-        auto &ring = h->header->rings[r];
-        uintptr_t this_summary_end =
-            (uintptr_t)ring.consumed_summary + ring.consumed_summary_words() * sizeof(std::atomic<uint64_t>);
+        uintptr_t this_payload_end = (uintptr_t)h->header->rings[r].task_payloads + 64 * sizeof(PTO2TaskPayload);
         uintptr_t next_desc_start = (uintptr_t)h->header->rings[r + 1].task_descriptors;
-        EXPECT_GE(next_desc_start, this_summary_end) << "Ring " << r << " and " << (r + 1) << " should not overlap";
+        EXPECT_GE(next_desc_start, this_payload_end) << "Ring " << r << " and " << (r + 1) << " should not overlap";
     }
 }
 
@@ -307,11 +252,9 @@ TEST(RuntimeArenaLayout, PerRingConfigInitializesRuntimeComponents) {
     void *sm = sm_arena.region_ptr(sm_off);
     std::memset(sm, 0, static_cast<size_t>(sm_size));
 
-    DeviceArena gm_arena;
-    const size_t gm_off = gm_arena.reserve(static_cast<size_t>(total_heap), PTO2_ALIGN_SIZE);
-    ASSERT_NE(gm_arena.commit(), nullptr);
-    void *gm = gm_arena.region_ptr(gm_off);
-    PTO2Runtime *rt = runtime_init_data_from_layout(runtime_arena, layout, PTO2_MODE_EXECUTE, sm, sm_size, gm, heaps);
+    std::vector<char> gm(static_cast<size_t>(total_heap));
+    PTO2Runtime *rt =
+        runtime_init_data_from_layout(runtime_arena, layout, PTO2_MODE_EXECUTE, sm, sm_size, gm.data(), heaps);
     ASSERT_NE(rt, nullptr);
     runtime_wire_arena_pointers(runtime_arena, layout, rt);
 
@@ -371,16 +314,6 @@ TEST(SharedMemoryBoundary, ValidateDetectsCorruption) {
     EXPECT_TRUE(h->validate());
 
     h->header->rings[0].fc.current_task_index.store(-1);
-    EXPECT_FALSE(h->validate());
-}
-
-TEST(SharedMemoryBoundary, ValidateRejectsConsumedBitmapOutsideRegion) {
-    DeviceArena arena;
-    PTO2SharedMemoryHandle *h = make_handle(arena, /*ws=*/256, /*heap=*/4096);
-    ASSERT_NE(h, nullptr);
-    EXPECT_TRUE(h->validate());
-
-    h->header->rings[0].consumed_leaf = nullptr;
     EXPECT_FALSE(h->validate());
 }
 

@@ -17,11 +17,12 @@
  * The allocator has one caller (the orchestrator thread), while scheduler
  * threads concurrently advance its reclaim watermark and error channel.
  *
- * Design contracts:
+ * Design contracts (try_bump_heap):
  *
- * - The bump-ring fast path keeps strict full/empty guards. On contiguous
- *   space exhaustion, the allocator switches to explicit free extents, where
- *   exact-fit allocations are unambiguous.
+ * - Wrap-around guard uses `tail > alloc_size` (strict >).  When
+ *   tail == alloc_size the wrap branch returns nullptr.  Allowing it
+ *   would create top == tail (full/empty ambiguity).  Strict >
+ *   sacrifices one quantum of capacity.
  *
  * - heap_available() returns max(at_end, at_begin), not the sum.
  *   A single allocation cannot split across the wrap boundary.
@@ -265,7 +266,11 @@ TEST_F(TaskAllocatorTest, HeapExactFitAtEnd) {
     EXPECT_EQ(static_cast<char *>(r2.packed_base), reinterpret_cast<char *>(heap_buf) + HEAP_SIZE - 64);
 }
 
-TEST_F(TaskAllocatorTest, ExtentFallbackAllowsWrapExactFit) {
+// Wrap guard `tail > alloc_size` uses strict > to prevent full/empty ambiguity.
+// If the allocation were allowed, heap_top would advance to alloc_size == tail,
+// making top == tail.  Because top == tail is the canonical "empty" state, the
+// ring could not distinguish "completely full" from "completely empty".
+TEST_F(TaskAllocatorTest, HeapWrapGuardRejectsTailEqualsAllocSize) {
     auto r1 = allocator.alloc(HEAP_SIZE);
     ASSERT_FALSE(r1.failed());
     EXPECT_EQ(allocator.heap_top(), HEAP_SIZE);
@@ -273,8 +278,7 @@ TEST_F(TaskAllocatorTest, ExtentFallbackAllowsWrapExactFit) {
     consume_up_to(descriptors, last_alive, heap_buf, WINDOW_SIZE, 1, 64);
 
     auto r2 = allocator.alloc(64);
-    ASSERT_FALSE(r2.failed());
-    EXPECT_EQ(r2.packed_base, static_cast<void *>(heap_buf));
+    EXPECT_TRUE(r2.failed()) << "wrap guard must reject when tail == alloc_size (full/empty ambiguity)";
 }
 
 TEST_F(TaskAllocatorTest, HeapWrapAroundSuccess) {
@@ -289,7 +293,8 @@ TEST_F(TaskAllocatorTest, HeapWrapAroundSuccess) {
     EXPECT_EQ(allocator.heap_top(), 64u);
 }
 
-TEST_F(TaskAllocatorTest, ExtentFallbackAllowsLinearGapExactFit) {
+// Linear-gap guard `tail - top > alloc_size` uses strict > for the same reason.
+TEST_F(TaskAllocatorTest, HeapLinearGapGuardRejectsExactFit) {
     // Fill most of heap, leaving just 64 at end so next alloc wraps.
     auto r1 = allocator.alloc(HEAP_SIZE - 64);
     ASSERT_FALSE(r1.failed());
@@ -303,13 +308,10 @@ TEST_F(TaskAllocatorTest, ExtentFallbackAllowsLinearGapExactFit) {
 
     // Now top=128, tail=HEAP_SIZE-64 (top < tail)
     // gap = (HEAP_SIZE-64) - 128 = HEAP_SIZE-192
-    // The bump-ring guard rejects this exact fit, then explicit extents can
-    // represent the now-empty gap without a full/empty sentinel ambiguity.
+    // Allocate exactly gap bytes: gap > alloc_size -> FALSE
     uint64_t gap = (HEAP_SIZE - 64) - 128;
     auto r3 = allocator.alloc(gap);
-    ASSERT_FALSE(r3.failed());
-    EXPECT_EQ(r3.packed_base, reinterpret_cast<char *>(heap_buf) + 128);
-    EXPECT_EQ(r3.packed_end, reinterpret_cast<char *>(heap_buf) + HEAP_SIZE - 64);
+    EXPECT_TRUE(r3.failed()) << "linear-gap guard must reject exact fit (full/empty ambiguity)";
 }
 
 TEST_F(TaskAllocatorTest, HeapTopLessThanTailInsufficientSpace) {
@@ -373,263 +375,6 @@ TEST_F(TaskAllocatorTest, WrapPathWastedSpace) {
 
     uint64_t avail = allocator.heap_available();
     EXPECT_LT(avail, HEAP_SIZE) << "Wasted space at end reduces available capacity";
-}
-
-TEST_F(TaskAllocatorTest, ExtentFallbackRecoversWrapPadding) {
-    auto old_segment = allocator.alloc(3008);
-    ASSERT_FALSE(old_segment.failed());
-    consume_up_to(descriptors, last_alive, heap_buf, WINDOW_SIZE, 1, 3008);
-
-    auto wrapped = allocator.alloc(1152);
-    ASSERT_FALSE(wrapped.failed());
-    EXPECT_EQ(wrapped.packed_base, static_cast<void *>(heap_buf));
-
-    auto from_padding = allocator.alloc(2048);
-    ASSERT_FALSE(from_padding.failed());
-    EXPECT_EQ(from_padding.packed_base, reinterpret_cast<char *>(heap_buf) + 1152);
-    EXPECT_EQ(from_padding.packed_end, reinterpret_cast<char *>(heap_buf) + 3200);
-}
-
-TEST_F(TaskAllocatorTest, ReusesConsumedExtentBehindLiveHead) {
-    auto head = allocator.alloc(1024);
-    auto hole = allocator.alloc(2048);
-    auto tail = allocator.alloc(1024);
-    ASSERT_FALSE(head.failed());
-    ASSERT_FALSE(hole.failed());
-    ASSERT_FALSE(tail.failed());
-    EXPECT_EQ(allocator.heap_used_bytes(), HEAP_SIZE);
-
-    slot_states[head.slot].task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
-    slot_states[hole.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
-    slot_states[tail.slot].task_state.store(PTO2_TASK_PENDING, std::memory_order_release);
-
-    auto reused = allocator.alloc(1024);
-    ASSERT_FALSE(reused.failed());
-    EXPECT_EQ(reused.packed_base, hole.packed_base);
-    EXPECT_EQ(allocator.heap_used_bytes(), 3072u);
-
-    slot_states[head.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
-    last_alive.store(2, std::memory_order_release);
-    auto probe = allocator.alloc(0);
-    ASSERT_FALSE(probe.failed());
-    EXPECT_EQ(allocator.heap_available(), 1024u) << "Previous task retirement must not free a reused live extent";
-    EXPECT_EQ(allocator.heap_used_bytes(), 2048u);
-
-    slot_states[reused.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
-    auto coalesced = allocator.alloc(3072);
-    ASSERT_FALSE(coalesced.failed());
-    EXPECT_EQ(coalesced.packed_base, head.packed_base);
-    EXPECT_EQ(coalesced.packed_end, tail.packed_base);
-    EXPECT_EQ(allocator.heap_used_bytes(), HEAP_SIZE);
-    EXPECT_EQ(allocator.heap_allocated_offset(), 0u);
-    EXPECT_EQ(allocator.heap_reclaimed_offset(), 0u);
-}
-
-TEST_F(TaskAllocatorTest, ConcurrentBackpressureFindsConsumedExtentBehindLiveHead) {
-    auto head = allocator.alloc(1024);
-    auto hole = allocator.alloc(2048);
-    auto tail = allocator.alloc(1024);
-    ASSERT_FALSE(head.failed());
-    ASSERT_FALSE(hole.failed());
-    ASSERT_FALSE(tail.failed());
-
-    slot_states[head.slot].task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
-    slot_states[hole.slot].task_state.store(PTO2_TASK_PENDING, std::memory_order_release);
-    slot_states[tail.slot].task_state.store(PTO2_TASK_PENDING, std::memory_order_release);
-
-    PTO2SharedMemoryHeader header{};
-    std::atomic<uint64_t> consumed_leaf[1]{};
-    std::atomic<uint64_t> consumed_summary[1]{};
-    header.rings[0].task_window_size = WINDOW_SIZE;
-    header.rings[0].task_window_mask = WINDOW_SIZE - 1;
-    header.rings[0].consumed_leaf = consumed_leaf;
-    header.rings[0].consumed_summary = consumed_summary;
-    header.orch_error_code.store(PTO2_ERROR_NONE);
-    header.sched_error_code.store(PTO2_ERROR_NONE);
-    header.orchestrator_reclaim_waiting.store(0);
-    std::atomic<bool> observed_wait{false};
-    std::thread reclaimer([&]() {
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (header.orchestrator_reclaim_waiting.load(std::memory_order_acquire) == 0 &&
-               std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::yield();
-        }
-        if (header.orchestrator_reclaim_waiting.load(std::memory_order_acquire) != 0) {
-            observed_wait.store(true, std::memory_order_release);
-            slot_states[hole.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
-            header.rings[0].publish_consumed(static_cast<uint32_t>(hole.task_id));
-        } else {
-            header.sched_error_code.store(PTO2_ERROR_SCHEDULER_TIMEOUT, std::memory_order_release);
-        }
-    });
-
-    auto reused = allocator.alloc(1024, &header, /*scheduler_runs_concurrently=*/true);
-    reclaimer.join();
-
-    EXPECT_TRUE(observed_wait.load(std::memory_order_acquire));
-    ASSERT_FALSE(reused.failed());
-    EXPECT_EQ(reused.packed_base, hole.packed_base);
-    EXPECT_EQ(last_alive.load(std::memory_order_acquire), 0);
-    EXPECT_EQ(header.orchestrator_reclaim_waiting.load(std::memory_order_acquire), 0);
-}
-
-TEST(TaskAllocatorBitmapTest, ConcurrentBackpressureReclaimsFromSecondSummaryWord) {
-    static constexpr int32_t kWindowSize = 8192;
-    static constexpr int32_t kInitialTaskId = 4097;
-    static constexpr uint64_t kHeapSize = 4096;
-
-    std::vector<PTO2TaskDescriptor> descriptors(kWindowSize);
-    std::vector<PTO2TaskSlotState> slot_states(kWindowSize);
-    alignas(64) uint8_t heap[kHeapSize]{};
-    std::atomic<int32_t> current_index{kInitialTaskId};
-    std::atomic<int32_t> last_alive{kInitialTaskId};
-    std::atomic<int32_t> error_code{PTO2_ERROR_NONE};
-    PTO2TaskAllocator allocator{};
-    allocator.init(
-        descriptors.data(), kWindowSize, &current_index, &last_alive, heap, kHeapSize, &error_code, slot_states.data(),
-        kInitialTaskId
-    );
-
-    auto head = allocator.alloc(1024);
-    auto hole = allocator.alloc(2048);
-    auto tail = allocator.alloc(1024);
-    ASSERT_FALSE(head.failed());
-    ASSERT_FALSE(hole.failed());
-    ASSERT_FALSE(tail.failed());
-    ASSERT_EQ(hole.slot >> 6, 64);
-
-    slot_states[head.slot].task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
-    slot_states[hole.slot].task_state.store(PTO2_TASK_PENDING, std::memory_order_release);
-    slot_states[tail.slot].task_state.store(PTO2_TASK_PENDING, std::memory_order_release);
-
-    PTO2SharedMemoryHeader header{};
-    std::atomic<uint64_t> consumed_leaf[kWindowSize / 64]{};
-    std::atomic<uint64_t> consumed_summary[kWindowSize / 4096]{};
-    header.rings[0].task_window_size = kWindowSize;
-    header.rings[0].task_window_mask = kWindowSize - 1;
-    header.rings[0].consumed_leaf = consumed_leaf;
-    header.rings[0].consumed_summary = consumed_summary;
-    header.orch_error_code.store(PTO2_ERROR_NONE);
-    header.sched_error_code.store(PTO2_ERROR_NONE);
-    header.orchestrator_reclaim_waiting.store(0);
-
-    std::atomic<bool> observed_wait{false};
-    std::thread reclaimer([&]() {
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (header.orchestrator_reclaim_waiting.load(std::memory_order_acquire) == 0 &&
-               std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::yield();
-        }
-        if (header.orchestrator_reclaim_waiting.load(std::memory_order_acquire) != 0) {
-            observed_wait.store(true, std::memory_order_release);
-            slot_states[hole.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
-            header.rings[0].publish_consumed(static_cast<uint32_t>(hole.task_id));
-        } else {
-            header.sched_error_code.store(PTO2_ERROR_SCHEDULER_TIMEOUT, std::memory_order_release);
-        }
-    });
-
-    auto reused = allocator.alloc(1024, &header, /*scheduler_runs_concurrently=*/true);
-    reclaimer.join();
-
-    EXPECT_TRUE(observed_wait.load(std::memory_order_acquire));
-    ASSERT_FALSE(reused.failed());
-    EXPECT_EQ(reused.packed_base, hole.packed_base);
-    EXPECT_EQ(consumed_summary[1].load(std::memory_order_acquire), 0u);
-    EXPECT_EQ(consumed_leaf[64].load(std::memory_order_acquire), 0u);
-}
-
-TEST_F(TaskAllocatorTest, ConcurrentBackpressureRequiresConsumedNotification) {
-    auto head = allocator.alloc(1024);
-    auto hole = allocator.alloc(2048);
-    auto tail = allocator.alloc(1024);
-    ASSERT_FALSE(head.failed());
-    ASSERT_FALSE(hole.failed());
-    ASSERT_FALSE(tail.failed());
-
-    slot_states[head.slot].task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
-    slot_states[hole.slot].task_state.store(PTO2_TASK_PENDING, std::memory_order_release);
-    slot_states[tail.slot].task_state.store(PTO2_TASK_PENDING, std::memory_order_release);
-
-    PTO2SharedMemoryHeader header{};
-    std::atomic<uint64_t> consumed_leaf[1]{};
-    std::atomic<uint64_t> consumed_summary[1]{};
-    header.rings[0].task_window_size = WINDOW_SIZE;
-    header.rings[0].task_window_mask = WINDOW_SIZE - 1;
-    header.rings[0].consumed_leaf = consumed_leaf;
-    header.rings[0].consumed_summary = consumed_summary;
-    header.orch_error_code.store(PTO2_ERROR_NONE);
-    header.sched_error_code.store(PTO2_ERROR_NONE);
-    header.orchestrator_reclaim_waiting.store(0);
-    std::thread no_event_reclaimer([&]() {
-        while (header.orchestrator_reclaim_waiting.load(std::memory_order_acquire) == 0) {
-            std::this_thread::yield();
-        }
-        slot_states[hole.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
-        header.sched_error_code.store(PTO2_ERROR_SCHEDULER_TIMEOUT, std::memory_order_release);
-    });
-
-    auto blocked = allocator.alloc(1024, &header, /*scheduler_runs_concurrently=*/true);
-    no_event_reclaimer.join();
-    EXPECT_TRUE(blocked.failed());
-    EXPECT_EQ(allocator.heap_used_bytes(), HEAP_SIZE);
-
-    header.sched_error_code.store(PTO2_ERROR_NONE, std::memory_order_release);
-    header.rings[0].publish_consumed(static_cast<uint32_t>(hole.task_id));
-    auto reused = allocator.alloc(1024, &header, /*scheduler_runs_concurrently=*/true);
-    ASSERT_FALSE(reused.failed());
-    EXPECT_EQ(reused.packed_base, hole.packed_base);
-}
-
-TEST_F(TaskAllocatorTest, BestFitPreservesLargeExtentForLargeRequest) {
-    auto large_hole = allocator.alloc(2048);
-    auto separator = allocator.alloc(64);
-    auto exact_hole = allocator.alloc(1024);
-    auto tail = allocator.alloc(960);
-    ASSERT_FALSE(large_hole.failed());
-    ASSERT_FALSE(separator.failed());
-    ASSERT_FALSE(exact_hole.failed());
-    ASSERT_FALSE(tail.failed());
-
-    slot_states[large_hole.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
-    slot_states[separator.slot].task_state.store(PTO2_TASK_PENDING, std::memory_order_release);
-    slot_states[exact_hole.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
-    slot_states[tail.slot].task_state.store(PTO2_TASK_PENDING, std::memory_order_release);
-
-    auto small = allocator.alloc(1024);
-    ASSERT_FALSE(small.failed());
-    EXPECT_EQ(small.packed_base, exact_hole.packed_base);
-
-    auto large = allocator.alloc(2048);
-    ASSERT_FALSE(large.failed());
-    EXPECT_EQ(large.packed_base, large_hole.packed_base);
-}
-
-TEST_F(TaskAllocatorTest, HeapCapacityDropsUnalignedTail) {
-    alignas(64) uint8_t unaligned_heap[1089]{};
-    allocator.init(
-        descriptors.data(), WINDOW_SIZE, &current_index, &last_alive, unaligned_heap, sizeof(unaligned_heap),
-        &error_code, slot_states.data()
-    );
-
-    EXPECT_EQ(allocator.heap_capacity(), 1088u);
-    auto full = allocator.alloc(1088);
-    ASSERT_FALSE(full.failed());
-    EXPECT_EQ(full.packed_base, static_cast<void *>(unaligned_heap));
-    EXPECT_EQ(full.packed_end, unaligned_heap + 1088);
-}
-
-TEST_F(TaskAllocatorTest, HeapBaseAlignsWithinPartition) {
-    alignas(64) uint8_t partition[1153]{};
-    allocator.init(
-        descriptors.data(), WINDOW_SIZE, &current_index, &last_alive, partition + 1, 1152, &error_code,
-        slot_states.data()
-    );
-
-    EXPECT_EQ(allocator.heap_capacity(), 1088u);
-    auto first = allocator.alloc(64);
-    ASSERT_FALSE(first.failed());
-    EXPECT_EQ(first.packed_base, partition + 64);
 }
 
 TEST_F(TaskAllocatorTest, AllocExactlyHeapSize) {

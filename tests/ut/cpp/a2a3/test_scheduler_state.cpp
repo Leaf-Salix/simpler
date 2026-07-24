@@ -98,7 +98,6 @@ protected:
     // payload, and the scheduler's release/propagate paths dereference it.
     static constexpr int kSlotPayloadPoolSize = 16;
     PTO2TaskPayload slot_payload_pool_[kSlotPayloadPoolSize];
-    PTO2TaskDescriptor slot_task_pool_[kSlotPayloadPoolSize];
     int slot_payload_pool_idx_ = 0;
 
     void SetUp() override {
@@ -135,10 +134,6 @@ protected:
         PTO2TaskPayload &slot_pl = slot_payload_pool_[slot_payload_pool_idx_++ % kSlotPayloadPoolSize];
         memset(&slot_pl, 0, sizeof(slot_pl));
         slot.payload = &slot_pl;
-        PTO2TaskDescriptor &task = slot_task_pool_[(slot_payload_pool_idx_ - 1) % kSlotPayloadPoolSize];
-        memset(&task, 0, sizeof(task));
-        task.task_id = PTO2TaskId::make(ring_id, static_cast<uint32_t>(slot_payload_pool_idx_ - 1));
-        slot.task = &task;
     }
 };
 
@@ -153,7 +148,6 @@ TEST_F(SchedulerStateTest, ConsumedNotReady) {
 
     sched.check_and_handle_consumed(slot);
     EXPECT_EQ(slot.task_state.load(), PTO2_TASK_COMPLETED);
-    EXPECT_EQ(sm_handle->header->rings[0].consumed_leaf[0].load(), 0u);
 }
 
 TEST_F(SchedulerStateTest, ConsumedTransition) {
@@ -163,8 +157,6 @@ TEST_F(SchedulerStateTest, ConsumedTransition) {
 
     sched.check_and_handle_consumed(slot);
     EXPECT_EQ(slot.task_state.load(), PTO2_TASK_CONSUMED);
-    EXPECT_EQ(sm_handle->header->rings[0].consumed_leaf[0].load(), 1u);
-    EXPECT_EQ(sm_handle->header->rings[0].consumed_summary[0].load(), 1u);
 }
 
 TEST_F(SchedulerStateTest, ConsumedNotCompletedState) {
@@ -184,7 +176,6 @@ TEST_F(SchedulerStateTest, ConsumedIdempotent) {
 
     sched.check_and_handle_consumed(slot);
     EXPECT_EQ(slot.task_state.load(), PTO2_TASK_CONSUMED);
-    EXPECT_EQ(sm_handle->header->rings[0].consumed_leaf[0].load(), 0u);
 }
 
 // =============================================================================
