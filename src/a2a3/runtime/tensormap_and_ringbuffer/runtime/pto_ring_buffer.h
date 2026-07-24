@@ -110,6 +110,16 @@ public:
         extent_reclaim_enabled_ = false;
         free_extents_ = nullptr;
         largest_free_extent_ = 0;
+#if SIMPLER_DFX
+        heap_stall_reported_ = false;
+        pending_collect_calls_ = 0;
+        pending_summary_bits_ = 0;
+        pending_leaf_bits_ = 0;
+        pending_reclaimed_ = 0;
+        pending_generation_misses_ = 0;
+        pending_range_misses_ = 0;
+        pending_state_misses_ = 0;
+#endif
         heap_allocated_bytes_ = 0;
         heap_reclaimed_bytes_ = 0;
         heap_allocated_offset_ = 0;
@@ -145,6 +155,9 @@ public:
         update_heap_tail(last_alive);
         bool blocked_on_heap = false;
         bool wait_published = false;
+#if SIMPLER_DFX
+        uint64_t no_reclaim_progress_start = get_sys_cnt_aicpu();
+#endif
         auto clear_reclaim_wait = [&]() {
             if (wait_published) {
                 sm_header->orchestrator_reclaim_waiting.store(0, std::memory_order_release);
@@ -213,6 +226,9 @@ public:
                 // Reclaim advanced -> productive backpressure, not a deadlock.
                 spin_count = 0;
                 prev_last_alive = last_alive;
+#if SIMPLER_DFX
+                no_reclaim_progress_start = get_sys_cnt_aicpu();
+#endif
             } else if ((spin_count & 1023) == 0) {
                 // The scheduler owns the progress watchdog while dispatch runs
                 // concurrently. Poll both error channels so its timeout can
@@ -225,6 +241,11 @@ public:
                     return {-1, -1, nullptr, nullptr};
                 }
             }
+#if SIMPLER_DFX
+            if (blocked_on_heap && sm_header != nullptr && (spin_count & ((UINT64_C(1) << 16) - 1)) == 0) {
+                maybe_report_heap_stall(*sm_header, aligned_size, last_alive, no_reclaim_progress_start);
+            }
+#endif
             SPIN_WAIT_HINT();
         }
     }
@@ -296,6 +317,16 @@ private:
     bool extent_reclaim_enabled_ = false;
     FreeExtent *free_extents_ = nullptr;
     uint64_t largest_free_extent_ = 0;
+#if SIMPLER_DFX
+    bool heap_stall_reported_ = false;
+    uint64_t pending_collect_calls_ = 0;
+    uint64_t pending_summary_bits_ = 0;
+    uint64_t pending_leaf_bits_ = 0;
+    uint64_t pending_reclaimed_ = 0;
+    uint64_t pending_generation_misses_ = 0;
+    uint64_t pending_range_misses_ = 0;
+    uint64_t pending_state_misses_ = 0;
+#endif
     uint64_t heap_allocated_bytes_ = 0;
     uint64_t heap_reclaimed_bytes_ = 0;
     uint64_t heap_allocated_offset_ = 0;
@@ -457,14 +488,23 @@ private:
         if (slot_states_ == nullptr) return;
         PTO2SharedMemoryRingHeader &ring = sm_header.rings[ring_id_];
         uint64_t leaf_words = ring.consumed_leaf_words();
+#if SIMPLER_DFX
+        pending_collect_calls_++;
+#endif
         for (uint64_t summary_index = 0; summary_index < ring.consumed_summary_words(); summary_index++) {
             uint64_t summary_bits = ring.consumed_summary[summary_index].exchange(0, std::memory_order_acq_rel);
+#if SIMPLER_DFX
+            pending_summary_bits_ += static_cast<uint64_t>(__builtin_popcountll(summary_bits));
+#endif
             while (summary_bits != 0) {
                 uint64_t leaf_index = summary_index * 64 + static_cast<uint64_t>(__builtin_ctzll(summary_bits));
                 summary_bits &= summary_bits - 1;
                 if (leaf_index >= leaf_words) continue;
 
                 uint64_t leaf_bits = ring.consumed_leaf[leaf_index].exchange(0, std::memory_order_acq_rel);
+#if SIMPLER_DFX
+                pending_leaf_bits_ += static_cast<uint64_t>(__builtin_popcountll(leaf_bits));
+#endif
                 while (leaf_bits != 0) {
                     int32_t slot =
                         static_cast<int32_t>(leaf_index * 64 + static_cast<uint64_t>(__builtin_ctzll(leaf_bits)));
@@ -472,31 +512,51 @@ private:
                     if (slot >= window_size_) continue;
 
                     PTO2TaskDescriptor &desc = descriptors_[slot];
-                    if (desc.task_id.ring() != ring_id_) continue;
+                    if (desc.task_id.ring() != ring_id_) {
+#if SIMPLER_DFX
+                        pending_generation_misses_++;
+#endif
+                        continue;
+                    }
                     int32_t task_id = static_cast<int32_t>(desc.task_id.local());
-                    if (task_id < first_task_id || task_id >= end_task_id) continue;
-                    if (slot_states_[slot].task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) continue;
-                    reclaim_descriptor(task_id, desc);
+                    if (task_id < first_task_id || task_id >= end_task_id) {
+#if SIMPLER_DFX
+                        pending_range_misses_++;
+#endif
+                        continue;
+                    }
+                    if (slot_states_[slot].task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) {
+#if SIMPLER_DFX
+                        pending_state_misses_++;
+#endif
+                        continue;
+                    }
+                    if (reclaim_descriptor(task_id, desc)) {
+#if SIMPLER_DFX
+                        pending_reclaimed_++;
+#endif
+                    }
                 }
             }
         }
     }
 
-    void reclaim_descriptor(int32_t task_id, PTO2TaskDescriptor &desc) {
-        if (desc.task_id != PTO2TaskId::make(ring_id_, static_cast<uint32_t>(task_id))) return;
+    bool reclaim_descriptor(int32_t task_id, PTO2TaskDescriptor &desc) {
+        if (desc.task_id != PTO2TaskId::make(ring_id_, static_cast<uint32_t>(task_id))) return false;
         auto *base = static_cast<char *>(desc.packed_buffer_base);
         auto *end = static_cast<char *>(desc.packed_buffer_end);
-        if (base == nullptr && end == nullptr) return;
+        if (base == nullptr && end == nullptr) return false;
         auto *heap_begin = static_cast<char *>(heap_base_);
         auto *heap_end = heap_begin + heap_size_;
-        if (base == nullptr || end == nullptr || base < heap_begin || end < base || end > heap_end) return;
+        if (base == nullptr || end == nullptr || base < heap_begin || end < base || end > heap_end) return false;
 
         desc.packed_buffer_base = nullptr;
         desc.packed_buffer_end = nullptr;
         uint64_t size = static_cast<uint64_t>(end - base);
-        if (size == 0) return;
+        if (size == 0) return false;
         insert_free_extent(base, size);
         record_heap_reclaim(size);
+        return true;
     }
 
     void insert_free_extent(void *base, uint64_t size) {
@@ -587,6 +647,121 @@ private:
         }
         return largest;
     }
+
+#if SIMPLER_DFX
+    __attribute__((noinline, cold)) void maybe_report_heap_stall(
+        PTO2SharedMemoryHeader &sm_header, uint64_t aligned_requested, int32_t last_alive,
+        uint64_t no_reclaim_progress_start
+    ) {
+        if (heap_stall_reported_ || ring_id_ != 3 || !extent_reclaim_enabled_ || slot_states_ == nullptr) {
+            return;
+        }
+        uint64_t no_reclaim_cycles = get_sys_cnt_aicpu() - no_reclaim_progress_start;
+        if (no_reclaim_cycles < PLATFORM_PROF_SYS_CNT_FREQ) return;
+        heap_stall_reported_ = true;
+
+        uint64_t free_bytes = 0;
+        uint64_t free_extent_count = 0;
+        for (FreeExtent *extent = free_extents_; extent != nullptr; extent = extent->next) {
+            free_bytes += extent->size;
+            free_extent_count++;
+        }
+
+        uint64_t pending_tasks = 0;
+        uint64_t completed_tasks = 0;
+        uint64_t consumed_tasks = 0;
+        uint64_t other_states = 0;
+        uint64_t live_buffers = 0;
+        uint64_t live_bytes = 0;
+        uint64_t consumed_live_buffers = 0;
+        uint64_t consumed_live_bytes = 0;
+        uint64_t reclaimed_buffers = 0;
+        uint64_t descriptor_misses = 0;
+        uint64_t invalid_buffers = 0;
+        uintptr_t heap_begin = reinterpret_cast<uintptr_t>(heap_base_);
+        uintptr_t heap_end = heap_begin + heap_size_;
+
+        for (int32_t task_id = last_alive; task_id < local_task_id_; task_id++) {
+            int32_t slot = task_id & window_mask_;
+            PTO2TaskDescriptor &desc = descriptors_[slot];
+            if (desc.task_id != PTO2TaskId::make(ring_id_, static_cast<uint32_t>(task_id))) {
+                descriptor_misses++;
+                continue;
+            }
+
+            PTO2TaskState state = slot_states_[slot].task_state.load(std::memory_order_acquire);
+            if (state == PTO2_TASK_PENDING) {
+                pending_tasks++;
+            } else if (state == PTO2_TASK_COMPLETED) {
+                completed_tasks++;
+            } else if (state == PTO2_TASK_CONSUMED) {
+                consumed_tasks++;
+            } else {
+                other_states++;
+            }
+
+            uintptr_t base = reinterpret_cast<uintptr_t>(desc.packed_buffer_base);
+            uintptr_t end = reinterpret_cast<uintptr_t>(desc.packed_buffer_end);
+            if (base == 0 && end == 0) {
+                reclaimed_buffers++;
+                continue;
+            }
+            if (base < heap_begin || end < base || end > heap_end) {
+                invalid_buffers++;
+                continue;
+            }
+
+            uint64_t size = static_cast<uint64_t>(end - base);
+            live_buffers++;
+            live_bytes += size;
+            if (state == PTO2_TASK_CONSUMED) {
+                consumed_live_buffers++;
+                consumed_live_bytes += size;
+            }
+        }
+
+        PTO2SharedMemoryRingHeader &ring = sm_header.rings[ring_id_];
+        uint64_t pending_leaf_bits = 0;
+        uint64_t pending_summary_bits = 0;
+        for (uint64_t i = 0; i < ring.consumed_leaf_words(); i++) {
+            pending_leaf_bits +=
+                static_cast<uint64_t>(__builtin_popcountll(ring.consumed_leaf[i].load(std::memory_order_acquire)));
+        }
+        for (uint64_t i = 0; i < ring.consumed_summary_words(); i++) {
+            pending_summary_bits +=
+                static_cast<uint64_t>(__builtin_popcountll(ring.consumed_summary[i].load(std::memory_order_acquire)));
+        }
+
+        PTO2TaskSlotState &head = slot_states_[last_alive & window_mask_];
+        uint32_t head_refcount = head.fanout_refcount.load(std::memory_order_acquire);
+        LOG_ERROR(
+            "[RING3_HEAP_STALL] task=%d last_alive=%d active=%d no_reclaim_cycles=%" PRIu64 " request=%" PRIu64
+            " used=%" PRIu64 " free=%" PRIu64 " largest=%" PRIu64 " extents=%" PRIu64,
+            local_task_id_, last_alive, local_task_id_ - last_alive, no_reclaim_cycles, aligned_requested,
+            heap_used_bytes(), free_bytes, largest_free_extent_, free_extent_count
+        );
+        LOG_ERROR(
+            "[RING3_HEAP_STALL] states pending=%" PRIu64 " completed=%" PRIu64 " consumed=%" PRIu64 " other=%" PRIu64
+            " live_buffers=%" PRIu64 " live_bytes=%" PRIu64 " consumed_live_buffers=%" PRIu64
+            " consumed_live_bytes=%" PRIu64 " reclaimed_buffers=%" PRIu64 " descriptor_misses=%" PRIu64
+            " invalid_buffers=%" PRIu64,
+            pending_tasks, completed_tasks, consumed_tasks, other_states, live_buffers, live_bytes,
+            consumed_live_buffers, consumed_live_bytes, reclaimed_buffers, descriptor_misses, invalid_buffers
+        );
+        LOG_ERROR(
+            "[RING3_HEAP_STALL] bitmap leaf_pending=%" PRIu64 " summary_pending=%" PRIu64 " drains=%" PRIu64
+            " summary_seen=%" PRIu64 " leaf_seen=%" PRIu64 " reclaimed=%" PRIu64 " generation_miss=%" PRIu64
+            " range_miss=%" PRIu64 " state_miss=%" PRIu64,
+            pending_leaf_bits, pending_summary_bits, pending_collect_calls_, pending_summary_bits_, pending_leaf_bits_,
+            pending_reclaimed_, pending_generation_misses_, pending_range_misses_, pending_state_misses_
+        );
+        LOG_ERROR(
+            "[RING3_HEAP_STALL] head=%d state=%d consumers=%u/%u scope_released=%d", last_alive,
+            static_cast<int>(head.task_state.load(std::memory_order_acquire)), head_refcount & ~PTO2_FANOUT_SCOPE_BIT,
+            head.fanout_count & ~PTO2_FANOUT_SCOPE_BIT, (head_refcount & PTO2_FANOUT_SCOPE_BIT) ? 1 : 0
+        );
+    }
+#endif
 
     void record_heap_allocation(uint64_t size) {
         heap_allocated_bytes_ += size;
