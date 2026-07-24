@@ -306,6 +306,28 @@ TEST_F(TaskAllocatorTest, HeapWrapAroundSuccess) {
     EXPECT_EQ(allocator.heap_top(), 64u);
 }
 
+// A ring that fully drains can leave top == tail parked at a non-zero offset,
+// splitting the free span into [top, size) and [0, tail).  With an allocation
+// larger than size/2 neither arc fits it, so without the empty-ring rebase the
+// next same-size allocation wedges even though the whole ring is free.
+TEST_F(TaskAllocatorTest, HeapEmptyRingRebasesForContiguousAlloc) {
+    constexpr uint64_t S = 3000;  // > HEAP_SIZE/2: the ring holds one at a time
+    auto r1 = allocator.alloc(S);
+    ASSERT_FALSE(r1.failed());
+    const uint64_t top_after = allocator.heap_top();
+
+    // Reclaim task 0 fully: tail advances to its extent end == top, draining the
+    // ring to empty (top == tail) while parked at a non-zero offset.
+    consume_up_to(descriptors, last_alive, heap_buf, WINDOW_SIZE, 1, top_after);
+
+    // The whole ring is free, so the next same-size allocation must succeed by
+    // rebasing to the heap base.
+    auto r2 = allocator.alloc(S);
+    ASSERT_FALSE(r2.failed()) << "empty ring must place an allocation that fits its whole span";
+    EXPECT_EQ(r2.packed_base, static_cast<void *>(heap_buf));
+    EXPECT_EQ(allocator.heap_top(), top_after);
+}
+
 // Linear-gap guard `tail - top > alloc_size` uses strict > for the same reason.
 TEST_F(TaskAllocatorTest, HeapLinearGapGuardRejectsExactFit) {
     // Fill most of heap, leaving just 64 at end so next alloc wraps.

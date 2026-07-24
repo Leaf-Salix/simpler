@@ -346,6 +346,26 @@ private:
                 // The collector attributes the wrap to the current scope's ring.
                 if (is_scope_stats_enabled()) scope_stats_note_heap_wrap(SCOPE_STATS_HEAP_SIDE_ALLOC);
 #endif
+            } else if (top == tail && alloc_size <= heap_size_) {
+                // The ring is empty (top == tail, used == 0) but parked at a
+                // non-zero offset, so its free span is split into [top, size)
+                // and [0, tail); this allocation fits neither arc even though
+                // the whole ring is free. Rebase to 0 to make the span
+                // contiguous, which is exactly the fresh-ring case, so it only
+                // applies when the allocation fits the ring. Reached only when
+                // top == tail != 0: an empty ring at offset 0 keeps its whole
+                // span at the end and takes the space_at_end branch above.
+                result = heap_base_;
+                heap_top_ = alloc_size;
+                heap_tail_ = 0;
+#if SIMPLER_DFX
+                // Both pointers wrap back to 0 together; note both sides so
+                // scope_stats keeps its monotonic unrolling exact.
+                if (is_scope_stats_enabled()) {
+                    scope_stats_note_heap_wrap(SCOPE_STATS_HEAP_SIDE_ALLOC);
+                    scope_stats_note_heap_wrap(SCOPE_STATS_HEAP_SIDE_RECLAIM);
+                }
+#endif
             } else {
                 LOG_DEBUG(
                     "try_bump_heap failed (top>=tail): top=%" PRIu64 ", tail=%" PRIu64 ", alloc=%" PRIu64
