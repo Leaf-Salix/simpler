@@ -110,20 +110,6 @@ public:
         extent_reclaim_enabled_ = false;
         free_extents_ = nullptr;
         largest_free_extent_ = 0;
-#if SIMPLER_DFX
-        free_extent_count_ = 0;
-        max_free_extent_count_ = 0;
-        extent_alloc_attempts_ = 0;
-        extent_alloc_scan_steps_ = 0;
-        extent_insert_calls_ = 0;
-        extent_insert_scan_steps_ = 0;
-        largest_extent_rescan_calls_ = 0;
-        largest_extent_rescan_steps_ = 0;
-        consumed_scan_calls_ = 0;
-        consumed_scan_steps_ = 0;
-        consumed_scan_candidates_ = 0;
-        reclaimed_descriptor_count_ = 0;
-#endif
         heap_allocated_bytes_ = 0;
         heap_reclaimed_bytes_ = 0;
         heap_allocated_offset_ = 0;
@@ -306,20 +292,6 @@ private:
     bool extent_reclaim_enabled_ = false;
     FreeExtent *free_extents_ = nullptr;
     uint64_t largest_free_extent_ = 0;
-#if SIMPLER_DFX
-    uint64_t free_extent_count_ = 0;
-    uint64_t max_free_extent_count_ = 0;
-    uint64_t extent_alloc_attempts_ = 0;
-    uint64_t extent_alloc_scan_steps_ = 0;
-    uint64_t extent_insert_calls_ = 0;
-    uint64_t extent_insert_scan_steps_ = 0;
-    uint64_t largest_extent_rescan_calls_ = 0;
-    uint64_t largest_extent_rescan_steps_ = 0;
-    uint64_t consumed_scan_calls_ = 0;
-    uint64_t consumed_scan_steps_ = 0;
-    uint64_t consumed_scan_candidates_ = 0;
-    uint64_t reclaimed_descriptor_count_ = 0;
-#endif
     uint64_t heap_allocated_bytes_ = 0;
     uint64_t heap_reclaimed_bytes_ = 0;
     uint64_t heap_allocated_offset_ = 0;
@@ -469,16 +441,9 @@ private:
 
     void collect_consumed_extents(int32_t first_task_id, int32_t end_task_id) {
         if (slot_states_ == nullptr) return;
-#if SIMPLER_DFX
-        consumed_scan_calls_++;
-        consumed_scan_steps_ += static_cast<uint64_t>(end_task_id - first_task_id);
-#endif
         for (int32_t task_id = first_task_id; task_id < end_task_id; task_id++) {
             int32_t slot = task_id & window_mask_;
             if (slot_states_[slot].task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) continue;
-#if SIMPLER_DFX
-            consumed_scan_candidates_++;
-#endif
             reclaim_descriptor(task_id, descriptors_[slot]);
         }
     }
@@ -496,9 +461,6 @@ private:
         desc.packed_buffer_end = nullptr;
         uint64_t size = static_cast<uint64_t>(end - base);
         if (size == 0) return;
-#if SIMPLER_DFX
-        reclaimed_descriptor_count_++;
-#endif
         insert_free_extent(base, size);
         record_heap_reclaim(size);
     }
@@ -506,25 +468,17 @@ private:
     void insert_free_extent(void *base, uint64_t size) {
         if (size < sizeof(FreeExtent)) return;
 
-#if SIMPLER_DFX
-        extent_insert_calls_++;
-#endif
         auto *start = static_cast<char *>(base);
         auto *end = start + size;
         FreeExtent *prev = nullptr;
         FreeExtent *cur = free_extents_;
         while (cur != nullptr && reinterpret_cast<char *>(cur) < start) {
-#if SIMPLER_DFX
-            extent_insert_scan_steps_++;
-#endif
             prev = cur;
             cur = cur->next;
         }
 
         FreeExtent *merged = nullptr;
-        bool merge_prev = prev != nullptr && reinterpret_cast<char *>(prev) + prev->size == start;
-        bool merge_next = cur != nullptr && reinterpret_cast<char *>(cur) == end;
-        if (merge_prev) {
+        if (prev != nullptr && reinterpret_cast<char *>(prev) + prev->size == start) {
             prev->size += size;
             merged = prev;
         } else {
@@ -539,18 +493,10 @@ private:
             merged = extent;
         }
 
-        if (merge_next) {
+        if (cur != nullptr && reinterpret_cast<char *>(cur) == end) {
             merged->size += cur->size;
             merged->next = cur->next;
         }
-#if SIMPLER_DFX
-        if (!merge_prev && !merge_next) {
-            free_extent_count_++;
-            max_free_extent_count_ = std::max(max_free_extent_count_, free_extent_count_);
-        } else if (merge_prev && merge_next) {
-            free_extent_count_--;
-        }
-#endif
         largest_free_extent_ = std::max(largest_free_extent_, merged->size);
     }
 
@@ -558,21 +504,12 @@ private:
         if (alloc_size == 0) {
             return static_cast<char *>(heap_base_) + heap_top_;
         }
-#if SIMPLER_DFX
-        extent_alloc_attempts_++;
-#endif
-        if (alloc_size > largest_free_extent_) {
-            maybe_log_extent_stats();
-            return nullptr;
-        }
+        if (alloc_size > largest_free_extent_) return nullptr;
 
         FreeExtent *best = nullptr;
         FreeExtent *best_prev = nullptr;
         FreeExtent *prev = nullptr;
         for (FreeExtent *cur = free_extents_; cur != nullptr; cur = cur->next) {
-#if SIMPLER_DFX
-            extent_alloc_scan_steps_++;
-#endif
             if (cur->size >= alloc_size && (best == nullptr || cur->size < best->size)) {
                 best = cur;
                 best_prev = prev;
@@ -580,10 +517,7 @@ private:
             }
             prev = cur;
         }
-        if (best == nullptr) {
-            maybe_log_extent_stats();
-            return nullptr;
-        }
+        if (best == nullptr) return nullptr;
 
         FreeExtent *cur = best;
         prev = best_prev;
@@ -595,9 +529,6 @@ private:
             } else {
                 free_extents_ = cur->next;
             }
-#if SIMPLER_DFX
-            free_extent_count_--;
-#endif
         } else {
             auto *remainder = reinterpret_cast<FreeExtent *>(result + alloc_size);
             remainder->size = extent_size - alloc_size;
@@ -612,38 +543,15 @@ private:
             largest_free_extent_ = find_largest_free_extent();
         }
         record_heap_allocation(alloc_size);
-        maybe_log_extent_stats();
         return result;
     }
 
-    uint64_t find_largest_free_extent() {
-#if SIMPLER_DFX
-        largest_extent_rescan_calls_++;
-#endif
+    uint64_t find_largest_free_extent() const {
         uint64_t largest = 0;
         for (FreeExtent *extent = free_extents_; extent != nullptr; extent = extent->next) {
-#if SIMPLER_DFX
-            largest_extent_rescan_steps_++;
-#endif
             largest = std::max(largest, extent->size);
         }
         return largest;
-    }
-
-    void maybe_log_extent_stats() {
-#if SIMPLER_DFX
-        if (ring_id_ != 3 || (extent_alloc_attempts_ != 1 && (extent_alloc_attempts_ & 32767) != 0)) return;
-        LOG_WARN(
-            "[RING3_EXTENT_STATS] task=%d attempts=%" PRIu64 " alloc_steps=%" PRIu64 " insert_calls=%" PRIu64
-            " insert_steps=%" PRIu64 " largest_calls=%" PRIu64 " largest_steps=%" PRIu64 " consumed_calls=%" PRIu64
-            " consumed_steps=%" PRIu64 " consumed_candidates=%" PRIu64 " reclaimed=%" PRIu64 " free_extents=%" PRIu64
-            " max_free_extents=%" PRIu64 " largest=%" PRIu64 " used=%" PRIu64,
-            local_task_id_, extent_alloc_attempts_, extent_alloc_scan_steps_, extent_insert_calls_,
-            extent_insert_scan_steps_, largest_extent_rescan_calls_, largest_extent_rescan_steps_, consumed_scan_calls_,
-            consumed_scan_steps_, consumed_scan_candidates_, reclaimed_descriptor_count_, free_extent_count_,
-            max_free_extent_count_, largest_free_extent_, heap_used_bytes()
-        );
-#endif
     }
 
     void record_heap_allocation(uint64_t size) {
