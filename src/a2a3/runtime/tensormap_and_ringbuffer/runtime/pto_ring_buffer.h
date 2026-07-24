@@ -110,7 +110,6 @@ public:
         extent_reclaim_enabled_ = false;
         free_extents_ = nullptr;
         largest_free_extent_ = 0;
-        consumed_epoch_seen_ = 0;
         heap_allocated_bytes_ = 0;
         heap_reclaimed_bytes_ = 0;
         heap_allocated_offset_ = 0;
@@ -163,15 +162,14 @@ public:
                 void *heap_ptr = nullptr;
                 if (extent_reclaim_enabled_) {
                     heap_ptr = try_extent_heap(aligned_size);
-                    if (heap_ptr == nullptr && (spin_count & 255) == 0 &&
-                        consumed_progressed(sm_header, scheduler_runs_concurrently)) {
+                    if (heap_ptr == nullptr && (spin_count & 255) == 0) {
                         collect_consumed_extents(last_alive, local_task_id_);
                         heap_ptr = try_extent_heap(aligned_size);
                     }
                 } else {
                     heap_ptr = try_bump_heap(aligned_size);
                     if (heap_ptr == nullptr) {
-                        enable_extent_reclaim(last_alive, sm_header);
+                        enable_extent_reclaim(last_alive);
                         heap_ptr = try_extent_heap(aligned_size);
                     }
                 }
@@ -294,7 +292,6 @@ private:
     bool extent_reclaim_enabled_ = false;
     FreeExtent *free_extents_ = nullptr;
     uint64_t largest_free_extent_ = 0;
-    uint32_t consumed_epoch_seen_ = 0;
     uint64_t heap_allocated_bytes_ = 0;
     uint64_t heap_reclaimed_bytes_ = 0;
     uint64_t heap_allocated_offset_ = 0;
@@ -400,7 +397,7 @@ private:
         return result;
     }
 
-    void enable_extent_reclaim(int32_t last_alive, PTO2SharedMemoryHeader *sm_header) {
+    void enable_extent_reclaim(int32_t last_alive) {
         extent_reclaim_enabled_ = true;
         free_extents_ = nullptr;
         largest_free_extent_ = 0;
@@ -420,18 +417,7 @@ private:
                 static_cast<uint64_t>(heap_size_ - upper_segment_end)
             );
         }
-        if (sm_header != nullptr) {
-            consumed_epoch_seen_ = sm_header->rings[ring_id_].fc.consumed_epoch.load(std::memory_order_acquire);
-        }
         collect_consumed_extents(last_alive, local_task_id_);
-    }
-
-    bool consumed_progressed(PTO2SharedMemoryHeader *sm_header, bool scheduler_runs_concurrently) {
-        if (!scheduler_runs_concurrently || sm_header == nullptr) return true;
-        uint32_t epoch = sm_header->rings[ring_id_].fc.consumed_epoch.load(std::memory_order_acquire);
-        if (epoch == consumed_epoch_seen_) return false;
-        consumed_epoch_seen_ = epoch;
-        return true;
     }
 
     uint64_t find_upper_segment_end(int32_t first_task_id) const {
