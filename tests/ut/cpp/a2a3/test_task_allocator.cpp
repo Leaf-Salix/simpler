@@ -60,10 +60,23 @@ static void consume_up_to(
     std::vector<PTO2TaskDescriptor> &descriptors, std::atomic<int32_t> &last_alive, void *heap_base,
     int32_t window_size, int32_t new_last_alive, uint64_t heap_tail_offset
 ) {
+    if (new_last_alive <= 0) {
+        last_alive.store(new_last_alive, std::memory_order_release);
+        return;
+    }
     int32_t last_consumed = new_last_alive - 1;
-    descriptors[last_consumed & (window_size - 1)].packed_buffer_end =
-        static_cast<char *>(heap_base) + heap_tail_offset;
+    PTO2TaskDescriptor &descriptor = descriptors[last_consumed & (window_size - 1)];
+    descriptor.task_id = PTO2TaskId::make(0, static_cast<uint32_t>(last_consumed));
+    descriptor.packed_buffer_end = static_cast<char *>(heap_base) + heap_tail_offset;
     last_alive.store(new_last_alive, std::memory_order_release);
+}
+
+static void
+publish_allocation(std::vector<PTO2TaskDescriptor> &descriptors, const PTO2TaskAllocResult &result, uint8_t ring_id) {
+    PTO2TaskDescriptor &descriptor = descriptors[result.slot];
+    descriptor.task_id = PTO2TaskId::make(ring_id, static_cast<uint32_t>(result.task_id));
+    descriptor.packed_buffer_base = result.packed_base;
+    descriptor.packed_buffer_end = result.packed_end;
 }
 
 // =============================================================================
@@ -357,6 +370,177 @@ TEST_F(TaskAllocatorTest, ZeroSizeAllocationAliased) {
     EXPECT_EQ(r1.packed_base, r2.packed_base) << "Zero-size allocs return same address";
     EXPECT_EQ(r1.packed_base, r1.packed_end) << "packed_end == packed_base for zero-size";
     EXPECT_EQ(allocator.heap_top(), 0u) << "top doesn't advance for zero-size allocs";
+}
+
+TEST_F(TaskAllocatorTest, ReplaysTask2639ZeroExtentHeadAndConsumedTask2640) {
+    constexpr int32_t INITIAL_TASK_ID = 2639;
+    constexpr uint8_t RING_ID = 3;
+    current_index.store(INITIAL_TASK_ID);
+    last_alive.store(INITIAL_TASK_ID);
+    allocator.init(
+        descriptors.data(), WINDOW_SIZE, &current_index, &last_alive, heap_buf, HEAP_SIZE, &error_code,
+        slot_states.data(), INITIAL_TASK_ID, RING_ID
+    );
+
+    auto zero_head = allocator.alloc(0);
+    ASSERT_FALSE(zero_head.failed());
+    ASSERT_EQ(zero_head.task_id, 2639);
+    publish_allocation(descriptors, zero_head, RING_ID);
+    slot_states[zero_head.slot].fanout_count = PTO2_FANOUT_SCOPE_BIT | 64;
+    slot_states[zero_head.slot].fanout_refcount.store(PTO2_FANOUT_SCOPE_BIT | 51, std::memory_order_relaxed);
+    slot_states[zero_head.slot].task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+
+    auto consumed_bytes = allocator.alloc(HEAP_SIZE);
+    ASSERT_FALSE(consumed_bytes.failed());
+    ASSERT_EQ(consumed_bytes.task_id, 2640);
+    publish_allocation(descriptors, consumed_bytes, RING_ID);
+    slot_states[consumed_bytes.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
+
+    auto next = allocator.alloc(64);
+
+    ASSERT_FALSE(next.failed());
+    EXPECT_EQ(next.packed_base, static_cast<void *>(heap_buf));
+    EXPECT_EQ(last_alive.load(std::memory_order_acquire), INITIAL_TASK_ID);
+    EXPECT_EQ(allocator.heap_reclaim_task_id(), 2641);
+    EXPECT_EQ(slot_states[zero_head.slot].task_state.load(std::memory_order_acquire), PTO2_TASK_COMPLETED);
+}
+
+TEST_F(TaskAllocatorTest, StopsAtFirstLivePositiveExtent) {
+    auto zero_head = allocator.alloc(0);
+    ASSERT_FALSE(zero_head.failed());
+    publish_allocation(descriptors, zero_head, 0);
+    slot_states[zero_head.slot].task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+
+    auto live_bytes = allocator.alloc(HEAP_SIZE / 2);
+    ASSERT_FALSE(live_bytes.failed());
+    publish_allocation(descriptors, live_bytes, 0);
+    slot_states[live_bytes.slot].task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+
+    auto later_consumed_bytes = allocator.alloc(HEAP_SIZE / 2);
+    ASSERT_FALSE(later_consumed_bytes.failed());
+    publish_allocation(descriptors, later_consumed_bytes, 0);
+    slot_states[later_consumed_bytes.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
+
+    auto blocked = allocator.alloc(64);
+
+    EXPECT_TRUE(blocked.failed());
+    EXPECT_EQ(allocator.heap_reclaim_task_id(), live_bytes.task_id);
+    EXPECT_EQ(allocator.heap_tail(), 0u);
+
+    error_code.store(PTO2_ERROR_NONE);
+    slot_states[live_bytes.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
+    auto unblocked = allocator.alloc(64);
+
+    ASSERT_FALSE(unblocked.failed());
+    EXPECT_EQ(unblocked.packed_base, static_cast<void *>(heap_buf));
+    EXPECT_EQ(allocator.heap_reclaim_task_id(), later_consumed_bytes.task_id + 1);
+    EXPECT_EQ(last_alive.load(std::memory_order_acquire), 0);
+}
+
+TEST_F(TaskAllocatorTest, ConcurrentBackpressureReclaimsWithoutLastAliveAdvance) {
+    auto zero_head = allocator.alloc(0);
+    ASSERT_FALSE(zero_head.failed());
+    publish_allocation(descriptors, zero_head, 0);
+    slot_states[zero_head.slot].task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+
+    auto positive_extent = allocator.alloc(HEAP_SIZE);
+    ASSERT_FALSE(positive_extent.failed());
+    publish_allocation(descriptors, positive_extent, 0);
+    slot_states[positive_extent.slot].task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+
+    PTO2SharedMemoryHeader header{};
+    header.orch_error_code.store(PTO2_ERROR_NONE);
+    header.sched_error_code.store(PTO2_ERROR_NONE);
+    header.orchestrator_reclaim_waiting.store(0);
+    std::thread reclaimer([&]() {
+        while (header.orchestrator_reclaim_waiting.load(std::memory_order_acquire) == 0) {
+            std::this_thread::yield();
+        }
+        slot_states[positive_extent.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
+    });
+
+    auto next = allocator.alloc(64, &header, /*scheduler_runs_concurrently=*/true);
+    reclaimer.join();
+
+    ASSERT_FALSE(next.failed());
+    EXPECT_EQ(next.packed_base, static_cast<void *>(heap_buf));
+    EXPECT_EQ(last_alive.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(allocator.heap_reclaim_task_id(), positive_extent.task_id + 1);
+    EXPECT_EQ(header.orchestrator_reclaim_waiting.load(std::memory_order_acquire), 0);
+}
+
+TEST_F(TaskAllocatorTest, DescriptorGenerationMismatchFailsClosed) {
+    auto zero_head = allocator.alloc(0);
+    ASSERT_FALSE(zero_head.failed());
+    publish_allocation(descriptors, zero_head, 1);
+    slot_states[zero_head.slot].task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+
+    auto consumed_bytes = allocator.alloc(HEAP_SIZE);
+    ASSERT_FALSE(consumed_bytes.failed());
+    publish_allocation(descriptors, consumed_bytes, 0);
+    slot_states[consumed_bytes.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
+
+    auto blocked = allocator.alloc(64);
+
+    EXPECT_TRUE(blocked.failed());
+    EXPECT_EQ(allocator.heap_reclaim_task_id(), zero_head.task_id);
+    EXPECT_EQ(allocator.heap_tail(), 0u);
+}
+
+TEST_F(TaskAllocatorTest, DecoupledReclaimAdvancesTailAcrossHeapWrap) {
+    auto before_wrap = allocator.alloc(HEAP_SIZE - 64);
+    ASSERT_FALSE(before_wrap.failed());
+    publish_allocation(descriptors, before_wrap, 0);
+    slot_states[before_wrap.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
+
+    auto zero_head = allocator.alloc(0);
+    ASSERT_FALSE(zero_head.failed());
+    publish_allocation(descriptors, zero_head, 0);
+    slot_states[zero_head.slot].task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+    EXPECT_EQ(allocator.heap_tail(), HEAP_SIZE - 64);
+
+    auto after_wrap = allocator.alloc(128);
+    ASSERT_FALSE(after_wrap.failed());
+    publish_allocation(descriptors, after_wrap, 0);
+    slot_states[after_wrap.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
+    ASSERT_EQ(after_wrap.packed_base, static_cast<void *>(heap_buf));
+
+    auto next = allocator.alloc(64);
+
+    ASSERT_FALSE(next.failed());
+    EXPECT_EQ(allocator.heap_tail(), 128u);
+    EXPECT_EQ(allocator.heap_reclaim_task_id(), after_wrap.task_id + 1);
+    EXPECT_EQ(next.packed_base, static_cast<void *>(heap_buf + 128));
+}
+
+TEST_F(TaskAllocatorTest, HeapCursorDoesNotPermitLiveTaskSlotReuse) {
+    constexpr int32_t SMALL_WINDOW_SIZE = 4;
+    allocator.init(
+        descriptors.data(), SMALL_WINDOW_SIZE, &current_index, &last_alive, heap_buf, HEAP_SIZE, &error_code,
+        slot_states.data()
+    );
+
+    auto zero_head = allocator.alloc(0);
+    ASSERT_FALSE(zero_head.failed());
+    publish_allocation(descriptors, zero_head, 0);
+    slot_states[zero_head.slot].task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+
+    auto consumed_bytes = allocator.alloc(64);
+    ASSERT_FALSE(consumed_bytes.failed());
+    publish_allocation(descriptors, consumed_bytes, 0);
+    slot_states[consumed_bytes.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
+
+    auto third = allocator.alloc(0);
+    ASSERT_FALSE(third.failed());
+    publish_allocation(descriptors, third, 0);
+
+    auto overflow = allocator.alloc(0);
+
+    EXPECT_TRUE(overflow.failed());
+    EXPECT_EQ(allocator.heap_reclaim_task_id(), third.task_id + 1);
+    EXPECT_EQ(last_alive.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(descriptors[zero_head.slot].task_id, PTO2TaskId::make(0, 0));
+    EXPECT_EQ(slot_states[zero_head.slot].task_state.load(std::memory_order_acquire), PTO2_TASK_COMPLETED);
 }
 
 // Wrap path: wasted space between old top and heap_size is not reclaimed.

@@ -80,8 +80,6 @@ Per-ring flow control and per-ring layout info are grouped together:
 struct PTO2RingFlowControl {
     std::atomic<int32_t> current_task_index;  // task ring head
     std::atomic<int32_t> last_task_alive;     // task ring tail
-    std::atomic<uint64_t> heap_top;           // heap alloc pointer
-    std::atomic<uint64_t> heap_tail;          // heap reclaim pointer
 };
 
 struct alignas(64) PTO2SharedMemoryRingHeader {
@@ -111,7 +109,7 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
 PTO2SharedMemoryRingHeader rings[PTO2_MAX_RING_DEPTH];
 ```
 
-Per-ring try-locks in the scheduler state prevent concurrent scheduler threads from interleaving watermark writes within the same ring. `FaninPool`/`DepListPool` `reclaim`/`ensure_space` take `PTO2SharedMemoryRingHeader&` directly (no `ring_id` or `fc` parameters).
+Per-ring try-locks in the scheduler state prevent concurrent scheduler threads from interleaving task-watermark writes within the same ring. Heap allocation and its independent FIFO reclaim cursor are orchestrator-local. `FaninPool`/`DepListPool` `reclaim`/`ensure_space` take `PTO2SharedMemoryRingHeader&` directly (no `ring_id` or `fc` parameters).
 
 ### 4.4 PTO2SharedMemoryHandle (lifecycle-only)
 
@@ -185,7 +183,7 @@ advance_ring_pointers(ring_id):  // protected by per-ring advance_lock
     sync_to_sm()  // release-store last_task_alive
 ```
 
-Per-ring try-locks in the scheduler state prevent concurrent scheduler threads from interleaving heap_tail writes within the same ring.
+Per-ring try-locks in the scheduler state prevent concurrent scheduler threads from interleaving `last_task_alive` writes within the same ring. The orchestrator separately advances each ring's heap cursor across zero-size extents and consumed positive extents; it never changes task state or task-slot reuse eligibility.
 
 ### 5.2 Cross-Ring Dependencies
 

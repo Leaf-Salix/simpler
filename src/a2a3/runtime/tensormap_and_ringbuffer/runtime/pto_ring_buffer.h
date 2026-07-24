@@ -103,7 +103,8 @@ public:
         local_task_id_ = initial_local_task_id;
         heap_top_ = 0;
         heap_tail_ = 0;
-        last_alive_seen_ = 0;
+        heap_reclaim_task_id_ = initial_local_task_id;
+        heap_reclaim_invalid_task_id_ = -1;
     }
 
     /**
@@ -133,6 +134,7 @@ public:
         int32_t prev_last_alive = last_alive_ptr_->load(std::memory_order_acquire);
         int32_t last_alive = prev_last_alive;
         update_heap_tail(last_alive);
+        int32_t prev_heap_reclaim_task_id = heap_reclaim_task_id_;
         bool blocked_on_heap = false;
         bool wait_published = false;
         auto clear_reclaim_wait = [&]() {
@@ -164,7 +166,8 @@ public:
             }
 
             if (!scheduler_runs_concurrently || sm_header == nullptr) {
-                report_deadlock(output_size, blocked_on_heap, /*scope_gated=*/head_blocked_on_scope_end(last_alive));
+                int32_t blocked_task_id = blocked_on_heap ? heap_reclaim_task_id_ : last_alive;
+                report_deadlock(output_size, blocked_on_heap, task_blocked_on_scope_end(blocked_task_id));
                 return {-1, -1, nullptr, nullptr};
             }
             if (!wait_published) {
@@ -180,22 +183,25 @@ public:
                 waiting = true;
             }
 #endif
-            last_alive = last_alive_ptr_->load(std::memory_order_acquire);
-            update_heap_tail(last_alive);
-            if (last_alive > prev_last_alive) {
-                // Reclaim advanced -> productive backpressure, not a deadlock.
-                spin_count = 0;
-                prev_last_alive = last_alive;
-            } else if ((spin_count & 1023) == 0) {
-                // The scheduler owns the progress watchdog while dispatch runs
-                // concurrently. Poll both error channels so its timeout can
-                // unwind this otherwise-unbounded back-pressure wait.
-                bool orch_failed =
-                    error_code_ptr_ != nullptr && error_code_ptr_->load(std::memory_order_acquire) != PTO2_ERROR_NONE;
-                bool sched_failed = sm_header->sched_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE;
-                if (orch_failed || sched_failed) {
-                    clear_reclaim_wait();
-                    return {-1, -1, nullptr, nullptr};
+            if ((spin_count & RECLAIM_POLL_MASK) == 0) {
+                last_alive = last_alive_ptr_->load(std::memory_order_acquire);
+                update_heap_tail(last_alive);
+                if (last_alive > prev_last_alive || heap_reclaim_task_id_ > prev_heap_reclaim_task_id) {
+                    // Reclaim advanced -> productive backpressure, not a deadlock.
+                    spin_count = 0;
+                    prev_last_alive = last_alive;
+                    prev_heap_reclaim_task_id = heap_reclaim_task_id_;
+                } else if ((spin_count & 1023) == 0) {
+                    // The scheduler owns the progress watchdog while dispatch runs
+                    // concurrently. Poll both error channels so its timeout can
+                    // unwind this otherwise-unbounded back-pressure wait.
+                    bool orch_failed = error_code_ptr_ != nullptr &&
+                                       error_code_ptr_->load(std::memory_order_acquire) != PTO2_ERROR_NONE;
+                    bool sched_failed = sm_header->sched_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE;
+                    if (orch_failed || sched_failed) {
+                        clear_reclaim_wait();
+                        return {-1, -1, nullptr, nullptr};
+                    }
                 }
             }
             SPIN_WAIT_HINT();
@@ -232,6 +238,7 @@ public:
     // Heap ring start: reclaim pointer (oldest byte still live). heap_top() is
     // the end (next allocation). heap_top - heap_tail == heap_used_bytes().
     uint64_t heap_tail() const { return heap_tail_; }
+    int32_t heap_reclaim_task_id() const { return heap_reclaim_task_id_; }
     uint64_t heap_capacity() const { return heap_size_; }
     uint64_t heap_used_bytes() const {
         if (heap_size_ == 0) return 0;
@@ -239,6 +246,8 @@ public:
     }
 
 private:
+    static constexpr uint64_t RECLAIM_POLL_MASK = 255;
+
     // --- Task Ring ---
     PTO2TaskDescriptor *descriptors_ = nullptr;
     // Parallel to descriptors_, indexed by task_id & window_mask_. Read-only here,
@@ -255,10 +264,11 @@ private:
     uint64_t heap_size_ = 0;
 
     // --- Local state (single-writer, no atomics needed) ---
-    int32_t local_task_id_ = 0;    // Next task ID to allocate
-    uint64_t heap_top_ = 0;        // Current heap allocation pointer
-    uint64_t heap_tail_ = 0;       // Heap reclamation pointer (derived from consumed tasks)
-    int32_t last_alive_seen_ = 0;  // last_task_alive at last heap_tail derivation
+    int32_t local_task_id_ = 0;                  // Next task ID to allocate
+    uint64_t heap_top_ = 0;                      // Current heap allocation pointer
+    uint64_t heap_tail_ = 0;                     // Heap reclamation pointer (derived from consumed tasks)
+    int32_t heap_reclaim_task_id_ = 0;           // Next task whose heap extent has not been retired
+    int32_t heap_reclaim_invalid_task_id_ = -1;  // Descriptor invariant failure, or -1
 
     // --- Shared ---
     std::atomic<int32_t> *error_code_ptr_ = nullptr;
@@ -285,30 +295,56 @@ private:
     }
 
     /**
-     * Derive heap_tail_ from the last consumed task's packed_buffer_end.
+     * Advance the FIFO heap cursor independently from the task-slot watermark.
      *
-     * Every task has a valid packed_buffer_end (equal to packed_buffer_base
-     * for zero-size allocations), so the last consumed task always determines
-     * the correct heap_tail — no backward scan needed.
+     * A live zero-size task owns no heap bytes, so it cannot block retirement
+     * of later consumed extents. Positive extents remain strictly FIFO: stop at
+     * the first one that is not known to be consumed.
      */
     void update_heap_tail(int32_t last_alive) {
-        if (last_alive <= last_alive_seen_) return;
-        last_alive_seen_ = last_alive;
+        uintptr_t heap_begin = reinterpret_cast<uintptr_t>(heap_base_);
+        uintptr_t heap_end = heap_begin + heap_size_;
 
-        PTO2TaskDescriptor &desc = descriptors_[(last_alive - 1) & window_mask_];
-        uint64_t old_tail = heap_tail_;
-        heap_tail_ =
-            static_cast<uint64_t>(static_cast<char *>(desc.packed_buffer_end) - static_cast<char *>(heap_base_));
+        while (heap_reclaim_task_id_ < local_task_id_) {
+            int32_t task_id = heap_reclaim_task_id_;
+            PTO2TaskDescriptor &desc = descriptors_[task_id & window_mask_];
+            PTO2TaskId expected_task_id = PTO2TaskId::make(ring_id_, static_cast<uint32_t>(task_id));
+            uintptr_t extent_begin = reinterpret_cast<uintptr_t>(desc.packed_buffer_base);
+            uintptr_t extent_end = reinterpret_cast<uintptr_t>(desc.packed_buffer_end);
+            bool consumed_by_watermark = task_id < last_alive;
+            bool descriptor_valid =
+                desc.task_id == expected_task_id && extent_end >= heap_begin && extent_end <= heap_end &&
+                (consumed_by_watermark || (extent_begin >= heap_begin && extent_begin <= extent_end));
+            if (!descriptor_valid) {
+                heap_reclaim_invalid_task_id_ = task_id;
+                return;
+            }
+            heap_reclaim_invalid_task_id_ = -1;
+
+            bool zero_extent = extent_begin == extent_end;
+            bool consumed = consumed_by_watermark;
+            if (!zero_extent && !consumed) {
+                if (slot_states_ == nullptr ||
+                    slot_states_[task_id & window_mask_].task_state.load(std::memory_order_acquire) !=
+                        PTO2_TASK_CONSUMED) {
+                    return;
+                }
+            }
+
+            if (!zero_extent) {
+                uint64_t old_tail = heap_tail_;
+                heap_tail_ = static_cast<uint64_t>(extent_end - heap_begin);
 #if SIMPLER_DFX
-        // Reclaim pointer moves forward monotonically in ring order; a decrease
-        // means it wrapped past heap_size_ (occupancy < heap_size_ guarantees at
-        // most one wrap per call). Report it so scope_stats can unroll.
-        if (is_scope_stats_enabled() && heap_tail_ < old_tail) {
-            scope_stats_note_heap_wrap(SCOPE_STATS_HEAP_SIDE_RECLAIM);
-        }
+                // A decreasing ring offset means the reclaim cursor wrapped.
+                if (is_scope_stats_enabled() && heap_tail_ < old_tail) {
+                    scope_stats_note_heap_wrap(SCOPE_STATS_HEAP_SIDE_RECLAIM);
+                }
 #else
-        (void)old_tail;
+                (void)old_tail;
 #endif
+            }
+            heap_reclaim_task_id_++;
+        }
     }
 
     /**
@@ -375,30 +411,29 @@ private:
         }
         {
             extern uint64_t g_orch_alloc_atomic_count;
-            g_orch_alloc_atomic_count += spin_count + 1;
+            g_orch_alloc_atomic_count += spin_count / (RECLAIM_POLL_MASK + 1) + 1;
         }
     }
 #endif
 
     /**
-     * Structural deadlock test on the reclaim head.
+     * Structural deadlock test on a task or heap reclaim blocker.
      *
-     * The head (oldest un-CONSUMED task, at last_task_alive) gates all
-     * reclamation. If it is COMPLETED and every consumer reference is released
-     * (low bits of fanout_refcount == consumer count) but the scope reference
-     * (bit31) is still unset, the only release left is its scope_end. Because
-     * this is evaluated while the orchestrator is blocked in alloc(), scope_end
-     * can never be reached -> provable deadlock, no timeout required.
+     * If the blocker is COMPLETED and every consumer reference is released but
+     * its declared scope reference is still unset, only scope_end can consume
+     * it. Because orchestration is blocked in alloc(), scope_end is unreachable.
      *
      * The COMPLETED guard is mandatory: a zero-consumer task has
      * refcount == 0 == (count & ~SCOPE_BIT) from birth, before it has run.
      */
-    bool head_blocked_on_scope_end(int32_t head_task_id) const {
-        if (slot_states_ == nullptr) return false;
-        PTO2TaskSlotState &h = slot_states_[head_task_id & window_mask_];
+    bool task_blocked_on_scope_end(int32_t task_id) const {
+        if (slot_states_ == nullptr || task_id < 0 || task_id >= local_task_id_) return false;
+        PTO2TaskSlotState &h = slot_states_[task_id & window_mask_];
         if (h.task_state.load(std::memory_order_acquire) != PTO2_TASK_COMPLETED) return false;
+        uint32_t fc = h.fanout_count;
+        if ((fc & PTO2_FANOUT_SCOPE_BIT) == 0) return false;
         uint32_t rc = h.fanout_refcount.load(std::memory_order_acquire);
-        return rc == (h.fanout_count & ~PTO2_FANOUT_SCOPE_BIT);
+        return (rc & PTO2_FANOUT_SCOPE_BIT) == 0 && (rc & ~PTO2_FANOUT_SCOPE_BIT) == (fc & ~PTO2_FANOUT_SCOPE_BIT);
     }
 
     /**
@@ -422,7 +457,11 @@ private:
         }
         LOG_ERROR("========================================");
         if (scope_gated) {
-            LOG_ERROR("Head task %d COMPLETED, all consumers released, scope still open ->", last_alive);
+            int32_t blocked_task_id = heap_blocked ? heap_reclaim_task_id_ : last_alive;
+            LOG_ERROR(
+                "%s task %d COMPLETED, all consumers released, scope still open ->",
+                heap_blocked ? "Heap reclaim" : "Head", blocked_task_id
+            );
             LOG_ERROR("only scope_end can free it and the orchestrator is blocked here.");
             LOG_ERROR("Provable head-of-line deadlock.");
         } else if (aligned_requested > heap_size_) {
@@ -441,6 +480,10 @@ private:
             "  Heap ring %u: top=%" PRIu64 ", tail=%" PRIu64 ", size=%" PRIu64 ", used=%" PRIu64 ", available=%" PRIu64,
             static_cast<unsigned>(ring_id_), heap_top_, htail, heap_size_, heap_used_bytes(), heap_available()
         );
+        LOG_ERROR("  Heap reclaim cursor: task=%d", heap_reclaim_task_id_);
+        if (heap_reclaim_invalid_task_id_ >= 0) {
+            LOG_ERROR("  Heap reclaim descriptor invariant failed at task %d", heap_reclaim_invalid_task_id_);
+        }
         if (heap_blocked) {
             LOG_ERROR("  Requested:  %d bytes", requested_output_size);
         }

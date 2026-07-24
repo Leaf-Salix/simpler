@@ -157,8 +157,6 @@ The orchestrator and schedulers communicate through a contiguous shared memory r
 | ----- | ------ | ------ | ------- |
 | `current_task_index` | Orchestrator | Scheduler | Next task ID to allocate (task ring head) |
 | `last_task_alive` | Scheduler | Orchestrator | Oldest still-active task (task ring tail) |
-| `heap_top` | Orchestrator | Scheduler | Heap ring allocation pointer |
-| `heap_tail` | Scheduler | Orchestrator | Heap ring reclamation pointer |
 | `orchestrator_done` | Orchestrator | Scheduler | Signals orchestration completion |
 | `orchestrator_reclaim_waiting` | Orchestrator | Scheduler | Orchestrator is blocked on task/heap reclaim before graph construction can finish |
 | `task_window_size` | Init | Both | Number of task slots (per-ring, in `PTO2SharedMemoryRingHeader`) |
@@ -219,11 +217,14 @@ The heap ring manages output buffer allocation from a circular GM heap.
 - `base`: GM heap base address
 - `size`: total heap size (default 1 GB)
 - `top`: allocation pointer (local to orchestrator)
-- `tail_ptr`: pointer to `header->heap_tail` (updated by scheduler)
+- `tail`: reclamation pointer (local to orchestrator)
+- `heap_reclaim_task_id`: next task whose heap extent has not been retired
 
 **Allocation**: Buffers are allocated contiguously from `top`. When reaching the end, allocation wraps to the beginning if `tail` has advanced far enough. Buffers never straddle the wrap-around boundary.
 
-**Reclamation**: When `last_task_alive` advances past a task, its `packed_buffer_end` is used to advance `heap_tail`, freeing the memory region.
+**Reclamation**: The orchestrator scans descriptors in task-ID order. A zero-size extent owns no heap bytes and is skipped even if its task slot is still live. A positive extent advances `tail` only after either `last_task_alive` has passed it or its slot state is observed as `CONSUMED`. The scan stops at the first live positive extent. This keeps byte reclamation FIFO while preventing a live zero-size task from pinning later consumed bytes.
+
+`last_task_alive` remains the task-slot, TensorMap, and auxiliary-pool lifetime watermark. Advancing the heap cursor does not recycle a task slot or change task state.
 
 ### 4.3 Dependency List Pool
 
@@ -239,7 +240,7 @@ The ring buffer mechanism provides **flow control** between the orchestrator (pr
 
 **Task Ring back-pressure**: When `active_count = current_index - last_task_alive >= window_size - 1`, `PTO2TaskAllocator::alloc` spin-waits until the scheduler completes tasks and advances `last_task_alive`.
 
-**Heap Ring back-pressure**: When the heap has insufficient contiguous space, `PTO2TaskAllocator::alloc` spin-waits until the scheduler advances `heap_tail` past completed tasks' output buffers.
+**Heap Ring back-pressure**: When the heap has insufficient contiguous space, `PTO2TaskAllocator::alloc` spin-waits while rescanning the FIFO heap cursor. Scheduler transitions to `CONSUMED` can therefore release bytes even when an earlier zero-size task keeps `last_task_alive` fixed.
 
 While either task/heap wait is active under concurrent dispatch, the allocator publishes `orchestrator_reclaim_waiting=1`. It does not treat a fixed period without `last_task_alive` movement as proof of deadlock: a producer may remain legitimately live while its consumers execute. The scheduler owns the residual forward-progress timeout because it can observe all running cores and global task completions. The allocator clears the flag on successful reclaim or when either runtime error channel asks it to unwind.
 
@@ -278,7 +279,7 @@ The runtime separates locally provable deadlocks from ordinary concurrent back-p
 
 When dispatch runs concurrently, the allocator does not classify the mutable head state locally. This includes both unreleased consumers and a head that currently appears to wait only for its scope reference. Freeing either head would be incorrect, so the allocator continues to apply back-pressure. If the scheduler's global completion count also stops for the scheduler timeout budget, no core owns a running task, and `orchestrator_reclaim_waiting=1`, the scheduler emits its normal stall classification (`RUNNING_STALLED`, `READY_IDLE`, `DEP_DEADLOCK`, or `ORCH_STARVATION`) and latches `PTO2_ERROR_SCHEDULER_TIMEOUT`. The allocator observes that scheduler error and unwinds without replacing it with `PTO2_ERROR_HEAP_RING_DEADLOCK`.
 
-This preserves in-order reclamation: a task's heap storage is never reused before all consumer and scope references are released.
+This preserves in-order byte reclamation: a positive extent is never reused before all consumer and scope references are released. Skipping a zero-size extent releases no storage.
 
 **Sizing guideline**: `task_window_size` must be larger than the maximum number of tasks in any single `PTO2_SCOPE`. A safe choice is `2 × max_tasks_per_scope` or simply the default 65536 for production.
 
