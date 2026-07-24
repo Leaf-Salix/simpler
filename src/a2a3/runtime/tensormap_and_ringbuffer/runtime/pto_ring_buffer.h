@@ -105,6 +105,10 @@ public:
         heap_tail_ = 0;
         heap_reclaim_task_id_ = initial_local_task_id;
         heap_reclaim_invalid_task_id_ = -1;
+#if SIMPLER_DFX
+        heap_reclaim_skipped_live_zero_ = false;
+        heap_reclaim_decoupled_logged_ = false;
+#endif
     }
 
     /**
@@ -147,6 +151,10 @@ public:
         uint64_t wait_start = 0;
         bool waiting = false;
 #endif
+#if SIMPLER_DFX
+        uint64_t reclaim_stall_start = 0;
+        bool reclaim_stall_dumped = false;
+#endif
 
         while (true) {
             // Check both resources; commit only if both available
@@ -173,6 +181,9 @@ public:
             if (!wait_published) {
                 sm_header->orchestrator_reclaim_waiting.store(1, std::memory_order_release);
                 wait_published = true;
+#if SIMPLER_DFX
+                reclaim_stall_start = get_sys_cnt_aicpu();
+#endif
             }
 
             // Spin: wait for scheduler to advance last_task_alive
@@ -191,6 +202,10 @@ public:
                     spin_count = 0;
                     prev_last_alive = last_alive;
                     prev_heap_reclaim_task_id = heap_reclaim_task_id_;
+#if SIMPLER_DFX
+                    reclaim_stall_start = get_sys_cnt_aicpu();
+                    reclaim_stall_dumped = false;
+#endif
                 } else if ((spin_count & 1023) == 0) {
                     // The scheduler owns the progress watchdog while dispatch runs
                     // concurrently. Poll both error channels so its timeout can
@@ -203,6 +218,13 @@ public:
                         return {-1, -1, nullptr, nullptr};
                     }
                 }
+#if SIMPLER_DFX
+                if (!reclaim_stall_dumped && (spin_count & RECLAIM_DFX_TIME_POLL_MASK) == 0 &&
+                    get_sys_cnt_aicpu() - reclaim_stall_start >= PLATFORM_PROF_SYS_CNT_FREQ) {
+                    dump_heap_reclaim_snapshot(last_alive, output_size);
+                    reclaim_stall_dumped = true;
+                }
+#endif
             }
             SPIN_WAIT_HINT();
         }
@@ -247,6 +269,10 @@ public:
 
 private:
     static constexpr uint64_t RECLAIM_POLL_MASK = 255;
+#if SIMPLER_DFX
+    static constexpr uint64_t RECLAIM_DFX_TIME_POLL_MASK = 65535;
+    static constexpr int32_t RECLAIM_DFX_DESCRIPTOR_LOG_LIMIT = 16;
+#endif
 
     // --- Task Ring ---
     PTO2TaskDescriptor *descriptors_ = nullptr;
@@ -269,6 +295,10 @@ private:
     uint64_t heap_tail_ = 0;                     // Heap reclamation pointer (derived from consumed tasks)
     int32_t heap_reclaim_task_id_ = 0;           // Next task whose heap extent has not been retired
     int32_t heap_reclaim_invalid_task_id_ = -1;  // Descriptor invariant failure, or -1
+#if SIMPLER_DFX
+    bool heap_reclaim_skipped_live_zero_ = false;
+    bool heap_reclaim_decoupled_logged_ = false;
+#endif
 
     // --- Shared ---
     std::atomic<int32_t> *error_code_ptr_ = nullptr;
@@ -323,14 +353,22 @@ private:
 
             bool zero_extent = extent_begin == extent_end;
             bool consumed = consumed_by_watermark;
+            bool consumed_ahead_of_watermark = false;
             if (!zero_extent && !consumed) {
                 if (slot_states_ == nullptr ||
                     slot_states_[task_id & window_mask_].task_state.load(std::memory_order_acquire) !=
                         PTO2_TASK_CONSUMED) {
                     return;
                 }
+                consumed_ahead_of_watermark = true;
             }
 
+#if SIMPLER_DFX
+            if (zero_extent && !consumed_by_watermark && slot_states_ != nullptr &&
+                slot_states_[task_id & window_mask_].task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) {
+                heap_reclaim_skipped_live_zero_ = true;
+            }
+#endif
             if (!zero_extent) {
                 uint64_t old_tail = heap_tail_;
                 heap_tail_ = static_cast<uint64_t>(extent_end - heap_begin);
@@ -339,13 +377,90 @@ private:
                 if (is_scope_stats_enabled() && heap_tail_ < old_tail) {
                     scope_stats_note_heap_wrap(SCOPE_STATS_HEAP_SIDE_RECLAIM);
                 }
+                if (heap_reclaim_skipped_live_zero_ && consumed_ahead_of_watermark && !heap_reclaim_decoupled_logged_) {
+                    LOG_INFO_V0(
+                        "[HEAP_RECLAIM_PROGRESS] ring=%u task=%d last_alive=%d tail=%" PRIu64
+                        " reason=consumed_after_live_zero",
+                        static_cast<unsigned>(ring_id_), task_id, last_alive, heap_tail_
+                    );
+                    heap_reclaim_decoupled_logged_ = true;
+                }
 #else
                 (void)old_tail;
+                (void)consumed_ahead_of_watermark;
 #endif
             }
             heap_reclaim_task_id_++;
         }
     }
+
+#if SIMPLER_DFX
+    __attribute__((noinline, cold)) void dump_heap_reclaim_snapshot(int32_t last_alive, int32_t requested_output_size) {
+        uintptr_t heap_begin = reinterpret_cast<uintptr_t>(heap_base_);
+        uintptr_t heap_end = heap_begin + heap_size_;
+        int32_t scanned = 0;
+        int32_t invalid = 0;
+        int32_t zero_live = 0;
+        int32_t positive_consumed = 0;
+        int32_t positive_live = 0;
+        int32_t first_live_positive = -1;
+        uint64_t consumed_positive_bytes = 0;
+        uint64_t live_positive_bytes = 0;
+
+        for (int32_t task_id = heap_reclaim_task_id_; task_id < local_task_id_; task_id++) {
+            PTO2TaskDescriptor &desc = descriptors_[task_id & window_mask_];
+            PTO2TaskId expected_task_id = PTO2TaskId::make(ring_id_, static_cast<uint32_t>(task_id));
+            uintptr_t extent_begin = reinterpret_cast<uintptr_t>(desc.packed_buffer_base);
+            uintptr_t extent_end = reinterpret_cast<uintptr_t>(desc.packed_buffer_end);
+            bool valid = desc.task_id == expected_task_id && extent_begin >= heap_begin && extent_begin <= heap_end &&
+                         extent_end >= extent_begin && extent_end <= heap_end;
+            if (!valid) {
+                invalid++;
+                if (scanned < RECLAIM_DFX_DESCRIPTOR_LOG_LIMIT) {
+                    LOG_WARN(
+                        "[HEAP_RECLAIM_STALL] DESC ring=%u task=%d valid=0 raw=%" PRIu64 " base=%p end=%p",
+                        static_cast<unsigned>(ring_id_), task_id, desc.task_id.raw, desc.packed_buffer_base,
+                        desc.packed_buffer_end
+                    );
+                }
+                scanned++;
+                continue;
+            }
+
+            uint64_t extent_size = static_cast<uint64_t>(extent_end - extent_begin);
+            PTO2TaskState state = slot_states_ != nullptr ?
+                                      slot_states_[task_id & window_mask_].task_state.load(std::memory_order_acquire) :
+                                      PTO2_TASK_PENDING;
+            if (extent_size == 0) {
+                if (state != PTO2_TASK_CONSUMED) zero_live++;
+            } else if (state == PTO2_TASK_CONSUMED || task_id < last_alive) {
+                positive_consumed++;
+                consumed_positive_bytes += extent_size;
+            } else {
+                positive_live++;
+                live_positive_bytes += extent_size;
+                if (first_live_positive < 0) first_live_positive = task_id;
+            }
+            if (scanned < RECLAIM_DFX_DESCRIPTOR_LOG_LIMIT) {
+                LOG_WARN(
+                    "[HEAP_RECLAIM_STALL] DESC ring=%u task=%d valid=1 size=%" PRIu64 " state=%d",
+                    static_cast<unsigned>(ring_id_), task_id, extent_size, static_cast<int32_t>(state)
+                );
+            }
+            scanned++;
+        }
+
+        LOG_WARN(
+            "[HEAP_RECLAIM_STALL] SUMMARY ring=%u current=%d last_alive=%d cursor=%d top=%" PRIu64 " tail=%" PRIu64
+            " available=%" PRIu64 " requested=%d scanned=%d invalid=%d zero_live=%d "
+            "first_live_positive=%d positive_live=%d live_bytes=%" PRIu64
+            " positive_consumed=%d consumed_bytes=%" PRIu64,
+            static_cast<unsigned>(ring_id_), local_task_id_, last_alive, heap_reclaim_task_id_, heap_top_, heap_tail_,
+            heap_available(), requested_output_size, scanned, invalid, zero_live, first_live_positive, positive_live,
+            live_positive_bytes, positive_consumed, consumed_positive_bytes
+        );
+    }
+#endif
 
     /**
      * Bump the heap pointer for the given allocation size.
