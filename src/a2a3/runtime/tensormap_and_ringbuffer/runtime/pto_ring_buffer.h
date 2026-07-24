@@ -157,37 +157,41 @@ public:
 #endif
 
         while (true) {
-            // Check both resources; commit only if both available
-            if (local_task_id_ - last_alive + 1 < window_size_) {
-                void *heap_ptr = nullptr;
-                if (extent_reclaim_enabled_) {
-                    heap_ptr = try_extent_heap(aligned_size);
-                    if (heap_ptr == nullptr && (spin_count & 255) == 0) {
-                        if (scheduler_runs_concurrently && sm_header != nullptr) {
-                            collect_consumed_extents_pending(*sm_header, last_alive, local_task_id_);
-                        } else {
-                            collect_consumed_extents(last_alive, local_task_id_);
+            if ((spin_count & 255) == 0) {
+                // Check both resources; commit only if both available
+                if (local_task_id_ - last_alive + 1 < window_size_) {
+                    void *heap_ptr = nullptr;
+                    if (extent_reclaim_enabled_) {
+                        heap_ptr = try_extent_heap(aligned_size);
+                        if (heap_ptr == nullptr) {
+                            if (scheduler_runs_concurrently && sm_header != nullptr) {
+                                collect_consumed_extents_pending(*sm_header, last_alive, local_task_id_);
+                            } else {
+                                collect_consumed_extents(last_alive, local_task_id_);
+                            }
+                            heap_ptr = try_extent_heap(aligned_size);
                         }
-                        heap_ptr = try_extent_heap(aligned_size);
+                    } else {
+                        heap_ptr = try_bump_heap(aligned_size);
+                        if (heap_ptr == nullptr) {
+                            enable_extent_reclaim(last_alive);
+                            heap_ptr = try_extent_heap(aligned_size);
+                        }
                     }
-                } else {
-                    heap_ptr = try_bump_heap(aligned_size);
-                    if (heap_ptr == nullptr) {
-                        enable_extent_reclaim(last_alive);
-                        heap_ptr = try_extent_heap(aligned_size);
-                    }
-                }
-                if (heap_ptr) {
-                    int32_t task_id = commit_task(heap_ptr, static_cast<char *>(heap_ptr) + aligned_size);
-                    clear_reclaim_wait();
+                    if (heap_ptr) {
+                        int32_t task_id = commit_task(heap_ptr, static_cast<char *>(heap_ptr) + aligned_size);
+                        clear_reclaim_wait();
 #if SIMPLER_ORCH_PROFILING
-                    record_wait(spin_count, wait_start, waiting);
+                        record_wait(spin_count, wait_start, waiting);
 #endif
-                    return {task_id, task_id & window_mask_, heap_ptr, static_cast<char *>(heap_ptr) + aligned_size};
+                        return {
+                            task_id, task_id & window_mask_, heap_ptr, static_cast<char *>(heap_ptr) + aligned_size
+                        };
+                    }
+                    blocked_on_heap = true;
+                } else {
+                    blocked_on_heap = false;
                 }
-                blocked_on_heap = true;
-            } else {
-                blocked_on_heap = false;
             }
 
             if (!scheduler_runs_concurrently || sm_header == nullptr) {
@@ -207,13 +211,18 @@ public:
                 waiting = true;
             }
 #endif
-            last_alive = last_alive_ptr_->load(std::memory_order_acquire);
-            update_heap_tail(last_alive);
-            if (last_alive > prev_last_alive) {
-                // Reclaim advanced -> productive backpressure, not a deadlock.
-                spin_count = 0;
-                prev_last_alive = last_alive;
-            } else if ((spin_count & 1023) == 0) {
+            bool reclaim_advanced = false;
+            if ((spin_count & 255) == 0) {
+                last_alive = last_alive_ptr_->load(std::memory_order_acquire);
+                update_heap_tail(last_alive);
+                if (last_alive > prev_last_alive) {
+                    // Reclaim advanced -> productive backpressure, not a deadlock.
+                    spin_count = 0;
+                    prev_last_alive = last_alive;
+                    reclaim_advanced = true;
+                }
+            }
+            if (!reclaim_advanced && (spin_count & 1023) == 0) {
                 // The scheduler owns the progress watchdog while dispatch runs
                 // concurrently. Poll both error channels so its timeout can
                 // unwind this otherwise-unbounded back-pressure wait.
@@ -458,6 +467,7 @@ private:
         PTO2SharedMemoryRingHeader &ring = sm_header.rings[ring_id_];
         uint64_t leaf_words = ring.consumed_leaf_words();
         for (uint64_t summary_index = 0; summary_index < ring.consumed_summary_words(); summary_index++) {
+            if (ring.consumed_summary[summary_index].load(std::memory_order_relaxed) == 0) continue;
             uint64_t summary_bits = ring.consumed_summary[summary_index].exchange(0, std::memory_order_acq_rel);
             while (summary_bits != 0) {
                 uint64_t leaf_index = summary_index * 64 + static_cast<uint64_t>(__builtin_ctzll(summary_bits));
@@ -620,7 +630,7 @@ private:
         }
         {
             extern uint64_t g_orch_alloc_atomic_count;
-            g_orch_alloc_atomic_count += spin_count + 1;
+            g_orch_alloc_atomic_count += (spin_count >> 8) + 1;
         }
     }
 #endif
