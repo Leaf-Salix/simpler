@@ -123,7 +123,6 @@ public:
         consumed_scan_steps_ = 0;
         consumed_scan_candidates_ = 0;
         reclaimed_descriptor_count_ = 0;
-        next_extent_stats_task_ = (static_cast<uint64_t>(initial_local_task_id) / 32768 + 1) * 32768;
 #endif
         heap_allocated_bytes_ = 0;
         heap_reclaimed_bytes_ = 0;
@@ -320,7 +319,6 @@ private:
     uint64_t consumed_scan_steps_ = 0;
     uint64_t consumed_scan_candidates_ = 0;
     uint64_t reclaimed_descriptor_count_ = 0;
-    uint64_t next_extent_stats_task_ = 32768;
 #endif
     uint64_t heap_allocated_bytes_ = 0;
     uint64_t heap_reclaimed_bytes_ = 0;
@@ -634,10 +632,7 @@ private:
 
     void maybe_log_extent_stats() {
 #if SIMPLER_DFX
-        if (ring_id_ != 3 || static_cast<uint64_t>(local_task_id_) < next_extent_stats_task_) return;
-        do {
-            next_extent_stats_task_ += 32768;
-        } while (static_cast<uint64_t>(local_task_id_) >= next_extent_stats_task_);
+        if (ring_id_ != 3 || (extent_alloc_attempts_ != 1 && (extent_alloc_attempts_ & 32767) != 0)) return;
         LOG_WARN(
             "[RING3_EXTENT_STATS] task=%d attempts=%" PRIu64 " alloc_steps=%" PRIu64 " insert_calls=%" PRIu64
             " insert_steps=%" PRIu64 " largest_calls=%" PRIu64 " largest_steps=%" PRIu64 " consumed_calls=%" PRIu64
