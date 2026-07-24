@@ -203,6 +203,7 @@ void PTO2SharedMemoryHandle::print_layout() {
         );
         LOG_INFO_V0("  current_task_idx: %d", h->rings[r].fc.current_task_index.load(std::memory_order_acquire));
         LOG_INFO_V0("  last_task_alive:  %d", h->rings[r].fc.last_task_alive.load(std::memory_order_acquire));
+        LOG_INFO_V0("  consumed_epoch:   %u", h->rings[r].fc.consumed_epoch.load(std::memory_order_acquire));
     }
     LOG_INFO_V0("orchestrator_done:  %d", h->orchestrator_done.load(std::memory_order_acquire));
     LOG_INFO_V0("orchestrator_reclaim_waiting: %d", h->orchestrator_reclaim_waiting.load(std::memory_order_acquire));

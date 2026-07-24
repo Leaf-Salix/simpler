@@ -157,6 +157,7 @@ The orchestrator and schedulers communicate through a contiguous shared memory r
 | ----- | ------ | ------ | ------- |
 | `current_task_index` | Orchestrator | Scheduler | Next task ID to allocate (task ring head) |
 | `last_task_alive` | Scheduler | Orchestrator | Oldest still-active task (task ring tail) |
+| `consumed_epoch` | Scheduler | Orchestrator | Signals that at least one new task may be reclaimable |
 | `orchestrator_done` | Orchestrator | Scheduler | Signals orchestration completion |
 | `orchestrator_reclaim_waiting` | Orchestrator | Scheduler | Orchestrator is blocked on task/heap reclaim before graph construction can finish |
 | `task_window_size` | Init | Both | Number of task slots (per-ring, in `PTO2SharedMemoryRingHeader`) |

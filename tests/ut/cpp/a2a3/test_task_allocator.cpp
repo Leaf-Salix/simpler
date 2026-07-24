@@ -467,6 +467,42 @@ TEST_F(TaskAllocatorTest, ConcurrentBackpressureFindsConsumedExtentBehindLiveHea
     EXPECT_EQ(header.orchestrator_reclaim_waiting.load(std::memory_order_acquire), 0);
 }
 
+TEST_F(TaskAllocatorTest, ConcurrentBackpressureRequiresConsumedProgress) {
+    auto head = allocator.alloc(1024);
+    auto hole = allocator.alloc(2048);
+    auto tail = allocator.alloc(1024);
+    ASSERT_FALSE(head.failed());
+    ASSERT_FALSE(hole.failed());
+    ASSERT_FALSE(tail.failed());
+
+    slot_states[head.slot].task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+    slot_states[hole.slot].task_state.store(PTO2_TASK_PENDING, std::memory_order_release);
+    slot_states[tail.slot].task_state.store(PTO2_TASK_PENDING, std::memory_order_release);
+
+    PTO2SharedMemoryHeader header{};
+    header.orch_error_code.store(PTO2_ERROR_NONE);
+    header.sched_error_code.store(PTO2_ERROR_NONE);
+    header.orchestrator_reclaim_waiting.store(0);
+    std::thread no_event_reclaimer([&]() {
+        while (header.orchestrator_reclaim_waiting.load(std::memory_order_acquire) == 0) {
+            std::this_thread::yield();
+        }
+        slot_states[hole.slot].task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
+        header.sched_error_code.store(PTO2_ERROR_SCHEDULER_TIMEOUT, std::memory_order_release);
+    });
+
+    auto blocked = allocator.alloc(1024, &header, /*scheduler_runs_concurrently=*/true);
+    no_event_reclaimer.join();
+    EXPECT_TRUE(blocked.failed());
+    EXPECT_EQ(allocator.heap_used_bytes(), HEAP_SIZE);
+
+    header.sched_error_code.store(PTO2_ERROR_NONE, std::memory_order_release);
+    header.rings[0].fc.consumed_epoch.fetch_add(1, std::memory_order_release);
+    auto reused = allocator.alloc(1024, &header, /*scheduler_runs_concurrently=*/true);
+    ASSERT_FALSE(reused.failed());
+    EXPECT_EQ(reused.packed_base, hole.packed_base);
+}
+
 TEST_F(TaskAllocatorTest, BestFitPreservesLargeExtentForLargeRequest) {
     auto large_hole = allocator.alloc(2048);
     auto separator = allocator.alloc(64);

@@ -566,7 +566,9 @@ struct PTO2SchedulerState {
         // claim). Without this lock a claim racing the consume desyncs the slot's
         // refcount and wedges in-order reclaim.
         bool became_consumed = false;
+        int32_t ring_id;
         slot_state.lock_fanout();
+        ring_id = slot_state.ring_id;
         if (slot_state.fanout_refcount.load(std::memory_order_acquire) == slot_state.fanout_count) {
             PTO2TaskState expected = PTO2_TASK_COMPLETED;
             became_consumed = slot_state.task_state.compare_exchange_strong(
@@ -576,13 +578,12 @@ struct PTO2SchedulerState {
         slot_state.unlock_fanout();
         if (!became_consumed) return;
 
-        ring_sched_states[slot_state.ring_id].ring->fc.consumed_epoch.fetch_add(1, std::memory_order_release);
+        ring_sched_states[ring_id].ring->fc.consumed_epoch.fetch_add(1, std::memory_order_release);
 
 #if SIMPLER_SCHED_PROFILING
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);
 #endif
 
-        int32_t ring_id = slot_state.ring_id;
         // advance_ring_pointers (and the reset_for_reuse it triggers) MUST run
         // outside fanout_lock: reset_for_reuse stores fanout_lock=0 and would
         // clobber a held lock. Safe here — the slot is CONSUMED and quiescent.
@@ -601,7 +602,9 @@ struct PTO2SchedulerState {
         // See the non-profiling overload for why the read + COMPLETED->CONSUMED
         // flip is serialized against the orchestrator's claim under fanout_lock.
         bool became_consumed = false;
+        int32_t ring_id;
         slot_state.lock_fanout();
+        ring_id = slot_state.ring_id;
         atomic_count += 1;  // lock CAS
         uint32_t fc = slot_state.fanout_count;
         uint32_t rc = slot_state.fanout_refcount.load(std::memory_order_acquire);
@@ -617,14 +620,13 @@ struct PTO2SchedulerState {
         atomic_count += 1;  // unlock store
         if (!became_consumed) return;
 
-        ring_sched_states[slot_state.ring_id].ring->fc.consumed_epoch.fetch_add(1, std::memory_order_release);
+        ring_sched_states[ring_id].ring->fc.consumed_epoch.fetch_add(1, std::memory_order_release);
         atomic_count += 1;
 
 #if SIMPLER_SCHED_PROFILING
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);
 #endif
 
-        int32_t ring_id = slot_state.ring_id;
         // advance_ring_pointers + reset_for_reuse run outside fanout_lock (reset
         // stores fanout_lock=0). Safe — the slot is CONSUMED and quiescent.
         // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
