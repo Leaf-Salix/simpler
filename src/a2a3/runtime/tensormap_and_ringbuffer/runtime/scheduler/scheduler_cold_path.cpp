@@ -30,6 +30,67 @@
 #include "runtime.h"
 #include "spin_hint.h"
 
+namespace {
+struct alignas(64) SchedulerThreadLivenessDiag {
+    std::atomic<uint64_t> sequence{0};
+    std::atomic<uint64_t> phase_enter_cycles{0};
+    std::atomic<uint64_t> attempt{0};
+    std::atomic<int64_t> task_id{-1};
+    std::atomic<int32_t> core_id{-1};
+    std::atomic<int32_t> subslot{-1};
+    std::atomic<int32_t> phase{static_cast<int32_t>(SchedulerLivenessPhase::Normal)};
+};
+
+std::atomic<SchedulerContext *> g_scheduler_diag_context{nullptr};
+SchedulerThreadLivenessDiag g_scheduler_thread_diag[MAX_AICPU_THREADS];
+
+const char *scheduler_liveness_phase_name(SchedulerLivenessPhase phase) {
+    switch (phase) {
+    case SchedulerLivenessPhase::Normal:
+        return "normal";
+    case SchedulerLivenessPhase::MailboxConditionPush:
+        return "mailbox_condition_push";
+    case SchedulerLivenessPhase::MailboxNormalDonePush:
+        return "mailbox_normal_done_push";
+    }
+    return "invalid";
+}
+}  // namespace
+
+void scheduler_liveness_diag_set_phase(
+    int32_t thread_idx, SchedulerLivenessPhase phase, uint64_t attempt, int64_t task_id, int32_t core_id,
+    int32_t subslot
+) {
+    if (thread_idx < 0 || thread_idx >= MAX_AICPU_THREADS) return;
+    SchedulerThreadLivenessDiag &diag = g_scheduler_thread_diag[thread_idx];
+    diag.sequence.fetch_add(1, std::memory_order_acq_rel);
+    diag.attempt.store(attempt, std::memory_order_relaxed);
+    diag.task_id.store(task_id, std::memory_order_relaxed);
+    diag.core_id.store(core_id, std::memory_order_relaxed);
+    diag.subslot.store(subslot, std::memory_order_relaxed);
+    diag.phase_enter_cycles.store(get_sys_cnt_aicpu(), std::memory_order_relaxed);
+    diag.phase.store(static_cast<int32_t>(phase), std::memory_order_release);
+    diag.sequence.fetch_add(1, std::memory_order_release);
+}
+
+void scheduler_liveness_diag_clear_phase(int32_t thread_idx) {
+    if (thread_idx < 0 || thread_idx >= MAX_AICPU_THREADS) return;
+    SchedulerThreadLivenessDiag &diag = g_scheduler_thread_diag[thread_idx];
+    diag.sequence.fetch_add(1, std::memory_order_acq_rel);
+    diag.phase_enter_cycles.store(0, std::memory_order_relaxed);
+    diag.phase.store(static_cast<int32_t>(SchedulerLivenessPhase::Normal), std::memory_order_release);
+    diag.sequence.fetch_add(1, std::memory_order_release);
+}
+
+void scheduler_liveness_diag_bind_context(SchedulerContext *ctx) {
+    g_scheduler_diag_context.store(ctx, std::memory_order_release);
+}
+
+extern "C" void pto2_log_scheduler_liveness_snapshot() {
+    SchedulerContext *ctx = g_scheduler_diag_context.load(std::memory_order_acquire);
+    if (ctx != nullptr) ctx->log_scheduler_liveness_snapshot();
+}
+
 // =============================================================================
 // Cold-path helpers for the main dispatch loop (noinline to reduce hot-loop icache)
 // =============================================================================
@@ -454,6 +515,105 @@ void SchedulerContext::log_reclaim_stall_snapshot() {
         LOG_WARN(
             "[RECLAIM_STALL] HEAD_SUMMARY ring=%d last_alive=%d matching_live_consumers=%d logged=%d", head_ring_id,
             last_alive, matching_live_consumers, logged_consumers
+        );
+    }
+}
+
+void SchedulerContext::log_scheduler_liveness_snapshot() {
+    uint64_t now = get_sys_cnt_aicpu();
+    uint64_t attempt = drain_state_.drain_attempt.load(std::memory_order_acquire);
+    int32_t drain_pending = drain_state_.sync_start_pending.load(std::memory_order_acquire);
+    PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
+    int64_t task_id = -1;
+
+    int32_t gated = 0;
+    int32_t staged_cores = 0;
+    int32_t running_slots = -1;
+    int32_t early_dispatch_state = -1;
+    int32_t early_sync_drain_state = -1;
+    int32_t early_launch_state = -1;
+    if (slot_state != nullptr && slot_state->payload != nullptr) {
+        PTO2TaskDescriptor *task = slot_state->task;
+        task_id = task != nullptr ? static_cast<int64_t>(task->task_id.raw) : -1;
+        PTO2TaskPayload &payload = *slot_state->payload;
+        gated = PTO2SchedulerState::owns_early_sync_drain(payload) ? 1 : 0;
+        for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
+            staged_cores += __builtin_popcountll(payload.staged_core_mask[w].load(std::memory_order_acquire));
+        }
+        running_slots = payload.running_slot_count.load(std::memory_order_acquire);
+        early_dispatch_state = payload.early_dispatch_state.load(std::memory_order_acquire);
+        early_sync_drain_state = payload.early_sync_drain_state.load(std::memory_order_acquire);
+        early_launch_state = payload.early_dispatch_launch_state.load(std::memory_order_acquire);
+    }
+
+    uint64_t mailbox_head = 0;
+    uint64_t mailbox_tail = 0;
+    uint64_t mailbox_tail_seq = 0;
+    if (rt_ != nullptr && rt_->aicore_mailbox != nullptr) {
+        AICoreCompletionMailbox *mailbox = rt_->aicore_mailbox;
+        mailbox_tail = mailbox->tail.load(std::memory_order_acquire);
+        mailbox_head = mailbox->head.load(std::memory_order_acquire);
+        if (mailbox_tail < mailbox_head) {
+            mailbox_tail_seq =
+                mailbox->entries[mailbox_tail & AICORE_COMPLETION_MAILBOX_MASK].seq.load(std::memory_order_acquire);
+        }
+    }
+
+    int32_t async_busy = -1;
+    int32_t async_count = -1;
+    if (sched_->async_wait_list.try_lock()) {
+        async_busy = 0;
+        async_count = sched_->async_wait_list.count;
+        sched_->async_wait_list.unlock();
+    }
+    int32_t reclaim_waiting = sched_ != nullptr && sched_->sm_header != nullptr ?
+                                  sched_->sm_header->orchestrator_reclaim_waiting.load(std::memory_order_acquire) :
+                                  -1;
+    int32_t submitted_tasks = 0;
+    if (sched_ != nullptr && sched_->sm_header != nullptr) {
+        for (int32_t r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            submitted_tasks += sched_->sm_header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
+        }
+    }
+    int32_t completed_tasks = completed_tasks_.load(std::memory_order_acquire);
+    LOG_WARN(
+        "[SCHED_LIVENESS] task=%" PRId64 " drain_pending=%d attempt=%" PRIu64
+        " owner=%d stage_go=%d stage_done=0x%x running_staged=%d gated=%d "
+        "staged_cores=%d running_slots=%d early_dispatch=%d early_sync=%d early_launch=%d "
+        "mailbox_head=%" PRIu64 " mailbox_tail=%" PRIu64 " occupancy=%" PRIu64 " tail_seq=%" PRIu64
+        " async_busy=%d async_count=%d mpsc_full=%" PRIu64 " completed=%d submitted=%d reclaim_waiting=%d",
+        task_id, drain_pending, attempt, drain_state_.drain_worker_elected.load(std::memory_order_acquire),
+        drain_state_.drain_stage_go.load(std::memory_order_acquire),
+        drain_state_.drain_stage_done_mask.load(std::memory_order_acquire),
+        drain_state_.drain_running_staged.load(std::memory_order_acquire), gated, staged_cores, running_slots,
+        early_dispatch_state, early_sync_drain_state, early_launch_state, mailbox_head, mailbox_tail,
+        mailbox_head - mailbox_tail, mailbox_tail_seq, async_busy, async_count,
+        sched_->async_wait_list.mpsc_skipped_count.load(std::memory_order_acquire), completed_tasks, submitted_tasks,
+        reclaim_waiting
+    );
+
+    uint32_t ack_mask = sync_start_drain_ack_mask_for_attempt(drain_ack_attempts_, active_sched_threads_, attempt);
+    LOG_WARN(
+        "[SCHED_LIVENESS] DRAIN attempt=%" PRIu64 " ack_mask=0x%x all_acked=0x%x", attempt, ack_mask,
+        (1u << active_sched_threads_) - 1
+    );
+    for (int32_t t = 0; t < active_sched_threads_; t++) {
+        SchedulerThreadLivenessDiag &diag = g_scheduler_thread_diag[t];
+        uint64_t seq_before = diag.sequence.load(std::memory_order_acquire);
+        SchedulerLivenessPhase phase = static_cast<SchedulerLivenessPhase>(diag.phase.load(std::memory_order_relaxed));
+        uint64_t entered = diag.phase_enter_cycles.load(std::memory_order_relaxed);
+        uint64_t phase_attempt = diag.attempt.load(std::memory_order_relaxed);
+        int64_t phase_task = diag.task_id.load(std::memory_order_relaxed);
+        int32_t phase_core = diag.core_id.load(std::memory_order_relaxed);
+        int32_t phase_subslot = diag.subslot.load(std::memory_order_relaxed);
+        uint64_t seq_after = diag.sequence.load(std::memory_order_acquire);
+        bool stable = seq_before == seq_after && (seq_before & 1) == 0;
+        uint64_t age_us = entered == 0 || now < entered ? 0 : (now - entered) * 1000000 / PLATFORM_PROF_SYS_CNT_FREQ;
+        LOG_WARN(
+            "[SCHED_LIVENESS] THREAD thread=%d phase=%s stable=%d age_us=%" PRIu64 " phase_attempt=%" PRIu64
+            " ack_attempt=%" PRIu64 " task=%" PRId64 " core=%d subslot=%d",
+            t, scheduler_liveness_phase_name(phase), stable ? 1 : 0, age_us, phase_attempt,
+            drain_ack_attempts_[t].load(std::memory_order_acquire), phase_task, phase_core, phase_subslot
         );
     }
 }
@@ -1380,6 +1540,8 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
 }
 
 void SchedulerContext::deinit() {
+    scheduler_liveness_diag_bind_context(nullptr);
+
     // Reset all per-core execution state
     for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
         core_exec_states_[i] = {};
@@ -1440,6 +1602,7 @@ void SchedulerContext::deinit() {
 void SchedulerContext::bind_runtime(PTO2Runtime *rt) {
     rt_ = rt;
     sched_ = &rt->scheduler;
+    scheduler_liveness_diag_bind_context(this);
 }
 
 void SchedulerContext::wait_for_orchestration_done_before_dispatch(Runtime *runtime, int32_t thread_idx) {

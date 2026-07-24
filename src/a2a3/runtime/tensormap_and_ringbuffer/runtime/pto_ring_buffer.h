@@ -55,6 +55,10 @@
 // structural checks plus the scheduler's global progress watchdog instead.
 #define PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES (PLATFORM_PROF_SYS_CNT_FREQ / 2)  // 500 ms
 
+#if SIMPLER_DFX
+extern "C" __attribute__((weak)) void pto2_log_scheduler_liveness_snapshot();
+#endif
+
 // =============================================================================
 // Task Allocator (unified task slot + heap buffer allocation)
 // =============================================================================
@@ -222,6 +226,9 @@ public:
                 if (!reclaim_stall_dumped && (spin_count & RECLAIM_DFX_TIME_POLL_MASK) == 0 &&
                     get_sys_cnt_aicpu() - reclaim_stall_start >= PLATFORM_PROF_SYS_CNT_FREQ) {
                     dump_heap_reclaim_snapshot(last_alive, output_size);
+                    if (pto2_log_scheduler_liveness_snapshot != nullptr) {
+                        pto2_log_scheduler_liveness_snapshot();
+                    }
                     reclaim_stall_dumped = true;
                 }
 #endif

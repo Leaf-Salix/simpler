@@ -33,7 +33,7 @@
 
 namespace {
 inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
-}
+}  // namespace
 
 // Pure function: read register result -> SlotTransition (no side effects).
 SlotTransition SchedulerContext::decide_slot_transition(
@@ -139,10 +139,20 @@ void SchedulerContext::complete_slot_task(
             const PTO2TaskId token = slot_state.task->task_id;
             for (uint32_t i = 0; i < cond_count; ++i) {
                 volatile DeferredCompletionEntry *e = &deferred_slab->entries[i];
+                bool mailbox_waiting = false;
                 while (!mailbox->try_push_condition(token, e->addr, e->expected_value, e->engine, e->completion_type)) {
+                    if (!mailbox_waiting) {
+                        scheduler_liveness_diag_set_phase(
+                            thread_idx, SchedulerLivenessPhase::MailboxConditionPush,
+                            drain_state_.drain_attempt.load(std::memory_order_acquire), static_cast<int64_t>(token.raw),
+                            core_id, static_cast<int32_t>(subslot)
+                        );
+                        mailbox_waiting = true;
+                    }
                     sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
                     SPIN_WAIT_HINT();
                 }
+                if (mailbox_waiting) scheduler_liveness_diag_clear_phase(thread_idx);
             }
             // Re-clear for the next reuse of this (core, buf) slot. Done here — on
             // the hot cache line we just read — instead of on every dispatch, since
@@ -165,10 +175,20 @@ void SchedulerContext::complete_slot_task(
     if (task_complete && slot_state.payload != nullptr && slot_state.has_any_subtask_deferred()) {
         // Some subtask of this task registered conditions; finish the
         // registration by handing the slot_state off to the consumer.
+        bool mailbox_waiting = false;
         while (!mailbox->try_push_normal_done(slot_state.task->task_id, reinterpret_cast<uint64_t>(&slot_state))) {
+            if (!mailbox_waiting) {
+                scheduler_liveness_diag_set_phase(
+                    thread_idx, SchedulerLivenessPhase::MailboxNormalDonePush,
+                    drain_state_.drain_attempt.load(std::memory_order_acquire),
+                    static_cast<int64_t>(slot_state.task->task_id.raw), core_id, static_cast<int32_t>(subslot)
+                );
+                mailbox_waiting = true;
+            }
             sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
             SPIN_WAIT_HINT();
         }
+        if (mailbox_waiting) scheduler_liveness_diag_clear_phase(thread_idx);
         defer_completion_to_consumer = true;
     }
 
