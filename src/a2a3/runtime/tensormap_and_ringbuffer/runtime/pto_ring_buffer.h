@@ -119,6 +119,7 @@ public:
         pending_generation_misses_ = 0;
         pending_range_misses_ = 0;
         pending_state_misses_ = 0;
+        extent_corruption_reported_ = false;
 #endif
         heap_allocated_bytes_ = 0;
         heap_reclaimed_bytes_ = 0;
@@ -178,6 +179,9 @@ public:
                     if (heap_ptr == nullptr && (spin_count & 255) == 0) {
                         if (scheduler_runs_concurrently && sm_header != nullptr) {
                             collect_consumed_extents_pending(*sm_header, last_alive, local_task_id_);
+#if SIMPLER_DFX
+                            maybe_report_heap_stall(*sm_header, aligned_size, last_alive, no_reclaim_progress_start);
+#endif
                         } else {
                             collect_consumed_extents(last_alive, local_task_id_);
                         }
@@ -326,6 +330,7 @@ private:
     uint64_t pending_generation_misses_ = 0;
     uint64_t pending_range_misses_ = 0;
     uint64_t pending_state_misses_ = 0;
+    bool extent_corruption_reported_ = false;
 #endif
     uint64_t heap_allocated_bytes_ = 0;
     uint64_t heap_reclaimed_bytes_ = 0;
@@ -566,7 +571,14 @@ private:
         auto *end = start + size;
         FreeExtent *prev = nullptr;
         FreeExtent *cur = free_extents_;
-        while (cur != nullptr && reinterpret_cast<char *>(cur) < start) {
+#if SIMPLER_DFX
+        uint64_t traversal_steps = 0;
+#endif
+        while (cur != nullptr) {
+#if SIMPLER_DFX
+            if (!validate_free_extent(cur, "insert", ++traversal_steps)) return;
+#endif
+            if (reinterpret_cast<char *>(cur) >= start) break;
             prev = cur;
             cur = cur->next;
         }
@@ -603,7 +615,13 @@ private:
         FreeExtent *best = nullptr;
         FreeExtent *best_prev = nullptr;
         FreeExtent *prev = nullptr;
+#if SIMPLER_DFX
+        uint64_t traversal_steps = 0;
+#endif
         for (FreeExtent *cur = free_extents_; cur != nullptr; cur = cur->next) {
+#if SIMPLER_DFX
+            if (!validate_free_extent(cur, "alloc", ++traversal_steps)) return nullptr;
+#endif
             if (cur->size >= alloc_size && (best == nullptr || cur->size < best->size)) {
                 best = cur;
                 best_prev = prev;
@@ -640,15 +658,46 @@ private:
         return result;
     }
 
-    uint64_t find_largest_free_extent() const {
+    uint64_t find_largest_free_extent() {
         uint64_t largest = 0;
+#if SIMPLER_DFX
+        uint64_t traversal_steps = 0;
+#endif
         for (FreeExtent *extent = free_extents_; extent != nullptr; extent = extent->next) {
+#if SIMPLER_DFX
+            if (!validate_free_extent(extent, "largest", ++traversal_steps)) return 0;
+#endif
             largest = std::max(largest, extent->size);
         }
         return largest;
     }
 
 #if SIMPLER_DFX
+    bool validate_free_extent(FreeExtent *extent, const char *operation, uint64_t traversal_steps) {
+        uintptr_t heap_begin = reinterpret_cast<uintptr_t>(heap_base_);
+        uintptr_t heap_end = heap_begin + heap_size_;
+        uintptr_t address = reinterpret_cast<uintptr_t>(extent);
+        bool pointer_valid = heap_size_ >= sizeof(FreeExtent) && address >= heap_begin &&
+                             address <= heap_end - sizeof(FreeExtent) && (address - heap_begin) % PTO2_ALIGN_SIZE == 0;
+        bool size_valid = pointer_valid && extent->size >= sizeof(FreeExtent) && extent->size <= heap_end - address;
+        bool traversal_valid = traversal_steps <= static_cast<uint64_t>(window_size_) + 2;
+        if (pointer_valid && size_valid && traversal_valid) return true;
+
+        if (!extent_corruption_reported_) {
+            extent_corruption_reported_ = true;
+            LOG_ERROR(
+                "[RING3_EXTENT_CORRUPTION] operation=%s task=%d extent=%p steps=%" PRIu64
+                " pointer_valid=%d size_valid=%d size=%" PRIu64,
+                operation, local_task_id_, static_cast<void *>(extent), traversal_steps, pointer_valid ? 1 : 0,
+                size_valid ? 1 : 0, pointer_valid ? extent->size : 0
+            );
+        }
+        if (error_code_ptr_ != nullptr) {
+            error_code_ptr_->store(PTO2_ERROR_HEAP_RING_DEADLOCK, std::memory_order_release);
+        }
+        return false;
+    }
+
     __attribute__((noinline, cold)) void maybe_report_heap_stall(
         PTO2SharedMemoryHeader &sm_header, uint64_t aligned_requested, int32_t last_alive,
         uint64_t no_reclaim_progress_start
@@ -663,6 +712,7 @@ private:
         uint64_t free_bytes = 0;
         uint64_t free_extent_count = 0;
         for (FreeExtent *extent = free_extents_; extent != nullptr; extent = extent->next) {
+            if (!validate_free_extent(extent, "snapshot", free_extent_count + 1)) return;
             free_bytes += extent->size;
             free_extent_count++;
         }
