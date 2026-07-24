@@ -80,7 +80,6 @@ Per-ring flow control and per-ring layout info are grouped together:
 struct PTO2RingFlowControl {
     std::atomic<int32_t> current_task_index;  // task ring head
     std::atomic<int32_t> last_task_alive;     // task ring tail
-    std::atomic<uint32_t> consumed_epoch;     // out-of-order reclaim progress
 };
 
 struct alignas(64) PTO2SharedMemoryRingHeader {

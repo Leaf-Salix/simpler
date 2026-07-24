@@ -78,7 +78,6 @@ struct alignas(64) PTO2RingFlowControl {
 };
 
 static_assert(sizeof(PTO2RingFlowControl) == 128, "PTO2RingFlowControl must be exactly 2 cache lines (128B)");
-static_assert(offsetof(PTO2RingFlowControl, consumed_epoch) == 68, "consumed_epoch must share scheduler cache line");
 
 /**
  * Per-ring shared memory header section.

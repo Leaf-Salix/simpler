@@ -279,7 +279,6 @@ private:
     uint8_t ring_id_ = 0;
     int32_t window_size_ = 0;
     int32_t window_mask_ = 0;
-    uint32_t consumed_epoch_seen_ = 0;
     std::atomic<int32_t> *current_index_ptr_ = nullptr;
     std::atomic<int32_t> *last_alive_ptr_ = nullptr;
 
@@ -295,6 +294,7 @@ private:
     bool extent_reclaim_enabled_ = false;
     FreeExtent *free_extents_ = nullptr;
     uint64_t largest_free_extent_ = 0;
+    uint32_t consumed_epoch_seen_ = 0;
     uint64_t heap_allocated_bytes_ = 0;
     uint64_t heap_reclaimed_bytes_ = 0;
     uint64_t heap_allocated_offset_ = 0;
