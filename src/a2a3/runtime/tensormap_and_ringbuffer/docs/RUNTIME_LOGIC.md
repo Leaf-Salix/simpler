@@ -148,6 +148,8 @@ The orchestrator and schedulers communicate through a contiguous shared memory r
 │    PTO2TaskDescriptor[N]    │  N = task_window_size per ring
 │    PTO2TaskPayload[N]       │
 │    PTO2TaskSlotState[N]     │
+│    consumed leaf bitmap     │  one bit per task slot
+│    consumed summary bitmap  │  one bit per leaf word
 └─────────────────────────────┘
 ```
 
@@ -162,6 +164,8 @@ The orchestrator and schedulers communicate through a contiguous shared memory r
 | `task_window_size` | Init | Both | Number of task slots (per-ring, in `PTO2SharedMemoryRingHeader`) |
 | `heap_size` | Init | Both | Heap total size (per-ring, in `PTO2SharedMemoryRingHeader`) |
 | `task_descriptors_offset` | Init | Both | Offset to TaskDescriptor array in SM (per-ring) |
+| `consumed_leaf` | Scheduler | Orchestrator | Per-slot notifications for newly `CONSUMED` tasks |
+| `consumed_summary` | Scheduler | Orchestrator | Non-empty leaf words, so reclaim work is proportional to notifications |
 | `total_size` | Init | Both | Total shared memory size |
 
 ### 3.2 Size Calculation
@@ -170,7 +174,9 @@ The orchestrator and schedulers communicate through a contiguous shared memory r
 total = ALIGN(Header)
       + Σ_ring [ ALIGN(window_size * sizeof(TaskDescriptor))
                + ALIGN(window_size * sizeof(TaskPayload))
-               + ALIGN(window_size * sizeof(TaskSlotState)) ]
+               + ALIGN(window_size * sizeof(TaskSlotState))
+               + ALIGN(ceil(window_size / 64) * sizeof(uint64_t))
+               + ALIGN(ceil(ceil(window_size / 64) / 64) * sizeof(uint64_t)) ]
 ```
 
 Alignment is 64 bytes (`PTO2_ALIGN_SIZE`).
@@ -219,17 +225,21 @@ heap boundary.
 
 **Pressure fallback**: If neither bump region can satisfy an allocation, the
 allocator switches that heap to explicit extent reclaim. It builds an
-address-ordered free list inside free heap blocks, collects every task whose
-state is `CONSUMED`, coalesces adjacent extents, and selects the smallest
-extent that satisfies each allocation. A live oldest task still blocks
+address-ordered free list inside free heap blocks, performs one scan of the
+active task window, coalesces adjacent extents, and selects the smallest extent
+that satisfies each allocation. After that transition, each successful
+`COMPLETED -> CONSUMED` state change publishes its physical slot to a two-level
+bitmap. Under pressure, the allocator atomically drains only the non-empty leaf
+words identified by the summary bitmap. A live oldest task still blocks
 task-slot watermark advancement, but it no longer pins unrelated `CONSUMED`
 output buffers behind it.
 
 The orchestrator is the only free-list writer. The scheduler only publishes
-`CONSUMED`; an acquire load of that state is the ownership handoff proving that
-all consumers and the owning scope have released the buffer. Each descriptor
-is cleared when its extent is collected, preventing a later watermark advance
-from releasing the same generation twice.
+`CONSUMED` and its slot notification; an acquire load of that state is the
+ownership handoff proving that all consumers and the owning scope have released
+the buffer. Each descriptor is cleared when its extent is collected, preventing
+a later watermark advance or stale bitmap notification from releasing the same
+generation twice.
 
 Scope stats use monotonic allocated/reclaimed byte counters rather than the
 physical bump cursors. `heap_end - heap_start` is the allocator-owned byte
@@ -253,8 +263,9 @@ The ring buffer mechanism provides **flow control** between the orchestrator (pr
 **Heap back-pressure**: When the heap has insufficient contiguous space,
 `PTO2TaskAllocator::alloc` first collects safe `CONSUMED` extents. It
 spin-waits only when no free extent is large enough. A cached largest-extent
-size makes that check constant-time; periodic scans collect newly consumed
-tasks while scheduler dispatch continues.
+size makes that check constant-time; the two-level consumed bitmap makes
+steady-state collection proportional to newly consumed slots instead of the
+full active task window.
 
 While either task/heap wait is active under concurrent dispatch, the allocator publishes `orchestrator_reclaim_waiting=1`. It does not treat a fixed period without `last_task_alive` movement as proof of deadlock: a producer may remain legitimately live while its consumers execute. The scheduler owns the residual forward-progress timeout because it can observe all running cores and global task completions. The allocator clears the flag on successful reclaim or when either runtime error channel asks it to unwind.
 

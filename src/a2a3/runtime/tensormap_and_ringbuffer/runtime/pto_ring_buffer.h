@@ -163,7 +163,11 @@ public:
                 if (extent_reclaim_enabled_) {
                     heap_ptr = try_extent_heap(aligned_size);
                     if (heap_ptr == nullptr && (spin_count & 255) == 0) {
-                        collect_consumed_extents(last_alive, local_task_id_);
+                        if (scheduler_runs_concurrently && sm_header != nullptr) {
+                            collect_consumed_extents_pending(*sm_header, last_alive, local_task_id_);
+                        } else {
+                            collect_consumed_extents(last_alive, local_task_id_);
+                        }
                         heap_ptr = try_extent_heap(aligned_size);
                     }
                 } else {
@@ -445,6 +449,36 @@ private:
             int32_t slot = task_id & window_mask_;
             if (slot_states_[slot].task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) continue;
             reclaim_descriptor(task_id, descriptors_[slot]);
+        }
+    }
+
+    void
+    collect_consumed_extents_pending(PTO2SharedMemoryHeader &sm_header, int32_t first_task_id, int32_t end_task_id) {
+        if (slot_states_ == nullptr) return;
+        PTO2SharedMemoryRingHeader &ring = sm_header.rings[ring_id_];
+        uint64_t leaf_words = ring.consumed_leaf_words();
+        for (uint64_t summary_index = 0; summary_index < ring.consumed_summary_words(); summary_index++) {
+            uint64_t summary_bits = ring.consumed_summary[summary_index].exchange(0, std::memory_order_acq_rel);
+            while (summary_bits != 0) {
+                uint64_t leaf_index = summary_index * 64 + static_cast<uint64_t>(__builtin_ctzll(summary_bits));
+                summary_bits &= summary_bits - 1;
+                if (leaf_index >= leaf_words) continue;
+
+                uint64_t leaf_bits = ring.consumed_leaf[leaf_index].exchange(0, std::memory_order_acq_rel);
+                while (leaf_bits != 0) {
+                    int32_t slot =
+                        static_cast<int32_t>(leaf_index * 64 + static_cast<uint64_t>(__builtin_ctzll(leaf_bits)));
+                    leaf_bits &= leaf_bits - 1;
+                    if (slot >= window_size_) continue;
+
+                    PTO2TaskDescriptor &desc = descriptors_[slot];
+                    if (desc.task_id.ring() != ring_id_) continue;
+                    int32_t task_id = static_cast<int32_t>(desc.task_id.local());
+                    if (task_id < first_task_id || task_id >= end_task_id) continue;
+                    if (slot_states_[slot].task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) continue;
+                    reclaim_descriptor(task_id, desc);
+                }
+            }
         }
     }
 

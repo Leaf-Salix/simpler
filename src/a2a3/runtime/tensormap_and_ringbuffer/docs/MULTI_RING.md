@@ -95,6 +95,8 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2TaskDescriptor *task_descriptors;
     PTO2TaskPayload *task_payloads;
     PTO2TaskSlotState *slot_states;
+    std::atomic<uint64_t> *consumed_leaf;     // one bit per physical task slot
+    std::atomic<uint64_t> *consumed_summary;  // one bit per leaf word
 
     // Accessors (slot = local_id & task_window_mask)
     PTO2TaskDescriptor &get_task_by_slot(int32_t slot);
