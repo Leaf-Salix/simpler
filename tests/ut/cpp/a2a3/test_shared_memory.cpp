@@ -20,7 +20,6 @@
 #include <gtest/gtest.h>
 #include <cstring>
 #include <limits>
-#include <vector>
 #include "pto_runtime2.h"
 #include "pto_runtime_status.h"
 #include "pto_shared_memory.h"
@@ -308,9 +307,11 @@ TEST(RuntimeArenaLayout, PerRingConfigInitializesRuntimeComponents) {
     void *sm = sm_arena.region_ptr(sm_off);
     std::memset(sm, 0, static_cast<size_t>(sm_size));
 
-    std::vector<char> gm(static_cast<size_t>(total_heap));
-    PTO2Runtime *rt =
-        runtime_init_data_from_layout(runtime_arena, layout, PTO2_MODE_EXECUTE, sm, sm_size, gm.data(), heaps);
+    DeviceArena gm_arena;
+    const size_t gm_off = gm_arena.reserve(static_cast<size_t>(total_heap), PTO2_ALIGN_SIZE);
+    ASSERT_NE(gm_arena.commit(), nullptr);
+    void *gm = gm_arena.region_ptr(gm_off);
+    PTO2Runtime *rt = runtime_init_data_from_layout(runtime_arena, layout, PTO2_MODE_EXECUTE, sm, sm_size, gm, heaps);
     ASSERT_NE(rt, nullptr);
     runtime_wire_arena_pointers(runtime_arena, layout, rt);
 
