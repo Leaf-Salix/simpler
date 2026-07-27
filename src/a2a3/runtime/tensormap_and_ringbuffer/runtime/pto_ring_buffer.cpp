@@ -23,6 +23,10 @@
 #include "common/unified_log.h"
 #include "scheduler/pto_scheduler.h"
 
+#if SIMPLER_DFX
+extern "C" __attribute__((weak, visibility("hidden"))) void pto2_log_scheduler_liveness_snapshot() {}
+#endif
+
 static void latch_pool_error(std::atomic<int32_t> *error_code_ptr, int32_t error_code) {
     if (error_code_ptr == nullptr) {
         return;
