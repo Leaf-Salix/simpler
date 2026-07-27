@@ -17,7 +17,9 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 #include "utils/device_arena.h"
 #include "scheduler/scheduler_types.h"
@@ -135,6 +137,48 @@ protected:
         memset(&slot_pl, 0, sizeof(slot_pl));
         slot.payload = &slot_pl;
     }
+
+    void init_ring_slot(
+        PTO2SharedMemoryRingHeader &ring, int32_t local_id, PTO2TaskState state, uint8_t ring_id,
+        uint32_t fanout_count = 1, uint32_t fanout_refcount = 1
+    ) {
+        PTO2TaskSlotState &slot = ring.get_slot_state_by_task_id(local_id);
+        memset(&slot, 0, sizeof(slot));
+        slot.task_state.store(state, std::memory_order_relaxed);
+        slot.fanin_count = 0;
+        slot.fanin_refcount.store(0, std::memory_order_relaxed);
+        slot.fanout_count = fanout_count;
+        slot.fanout_refcount.store(fanout_refcount, std::memory_order_relaxed);
+        slot.fanout_lock.store(0, std::memory_order_relaxed);
+        slot.fanout_head = nullptr;
+        slot.ring_id = ring_id;
+        slot.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIC);
+        slot.completed_subtasks.store(0, std::memory_order_relaxed);
+        slot.total_required_subtasks = 1;
+        slot.logical_block_num = 1;
+        slot.lifecycle_flags.store(PTO2_COMPLETION_DONE, std::memory_order_relaxed);
+        PTO2TaskPayload &payload = ring.get_payload_by_task_id(local_id);
+        PTO2TaskDescriptor &task = ring.get_task_by_task_id(local_id);
+        memset(&payload, 0, sizeof(payload));
+        memset(&task, 0, sizeof(task));
+        slot.payload = &payload;
+        slot.task = &task;
+    }
+
+    void setup_ring_for_reclaim_race(int32_t ring_id, int32_t current_task_index, int32_t blocked_task_id) {
+        PTO2SharedMemoryRingHeader &ring = sm_handle->header->rings[ring_id];
+        PTO2SchedulerState::RingSchedState &ring_sched = sched.ring_sched_states[ring_id];
+
+        ring.fc.current_task_index.store(current_task_index, std::memory_order_release);
+        ring.fc.last_task_alive.store(0, std::memory_order_release);
+        ring_sched.last_task_alive = 0;
+        ring_sched.advance_lock.store(0, std::memory_order_release);
+
+        for (int32_t task_id = 0; task_id < current_task_index; task_id++) {
+            PTO2TaskState state = task_id < blocked_task_id ? PTO2_TASK_CONSUMED : PTO2_TASK_COMPLETED;
+            init_ring_slot(ring, task_id, state, static_cast<uint8_t>(ring_id));
+        }
+    }
 };
 
 // =============================================================================
@@ -200,6 +244,91 @@ TEST_F(SchedulerStateTest, ReleaseProducerTriggersConsumed) {
 
     sched.release_producer(slot);
     EXPECT_EQ(slot.task_state.load(), PTO2_TASK_CONSUMED);
+}
+
+TEST_F(SchedulerStateTest, ConsumedHeadAdvancesAfterContendedAdvanceLock) {
+    constexpr int32_t ring_id = PTO2_MAX_RING_DEPTH - 1;
+    constexpr int32_t head_task_id = 0;
+    setup_ring_for_reclaim_race(ring_id, /*current_task_index=*/1, head_task_id);
+
+    PTO2SharedMemoryRingHeader &ring = sm_handle->header->rings[ring_id];
+    PTO2SchedulerState::RingSchedState &ring_sched = sched.ring_sched_states[ring_id];
+    PTO2TaskSlotState &head = ring.get_slot_state_by_task_id(head_task_id);
+
+    ring_sched.advance_lock.store(1, std::memory_order_release);
+    std::thread unlocker([&]() {
+        while (head.task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) {
+            std::this_thread::yield();
+        }
+        ring_sched.advance_lock.store(0, std::memory_order_release);
+    });
+
+    sched.check_and_handle_consumed(head);
+    unlocker.join();
+
+    EXPECT_EQ(head.task_state.load(std::memory_order_acquire), PTO2_TASK_CONSUMED);
+    EXPECT_EQ(ring.fc.last_task_alive.load(std::memory_order_acquire), 1)
+        << "a CONSUMED ring head must not remain pinned after advance_lock contention clears";
+}
+
+TEST_F(SchedulerStateTest, ContendedConsumedHeadAdvanceStress) {
+    constexpr int32_t ring_id = PTO2_MAX_RING_DEPTH - 1;
+    constexpr int32_t blocked_task_id = PTO2_TASK_WINDOW_SIZE - 384;
+    constexpr int32_t follower_task_id = blocked_task_id + 1;
+    constexpr int32_t current_task_index = follower_task_id + 1;
+    constexpr int32_t attempts = 64;
+
+    int observed_race_window = 0;
+    int stale_watermark = 0;
+
+    for (int32_t attempt = 0; attempt < attempts && stale_watermark == 0; attempt++) {
+        setup_ring_for_reclaim_race(ring_id, current_task_index, blocked_task_id);
+
+        PTO2SharedMemoryRingHeader &ring = sm_handle->header->rings[ring_id];
+        PTO2SchedulerState::RingSchedState &ring_sched = sched.ring_sched_states[ring_id];
+        PTO2TaskSlotState &first_prefix = ring.get_slot_state_by_task_id(0);
+        PTO2TaskSlotState &blocked_head = ring.get_slot_state_by_task_id(blocked_task_id);
+        PTO2TaskSlotState &follower = ring.get_slot_state_by_task_id(follower_task_id);
+        std::atomic<bool> start{false};
+
+        std::thread owner([&]() {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            sched.check_and_handle_consumed(follower);
+        });
+
+        start.store(true, std::memory_order_release);
+
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+        bool in_reset_window = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            bool owner_holds_lock = ring_sched.advance_lock.load(std::memory_order_acquire) != 0;
+            bool owner_started_reset =
+                first_prefix.lifecycle_flags.load(std::memory_order_acquire) == PTO2_LIFECYCLE_FLAGS_NONE;
+            if (owner_holds_lock && owner_started_reset) {
+                in_reset_window = true;
+                break;
+            }
+        }
+
+        if (in_reset_window) {
+            observed_race_window++;
+        }
+        sched.check_and_handle_consumed(blocked_head);
+        owner.join();
+
+        int32_t published_last_alive = ring.fc.last_task_alive.load(std::memory_order_acquire);
+        if (blocked_head.task_state.load(std::memory_order_acquire) == PTO2_TASK_CONSUMED &&
+            published_last_alive <= blocked_task_id) {
+            stale_watermark++;
+        }
+    }
+
+    EXPECT_GT(observed_race_window, 0) << "stress did not enter the contested advance window";
+    EXPECT_EQ(
+        stale_watermark, 0
+    ) << "a consumed ring head was left behind after another thread's advance pass released the lock";
 }
 
 // =============================================================================

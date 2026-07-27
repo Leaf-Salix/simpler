@@ -519,6 +519,39 @@ struct PTO2SchedulerState {
     // Inline hot-path methods
     // =========================================================================
 
+    void advance_ring_after_consumed(int32_t ring_id) {
+        auto &ring_sched = ring_sched_states[ring_id];
+        int32_t expected_lock = 0;
+        while (!ring_sched.advance_lock.compare_exchange_weak(
+            expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
+        )) {
+            expected_lock = 0;
+            SPIN_WAIT_HINT();
+        }
+        ring_sched.advance_ring_pointers();
+        ring_sched.advance_lock.store(0, std::memory_order_release);
+    }
+
+#if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
+    void advance_ring_after_consumed(int32_t ring_id, uint64_t &atomic_count) {
+        auto &ring_sched = ring_sched_states[ring_id];
+        uint64_t ops = 0;
+        int32_t expected_lock = 0;
+        while (!ring_sched.advance_lock.compare_exchange_weak(
+            expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
+        )) {
+            ops++;
+            expected_lock = 0;
+            SPIN_WAIT_HINT();
+        }
+        ops++;
+        ring_sched.advance_ring_pointers();
+        ring_sched.advance_lock.store(0, std::memory_order_release);
+        ops++;
+        atomic_count += ops;
+    }
+#endif
+
     // Route a ready slot to the right global queue. Dummy tasks (empty
     // active_mask) live in dummy_ready_queue; everything else goes to the
     // per-shape ready_queues[].
@@ -557,17 +590,8 @@ struct PTO2SchedulerState {
 #endif
 
         int32_t ring_id = slot_state.ring_id;
-        // advance_ring_pointers (and the reset_for_reuse it triggers) MUST run
-        // outside fanout_lock: reset_for_reuse stores fanout_lock=0 and would
-        // clobber a held lock. Safe here — the slot is CONSUMED and quiescent.
-        // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
-        int32_t expected_lock = 0;
-        if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
-                expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
-            )) {
-            ring_sched_states[ring_id].advance_ring_pointers();
-            ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
-        }
+        // Runs outside fanout_lock: reset_for_reuse stores fanout_lock=0.
+        advance_ring_after_consumed(ring_id);
     }
 
 #if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
@@ -597,18 +621,8 @@ struct PTO2SchedulerState {
 
         int32_t ring_id = slot_state.ring_id;
         // advance_ring_pointers + reset_for_reuse run outside fanout_lock (reset
-        // stores fanout_lock=0). Safe — the slot is CONSUMED and quiescent.
-        // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
-        int32_t expected_lock = 0;
-        if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
-                expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
-            )) {
-            ring_sched_states[ring_id].advance_ring_pointers();
-            ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
-            atomic_count += 2;  // try-lock CAS + unlock store
-        } else {
-            atomic_count += 1;  // failed try-lock CAS
-        }
+        // stores fanout_lock=0). Safe: the slot is CONSUMED and quiescent.
+        advance_ring_after_consumed(ring_id, atomic_count);
     }
 #endif
 
