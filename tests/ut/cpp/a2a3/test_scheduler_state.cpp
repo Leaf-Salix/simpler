@@ -136,7 +136,7 @@ protected:
         ring.fc.current_task_index.store(current_task_index, std::memory_order_release);
         ring.fc.last_task_alive.store(0, std::memory_order_release);
         ring_sched.last_task_alive = 0;
-        ring_sched.advance_lock.store(0, std::memory_order_release);
+        ring_sched.advance_lock.store(PTO2SchedulerState::RingSchedState::kAdvanceUnlocked, std::memory_order_release);
 
         for (int32_t task_id = 0; task_id < current_task_index; task_id++) {
             PTO2TaskState state = task_id < blocked_task_id ? PTO2_TASK_CONSUMED : PTO2_TASK_COMPLETED;
@@ -176,12 +176,13 @@ TEST_F(SchedulerStateTest, ConsumedHeadAdvancesAfterContendedAdvanceLock) {
     PTO2SchedulerState::RingSchedState &ring_sched = sched.ring_sched_states[ring_id];
     PTO2TaskSlotState &head = ring.get_slot_state_by_task_id(head_task_id);
 
-    ring_sched.advance_lock.store(1, std::memory_order_release);
+    ring_sched.advance_lock.store(PTO2SchedulerState::RingSchedState::kAdvanceLocked, std::memory_order_release);
+    ring_sched.advance_ring_pointers();
     std::thread unlocker([&]() {
         while (head.task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) {
             std::this_thread::yield();
         }
-        ring_sched.advance_lock.store(0, std::memory_order_release);
+        ring_sched.release_advance_lock_after_scan();
     });
 
     sched.check_and_handle_consumed(head);
@@ -190,6 +191,9 @@ TEST_F(SchedulerStateTest, ConsumedHeadAdvancesAfterContendedAdvanceLock) {
     EXPECT_EQ(head.task_state.load(std::memory_order_acquire), PTO2_TASK_CONSUMED);
     EXPECT_EQ(ring.fc.last_task_alive.load(std::memory_order_acquire), 1)
         << "a CONSUMED ring head must not remain pinned after advance_lock contention clears";
+    EXPECT_EQ(
+        ring_sched.advance_lock.load(std::memory_order_acquire), PTO2SchedulerState::RingSchedState::kAdvanceUnlocked
+    );
 }
 
 TEST_F(SchedulerStateTest, ContendedConsumedHeadAdvanceStress) {
