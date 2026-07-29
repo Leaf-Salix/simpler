@@ -1409,76 +1409,85 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 );
             }
 #endif
-            idle_iterations++;
+            bool advanced_reclaim = sched_->drain_pending_ring_advances();
+            if (advanced_reclaim) {
+                idle_iterations = 0;
+                last_progress_ts = get_sys_cnt_aicpu();
+                last_global_progress_count = completed_tasks_.load(std::memory_order_relaxed);
+            } else {
+                idle_iterations++;
 
-            if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0) {
-                LoopAction action = check_idle_fatal_error(thread_idx, header, runtime);
-                if (action == LoopAction::BREAK_LOOP) break;
-                int32_t global_progress_count = completed_tasks_.load(std::memory_order_relaxed);
-                if (global_progress_count != last_global_progress_count) {
-                    last_global_progress_count = global_progress_count;
-                    last_progress_ts = get_sys_cnt_aicpu();
-                }
-            }
-
-            if (idle_iterations % STALL_LOG_INTERVAL == 0) {
-                log_stall_diagnostics(thread_idx, total_tasks_, idle_iterations, last_progress_count);
-            }
-            // Wall-clock budget gate, with two fatal-latch branches:
-            //
-            // 1. Self owns a RUNNING task — first-hand evidence the
-            //    dispatch is stuck. Latch.
-            // 2. No thread anywhere owns a RUNNING task AND either the final
-            //    task set remains unfinished or the orchestrator is blocked
-            //    waiting for scheduler-driven reclaim. The latter makes the
-            //    same global stall observable before orchestration can finish.
-            //
-            // Otherwise: a sibling thread owns a RUNNING task but hasn't
-            // hit its own budget yet (typical distributed startup-skew
-            // case) — refresh last_progress_ts and keep spinning. The
-            // STALL diagnostic above still fires periodically so
-            // observability is preserved.
-            if (get_sys_cnt_aicpu() - last_progress_ts > scheduler_timeout_cycles) {
-                bool self_owns = self_owns_running_task(thread_idx);
-                bool global_stuck = false;
-                if (!self_owns) {
-                    int32_t completed_before = completed_tasks_.load(std::memory_order_acquire);
-                    bool reclaim_waiting_before =
-                        header != nullptr && header->orchestrator_reclaim_waiting.load(std::memory_order_acquire) != 0;
-                    bool no_running_before = no_thread_owns_running_task();
-
-                    int32_t completed_after = completed_tasks_.load(std::memory_order_acquire);
-                    bool reclaim_waiting_after =
-                        header != nullptr && header->orchestrator_reclaim_waiting.load(std::memory_order_acquire) != 0;
-                    bool no_running_after = no_thread_owns_running_task();
-
-                    if (completed_after != last_global_progress_count) {
-                        last_global_progress_count = completed_after;
+                if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0) {
+                    LoopAction action = check_idle_fatal_error(thread_idx, header, runtime);
+                    if (action == LoopAction::BREAK_LOOP) break;
+                    int32_t global_progress_count = completed_tasks_.load(std::memory_order_relaxed);
+                    if (global_progress_count != last_global_progress_count) {
+                        last_global_progress_count = global_progress_count;
                         last_progress_ts = get_sys_cnt_aicpu();
-                    } else {
-                        global_stuck = scheduler_global_stall_is_stable(
-                            last_global_progress_count, completed_before, completed_after, total_tasks_,
-                            reclaim_waiting_before, reclaim_waiting_after, no_running_before, no_running_after
-                        );
                     }
                 }
-                if (self_owns || global_stuck) {
-                    // Latch the error + emergency_shutdown, then break to the
-                    // shared end-of-loop cleanup so the diagnostic buffers get
-                    // flushed to the host. An early return here would strand the
-                    // stuck task's already-dumped inputs and every completed
-                    // task's in/out records in the unflushed per-thread dump
-                    // buffer — exactly the state we need to triage the hang.
-                    timeout_rc = handle_timeout_exit(
-                        thread_idx, header, runtime, idle_iterations, last_progress_count
-#if SIMPLER_DFX
-                        ,
-                        l2_swimlane.sched_start_ts
-#endif
-                    );
-                    break;
+
+                if (idle_iterations % STALL_LOG_INTERVAL == 0) {
+                    log_stall_diagnostics(thread_idx, total_tasks_, idle_iterations, last_progress_count);
                 }
-                last_progress_ts = get_sys_cnt_aicpu();
+                // Wall-clock budget gate, with two fatal-latch branches:
+                //
+                // 1. Self owns a RUNNING task — first-hand evidence the
+                //    dispatch is stuck. Latch.
+                // 2. No thread anywhere owns a RUNNING task AND either the final
+                //    task set remains unfinished or the orchestrator is blocked
+                //    waiting for scheduler-driven reclaim. The latter makes the
+                //    same global stall observable before orchestration can finish.
+                //
+                // Otherwise: a sibling thread owns a RUNNING task but hasn't
+                // hit its own budget yet (typical distributed startup-skew
+                // case) — refresh last_progress_ts and keep spinning. The
+                // STALL diagnostic above still fires periodically so
+                // observability is preserved.
+                if (get_sys_cnt_aicpu() - last_progress_ts > scheduler_timeout_cycles) {
+                    bool self_owns = self_owns_running_task(thread_idx);
+                    bool global_stuck = false;
+                    if (!self_owns) {
+                        int32_t completed_before = completed_tasks_.load(std::memory_order_acquire);
+                        bool reclaim_waiting_before =
+                            header != nullptr &&
+                            header->orchestrator_reclaim_waiting.load(std::memory_order_acquire) != 0;
+                        bool no_running_before = no_thread_owns_running_task();
+
+                        int32_t completed_after = completed_tasks_.load(std::memory_order_acquire);
+                        bool reclaim_waiting_after =
+                            header != nullptr &&
+                            header->orchestrator_reclaim_waiting.load(std::memory_order_acquire) != 0;
+                        bool no_running_after = no_thread_owns_running_task();
+
+                        if (completed_after != last_global_progress_count) {
+                            last_global_progress_count = completed_after;
+                            last_progress_ts = get_sys_cnt_aicpu();
+                        } else {
+                            global_stuck = scheduler_global_stall_is_stable(
+                                last_global_progress_count, completed_before, completed_after, total_tasks_,
+                                reclaim_waiting_before, reclaim_waiting_after, no_running_before, no_running_after
+                            );
+                        }
+                    }
+                    if (self_owns || global_stuck) {
+                        // Latch the error + emergency_shutdown, then break to the
+                        // shared end-of-loop cleanup so the diagnostic buffers get
+                        // flushed to the host. An early return here would strand the
+                        // stuck task's already-dumped inputs and every completed
+                        // task's in/out records in the unflushed per-thread dump
+                        // buffer — exactly the state we need to triage the hang.
+                        timeout_rc = handle_timeout_exit(
+                            thread_idx, header, runtime, idle_iterations, last_progress_count
+#if SIMPLER_DFX
+                            ,
+                            l2_swimlane.sched_start_ts
+#endif
+                        );
+                        break;
+                    }
+                    last_progress_ts = get_sys_cnt_aicpu();
+                }
             }
             SPIN_WAIT_HINT();
 #if SIMPLER_DFX
