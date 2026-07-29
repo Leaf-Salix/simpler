@@ -401,6 +401,38 @@ bool ready_queue_init_data_from_layout(PTO2ReadyQueue *queue, DeviceArena &arena
 void ready_queue_wire_arena_pointers(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off);
 void ready_queue_destroy(PTO2ReadyQueue *queue);
 
+#if SIMPLER_DFX
+inline std::atomic<uint64_t> g_sched_advance_requests[PTO2_MAX_RING_DEPTH] = {};
+inline std::atomic<uint64_t> g_sched_advance_owner_acquired[PTO2_MAX_RING_DEPTH] = {};
+inline std::atomic<uint64_t> g_sched_advance_pending_marked[PTO2_MAX_RING_DEPTH] = {};
+inline std::atomic<uint64_t> g_sched_advance_pending_joined[PTO2_MAX_RING_DEPTH] = {};
+inline std::atomic<uint64_t> g_sched_advance_rescans[PTO2_MAX_RING_DEPTH] = {};
+inline std::atomic<uint64_t> g_sched_advance_unlocks[PTO2_MAX_RING_DEPTH] = {};
+inline std::atomic<uint64_t> g_sched_advance_slots_reclaimed[PTO2_MAX_RING_DEPTH] = {};
+inline std::atomic<uint64_t> g_sched_advance_normal_scan_cycles[PTO2_MAX_RING_DEPTH] = {};
+inline std::atomic<uint64_t> g_sched_advance_rescan_scan_cycles[PTO2_MAX_RING_DEPTH] = {};
+
+inline void
+sched_advance_profile_add(std::atomic<uint64_t> (&counters)[PTO2_MAX_RING_DEPTH], int32_t ring_id, uint64_t value = 1) {
+    if (ring_id < 0 || ring_id >= PTO2_MAX_RING_DEPTH) return;
+    counters[ring_id].fetch_add(value, std::memory_order_relaxed);
+}
+
+inline void scheduler_reset_advance_profile() {
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        g_sched_advance_requests[r].store(0, std::memory_order_relaxed);
+        g_sched_advance_owner_acquired[r].store(0, std::memory_order_relaxed);
+        g_sched_advance_pending_marked[r].store(0, std::memory_order_relaxed);
+        g_sched_advance_pending_joined[r].store(0, std::memory_order_relaxed);
+        g_sched_advance_rescans[r].store(0, std::memory_order_relaxed);
+        g_sched_advance_unlocks[r].store(0, std::memory_order_relaxed);
+        g_sched_advance_slots_reclaimed[r].store(0, std::memory_order_relaxed);
+        g_sched_advance_normal_scan_cycles[r].store(0, std::memory_order_relaxed);
+        g_sched_advance_rescan_scan_cycles[r].store(0, std::memory_order_relaxed);
+    }
+}
+#endif
+
 /**
  * Statistics returned by mixed-task completion processing
  */
@@ -480,7 +512,7 @@ struct PTO2SchedulerState {
         }
 #endif
 
-        void advance_ring_pointers() {
+        void advance_ring_pointers([[maybe_unused]] int32_t profile_ring_id = -1) {
             int32_t current_task_index = ring->fc.current_task_index.load(std::memory_order_acquire);
             int32_t old_last_task_alive = last_task_alive;
 
@@ -500,16 +532,25 @@ struct PTO2SchedulerState {
             for (int32_t id = old_last_task_alive; id < last_task_alive; id++) {
                 ring->get_slot_state_by_task_id(id).reset_for_reuse();
             }
+#if SIMPLER_DFX
+            sched_advance_profile_add(
+                g_sched_advance_slots_reclaimed, profile_ring_id,
+                static_cast<uint64_t>(last_task_alive - old_last_task_alive)
+            );
+#endif
 
             sync_to_sm();
         }
 
-        void release_advance_lock_after_scan() {
+        void release_advance_lock_after_scan([[maybe_unused]] int32_t profile_ring_id = -1) {
             for (;;) {
                 int32_t expected_lock = kAdvanceLocked;
                 if (advance_lock.compare_exchange_strong(
                         expected_lock, kAdvanceUnlocked, std::memory_order_acq_rel, std::memory_order_acquire
                     )) {
+#if SIMPLER_DFX
+                    sched_advance_profile_add(g_sched_advance_unlocks, profile_ring_id);
+#endif
                     return;
                 }
                 if (expected_lock != kAdvanceLockedPending) {
@@ -532,19 +573,40 @@ struct PTO2SchedulerState {
                     }
                     SPIN_WAIT_HINT();
                 }
-                advance_ring_pointers();
+#if SIMPLER_DFX
+                sched_advance_profile_add(g_sched_advance_rescans, profile_ring_id);
+                uint64_t scan_start = get_sys_cnt_aicpu();
+#endif
+                advance_ring_pointers(profile_ring_id);
+#if SIMPLER_DFX
+                sched_advance_profile_add(
+                    g_sched_advance_rescan_scan_cycles, profile_ring_id, get_sys_cnt_aicpu() - scan_start
+                );
+#endif
             }
         }
 
-        void request_advance_after_consumed() {
+        void request_advance_after_consumed(int32_t profile_ring_id = -1) {
+#if SIMPLER_DFX
+            sched_advance_profile_add(g_sched_advance_requests, profile_ring_id);
+#endif
             int32_t state = kAdvanceUnlocked;
             for (;;) {
                 if (state == kAdvanceUnlocked) {
                     if (advance_lock.compare_exchange_weak(
                             state, kAdvanceLocked, std::memory_order_acquire, std::memory_order_acquire
                         )) {
-                        advance_ring_pointers();
-                        release_advance_lock_after_scan();
+#if SIMPLER_DFX
+                        sched_advance_profile_add(g_sched_advance_owner_acquired, profile_ring_id);
+                        uint64_t scan_start = get_sys_cnt_aicpu();
+#endif
+                        advance_ring_pointers(profile_ring_id);
+#if SIMPLER_DFX
+                        sched_advance_profile_add(
+                            g_sched_advance_normal_scan_cycles, profile_ring_id, get_sys_cnt_aicpu() - scan_start
+                        );
+#endif
+                        release_advance_lock_after_scan(profile_ring_id);
                         return;
                     }
                     continue;
@@ -553,6 +615,9 @@ struct PTO2SchedulerState {
                     if (advance_lock.compare_exchange_weak(
                             state, kAdvanceLockedPending, std::memory_order_acq_rel, std::memory_order_acquire
                         )) {
+#if SIMPLER_DFX
+                        sched_advance_profile_add(g_sched_advance_pending_marked, profile_ring_id);
+#endif
                         return;
                     }
                     continue;
@@ -563,6 +628,9 @@ struct PTO2SchedulerState {
                     if (advance_lock.compare_exchange_weak(
                             state, kAdvanceLockedPending, std::memory_order_acq_rel, std::memory_order_acquire
                         )) {
+#if SIMPLER_DFX
+                        sched_advance_profile_add(g_sched_advance_pending_joined, profile_ring_id);
+#endif
                         return;
                     }
                     continue;
@@ -573,13 +641,16 @@ struct PTO2SchedulerState {
         }
 
 #if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
-        void release_advance_lock_after_scan(uint64_t &atomic_count) {
+        void release_advance_lock_after_scan([[maybe_unused]] int32_t profile_ring_id, uint64_t &atomic_count) {
             for (;;) {
                 int32_t expected_lock = kAdvanceLocked;
                 atomic_count++;
                 if (advance_lock.compare_exchange_strong(
                         expected_lock, kAdvanceUnlocked, std::memory_order_acq_rel, std::memory_order_acquire
                     )) {
+#if SIMPLER_DFX
+                    sched_advance_profile_add(g_sched_advance_unlocks, profile_ring_id);
+#endif
                     return;
                 }
                 if (expected_lock != kAdvanceLockedPending) {
@@ -603,11 +674,23 @@ struct PTO2SchedulerState {
                     }
                     SPIN_WAIT_HINT();
                 }
-                advance_ring_pointers();
+#if SIMPLER_DFX
+                sched_advance_profile_add(g_sched_advance_rescans, profile_ring_id);
+                uint64_t scan_start = get_sys_cnt_aicpu();
+#endif
+                advance_ring_pointers(profile_ring_id);
+#if SIMPLER_DFX
+                sched_advance_profile_add(
+                    g_sched_advance_rescan_scan_cycles, profile_ring_id, get_sys_cnt_aicpu() - scan_start
+                );
+#endif
             }
         }
 
-        void request_advance_after_consumed(uint64_t &atomic_count) {
+        void request_advance_after_consumed(int32_t profile_ring_id, uint64_t &atomic_count) {
+#if SIMPLER_DFX
+            sched_advance_profile_add(g_sched_advance_requests, profile_ring_id);
+#endif
             int32_t state = kAdvanceUnlocked;
             for (;;) {
                 if (state == kAdvanceUnlocked) {
@@ -615,8 +698,17 @@ struct PTO2SchedulerState {
                     if (advance_lock.compare_exchange_weak(
                             state, kAdvanceLocked, std::memory_order_acquire, std::memory_order_acquire
                         )) {
-                        advance_ring_pointers();
-                        release_advance_lock_after_scan(atomic_count);
+#if SIMPLER_DFX
+                        sched_advance_profile_add(g_sched_advance_owner_acquired, profile_ring_id);
+                        uint64_t scan_start = get_sys_cnt_aicpu();
+#endif
+                        advance_ring_pointers(profile_ring_id);
+#if SIMPLER_DFX
+                        sched_advance_profile_add(
+                            g_sched_advance_normal_scan_cycles, profile_ring_id, get_sys_cnt_aicpu() - scan_start
+                        );
+#endif
+                        release_advance_lock_after_scan(profile_ring_id, atomic_count);
                         return;
                     }
                     continue;
@@ -626,6 +718,9 @@ struct PTO2SchedulerState {
                     if (advance_lock.compare_exchange_weak(
                             state, kAdvanceLockedPending, std::memory_order_acq_rel, std::memory_order_acquire
                         )) {
+#if SIMPLER_DFX
+                        sched_advance_profile_add(g_sched_advance_pending_marked, profile_ring_id);
+#endif
                         return;
                     }
                     continue;
@@ -637,6 +732,9 @@ struct PTO2SchedulerState {
                     if (advance_lock.compare_exchange_weak(
                             state, kAdvanceLockedPending, std::memory_order_acq_rel, std::memory_order_acquire
                         )) {
+#if SIMPLER_DFX
+                        sched_advance_profile_add(g_sched_advance_pending_joined, profile_ring_id);
+#endif
                         return;
                     }
                     continue;
@@ -707,7 +805,7 @@ struct PTO2SchedulerState {
         // advance_ring_pointers (and the reset_for_reuse it triggers) MUST run
         // outside fanout_lock: reset_for_reuse stores fanout_lock=0 and would
         // clobber a held lock. Safe here — the slot is CONSUMED and quiescent.
-        ring_sched_states[slot_state.ring_id].request_advance_after_consumed();
+        ring_sched_states[slot_state.ring_id].request_advance_after_consumed(slot_state.ring_id);
     }
 
 #if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
@@ -737,7 +835,7 @@ struct PTO2SchedulerState {
 
         // advance_ring_pointers + reset_for_reuse run outside fanout_lock (reset
         // stores fanout_lock=0). Safe — the slot is CONSUMED and quiescent.
-        ring_sched_states[slot_state.ring_id].request_advance_after_consumed(atomic_count);
+        ring_sched_states[slot_state.ring_id].request_advance_after_consumed(slot_state.ring_id, atomic_count);
     }
 #endif
 

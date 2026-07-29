@@ -161,6 +161,9 @@ bool PTO2SchedulerState::init_data_from_layout(
     sched->tasks_completed.store(0, std::memory_order_relaxed);
     sched->tasks_consumed.store(0, std::memory_order_relaxed);
 #endif
+#if SIMPLER_DFX
+    scheduler_reset_advance_profile();
+#endif
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         if (!sched->ring_sched_states[r].init_data_from_layout(sm_dev_base, r)) {
@@ -211,6 +214,9 @@ void PTO2SchedulerState::reset_for_reuse(const PTO2SchedulerLayout &layout, void
 #if SIMPLER_SCHED_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
     sched->tasks_consumed.store(0, std::memory_order_relaxed);
+#endif
+#if SIMPLER_DFX
+    scheduler_reset_advance_profile();
 #endif
 
     auto *orch_err = pto2_sm_layout::orch_error_code_addr(sm_dev_base);

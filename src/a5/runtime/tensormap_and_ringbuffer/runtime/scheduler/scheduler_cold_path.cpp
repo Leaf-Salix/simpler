@@ -625,6 +625,63 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, [[maybe_unuse
         cycles_to_us(sched_total), static_cast<uint64_t>(l2_swimlane.sched_loop_count), cur_thread_completed
     );
 #endif
+    if (thread_idx == 0) {
+        uint64_t advance_requests = 0;
+        uint64_t advance_owner_acquired = 0;
+        uint64_t advance_pending_marked = 0;
+        uint64_t advance_pending_joined = 0;
+        uint64_t advance_rescans = 0;
+        uint64_t advance_unlocks = 0;
+        uint64_t advance_slots_reclaimed = 0;
+        uint64_t advance_normal_scan_cycles = 0;
+        uint64_t advance_rescan_scan_cycles = 0;
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            advance_requests += g_sched_advance_requests[r].load(std::memory_order_relaxed);
+            advance_owner_acquired += g_sched_advance_owner_acquired[r].load(std::memory_order_relaxed);
+            advance_pending_marked += g_sched_advance_pending_marked[r].load(std::memory_order_relaxed);
+            advance_pending_joined += g_sched_advance_pending_joined[r].load(std::memory_order_relaxed);
+            advance_rescans += g_sched_advance_rescans[r].load(std::memory_order_relaxed);
+            advance_unlocks += g_sched_advance_unlocks[r].load(std::memory_order_relaxed);
+            advance_slots_reclaimed += g_sched_advance_slots_reclaimed[r].load(std::memory_order_relaxed);
+            advance_normal_scan_cycles += g_sched_advance_normal_scan_cycles[r].load(std::memory_order_relaxed);
+            advance_rescan_scan_cycles += g_sched_advance_rescan_scan_cycles[r].load(std::memory_order_relaxed);
+        }
+        if (advance_requests > 0) {
+            uint64_t pending_requests = advance_pending_marked + advance_pending_joined;
+            uint64_t normal_scans = advance_owner_acquired;
+            uint64_t rescan_scans = advance_rescans;
+            uint64_t total_scans = normal_scans + rescan_scans;
+            uint64_t total_scan_cycles = advance_normal_scan_cycles + advance_rescan_scan_cycles;
+            double pending_rate = pending_requests * 100.0 / advance_requests;
+            double rescan_share = total_scans > 0 ? rescan_scans * 100.0 / total_scans : 0.0;
+            double rescan_per_normal = normal_scans > 0 ? rescan_scans * 1.0 / normal_scans : 0.0;
+            double slots_per_request = advance_slots_reclaimed * 1.0 / advance_requests;
+            double slots_per_scan = total_scans > 0 ? advance_slots_reclaimed * 1.0 / total_scans : 0.0;
+            double normal_scan_us = cycles_to_us(advance_normal_scan_cycles);
+            double rescan_scan_us = cycles_to_us(advance_rescan_scan_cycles);
+            double total_scan_us = cycles_to_us(total_scan_cycles);
+            double rescan_cycle_share =
+                total_scan_cycles > 0 ? advance_rescan_scan_cycles * 100.0 / total_scan_cycles : 0.0;
+            double avg_normal_scan_us = normal_scans > 0 ? normal_scan_us / normal_scans : 0.0;
+            double avg_rescan_scan_us = rescan_scans > 0 ? rescan_scan_us / rescan_scans : 0.0;
+            LOG_INFO_V9(
+                "Advance profile: requests=%" PRIu64 ", owner=%" PRIu64 ", pending=%" PRIu64 " (mark=%" PRIu64
+                ", join=%" PRIu64 ", rate=%.1f%%), normal_scans=%" PRIu64 ", rescan_scans=%" PRIu64
+                ", total_scans=%" PRIu64 ", rescan_share=%.1f%%"
+                ", rescan/normal=%.3f, unlocks=%" PRIu64 ", reclaimed=%" PRIu64
+                ", reclaimed/request=%.3f, reclaimed/scan=%.3f, normal_scan_us=%.3f"
+                ", rescan_scan_us=%.3f, total_scan_us=%.3f, rescan_cycle_share=%.1f%%"
+                ", avg_normal_scan_us=%.4f, avg_rescan_scan_us=%.4f",
+                static_cast<uint64_t>(advance_requests), static_cast<uint64_t>(advance_owner_acquired),
+                static_cast<uint64_t>(pending_requests), static_cast<uint64_t>(advance_pending_marked),
+                static_cast<uint64_t>(advance_pending_joined), pending_rate, static_cast<uint64_t>(normal_scans),
+                static_cast<uint64_t>(rescan_scans), static_cast<uint64_t>(total_scans), rescan_share,
+                rescan_per_normal, static_cast<uint64_t>(advance_unlocks),
+                static_cast<uint64_t>(advance_slots_reclaimed), slots_per_request, slots_per_scan, normal_scan_us,
+                rescan_scan_us, total_scan_us, rescan_cycle_share, avg_normal_scan_us, avg_rescan_scan_us
+            );
+        }
+    }
 }
 #endif
 
