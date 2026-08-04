@@ -57,6 +57,7 @@ enum class AicpuPhase : uint32_t {
     ConfigValidate,  // config_func() + arg-count validate
     ArenaWire,       // attach prebuilt runtime arena + wire device pointers
     SmReset,         // SM/ring reset + finalize + bind, up to releasing the schedulers
+    AfterBarrier,    // scheduler tail after the profiled graph barrier task
     Count,
 };
 

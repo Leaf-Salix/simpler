@@ -528,6 +528,7 @@ static void emit_device_phase_markers(DeviceRunnerBase *runner) {
         {AicpuPhase::ConfigValidate, "simpler_run.runner_run.device_wall.config_validate"},
         {AicpuPhase::ArenaWire, "simpler_run.runner_run.device_wall.arena_wire"},
         {AicpuPhase::SmReset, "simpler_run.runner_run.device_wall.sm_reset"},
+        {AicpuPhase::AfterBarrier, "simpler_run.runner_run.device_wall.after_barrier"},
         {AicpuPhase::PostOrch, "simpler_run.runner_run.device_wall.post_orch"},
         {AicpuPhase::OrchWindow, "simpler_run.runner_run.device_wall.orch"},
         {AicpuPhase::SchedWindow, "simpler_run.runner_run.device_wall.sched"},

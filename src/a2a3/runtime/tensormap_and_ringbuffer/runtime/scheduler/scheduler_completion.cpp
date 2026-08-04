@@ -175,6 +175,23 @@ void SchedulerContext::complete_slot_task(
 
     if (task_complete && !defer_completion_to_consumer) {
 #if SIMPLER_DFX
+        constexpr int32_t kAfterBarrierProbeFuncId = 0;  // moe_start_barrier in the generated MoE callable.
+        bool is_after_barrier_probe_task = false;
+        for (int32_t raw_subtask_id = 0; raw_subtask_id < PTO2_SUBTASK_SLOT_COUNT; raw_subtask_id++) {
+            auto probe_subslot = static_cast<PTO2SubtaskSlot>(raw_subtask_id);
+            if (slot_state.active_mask.subtask_active(probe_subslot) &&
+                slot_state.task->kernel_id[raw_subtask_id] == kAfterBarrierProbeFuncId) {
+                is_after_barrier_probe_task = true;
+                break;
+            }
+        }
+        uint64_t expected_after_barrier_start_cycle = 0;
+        if (is_after_barrier_probe_task && after_barrier_start_cycle_.load(std::memory_order_relaxed) == 0) {
+            uint64_t probe_ts = finish_ts != 0 ? finish_ts : get_sys_cnt_aicpu();
+            after_barrier_start_cycle_.compare_exchange_strong(
+                expected_after_barrier_start_cycle, probe_ts, std::memory_order_relaxed, std::memory_order_relaxed
+            );
+        }
         if (is_dump_args_enabled()) {
             dump_args_for_task<PTO2_SUBTASK_SLOT_COUNT>(
                 thread_idx, slot_state, ArgsDumpStage::AFTER_COMPLETION,

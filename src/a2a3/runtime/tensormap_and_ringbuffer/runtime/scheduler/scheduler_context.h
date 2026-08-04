@@ -176,6 +176,11 @@ private:
     // --- Task-execution tracking ---
     std::atomic<int32_t> completed_tasks_{0};
     int32_t total_tasks_{0};
+#if SIMPLER_DFX
+    // Probe window used by device-domain STRACE: in the current MoE graph,
+    // func_id 0 is moe_start_barrier.
+    std::atomic<uint64_t> after_barrier_start_cycle_{0};
+#endif
     // Device orchestration: set by last orchestrator when graph is built; schedulers poll it.
     std::atomic<bool> orchestrator_done_{false};
     std::atomic<bool> completed_{false};

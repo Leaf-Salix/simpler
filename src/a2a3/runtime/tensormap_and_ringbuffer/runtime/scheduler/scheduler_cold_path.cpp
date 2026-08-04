@@ -500,6 +500,10 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, [[maybe_unuse
     aicpu_phase_set_window(
         AicpuPhase::SchedWindow, static_cast<uint64_t>(l2_swimlane.sched_start_ts), static_cast<uint64_t>(sched_end_ts)
     );
+    uint64_t after_barrier_start_cycle = after_barrier_start_cycle_.load(std::memory_order_relaxed);
+    if (after_barrier_start_cycle != 0 && sched_end_ts > after_barrier_start_cycle) {
+        aicpu_phase_set_window(AicpuPhase::AfterBarrier, after_barrier_start_cycle, sched_end_ts);
+    }
 #if SIMPLER_SCHED_PROFILING
     LOG_INFO(
         "Thread %d: sched_start=%" PRIu64 " sched_end=%" PRIu64 " sched_cost=%.3fus", thread_idx,
@@ -1143,6 +1147,9 @@ int32_t SchedulerContext::pre_handshake_init(
     // post_handshake_init; reset on the leader before any scheduler thread is
     // released to dispatch.
     completed_tasks_.store(0, std::memory_order_release);
+#if SIMPLER_DFX
+    after_barrier_start_cycle_.store(0, std::memory_order_release);
+#endif
     orchestrator_done_.store(false, std::memory_order_release);
     func_id_to_addr_ = runtime->dev.func_id_to_addr_;
 
@@ -1216,6 +1223,9 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     // total_tasks_ is read in pre_handshake_init (before the orchestrator's early
     // SM reset on the decoupled path can zero the ring counters).
     completed_tasks_.store(0, std::memory_order_release);
+#if SIMPLER_DFX
+    after_barrier_start_cycle_.store(0, std::memory_order_release);
+#endif
 
     // Device orchestration: the orchestrator thread flips this when the graph is built.
     orchestrator_done_.store(false, std::memory_order_release);
@@ -1315,6 +1325,9 @@ void SchedulerContext::deinit() {
 
     // Reset task counters and orchestrator state
     completed_tasks_.store(0, std::memory_order_release);
+#if SIMPLER_DFX
+    after_barrier_start_cycle_.store(0, std::memory_order_release);
+#endif
     total_tasks_ = 0;
     orchestrator_done_.store(false, std::memory_order_release);
     completed_.store(false, std::memory_order_release);
