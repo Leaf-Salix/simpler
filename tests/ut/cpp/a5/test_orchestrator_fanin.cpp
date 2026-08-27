@@ -84,10 +84,19 @@ TEST_F(OrchestratorFaninTest, AllocationTaskCarriesCleanupBoundaryWatermark) {
     orch.begin_scope();
 
     auto &rss = sched.ring_sched_states[0];
-    ASSERT_NE(rss.dep_pool.alloc(), nullptr);
-    int32_t expected_mark = rss.dep_pool.top;
+    CoreTaskArgs producer_args;
+    TaskOutputTensors producer = orch.submit_dummy_task(producer_args);
+    ASSERT_TRUE(producer.task_id().is_valid());
 
-    for (int32_t i = 1; i < CHIP_DEP_POOL_CLEANUP_INTERVAL; i++) {
+    TaskId deps[] = {producer.task_id()};
+    DepFlags kinds[] = {DEP_WAIT};
+    CoreTaskArgs consumer_args;
+    consumer_args.set_dependencies_with_kinds(deps, kinds, 1);
+    ASSERT_TRUE(orch.submit_dummy_task(consumer_args).task_id().is_valid());
+    int32_t expected_mark = rss.dep_pool.top;
+    ASSERT_EQ(expected_mark, 2);
+
+    for (int32_t i = 2; i < CHIP_DEP_POOL_CLEANUP_INTERVAL - 1; i++) {
         CoreTaskArgs dummy_args;
         ASSERT_TRUE(orch.submit_dummy_task(dummy_args).task_id().is_valid());
     }
@@ -103,7 +112,16 @@ TEST_F(OrchestratorFaninTest, AllocationTaskCarriesCleanupBoundaryWatermark) {
     ASSERT_EQ(simpler::tmr::task_local_id(allocated.task_id()), CHIP_DEP_POOL_CLEANUP_INTERVAL - 1);
     EXPECT_EQ(ring.get_slot_state_by_task_id(CHIP_DEP_POOL_CLEANUP_INTERVAL - 1).dep_pool_mark, expected_mark);
 
-    rss.dep_pool.reclaim(ring, CHIP_DEP_POOL_CLEANUP_INTERVAL);
+    for (int32_t i = 0; i < CHIP_DEP_POOL_CLEANUP_INTERVAL - 1; i++) {
+        auto &slot = ring.get_slot_state_by_task_id(i);
+        sched.on_task_complete(slot);
+        sched.on_task_release(slot);
+    }
+    orch.end_scope();
+
+    int32_t last_task_alive = ring.fc.last_task_alive.load(std::memory_order_acquire);
+    ASSERT_EQ(last_task_alive, CHIP_DEP_POOL_CLEANUP_INTERVAL);
+    rss.dep_pool.reclaim(ring, last_task_alive);
     EXPECT_EQ(rss.dep_pool.tail, expected_mark);
 }
 
