@@ -68,6 +68,32 @@ add_runtime_output_arg(CoreTaskArgs &args, std::vector<TensorCreateInfo> &create
     args.add_output(create_infos.back());
 }
 
+TEST_F(OrchestratorFaninTest, AllocationTaskCarriesCleanupBoundaryWatermark) {
+    orch.begin_scope();
+
+    auto &rss = sched.ring_sched_states[0];
+    ASSERT_NE(rss.dep_pool.alloc(), nullptr);
+    int32_t expected_mark = rss.dep_pool.top;
+
+    for (int32_t i = 1; i < CHIP_DEP_POOL_CLEANUP_INTERVAL; i++) {
+        CoreTaskArgs dummy_args;
+        ASSERT_TRUE(orch.submit_dummy_task(dummy_args).task_id().is_valid());
+    }
+
+    auto &ring = sm_handle->header->rings[0];
+    ring.get_slot_state_by_task_id(CHIP_DEP_POOL_CLEANUP_INTERVAL - 1).dep_pool_mark = 0;
+
+    CoreTaskArgs args;
+    std::vector<TensorCreateInfo> create_infos;
+    add_runtime_output_arg(args, create_infos, 1);
+    TaskOutputTensors allocated = orch.alloc_tensors(args);
+    ASSERT_TRUE(allocated.task_id().is_valid());
+    ASSERT_EQ(simpler::tmr::task_local_id(allocated.task_id()), CHIP_DEP_POOL_CLEANUP_INTERVAL - 1);
+
+    rss.dep_pool.reclaim(ring, CHIP_DEP_POOL_CLEANUP_INTERVAL);
+    EXPECT_EQ(rss.dep_pool.tail, expected_mark);
+}
+
 TEST_F(OrchestratorFaninTest, DuplicateExplicitProducerAddsOneFanin) {
     orch.begin_scope();
 
