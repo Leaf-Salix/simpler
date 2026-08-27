@@ -101,6 +101,7 @@ TEST_F(OrchestratorFaninTest, AllocationTaskCarriesCleanupBoundaryWatermark) {
     TaskOutputTensors allocated = orch.alloc_tensors(args);
     ASSERT_TRUE(allocated.task_id().is_valid());
     ASSERT_EQ(simpler::tmr::task_local_id(allocated.task_id()), CHIP_DEP_POOL_CLEANUP_INTERVAL - 1);
+    EXPECT_EQ(ring.get_slot_state_by_task_id(CHIP_DEP_POOL_CLEANUP_INTERVAL - 1).dep_pool_mark, expected_mark);
 
     rss.dep_pool.reclaim(ring, CHIP_DEP_POOL_CLEANUP_INTERVAL);
     EXPECT_EQ(rss.dep_pool.tail, expected_mark);

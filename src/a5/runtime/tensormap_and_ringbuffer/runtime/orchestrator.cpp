@@ -1334,6 +1334,7 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 
     if (prepared.slot_state != nullptr) {
+        mark_dep_pool_position(*prepared.slot_state);
         // Hidden alloc tasks complete inline in the orchestrator before any
         // consumer can exist, so they have no fanout to notify and no worker
         // subtasks to retire. Running the full on_task_complete path
