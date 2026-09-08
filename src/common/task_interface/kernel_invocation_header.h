@@ -33,12 +33,7 @@
 
 #include <stdint.h>
 
-typedef enum SimplerExecutionMode {
-    /* Historical exclusive-device semantics, claimed by simpler_init. */
-    SIMPLER_MODE_PROGRAM = 0,
-    /* Borrowed-device semantics, claimed by simpler_kernel_mode_init. */
-    SIMPLER_MODE_KERNEL = 1,
-} SimplerExecutionMode;
+#include "execution_mode.h"
 
 typedef struct SimplerKernelInvocationHeader {
     uint32_t mode;       /* SimplerExecutionMode of the issuing context */
