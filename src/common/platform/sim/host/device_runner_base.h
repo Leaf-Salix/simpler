@@ -55,6 +55,7 @@
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "platform_comm/comm.h"
+#include "host/kernel_execution_state.h"
 #include "host/memory_allocator.h"
 #include "host/chip_swimlane_collector.h"
 #include "host/host_phase_records.h"
@@ -260,6 +261,14 @@ public:
     void set_dma_workspace_request(bool enable_sdma) { sdma_requested_ = enable_sdma; }
     int ensure_dma_workspace_provisioned();
     int device_id() const { return device_id_; }
+
+    /**
+     * Single source of this context's execution mode, claimed by whichever
+     * init entry runs first. Every kernel-mode guard on the arena path keys
+     * on it.
+     */
+    ExecutionModeClaimState &execution_mode_claim() { return execution_mode_claim_; }
+
     uint64_t last_device_wall_ns() const { return device_wall_ns_; }
     // Per-phase AICPU wall (ns) from the most recent run; RunWall aliases
     // last_device_wall_ns(). 0 for a phase that was never stamped. Used to emit
@@ -348,6 +357,10 @@ protected:
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};
+
+    // Which execution mode owns this context; program/kernel init claim it
+    // mutually exclusively.
+    ExecutionModeClaimState execution_mode_claim_;
 
     // Executor binaries — populated once via set_executors() during simpler_init,
     // owned for the rest of the runner's lifetime.

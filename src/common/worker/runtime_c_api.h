@@ -30,6 +30,9 @@
  *                   simpler_unregister_callable,
  *                   get_aicpu_dlopen_count, get_host_dlopen_count,
  *                   get_run_stream_set_create_count
+ *   - kernel mode:  simpler_kernel_mode_supported, simpler_kernel_mode_init,
+ *                   simpler_kernel_mode_prepare_callable,
+ *                   simpler_kernel_mode_launch
  *   - pipeline:     get_pipeline_contract,
  *                   supports_concurrent_native_prepare_ctx,
  *                   get_arena_bank_gm_heap_base_ctx,
@@ -102,6 +105,10 @@ enum {
     /* The request names a capability this platform/runtime does not implement. */
     PTO_RUNTIME_ERR_UNSUPPORTED = PTO_RUNTIME_ERR_BASE - 1,
     PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE = PTO_RUNTIME_ERR_BASE - 2,
+    /* The call is structurally valid but arrives out of order for this
+       context's lifecycle (e.g. launch on a context with no live kernel
+       claim). */
+    PTO_RUNTIME_ERR_INVALID_STATE = PTO_RUNTIME_ERR_BASE - 3,
 };
 
 /** Return values from simpler_poll_run(). */
@@ -522,6 +529,91 @@ size_t get_host_dlopen_count(DeviceContextHandle ctx);
  * bootstrap pair.
  */
 size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
+
+/* ===========================================================================
+ * Kernel-mode lifecycle (four entries + finalize_device)
+ *
+ * A context has one of two execution modes for its whole lifetime, decided by
+ * which init entry runs first. simpler_init claims program mode — the
+ * historical exclusive-device path driven through the prepared-run family
+ * above. simpler_kernel_mode_init claims kernel mode, which borrows the
+ * caller's already-current device and caller-owned stream to enqueue one
+ * bounded asynchronous operator per launch: no device reset, no internal
+ * stream/device synchronize on the prepare/launch/close paths, zero
+ * allocation at launch, and no capture/model-state queries, so a launch is
+ * capturable by ACLGraph as an ordinary node. The claim is the single mode
+ * source (ExecutionModeClaimState on the platform runner): every kernel-mode
+ * guard on the device/ACL lifecycle and arena paths keys on it, so the
+ * guards arm the moment kernel init is accepted, with no separate
+ * declaration call to forget.
+ *
+ * Kernel-mode capacity is a mode invariant, not a gated state: `config` is
+ * context-static, so each pooled arena region is committed at most once and
+ * never grown or released afterwards. The platform arena reports a growth or
+ * release request under kernel mode as an internal invariant break
+ * (PTO_RUNTIME_ERR_INTERNAL), and capacity intent travels in
+ * CallConfig.runtime_env like everywhere else.
+ *
+ * All four entries below are part of the required dlsym surface: every
+ * host_runtime.so exports them, and variants without kernel-mode support
+ * export stubs that run the same structural validation before reporting
+ * PTO_RUNTIME_ERR_UNSUPPORTED. The fifth lifecycle entry is the existing
+ * finalize_device(): in kernel mode it releases only context-owned resources
+ * and never resets the device or finalizes ACL.
+ *
+ * These entries accept only POD structs, serialized blobs, and device/stream
+ * pointers — never framework objects. The caller stream is always an explicit
+ * parameter and is never stored beyond the call or destroyed by simpler.
+ * =========================================================================== */
+
+/** Return nonzero when this runtime/context can execute kernel-mode launches. */
+int simpler_kernel_mode_supported(DeviceContextHandle ctx);
+
+/**
+ * Initialize a kernel-mode context on the caller's already-current device.
+ *
+ * A successful call claims kernel mode for the context — mutually exclusive
+ * with the program-mode simpler_init — and the claim is what arms the
+ * kernel-mode guards on the platform's device/ACL lifecycle and arena paths.
+ *
+ * Takes no device ownership: no device reset, no ACL init/finalize, and no
+ * stream or device synchronize on this path. Creates only context-owned
+ * persistent handles used by asynchronous preparation and launch. `config`
+ * is context-static; launches never mutate it. `context_generation` is a
+ * nonzero host-process-unique identity minted by the caller for sequential
+ * contexts; generation zero is invalid.
+ */
+int simpler_kernel_mode_init(
+    DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
+    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
+    const CallConfig *config, uint64_t context_generation
+);
+
+/**
+ * Stage one callable for kernel-mode launches, outside ACLGraph capture.
+ *
+ * `callable` points to a canonical ChipCallable image of exactly
+ * `callable_size` bytes; every flexible-array offset is validated before the
+ * image is hashed or uploaded. Preparation may allocate persistent state and
+ * enqueue asynchronous device work on `caller_stream`, but never synchronizes
+ * a stream or device — preparation errors surface through the caller's own
+ * warmup + synchronize. The stream is borrowed for this call only.
+ */
+int simpler_kernel_mode_prepare_callable(
+    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream
+);
+
+/**
+ * Enqueue one bounded asynchronous kernel-mode operator invocation.
+ *
+ * `args` points to a ChipStorageTaskArgs POD whose tensor addresses are
+ * caller-owned device addresses; they are passed through without ever being
+ * dereferenced on the host. The launch path performs no device malloc/free,
+ * no tensor staging, no synchronize, no capture-state query, and no
+ * stream-to-model attachment. A return of 0 means the sequence was enqueued;
+ * device execution may still be in flight and may still fail asynchronously.
+ */
+int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream);
 
 #ifdef __cplusplus
 }
