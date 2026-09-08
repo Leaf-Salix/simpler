@@ -373,7 +373,22 @@ int DeviceRunnerBase::setup_static_arena(
     ArenaBank &bank = this->arena_bank(arena_bank);
 
     bool arena_changed = false;
-    auto commit_region = [&arena_changed](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
+    // A kernel-mode context's config is context-static, so each region is
+    // committed at most once and never grown or released afterwards; captured
+    // graphs may hold the committed base address. A request that would
+    // re-base or release a committed region under kernel mode is therefore an
+    // internal invariant break, not caller-configurable behavior.
+    const bool kernel_mode = execution_mode_claim().mode() == ClaimedExecutionMode::Kernel;
+    auto commit_region = [&arena_changed,
+                          kernel_mode](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
+        if (kernel_mode && arena.is_committed() &&
+            (requested_size == 0 ? cached_size != 0 : requested_size > cached_size)) {
+            LOG_ERROR(
+                "setup_static_arena: kernel mode forbids %s a committed region (cached %zu, requested %zu)",
+                requested_size == 0 ? "releasing" : "growing", cached_size, requested_size
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
         if (requested_size == 0) {
             // hbg's runtime_arena path: caller passed 0 and never reserved
             // a region. Leave the arena uncommitted; acquire_pooled_* will

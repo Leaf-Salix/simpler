@@ -65,6 +65,7 @@
 #include "aicpu_loader/host/load_aicpu_op.h"
 #include "host/chip_swimlane_collector.h"
 #include "host/host_phase_records.h"
+#include "host/kernel_execution_state.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
 #include "host/runtime_timeout_config.h"
@@ -133,6 +134,14 @@ public:
      * distinct buffers; tests read this to prove the split is real.
      */
     uint64_t retained_temp_addr(uint32_t slot_id) const;
+
+    /**
+     * Single source of this context's execution mode. Every kernel-mode guard
+     * on the ACL-lifecycle and arena paths keys on it; claiming the mode is an
+     * init entry's obligation, and no entry claims, so the mode stays
+     * unclaimed on every context and those guards never fire.
+     */
+    ExecutionModeClaimState &execution_mode_claim() { return execution_mode_claim_; }
 
     /** Allocate / free / copy on the per-Worker `MemoryAllocator` + CANN runtime. */
     void *allocate_tensor(std::size_t bytes);
@@ -1179,6 +1188,9 @@ protected:
     // `device_id_` is written once by simpler_init and is immutable while
     // native prepare, execution, and collector threads attach to the runner.
     int device_id_{-1};
+    // Which execution mode owns this context; program/kernel init claim it
+    // mutually exclusively.
+    ExecutionModeClaimState execution_mode_claim_;
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results
