@@ -1043,6 +1043,38 @@ set(HBG_ORCH_SHARED_SOURCES
     ${CMAKE_SOURCE_DIR}/stubs/hbg_orch_stubs.cpp
     ${HBG_SHARED_RUNTIME_SOURCES}
 )
+add_a2a3_hbg_runtime_test(test_hbg_host_graph_build common/test_hbg_host_graph_build.cpp)
+add_a5_hbg_runtime_test(test_a5_hbg_host_graph_build common/test_hbg_host_graph_build.cpp)
+foreach(arch IN ITEMS a2a3 a5)
+    if(arch STREQUAL "a2a3")
+        set(hbg_build_target test_hbg_host_graph_build)
+    else()
+        set(hbg_build_target test_a5_hbg_host_graph_build)
+    endif()
+    target_compile_definitions(${hbg_build_target} PRIVATE SIMPLER_PLATFORM_NAME="${arch}sim")
+    target_sources(${hbg_build_target} PRIVATE
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_execution_state.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_device_resources.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/host/memory_allocator.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/${arch}/runtime/host_build_graph/host/runtime_maker.cpp
+        ${HBG_SHARED_RUNTIME_SOURCES}
+        ${HBG_HOST_DIR}/orchestrator.cpp
+        ${HBG_HOST_DIR}/runtime_core.cpp
+        ${HBG_HOST_DIR}/host_tensor_access.cpp
+        ${HBG_HOST_DIR}/host_phase_trace.cpp
+        ${HBG_HOST_DIR}/dep_gen_host_graph.cpp
+        ${HBG_HOST_DIR}/graph_recorder_pool.cpp
+        ${HBG_HOST_DIR}/ready_queue_sizing.cpp
+        ${HBG_HOST_DIR}/kernel_graph_template.cpp
+        ${HBG_HOST_DIR}/kernel_graph_slot.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/host_build_graph/device/kernel_graph_slot_registry.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/platform_compile_info.cpp
+    )
+    target_sources(${hbg_build_target} PRIVATE ${CMAKE_SOURCE_DIR}/../../../src/common/log/host_log.cpp)
+    target_link_libraries(${hbg_build_target} PRIVATE ${CMAKE_DL_LIBS})
+endforeach()
+
 add_a2a3_hbg_runtime_test(test_hbg_task_allocator a2a3/test_hbg_task_allocator.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_tensormap a2a3/test_hbg_tensormap.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_dep_gen_host_graph a2a3/test_dep_gen_host_graph.cpp)
@@ -1602,6 +1634,20 @@ target_link_libraries(test_a2a3_aicpu_affinity_select PRIVATE
 )
 add_test(NAME test_a2a3_aicpu_affinity_select COMMAND test_a2a3_aicpu_affinity_select)
 set_tests_properties(test_a2a3_aicpu_affinity_select PROPERTIES LABELS "no_hardware")
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_a2a3_thread_scheduling a2a3/test_thread_scheduling.cpp)
+    target_include_directories(test_a2a3_thread_scheduling PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    )
+    target_link_libraries(test_a2a3_thread_scheduling PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+    target_link_options(test_a2a3_thread_scheduling PRIVATE
+        -Wl,--wrap=sched_getscheduler -Wl,--wrap=sched_setscheduler
+    )
+    add_test(NAME test_a2a3_thread_scheduling COMMAND test_a2a3_thread_scheduling)
+    set_tests_properties(test_a2a3_thread_scheduling PROPERTIES LABELS "no_hardware")
+endif()
 
 # a5 CPU_TOPO fallback and affinity selection. Pure logic; packaged fallback
 # entries enforce their own verified SoC, host-architecture, and OCCUPY constraints.
