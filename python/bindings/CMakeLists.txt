@@ -9,8 +9,53 @@
 
 # nanobind Python bindings for task_interface and distributed runtime
 
+# Torch's private C++ ABI stays in a separate optional extension.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    execute_process(COMMAND ${Python_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/detect_torch_adapter.py
+        OUTPUT_VARIABLE _torch_metadata RESULT_VARIABLE _torch_status OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT _torch_status EQUAL 0)
+        message(FATAL_ERROR "Cannot inspect installed Torch adapter dependencies")
+    endif()
+    if(_torch_metadata)
+        string(REPLACE "\n" ";" _torch_fields "${_torch_metadata}")
+        list(GET _torch_fields 0 _torch_root)
+        list(GET _torch_fields 1 _torch_npu_root)
+        list(GET _torch_fields 2 _torch_abi)
+        list(GET _torch_fields 3 TORCH_ADAPTER_VERSION)
+        list(GET _torch_fields 4 TORCH_ADAPTER_NPU_VERSION)
+        configure_file(torch_adapter_build.h.in torch_adapter_build.h @ONLY)
+        nanobind_add_module(_torch_npu_adapter torch_npu_kernel_adapter.cpp)
+        target_include_directories(_torch_npu_adapter PRIVATE
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${CMAKE_SOURCE_DIR}/src/common/worker
+            ${CMAKE_SOURCE_DIR}/src/common/task_interface
+            ${_torch_root}/include
+            ${_torch_root}/include/torch/csrc/api/include
+            ${_torch_npu_root}/include
+            ${_torch_npu_root}/include/third_party/acl/inc
+            ${_torch_npu_root}/include/third_party/hccl/inc)
+        target_compile_definitions(_torch_npu_adapter PRIVATE _GLIBCXX_USE_CXX11_ABI=${_torch_abi})
+        target_link_libraries(_torch_npu_adapter PRIVATE
+            ${_torch_root}/lib/libtorch.so ${_torch_root}/lib/libtorch_cpu.so
+            ${_torch_root}/lib/libtorch_python.so ${_torch_root}/lib/libc10.so
+            ${_torch_npu_root}/lib/libtorch_npu.so)
+        set_target_properties(_torch_npu_adapter PROPERTIES
+            BUILD_RPATH "${_torch_root}/lib;${_torch_npu_root}/lib"
+            INSTALL_RPATH "$ORIGIN/torch/lib;$ORIGIN/torch_npu/lib")
+        if(SKBUILD_MODE)
+            install(TARGETS _torch_npu_adapter DESTINATION .)
+        else()
+            set_target_properties(_torch_npu_adapter PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/python)
+        endif()
+    else()
+        message(STATUS "Torch-NPU not installed: building without the optional kernel adapter")
+    endif()
+endif()
+
+
 set(BINDING_SOURCES
     task_interface.cpp
+    kernel_host.cpp
 )
 
 list(TRANSFORM BINDING_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
@@ -50,6 +95,7 @@ target_compile_definitions(_task_interface PRIVATE
 )
 
 target_sources(_task_interface PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/common/worker/kernel_host_owner.cpp
     ${CMAKE_SOURCE_DIR}/src/common/worker/chip_worker.cpp
     ${CMAKE_SOURCE_DIR}/src/common/worker/chip_run_lane.cpp
     ${CMAKE_SOURCE_DIR}/src/common/log/host_log.cpp

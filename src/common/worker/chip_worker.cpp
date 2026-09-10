@@ -10,6 +10,7 @@
  */
 
 #include "chip_worker.h"
+#include "kernel_host_owner.h"
 
 #include "chip_run_lane.h"
 #include "common/host_log_binding.h"
@@ -161,13 +162,126 @@ ChipWorker::RuntimeStorage &ChipWorker::RuntimeStorage::operator=(RuntimeStorage
     return *this;
 }
 
-ChipWorker::~ChipWorker() { finalize(); }
+ChipWorker::~ChipWorker() {
+    if (!kernel_owner_) finalize();
+}
+
+ChipWorker::GetPipelineContractFn ChipWorker::bind_runtime_symbols(void *handle) {
+    GetPipelineContractFn get_pipeline_contract_fn = nullptr;
+    create_device_context_fn_ = load_symbol<CreateDeviceContextFn>(handle, "create_device_context");
+    destroy_device_context_fn_ = load_symbol<DestroyDeviceContextFn>(handle, "destroy_device_context");
+    device_malloc_ctx_fn_ = load_symbol<DeviceMallocCtxFn>(handle, "device_malloc_ctx");
+    device_free_ctx_fn_ = load_symbol<DeviceFreeCtxFn>(handle, "device_free_ctx");
+    device_committed_memory_fn_ = load_symbol<GetCommittedDeviceMemoryFn>(handle, "committed_device_memory_ctx");
+    device_memory_info_fn_ = load_symbol<GetDeviceMemoryInfoFn>(handle, "device_memory_info_ctx");
+    copy_to_device_ctx_fn_ = load_symbol<CopyToDeviceCtxFn>(handle, "copy_to_device_ctx");
+    copy_from_device_ctx_fn_ = load_symbol<CopyFromDeviceCtxFn>(handle, "copy_from_device_ctx");
+    get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
+    get_runtime_alignment_fn_ = load_symbol<GetRuntimeAlignmentFn>(handle, "get_runtime_alignment");
+    simpler_init_fn_ = load_symbol<SimplerInitFn>(handle, "simpler_init");
+    register_callable_fn_ = load_symbol<SimplerRegisterCallableFn>(handle, "simpler_register_callable");
+    run_fn_ = load_symbol<SimplerRunFn>(handle, "simpler_run");
+    prepare_run_fn_ = load_symbol<SimplerPrepareRunFn>(handle, "simpler_prepare_run");
+    launch_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_launch_run");
+    poll_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_poll_run");
+    wait_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_wait_run");
+    finalize_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_finalize_run");
+    supports_concurrent_native_prepare_fn_ =
+        load_symbol<SupportsConcurrentNativePrepareFn>(handle, "supports_concurrent_native_prepare_ctx");
+    get_arena_bank_gm_heap_base_fn_ = load_symbol<GetArenaBankGmHeapBaseFn>(handle, "get_arena_bank_gm_heap_base_ctx");
+    get_retained_temp_addr_fn_ = load_symbol<GetRetainedTempAddrFn>(handle, "get_retained_temp_addr_ctx");
+    get_pipeline_contract_fn = load_symbol<GetPipelineContractFn>(handle, "get_pipeline_contract");
+    unregister_callable_fn_ = load_symbol<SimplerUnregisterCallableFn>(handle, "simpler_unregister_callable");
+    get_aicpu_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_aicpu_dlopen_count");
+    get_host_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_host_dlopen_count");
+    get_run_stream_set_create_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_run_stream_set_create_count");
+    finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
+    // ACL lifecycle + comm_* are part of the uniform host_runtime.so ABI.
+    // Every platform runtime exports all of them — runtimes that do not
+    // have a real backend (today: a5) ship not-supported stubs rather
+    // than omitting the symbols.  This keeps ChipWorker.init platform-
+    // agnostic: no per-symbol probing, no half-loaded extension groups.
+    ensure_acl_ready_fn_ = load_symbol<EnsureAclReadyFn>(handle, "ensure_acl_ready_ctx");
+    create_comm_stream_fn_ = load_symbol<CreateCommStreamFn>(handle, "create_comm_stream_ctx");
+    destroy_comm_stream_fn_ = load_symbol<DestroyCommStreamFn>(handle, "destroy_comm_stream_ctx");
+    comm_init_fn_ = load_symbol<CommInitFn>(handle, "comm_init");
+    comm_alloc_windows_fn_ = load_symbol<CommAllocWindowsFn>(handle, "comm_alloc_windows");
+    comm_get_local_window_base_fn_ = load_symbol<CommGetLocalWindowBaseFn>(handle, "comm_get_local_window_base");
+    comm_get_window_size_fn_ = load_symbol<CommGetWindowSizeFn>(handle, "comm_get_window_size");
+    comm_derive_context_fn_ = load_symbol<CommDeriveContextFn>(handle, "comm_derive_context");
+    comm_alloc_domain_windows_fn_ = load_symbol<CommAllocDomainWindowsFn>(handle, "comm_alloc_domain_windows");
+    comm_release_domain_windows_fn_ = load_symbol<CommReleaseDomainWindowsFn>(handle, "comm_release_domain_windows");
+    comm_global_domain_prepare_fn_ = load_symbol<CommGlobalDomainPrepareFn>(handle, "comm_global_domain_prepare");
+    comm_global_domain_import_fn_ = load_symbol<CommGlobalDomainImportFn>(handle, "comm_global_domain_import");
+    comm_global_domain_release_fn_ = load_symbol<CommGlobalDomainReleaseFn>(handle, "comm_global_domain_release");
+    comm_barrier_fn_ = load_symbol<CommBarrierFn>(handle, "comm_barrier");
+    comm_destroy_fn_ = load_symbol<CommDestroyFn>(handle, "comm_destroy");
+    // Kernel-mode lifecycle entries are part of the uniform host_runtime.so
+    // ABI like the ACL/comm group above: every runtime exports them, and
+    // variants without kernel-mode support ship validating stubs.
+    kernel_supported_fn_ = load_symbol<SimplerKernelSupportedFn>(handle, "simpler_kernel_mode_supported");
+    kernel_init_fn_ = load_symbol<SimplerKernelInitFn>(handle, "simpler_kernel_mode_init");
+    kernel_prepare_callable_fn_ =
+        load_symbol<SimplerKernelPrepareCallableFn>(handle, "simpler_kernel_mode_prepare_callable");
+    kernel_launch_fn_ = load_symbol<SimplerKernelLaunchFn>(handle, "simpler_kernel_mode_launch");
+    return get_pipeline_contract_fn;
+}
+
+void ChipWorker::reset_runtime_bindings() {
+    create_device_context_fn_ = nullptr;
+    destroy_device_context_fn_ = nullptr;
+    device_malloc_ctx_fn_ = nullptr;
+    device_free_ctx_fn_ = nullptr;
+    device_committed_memory_fn_ = nullptr;
+    device_memory_info_fn_ = nullptr;
+    copy_to_device_ctx_fn_ = nullptr;
+    copy_from_device_ctx_fn_ = nullptr;
+    get_runtime_size_fn_ = nullptr;
+    get_runtime_alignment_fn_ = nullptr;
+    simpler_init_fn_ = nullptr;
+    register_callable_fn_ = nullptr;
+    run_fn_ = nullptr;
+    prepare_run_fn_ = nullptr;
+    launch_run_fn_ = nullptr;
+    poll_run_fn_ = nullptr;
+    wait_run_fn_ = nullptr;
+    finalize_run_fn_ = nullptr;
+    supports_concurrent_native_prepare_fn_ = nullptr;
+    get_arena_bank_gm_heap_base_fn_ = nullptr;
+    get_retained_temp_addr_fn_ = nullptr;
+    unregister_callable_fn_ = nullptr;
+    get_aicpu_dlopen_count_fn_ = nullptr;
+    get_host_dlopen_count_fn_ = nullptr;
+    get_run_stream_set_create_count_fn_ = nullptr;
+    finalize_device_fn_ = nullptr;
+    ensure_acl_ready_fn_ = nullptr;
+    create_comm_stream_fn_ = nullptr;
+    destroy_comm_stream_fn_ = nullptr;
+    comm_init_fn_ = nullptr;
+    comm_alloc_windows_fn_ = nullptr;
+    comm_get_local_window_base_fn_ = nullptr;
+    comm_get_window_size_fn_ = nullptr;
+    comm_derive_context_fn_ = nullptr;
+    comm_alloc_domain_windows_fn_ = nullptr;
+    comm_release_domain_windows_fn_ = nullptr;
+    comm_global_domain_prepare_fn_ = nullptr;
+    comm_global_domain_import_fn_ = nullptr;
+    comm_global_domain_release_fn_ = nullptr;
+    comm_barrier_fn_ = nullptr;
+    comm_destroy_fn_ = nullptr;
+    kernel_supported_fn_ = nullptr;
+    kernel_init_fn_ = nullptr;
+    kernel_prepare_callable_fn_ = nullptr;
+    kernel_launch_fn_ = nullptr;
+    runtime_bufs_.clear();
+}
 
 void ChipWorker::init(
     const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
     const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config, bool enable_sdma,
     const std::string &sim_context_path, const std::string &sdma_warmup_path
 ) {
+    if (kernel_owner_) throw std::runtime_error("ChipWorker kernel context cannot become a program context");
     if (finalized_) {
         throw std::runtime_error("ChipWorker already finalized; cannot reinitialize");
     }
@@ -201,70 +315,7 @@ void ChipWorker::init(
     DlHandleGuard host_guard(handle);
     bind_host_log_state(handle, "host runtime");
 
-    GetPipelineContractFn get_pipeline_contract_fn = nullptr;
-    try {
-        create_device_context_fn_ = load_symbol<CreateDeviceContextFn>(handle, "create_device_context");
-        destroy_device_context_fn_ = load_symbol<DestroyDeviceContextFn>(handle, "destroy_device_context");
-        device_malloc_ctx_fn_ = load_symbol<DeviceMallocCtxFn>(handle, "device_malloc_ctx");
-        device_free_ctx_fn_ = load_symbol<DeviceFreeCtxFn>(handle, "device_free_ctx");
-        device_committed_memory_fn_ = load_symbol<GetCommittedDeviceMemoryFn>(handle, "committed_device_memory_ctx");
-        device_memory_info_fn_ = load_symbol<GetDeviceMemoryInfoFn>(handle, "device_memory_info_ctx");
-        copy_to_device_ctx_fn_ = load_symbol<CopyToDeviceCtxFn>(handle, "copy_to_device_ctx");
-        copy_from_device_ctx_fn_ = load_symbol<CopyFromDeviceCtxFn>(handle, "copy_from_device_ctx");
-        get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
-        get_runtime_alignment_fn_ = load_symbol<GetRuntimeAlignmentFn>(handle, "get_runtime_alignment");
-        simpler_init_fn_ = load_symbol<SimplerInitFn>(handle, "simpler_init");
-        register_callable_fn_ = load_symbol<SimplerRegisterCallableFn>(handle, "simpler_register_callable");
-        run_fn_ = load_symbol<SimplerRunFn>(handle, "simpler_run");
-        prepare_run_fn_ = load_symbol<SimplerPrepareRunFn>(handle, "simpler_prepare_run");
-        launch_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_launch_run");
-        poll_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_poll_run");
-        wait_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_wait_run");
-        finalize_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_finalize_run");
-        supports_concurrent_native_prepare_fn_ =
-            load_symbol<SupportsConcurrentNativePrepareFn>(handle, "supports_concurrent_native_prepare_ctx");
-        get_arena_bank_gm_heap_base_fn_ =
-            load_symbol<GetArenaBankGmHeapBaseFn>(handle, "get_arena_bank_gm_heap_base_ctx");
-        get_retained_temp_addr_fn_ = load_symbol<GetRetainedTempAddrFn>(handle, "get_retained_temp_addr_ctx");
-        get_pipeline_contract_fn = load_symbol<GetPipelineContractFn>(handle, "get_pipeline_contract");
-        unregister_callable_fn_ = load_symbol<SimplerUnregisterCallableFn>(handle, "simpler_unregister_callable");
-        get_aicpu_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_aicpu_dlopen_count");
-        get_host_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_host_dlopen_count");
-        get_run_stream_set_create_count_fn_ =
-            load_symbol<GetAicpuDlopenCountFn>(handle, "get_run_stream_set_create_count");
-        finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
-        // ACL lifecycle + comm_* are part of the uniform host_runtime.so ABI.
-        // Every platform runtime exports all of them — runtimes that do not
-        // have a real backend (today: a5) ship not-supported stubs rather
-        // than omitting the symbols.  This keeps ChipWorker.init platform-
-        // agnostic: no per-symbol probing, no half-loaded extension groups.
-        ensure_acl_ready_fn_ = load_symbol<EnsureAclReadyFn>(handle, "ensure_acl_ready_ctx");
-        create_comm_stream_fn_ = load_symbol<CreateCommStreamFn>(handle, "create_comm_stream_ctx");
-        destroy_comm_stream_fn_ = load_symbol<DestroyCommStreamFn>(handle, "destroy_comm_stream_ctx");
-        comm_init_fn_ = load_symbol<CommInitFn>(handle, "comm_init");
-        comm_alloc_windows_fn_ = load_symbol<CommAllocWindowsFn>(handle, "comm_alloc_windows");
-        comm_get_local_window_base_fn_ = load_symbol<CommGetLocalWindowBaseFn>(handle, "comm_get_local_window_base");
-        comm_get_window_size_fn_ = load_symbol<CommGetWindowSizeFn>(handle, "comm_get_window_size");
-        comm_derive_context_fn_ = load_symbol<CommDeriveContextFn>(handle, "comm_derive_context");
-        comm_alloc_domain_windows_fn_ = load_symbol<CommAllocDomainWindowsFn>(handle, "comm_alloc_domain_windows");
-        comm_release_domain_windows_fn_ =
-            load_symbol<CommReleaseDomainWindowsFn>(handle, "comm_release_domain_windows");
-        comm_global_domain_prepare_fn_ = load_symbol<CommGlobalDomainPrepareFn>(handle, "comm_global_domain_prepare");
-        comm_global_domain_import_fn_ = load_symbol<CommGlobalDomainImportFn>(handle, "comm_global_domain_import");
-        comm_global_domain_release_fn_ = load_symbol<CommGlobalDomainReleaseFn>(handle, "comm_global_domain_release");
-        comm_barrier_fn_ = load_symbol<CommBarrierFn>(handle, "comm_barrier");
-        comm_destroy_fn_ = load_symbol<CommDestroyFn>(handle, "comm_destroy");
-        // Kernel-mode lifecycle entries are part of the uniform host_runtime.so
-        // ABI like the ACL/comm group above: every runtime exports them, and
-        // variants without kernel-mode support ship validating stubs.
-        kernel_supported_fn_ = load_symbol<SimplerKernelSupportedFn>(handle, "simpler_kernel_mode_supported");
-        kernel_init_fn_ = load_symbol<SimplerKernelInitFn>(handle, "simpler_kernel_mode_init");
-        kernel_prepare_callable_fn_ =
-            load_symbol<SimplerKernelPrepareCallableFn>(handle, "simpler_kernel_mode_prepare_callable");
-        kernel_launch_fn_ = load_symbol<SimplerKernelLaunchFn>(handle, "simpler_kernel_mode_launch");
-    } catch (...) {
-        throw;
-    }
+    const GetPipelineContractFn get_pipeline_contract_fn = bind_runtime_symbols(handle);
 
     const PipelineContract *contract = get_pipeline_contract_fn();
     if (!is_valid_pipeline_contract(contract) || !has_serviceable_arena_topology(*contract) ||
@@ -350,51 +401,7 @@ void ChipWorker::init(
     } catch (...) {
         destroy_device_context_fn_(device_ctx_);
         device_ctx_ = nullptr;
-        create_device_context_fn_ = nullptr;
-        destroy_device_context_fn_ = nullptr;
-        device_malloc_ctx_fn_ = nullptr;
-        device_free_ctx_fn_ = nullptr;
-        device_committed_memory_fn_ = nullptr;
-        device_memory_info_fn_ = nullptr;
-        copy_to_device_ctx_fn_ = nullptr;
-        copy_from_device_ctx_fn_ = nullptr;
-        get_runtime_size_fn_ = nullptr;
-        get_runtime_alignment_fn_ = nullptr;
-        simpler_init_fn_ = nullptr;
-        register_callable_fn_ = nullptr;
-        run_fn_ = nullptr;
-        prepare_run_fn_ = nullptr;
-        launch_run_fn_ = nullptr;
-        poll_run_fn_ = nullptr;
-        wait_run_fn_ = nullptr;
-        finalize_run_fn_ = nullptr;
-        supports_concurrent_native_prepare_fn_ = nullptr;
-        get_arena_bank_gm_heap_base_fn_ = nullptr;
-        get_retained_temp_addr_fn_ = nullptr;
-        unregister_callable_fn_ = nullptr;
-        get_aicpu_dlopen_count_fn_ = nullptr;
-        get_host_dlopen_count_fn_ = nullptr;
-        get_run_stream_set_create_count_fn_ = nullptr;
-        finalize_device_fn_ = nullptr;
-        ensure_acl_ready_fn_ = nullptr;
-        create_comm_stream_fn_ = nullptr;
-        destroy_comm_stream_fn_ = nullptr;
-        comm_init_fn_ = nullptr;
-        comm_alloc_windows_fn_ = nullptr;
-        comm_get_local_window_base_fn_ = nullptr;
-        comm_get_window_size_fn_ = nullptr;
-        comm_alloc_domain_windows_fn_ = nullptr;
-        comm_release_domain_windows_fn_ = nullptr;
-        comm_global_domain_prepare_fn_ = nullptr;
-        comm_global_domain_import_fn_ = nullptr;
-        comm_global_domain_release_fn_ = nullptr;
-        comm_barrier_fn_ = nullptr;
-        comm_destroy_fn_ = nullptr;
-        kernel_supported_fn_ = nullptr;
-        kernel_init_fn_ = nullptr;
-        kernel_prepare_callable_fn_ = nullptr;
-        kernel_launch_fn_ = nullptr;
-        runtime_bufs_.clear();
+        reset_runtime_bindings();
         throw;
     }
     if (init_rc != 0) {
@@ -412,52 +419,7 @@ void ChipWorker::init(
         // sim context.
         destroy_device_context_fn_(device_ctx_);
         device_ctx_ = nullptr;
-        create_device_context_fn_ = nullptr;
-        destroy_device_context_fn_ = nullptr;
-        device_malloc_ctx_fn_ = nullptr;
-        device_free_ctx_fn_ = nullptr;
-        device_committed_memory_fn_ = nullptr;
-        device_memory_info_fn_ = nullptr;
-        copy_to_device_ctx_fn_ = nullptr;
-        copy_from_device_ctx_fn_ = nullptr;
-        get_runtime_size_fn_ = nullptr;
-        get_runtime_alignment_fn_ = nullptr;
-        simpler_init_fn_ = nullptr;
-        register_callable_fn_ = nullptr;
-        run_fn_ = nullptr;
-        prepare_run_fn_ = nullptr;
-        launch_run_fn_ = nullptr;
-        poll_run_fn_ = nullptr;
-        wait_run_fn_ = nullptr;
-        finalize_run_fn_ = nullptr;
-        supports_concurrent_native_prepare_fn_ = nullptr;
-        get_arena_bank_gm_heap_base_fn_ = nullptr;
-        get_retained_temp_addr_fn_ = nullptr;
-        unregister_callable_fn_ = nullptr;
-        get_aicpu_dlopen_count_fn_ = nullptr;
-        get_host_dlopen_count_fn_ = nullptr;
-        get_run_stream_set_create_count_fn_ = nullptr;
-        finalize_device_fn_ = nullptr;
-        ensure_acl_ready_fn_ = nullptr;
-        create_comm_stream_fn_ = nullptr;
-        destroy_comm_stream_fn_ = nullptr;
-        comm_init_fn_ = nullptr;
-        comm_alloc_windows_fn_ = nullptr;
-        comm_get_local_window_base_fn_ = nullptr;
-        comm_get_window_size_fn_ = nullptr;
-        comm_derive_context_fn_ = nullptr;
-        comm_alloc_domain_windows_fn_ = nullptr;
-        comm_release_domain_windows_fn_ = nullptr;
-        comm_global_domain_prepare_fn_ = nullptr;
-        comm_global_domain_import_fn_ = nullptr;
-        comm_global_domain_release_fn_ = nullptr;
-        comm_barrier_fn_ = nullptr;
-        comm_destroy_fn_ = nullptr;
-        kernel_supported_fn_ = nullptr;
-        kernel_init_fn_ = nullptr;
-        kernel_prepare_callable_fn_ = nullptr;
-        kernel_launch_fn_ = nullptr;
-        runtime_bufs_.clear();
+        reset_runtime_bindings();
         throw std::runtime_error("simpler_init failed with code " + std::to_string(init_rc));
     }
 
@@ -472,7 +434,65 @@ void ChipWorker::init(
     run_lane_ = std::make_unique<ChipRunLane>(*this);
 }
 
+uint64_t ChipWorker::next_kernel_context_generation() {
+    static std::atomic<uint64_t> counter{0};
+    return counter.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+void ChipWorker::kernel_init(
+    const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
+    const std::string &dispatcher_path, int device_id, const CallConfig &config, uint64_t context_generation,
+    const std::string &sim_context_path
+) {
+    if (finalized_ || initialized_ || kernel_owner_) {
+        throw std::runtime_error("ChipWorker already initialized or finalized; cannot reinitialize");
+    }
+    if (device_id < 0 || context_generation == 0) {
+        throw std::invalid_argument("kernel_init requires a non-negative device and nonzero context_generation");
+    }
+    if (!sim_context_path.empty()) load_sim_context(sim_context_path);
+    auto cpu = read_binary_file(aicpu_path);
+    auto core = read_binary_file(aicore_path);
+    auto dispatcher = dispatcher_path.empty() ? std::vector<uint8_t>{} : read_binary_file(dispatcher_path);
+    kernel_owner_ = std::make_shared<simpler::kernel::KernelHostOwner>(host_lib_path);
+    const int rc = kernel_owner_->initialize(device_id, cpu, core, dispatcher, config, context_generation);
+    if (rc == PTO_RUNTIME_ERR_UNSUPPORTED)
+        throw UnsupportedRuntimeOperation("this host runtime does not support kernel mode: " + std::to_string(rc));
+    if (rc != 0) throw std::runtime_error("simpler_kernel_mode_init failed with code " + std::to_string(rc));
+}
+
+std::shared_ptr<simpler::kernel::KernelHostOwner> ChipWorker::kernel_owner() const {
+    if (!kernel_owner_) throw std::runtime_error("ChipWorker has no kernel context; call kernel_init() first");
+    return kernel_owner_;
+}
+
+bool ChipWorker::initialized() const { return kernel_owner_ ? kernel_owner_->ready() : initialized_; }
+
+int ChipWorker::device_id() const { return kernel_owner_ ? kernel_owner_->device() : device_id_; }
+
+bool ChipWorker::kernel_mode_supported() const {
+    if (kernel_owner_) return kernel_owner_->supported() != 0;
+    if (!initialized_) throw std::runtime_error("ChipWorker not initialized; call init() or kernel_init() first");
+    return kernel_supported_fn_(device_ctx_) != 0;
+}
+
+void ChipWorker::kernel_prepare_callable(int32_t callable_id, const void *callable, size_t callable_size) {
+    const int rc = kernel_owner()->prepare(callable_id, callable, callable_size);
+    if (rc != 0)
+        throw std::runtime_error("simpler_kernel_mode_prepare_callable failed with code " + std::to_string(rc));
+}
+
+void ChipWorker::kernel_launch(int32_t callable_id, const ChipStorageTaskArgs *args, void *caller_stream) {
+    const int rc = kernel_owner()->launch(callable_id, args, caller_stream);
+    if (rc != 0) throw std::runtime_error("simpler_kernel_mode_launch failed with code " + std::to_string(rc));
+}
+
 void ChipWorker::finalize() {
+    if (kernel_owner_) {
+        const int rc = kernel_owner_->close();
+        if (rc != 0) throw std::runtime_error("finalize_device failed with code " + std::to_string(rc));
+        return;
+    }
     if (run_lane_ != nullptr) {
         try {
             run_lane_->close();
@@ -519,51 +539,7 @@ void ChipWorker::finalize() {
         dlclose(lib_handle_);
     }
     lib_handle_ = nullptr;
-    create_device_context_fn_ = nullptr;
-    destroy_device_context_fn_ = nullptr;
-    device_malloc_ctx_fn_ = nullptr;
-    device_free_ctx_fn_ = nullptr;
-    device_committed_memory_fn_ = nullptr;
-    device_memory_info_fn_ = nullptr;
-    copy_to_device_ctx_fn_ = nullptr;
-    copy_from_device_ctx_fn_ = nullptr;
-    get_runtime_size_fn_ = nullptr;
-    get_runtime_alignment_fn_ = nullptr;
-    register_callable_fn_ = nullptr;
-    run_fn_ = nullptr;
-    prepare_run_fn_ = nullptr;
-    launch_run_fn_ = nullptr;
-    poll_run_fn_ = nullptr;
-    wait_run_fn_ = nullptr;
-    finalize_run_fn_ = nullptr;
-    supports_concurrent_native_prepare_fn_ = nullptr;
-    get_arena_bank_gm_heap_base_fn_ = nullptr;
-    get_retained_temp_addr_fn_ = nullptr;
-    unregister_callable_fn_ = nullptr;
-    get_aicpu_dlopen_count_fn_ = nullptr;
-    get_host_dlopen_count_fn_ = nullptr;
-    get_run_stream_set_create_count_fn_ = nullptr;
-    finalize_device_fn_ = nullptr;
-    ensure_acl_ready_fn_ = nullptr;
-    create_comm_stream_fn_ = nullptr;
-    destroy_comm_stream_fn_ = nullptr;
-    comm_init_fn_ = nullptr;
-    comm_alloc_windows_fn_ = nullptr;
-    comm_get_local_window_base_fn_ = nullptr;
-    comm_get_window_size_fn_ = nullptr;
-    comm_derive_context_fn_ = nullptr;
-    comm_alloc_domain_windows_fn_ = nullptr;
-    comm_release_domain_windows_fn_ = nullptr;
-    comm_global_domain_prepare_fn_ = nullptr;
-    comm_global_domain_import_fn_ = nullptr;
-    comm_global_domain_release_fn_ = nullptr;
-    comm_barrier_fn_ = nullptr;
-    comm_destroy_fn_ = nullptr;
-    kernel_supported_fn_ = nullptr;
-    kernel_init_fn_ = nullptr;
-    kernel_prepare_callable_fn_ = nullptr;
-    kernel_launch_fn_ = nullptr;
-    runtime_bufs_.clear();
+    reset_runtime_bindings();
     pipeline_generations_.reset();
     pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, {}};
     initialized_ = false;
@@ -958,6 +934,7 @@ void ChipWorker::unregister_callable(int32_t callable_id) {
 }
 
 size_t ChipWorker::aicpu_dlopen_count() const {
+    if (kernel_owner_) throw UnsupportedRuntimeOperation("aicpu_dlopen_count is a program-mode diagnostic");
     if (!initialized_) {
         return 0;
     }
@@ -965,6 +942,7 @@ size_t ChipWorker::aicpu_dlopen_count() const {
 }
 
 size_t ChipWorker::committed_device_memory() const {
+    if (kernel_owner_) return kernel_owner_->committed_device_memory();
     if (!initialized_) {
         return 0;
     }
@@ -972,6 +950,7 @@ size_t ChipWorker::committed_device_memory() const {
 }
 
 DeviceMemoryInfo ChipWorker::device_memory_info() const {
+    if (kernel_owner_) throw UnsupportedRuntimeOperation("device_memory_info requires a program-owned device");
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
@@ -987,6 +966,7 @@ DeviceMemoryInfo ChipWorker::device_memory_info() const {
 }
 
 size_t ChipWorker::host_dlopen_count() const {
+    if (kernel_owner_) throw UnsupportedRuntimeOperation("host_dlopen_count is a program-mode diagnostic");
     if (!initialized_) {
         return 0;
     }
@@ -994,6 +974,7 @@ size_t ChipWorker::host_dlopen_count() const {
 }
 
 size_t ChipWorker::run_stream_set_create_count() const {
+    if (kernel_owner_) throw UnsupportedRuntimeOperation("run_stream_set_create_count is a program-mode diagnostic");
     if (!initialized_) {
         return 0;
     }

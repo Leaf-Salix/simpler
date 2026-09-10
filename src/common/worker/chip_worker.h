@@ -30,6 +30,10 @@
 #include "runtime_c_api.h"
 #include "types.h"
 
+namespace simpler::kernel {
+class KernelHostOwner;
+}
+
 /** Opaque identity for one prepared native run owned by a ChipWorker. */
 struct ChipWorkerNativeRun {
     uint32_t slot_id{0};
@@ -92,6 +96,24 @@ public:
         const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config = nullptr,
         bool enable_sdma = false, const std::string &sim_context_path = "", const std::string &sdma_warmup_path = ""
     );
+
+    /// Kernel initialization borrows the current device. It is exclusive with
+    /// program init; even a failed native init requires explicit finalize.
+    /// Init itself must not race another operation on this worker.
+    void kernel_init(
+        const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
+        const std::string &dispatcher_path, int device_id, const CallConfig &config, uint64_t context_generation,
+        const std::string &sim_context_path = ""
+    );
+    bool kernel_mode_supported() const;
+    /// Synchronous registration on the context's dedicated stream, outside capture.
+    void kernel_prepare_callable(int32_t callable_id, const void *callable, size_t callable_size);
+    /// Direct POD submission; rejects while framework callbacks are pending.
+    void kernel_launch(int32_t callable_id, const ChipStorageTaskArgs *args, void *caller_stream);
+    static uint64_t next_kernel_context_generation();
+    /// The queue lease and every direct kernel entry share this context owner.
+    std::shared_ptr<simpler::kernel::KernelHostOwner> kernel_owner() const;
+    bool has_kernel_context() const { return bool(kernel_owner_); }
 
     /// Tear down everything: device resources and runtime library.
     /// Terminal — the object cannot be reused after this.
@@ -231,8 +253,8 @@ public:
     void comm_destroy(uint64_t comm_handle);
     void comm_destroy_all();
 
-    int device_id() const { return device_id_; }
-    bool initialized() const { return initialized_; }
+    int device_id() const;
+    bool initialized() const;
     unsigned pipeline_depth() const { return pipeline_contract_.pipeline_depth; }
     size_t runtime_slot_count() const { return runtime_bufs_.size(); }
     bool supports_concurrent_native_prepare() const;
@@ -310,6 +332,19 @@ private:
         size_t window_size = 0;
     };
 
+    /// Resolve every entry of the uniform host_runtime.so ABI out of `handle`
+    /// into this worker's function-pointer members, and return the
+    /// get_pipeline_contract entry, which stays a local because no member
+    /// holds it. All-or-nothing: load_symbol throws on the first missing
+    /// symbol, and the caller rolls back with reset_runtime_bindings().
+    GetPipelineContractFn bind_runtime_symbols(void *handle);
+
+    /// Drop every binding this worker holds into the runtime module: the
+    /// function pointers resolved by bind_runtime_symbols and the per-slot
+    /// native-run storage. Leaves `lib_handle_` and `device_ctx_` alone —
+    /// their owners differ per teardown path, and each unwinds them itself.
+    void reset_runtime_bindings();
+
     void *create_comm_stream_checked(const char *op_name);
     void destroy_comm_stream_best_effort(void *stream, int *rc);
     CommSession *find_comm_session(uint64_t comm_handle);
@@ -365,6 +400,8 @@ private:
     SimplerKernelPrepareCallableFn kernel_prepare_callable_fn_ = nullptr;
     SimplerKernelLaunchFn kernel_launch_fn_ = nullptr;
     void *device_ctx_ = nullptr;
+    // Kernel-only owner. Program resources remain in the fields above.
+    std::shared_ptr<simpler::kernel::KernelHostOwner> kernel_owner_;
     std::vector<CommSession> comm_sessions_;
     std::unordered_map<uint64_t, size_t> comm_session_index_;
     std::unordered_set<uint64_t> global_domain_ids_;

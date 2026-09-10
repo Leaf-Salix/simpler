@@ -1413,7 +1413,7 @@ class ChipWorker:
         with self._lifecycle_lock:
             if self._init_in_progress:
                 raise RuntimeError("ChipWorker.init() is already in progress")
-            if self._impl.initialized:
+            if self._impl.initialized or self._impl._has_kernel_context:
                 raise RuntimeError("ChipWorker is already initialized")
             self._init_owner_thread = threading.current_thread()
             self._init_in_progress = True
@@ -1443,6 +1443,101 @@ class ChipWorker:
         finally:
             with self._lifecycle_lock:
                 self._init_in_progress = False
+
+    def kernel_init(
+        self,
+        device_id: int,
+        bins: Any,
+        config: CallConfig,
+        context_generation: int | None = None,
+        log_level: int | None = None,
+    ):
+        """Bind the runtime as a kernel-mode context on a device the caller
+        already holds. No caller stream is needed for initialization or prepare.
+
+        The kernel counterpart of init(), and mutually exclusive with it. The
+        caller owns the device: this takes no ACL ownership, does
+        no aclrtSetDevice, and resets nothing at teardown.
+
+        Args:
+            device_id: the device the calling thread has already made current.
+            bins: same structural type init() takes — an object exposing
+                host_path / aicpu_path / aicore_path / dispatcher_path /
+                sim_context_path.
+            config: context-static CallConfig; launches never mutate it.
+            context_generation: nonzero and unique within this process. Minted
+                here when omitted.
+            log_level: as for init().
+        """
+        with self._lifecycle_lock:
+            if self._init_in_progress:
+                raise RuntimeError("ChipWorker.init() is already in progress")
+            if self._impl.initialized or self._impl._has_kernel_context:
+                raise RuntimeError("ChipWorker is already initialized")
+            self._init_owner_thread = threading.current_thread()
+            self._init_in_progress = True
+
+        try:
+            _initialize_host_log(log_level)
+            dispatcher_path = getattr(bins, "dispatcher_path", None)
+            sim_context_path = getattr(bins, "sim_context_path", None)
+            generation = (
+                int(_ChipWorker.next_kernel_context_generation())
+                if context_generation is None
+                else int(context_generation)
+            )
+            self._impl.kernel_init(
+                str(bins.host_path),
+                str(bins.aicpu_path),
+                str(bins.aicore_path),
+                "" if dispatcher_path is None else str(dispatcher_path),
+                int(device_id),
+                config,
+                generation,
+                "" if sim_context_path is None else str(sim_context_path),
+            )
+        finally:
+            with self._lifecycle_lock:
+                self._init_in_progress = False
+
+    @property
+    def kernel_mode_supported(self) -> bool:
+        """Whether the bound runtime can execute kernel-mode launches."""
+        return bool(self._impl.kernel_mode_supported)
+
+    def kernel_prepare_callable(self, chip_callable: ChipCallable) -> int:
+        """Synchronously prepare outside capture and return the callable id.
+
+        Native registration uses the context's dedicated stream and completes
+        before return. No taskQueue entry or caller stream participates here.
+        """
+        with self._registry_lock:
+            callable_id = self._allocate_slot_locked()
+            self._callable_registry[callable_id] = chip_callable
+        try:
+            self._impl.kernel_prepare_callable(int(callable_id), chip_callable)
+        except BaseException:
+            with self._registry_lock:
+                self._callable_registry.pop(callable_id, None)
+            raise
+        return callable_id
+
+    def kernel_launch(self, callable_id: int, args, caller_stream: int):
+        """Direct native submission of complete POD args on an explicit stream.
+
+        Returning means the sequence was enqueued on the caller's stream; device
+        execution may still be in flight and may still fail asynchronously.
+        Torch callers use simpler.kernel.enqueue(self, ...) for taskQueue and
+        Tensor lifetime protection. Direct submission rejects pending callbacks.
+        """
+        stream = int(caller_stream)
+        if not stream:
+            raise ValueError("kernel_launch requires a non-null caller_stream")
+        self._impl.kernel_launch(int(callable_id), args, stream)
+
+    def _queue_handle(self):
+        """Share the same kernel context with the optional Torch adapter."""
+        return self._impl._queue_handle()
 
     def finalize(self):
         """Tear down everything: device resources and runtime library.

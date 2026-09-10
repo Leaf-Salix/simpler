@@ -97,6 +97,37 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | `allocate_domain(*, name, workers, window_size, buffers=())` | Context manager returning a handle indexed by domain-local rank |
 | `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Delegates allocation to the owning Worker; target chip memory is named by the returned handle |
 
+## `ChipWorker` L2 kernel mode
+
+The kernel entry is separate from `Worker`'s program lifecycle. Import
+`ChipWorker` from `simpler.task_interface`; the optional Torch-NPU adapter is
+`simpler.kernel.enqueue`. Both use the same kernel context owner.
+
+| Method | Contract |
+| ------ | -------- |
+| `kernel_init(device_id, bins, config, context_generation=None, log_level=None)` | Borrows the already-current device. `bins` supplies the same binary paths as program init. No caller stream is needed. An omitted generation uses the shared process counter; explicit values must be process-unique. Native init failure still requires explicit `finalize()` |
+| `kernel_prepare_callable(chip_callable) -> int` | Outside capture; registration on the context's dedicated stream completes before return. Returns a context-local callable id, not a cross-worker handle |
+| `kernel_launch(cid, args, caller_stream)` | Direct native POD submission. Requires an explicit non-null stream and no pending framework callbacks. Does not protect Torch storage or enter its taskQueue |
+| `simpler.kernel.enqueue(worker, cid, tensors, scalar_bits=())` | Torch path: captures the current framework stream without draining the queue, snapshots descriptors/scalars, and retains Tensor storage through callback and device-use windows |
+| `kernel_mode_supported` | Reports the bound backend's execution capability; successful initialization does not imply launch support |
+| `finalize()` | Rejects pending callbacks without cancelling them. Failed native cleanup retains the owner and registrations for retry. Call on the initialization thread, after device quiescence and destruction of all referencing graphs |
+
+Kernel garbage collection does not implicitly finalize device resources. The
+native runtime must join internal uses back to the caller stream, including
+partial-enqueue failure cleanup. The adapter rejects recognizable external
+storage; additional logical slot ownership inside ordinary Torch storage still
+requires the caller's lease until all device/graph uses finish.
+
+The current backend supports TMR initialization/preparation but still rejects
+launch while execution providers are missing. Adapter tests do not claim a
+working operator or ACLGraph execution pipeline.
+
+The `committed_device_memory` property queries the same kernel context's native accounting;
+it is not a second capacity table or a total-device HBM measurement. The
+program-only `device_memory_info()` and program runtime counters are not exposed
+as fabricated zero values on kernel workers. Use framework device accounting for
+the borrowed device's free/total snapshot.
+
 ## Callables and task args
 
 ```python
