@@ -158,10 +158,11 @@ typedef enum PipelineResourceKind {
 typedef struct PipelineResource {
     uint32_t kind;
     uint32_t resource_class;
-    /* Program: reserved, must be 0. Kernel: arena kinds declare nonzero
-       required usable bytes per copy, not committed HBM or capacity budgets.
-       Streams and TASK_ARGS must be 0; task-argument byte limits are not
-       represented by this field. */
+    /* Program: reserved, must be 0. Kernel: every resource that occupies
+       storage declares nonzero required usable bytes per copy — the device
+       arenas and the per-run host argument buffer alike — which is a per-copy
+       requirement, not committed HBM or a capacity budget. An EXEC_HANDLE is
+       not storage and must be 0. */
     uint64_t bytes_per_copy;
 } PipelineResource;
 

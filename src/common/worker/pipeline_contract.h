@@ -51,8 +51,11 @@ inline bool is_valid_pipeline_contract(const PipelineContract *contract, uint32_
             resource.resource_class > PTO_PIPELINE_EXEC_HANDLE) {
             return false;
         }
-        const bool sized_arena = mode == SIMPLER_MODE_KERNEL && resource.kind <= PTO_PIPELINE_RUNTIME_IMAGE;
-        if (sized_arena ? resource.bytes_per_copy == 0 : resource.bytes_per_copy != 0) return false;
+        // A kernel-mode resource that occupies bytes states how many per copy;
+        // an execution handle is not a buffer and carries none. The partition is
+        // the resource class, so adding a kind cannot change which rule applies.
+        const bool sized = mode == SIMPLER_MODE_KERNEL && resource.resource_class != PTO_PIPELINE_EXEC_HANDLE;
+        if (sized ? resource.bytes_per_copy == 0 : resource.bytes_per_copy != 0) return false;
     }
     return true;
 }
@@ -135,9 +138,8 @@ inline bool has_serviceable_stream_topology(const PipelineContract &contract) {
 
 // Complete TMR kernel admission, including structural checks before any lookup.
 inline bool is_valid_tmr_kernel_pipeline_contract(const PipelineContract *contract) {
-    if (!is_valid_pipeline_contract(contract, SIMPLER_MODE_KERNEL) || contract->pipeline_depth != 1 ||
-        contract->resource_count != 6 || !has_serviceable_arena_topology(*contract) ||
-        !has_serviceable_stream_topology(*contract)) {
+    if (!is_valid_pipeline_contract(contract, SIMPLER_MODE_KERNEL) || contract->resource_count != 6 ||
+        !has_serviceable_arena_topology(*contract) || !has_serviceable_stream_topology(*contract)) {
         return false;
     }
     for (uint32_t kind = PTO_PIPELINE_GM_HEAP; kind <= PTO_PIPELINE_TASK_ARGS; ++kind) {

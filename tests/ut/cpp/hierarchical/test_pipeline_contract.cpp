@@ -222,11 +222,11 @@ TEST(PipelineContract, ShippedArenaTopologiesAreServiceable) {
 }
 
 PipelineContract kernel_contract() {
-    PipelineContract c{PTO_PIPELINE_CONTRACT_ABI_VERSION, 6, 1, {}};
+    PipelineContract c{PTO_PIPELINE_CONTRACT_ABI_VERSION, 6, 2, {}};
     for (uint32_t kind = PTO_PIPELINE_GM_HEAP; kind <= PTO_PIPELINE_RUNTIME_IMAGE; ++kind) {
         c.resources[kind - 1] = {kind, PTO_PIPELINE_DEVICE_SCRATCH, 4096};
     }
-    c.resources[3] = {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, 0};
+    c.resources[3] = {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, 4096};
     c.resources[4] = {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0};
     c.resources[5] = {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0};
     return c;
@@ -242,7 +242,7 @@ TEST(PipelineContract, KernelByteRulesAreModeSpecific) {
     EXPECT_FALSE(is_valid_pipeline_contract(nullptr, SIMPLER_MODE_KERNEL));
     for (uint32_t i = 0; i < c.resource_count; ++i) {
         auto invalid = c;
-        invalid.resources[i].bytes_per_copy = i < 3 ? 0 : 1;
+        invalid.resources[i].bytes_per_copy = i < 4 ? 0 : 1;
         EXPECT_FALSE(is_valid_pipeline_contract(&invalid, SIMPLER_MODE_KERNEL)) << i;
     }
 }
@@ -261,7 +261,13 @@ TEST(PipelineContract, KernelRequiresExactlyItsSupportedResourceShape) {
         EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&duplicate)) << i;
     }
     auto invalid = c;
-    invalid.pipeline_depth = 2;
+    // Depth is the runtime's choice across the supported range: a pipelined
+    // eager context needs more than one slot, a capture-only one needs one.
+    invalid.pipeline_depth = 1;
+    EXPECT_TRUE(is_valid_tmr_kernel_pipeline_contract(&invalid));
+    invalid.pipeline_depth = 0;
+    EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&invalid));
+    invalid.pipeline_depth = PTO_PIPELINE_MAX_DEPTH + 1;
     EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&invalid));
     invalid = c;
     invalid.resource_count = PTO_PIPELINE_MAX_RESOURCES + 1;

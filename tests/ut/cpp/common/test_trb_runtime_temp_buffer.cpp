@@ -530,8 +530,10 @@ TEST(KernelPipelineBuilder, DefaultAndPackedInputsPreserveProgramContract) {
     PipelineContract contract{};
     ASSERT_EQ(build_kernel_pipeline_contract_impl(&defaults, &contract), 0);
     EXPECT_TRUE(is_valid_tmr_kernel_pipeline_contract(&contract));
-    EXPECT_EQ(contract.pipeline_depth, 1u);
-    EXPECT_EQ(required_bytes(contract, PTO_PIPELINE_TASK_ARGS), 0u);
+    EXPECT_EQ(contract.pipeline_depth, 2u);
+    // Per-run args are a pipelined host buffer: one copy per slot, of the size a
+    // launch actually hands over.
+    EXPECT_EQ(required_bytes(contract, PTO_PIPELINE_TASK_ARGS), sizeof(ChipStorageTaskArgs));
 
     // CallConfig is packed and may start at any byte; use a genuinely unaligned input.
     alignas(uint64_t) std::array<unsigned char, sizeof(CallConfig) + 1> packed{};
@@ -629,7 +631,11 @@ TEST_F(TrbRuntimeTempBufferTest, LargestRingCountsOnlyReserveLayout) {
     EXPECT_EQ(fake_.copy_to_count, 0);
 }
 
-TEST(KernelPipelineBuilder, IndependentCallsCanInterleave) {
+// Sizing reads only its own config and writes only its own output: no static or
+// thread-local state backs it. Init calls the builder once per context, so this
+// guards that one call against another context's rather than sanctioning a
+// recompute of a context's own contract.
+TEST(KernelPipelineBuilder, SizingKeepsNoSharedState) {
     constexpr size_t count = 4;
     std::array<CallConfig, count> configs;
     std::array<PipelineContract, count> expected{};

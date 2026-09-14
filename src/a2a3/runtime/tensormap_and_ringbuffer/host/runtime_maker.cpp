@@ -524,9 +524,9 @@ extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, Pip
     const PipelineContract candidate = {
         PTO_PIPELINE_CONTRACT_ABI_VERSION,
         6,
-        1,
+        2,
         {
-            {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, 0},
+            {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, sizeof(ChipStorageTaskArgs)},
             {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DEVICE_SCRATCH, sizes.total_heap},
             {PTO_PIPELINE_GM_SM, PTO_PIPELINE_DEVICE_SCRATCH, sizes.sm_size},
             {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DEVICE_SCRATCH, layout.offsets.arena_size},
