@@ -17,8 +17,7 @@
  * running in host-based simulation environment.
  */
 
-#ifndef PLATFORM_A5SIM_AICORE_INNER_KERNEL_H_
-#define PLATFORM_A5SIM_AICORE_INNER_KERNEL_H_
+#pragma once
 
 #include <atomic>
 #include <cstdint>
@@ -112,6 +111,8 @@ typedef int mem_dsb_t;
 // OUT_OF_ORDER_FULL_BARRIER - full memory barrier preventing all load/store reordering.
 // Equivalent to dmb ish (aarch64) / mfence (x86).
 #define OUT_OF_ORDER_FULL_BARRIER() __sync_synchronize()
+
+inline uint32_t read_aicore_teardown_control(uint32_t *control) { return __atomic_load_n(control, __ATOMIC_ACQUIRE); }
 
 // =============================================================================
 // MMIO Load/Store Intrinsics (sim stubs)
@@ -213,5 +214,3 @@ inline void write_reg(RegId reg, uint64_t value) {
  * @return Physical core ID for the current simulated core
  */
 inline uint32_t get_physical_core_id() { return sim_get_physical_core_id(); }
-
-#endif  // PLATFORM_A5SIM_AICORE_INNER_KERNEL_H_

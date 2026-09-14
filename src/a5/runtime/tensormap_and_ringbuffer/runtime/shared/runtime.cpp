@@ -31,6 +31,7 @@ Runtime::Runtime() {
 
     // Initialize the device-copied descriptor (`dev`).
     memset(dev.workers, 0, sizeof(dev.workers));
+    memset(dev.teardown_gates, 0, sizeof(dev.teardown_gates));
     dev.worker_count = 0;
     dev.aicpu_thread_num = 1;
     dev.ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;

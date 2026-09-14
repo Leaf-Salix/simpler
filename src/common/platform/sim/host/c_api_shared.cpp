@@ -29,6 +29,9 @@
 #include "device_runner_base.h"
 #include "host/dep_gen_collector.h"  // make_deps_json_path
 #include "host/kernel_entry_validation.h"
+#include "host/kernel_static_config.h"
+#include "host/kernel_pipeline_contract.h"
+#include "worker/pipeline_contract.h"
 #include "prepare_callable_common.h"
 #include "task_args_wire.h"
 #include "native_run_context.h"
@@ -233,6 +236,10 @@ static uint32_t get_chip_swimlane_level(void *runner_ctx) {
     return static_cast<SimDeviceRunnerBase *>(runner_ctx)->chip_swimlane_level();
 }
 
+static bool is_kernel_mode(void *runner_ctx) {
+    return runner_ctx != nullptr && static_cast<SimDeviceRunnerBase *>(runner_ctx)->execution_mode_latch().is_kernel();
+}
+
 static bool publish_chip_swimlane_extension(
     void *runner_ctx, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
 ) {
@@ -357,6 +364,7 @@ static const HostApiOps g_host_api_ops = {
     .host_phase_pool_arm = host_phase_pool_arm,
     .host_phase_pool_finish = host_phase_pool_finish,
     .publish_chip_swimlane_extension = publish_chip_swimlane_extension,
+    .is_kernel_mode = is_kernel_mode,
 };
 
 /* ===========================================================================
@@ -1068,6 +1076,19 @@ int simpler_kernel_mode_init(
         config, context_generation
     );
     if (rc != 0) return rc;
+    try {
+        PipelineContract contract{};
+        const int config_rc = KernelStaticConfig::validate(config);
+        if (config_rc != 0) return config_rc;
+        const int rc = build_kernel_pipeline_contract_impl(config, &contract);
+        if (rc != 0) return rc;
+        if (!is_valid_pipeline_contract(&contract, SIMPLER_MODE_KERNEL) || !has_serviceable_arena_topology(contract) ||
+            !has_serviceable_stream_topology(contract)) {
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     LOG_ERROR("simpler_kernel_mode_init: kernel mode is not supported by the simulator");
     return PTO_RUNTIME_ERR_UNSUPPORTED;
 }

@@ -91,7 +91,13 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // the poll cannot miss it and mistake a later task for the reset value.
     // Window-open is the sync point for everything the AICPU publishes (task
     // pointer, swimlane head): the AICPU writes those before opening the window.
+    uint32_t window_polls = 0;
     while (read_reg(RegId::DATA_MAIN_BASE) == 0) {
+        if ((window_polls++ & (AICORE_PRE_WINDOW_CANCEL_POLL_INTERVAL - 1)) == 0 &&
+            read_aicore_teardown_control(&runtime->dev.teardown_gates[block_idx].post_close_release) ==
+                AICORE_PRE_WINDOW_HOST_CANCEL) {
+            return;
+        }
         SPIN_WAIT_HINT();
     }
     // Report initial idle status via register (FAST_PATH is now open).

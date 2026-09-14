@@ -1406,7 +1406,7 @@ class TestChipCallable:
         assert "sig_count=2" in r
         assert "child_count=1" in r
 
-    def test_scalar_count_without_scalars_is_zero(self):
+    def test_scalar_free_signature_has_zero_scalar_count(self):
         chip = ChipCallable.build(
             signature=[ArgDirection.IN],
             func_name="test_func",
@@ -1415,7 +1415,7 @@ class TestChipCallable:
         )
         assert chip.scalar_count == 0
 
-    def test_scalar_count_derived_from_signature(self):
+    def test_scalar_count_is_derived_from_signature(self):
         chip = ChipCallable.build(
             signature=[ArgDirection.IN, ArgDirection.OUT] + [ArgDirection.SCALAR] * 5,
             func_name="test_func",
@@ -1435,19 +1435,39 @@ class TestChipCallable:
         clone = ChipCallable.from_bytes(raw)
         assert clone.scalar_count == 7
 
-    @pytest.mark.parametrize("signature_count", [-1, 257])
-    def test_scalar_count_rejects_corrupt_cached_signature_count(self, signature_count):
+    def test_factory_rejects_redundant_scalar_count_keyword(self):
+        with pytest.raises(TypeError):
+            ChipCallable.build(
+                signature=[ArgDirection.IN, ArgDirection.OUT],
+                func_name="test_func",
+                binary=b"\x00",
+                children=[],
+                scalar_count=5,
+            )
+
+    @pytest.mark.parametrize("padding", [b"\x00" * 12, b"\xff" * 12, struct.pack("<i", 1) + b"\x00" * 8])
+    def test_cached_blob_scalar_count_ignores_historical_padding(self, padding):
         chip = ChipCallable.build(
-            signature=[ArgDirection.IN, ArgDirection.SCALAR],
+            signature=[ArgDirection.IN] + [ArgDirection.SCALAR] * 3,
             func_name="test_func",
             binary=b"\x00",
             children=[],
         )
         raw = bytearray(ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size())))
-        # The wire signature contains 256 int32 ArgDirection entries before sig_count.
-        struct.pack_into("<i", raw, 256 * struct.calcsize("<i"), signature_count)
+        # These offsets are the fixed ChipCallable wire ABI, guarded in callable.h.
+        raw[9364:9376] = padding
         clone = ChipCallable.from_bytes(bytes(raw))
-        with pytest.raises(ValueError, match=rf"signature count {signature_count}.*256"):
+        assert clone.scalar_count == 3
+        assert clone.sig_count - clone.scalar_count == 1
+        assert clone.func_name == "test_func"
+
+    @pytest.mark.parametrize("bad", [-1, 257])
+    def test_cached_blob_rejects_corrupt_signature_count_before_scanning(self, bad):
+        chip = ChipCallable.build([], "test_func", b"\x00", [])
+        raw = bytearray(ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size())))
+        struct.pack_into("<i", raw, 1024, bad)
+        clone = ChipCallable.from_bytes(bytes(raw))
+        with pytest.raises(ValueError, match=rf"{bad}.*256"):
             _ = clone.scalar_count
 
 

@@ -293,8 +293,10 @@ public:
 
     /**
      * This context's execution identity, latched once by whichever init entry
-     * constructs it. Simulation supports program mode only: it has no device
-     * streams for a caller to lend.
+     * constructs it. The arena guard keys on is_kernel(), as does the trb
+     * retained temporary buffer through HostApiOps::is_kernel_mode. Simulation
+     * never supports kernel mode — it has no real streams for a caller to lend
+     * — so on this backend the latch only ever holds PROGRAM.
      */
     ExecutionModeLatch &execution_mode_latch() { return execution_mode_latch_; }
 

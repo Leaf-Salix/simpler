@@ -136,6 +136,25 @@ int kernel_args_init_ffts_base_addr(KernelArgsHelper &helper) {
 // DeviceRunner Implementation
 // =============================================================================
 
+int DeviceRunner::fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) {
+    if (args == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+
+    int rc = init_aicore_register_addresses(&args->regs, device_id, mem_alloc_, AicoreRegKind::Ctrl);
+    if (rc != 0) {
+        LOG_ERROR("fill_persistent_arch_fields: init_aicore_register_addresses(Ctrl) failed: %d", rc);
+        return rc;
+    }
+
+    uint32_t ffts_len = 0;
+    rc = rtGetC2cCtrlAddr(&args->ffts_base_addr, &ffts_len);
+    if (rc != 0) {
+        LOG_ERROR("fill_persistent_arch_fields: rtGetC2cCtrlAddr failed: %d", rc);
+        args->ffts_base_addr = 0;
+        return rc;
+    }
+    return 0;
+}
+
 DeviceRunner::~DeviceRunner() { finalize(); }
 
 // `setup_static_arena`, `create_thread`, `attach_current_thread`,
@@ -234,6 +253,56 @@ void DeviceRunner::arm_host_dep_gen_capture(bool enable) {
     dep_gen_host_graph_set_enabled(enable);
 }
 
+int DeviceRunner::prepare_aicpu_affinity(Runtime &runtime, int requested, rtStream_t control_stream) {
+    (void)control_stream;
+    {
+        std::vector<pto::a2a3::AicpuLogicalCpu> user_cpus;
+        std::vector<int32_t> allowed;
+        runtime.set_aicpu_allowed_cpu_count(0);
+        runtime.set_aicpu_launch_count(0);
+        if (!pto::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), user_cpus)) {
+            LOG_ERROR("A2A3 AICPU topology probe failed; cannot configure affinity gate");
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        int resolved_aicpu =
+            resolve_aicpu_thread_num(requested, static_cast<int>(user_cpus.size()), PLATFORM_DEFAULT_AICPU_THREAD_NUM);
+        if (resolved_aicpu < 0) return PTO_RUNTIME_ERR_INTERNAL;
+        if (!pto::a2a3::compute_allowed_cpus(user_cpus, resolved_aicpu, allowed)) {
+            LOG_ERROR(
+                "A2A3 AICPU topology has %zu user cpus, cannot fit %d active threads", user_cpus.size(), resolved_aicpu
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        runtime.set_aicpu_thread_num(resolved_aicpu);
+        const size_t cap = runtime.aicpu_allowed_cpus_capacity();
+        if (allowed.size() > cap) {
+            LOG_ERROR("A2A3 compute_allowed_cpus returned %zu > cap %zu", allowed.size(), cap);
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        int32_t *allowed_cpus = runtime.get_aicpu_allowed_cpus();
+        for (size_t i = 0; i < allowed.size(); ++i)
+            allowed_cpus[i] = allowed[i];
+        runtime.set_aicpu_allowed_cpu_count(static_cast<int32_t>(allowed.size()));
+        int32_t launch_n = static_cast<int32_t>(user_cpus.size());
+        if (launch_n > PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH) {
+            launch_n = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
+        }
+        runtime.set_aicpu_launch_count(launch_n);
+
+        std::string dump;
+        for (size_t i = 0; i < allowed.size(); ++i) {
+            if (i) dump += ", ";
+            dump += std::to_string(allowed[i]);
+            if (i + 1 == allowed.size()) dump += "(last)";
+        }
+        LOG_INFO(
+            "A2A3 AICPU ALLOWED_CPUS = [%s] (active=%d, launch=%d, user_cpus=%zu)", dump.c_str(),
+            runtime.get_aicpu_thread_num(), runtime.get_aicpu_launch_count(), user_cpus.size()
+        );
+    }
+    return 0;
+}
+
 int DeviceRunner::prepare_execution(
     Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
     std::unique_ptr<PreparedExecution> *prepared
@@ -310,57 +379,9 @@ int DeviceRunner::prepare_execution(
 
     resolve_task_binary_addrs(runtime);
 
-    // a2a3 onboard now uses the same host-computed, device-filtered affinity
-    // shape as a5. Host probes the AICPU user pool once, chooses the active
-    // cpu_ids deterministically, writes them into Runtime, and the AICPU-side
-    // gate only matches sched_getcpu() against this table.
-    {
-        std::vector<pto::a2a3::AicpuLogicalCpu> user_cpus;
-        std::vector<int32_t> allowed;
-        runtime.set_aicpu_allowed_cpu_count(0);
-        runtime.set_aicpu_launch_count(0);
-        if (!pto::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), user_cpus)) {
-            LOG_ERROR("A2A3 AICPU topology probe failed; cannot configure affinity gate");
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        int resolved_aicpu = resolve_aicpu_thread_num(
-            runtime.get_aicpu_thread_num(), static_cast<int>(user_cpus.size()), PLATFORM_DEFAULT_AICPU_THREAD_NUM
-        );
-        if (resolved_aicpu < 0) return PTO_RUNTIME_ERR_INTERNAL;
-        if (!pto::a2a3::compute_allowed_cpus(user_cpus, resolved_aicpu, allowed)) {
-            LOG_ERROR(
-                "A2A3 AICPU topology has %zu user cpus, cannot fit %d active threads", user_cpus.size(), resolved_aicpu
-            );
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        runtime.set_aicpu_thread_num(resolved_aicpu);
-        launch_aicpu_num = resolved_aicpu;
-        const size_t cap = runtime.aicpu_allowed_cpus_capacity();
-        if (allowed.size() > cap) {
-            LOG_ERROR("A2A3 compute_allowed_cpus returned %zu > cap %zu", allowed.size(), cap);
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        int32_t *allowed_cpus = runtime.get_aicpu_allowed_cpus();
-        for (size_t i = 0; i < allowed.size(); ++i)
-            allowed_cpus[i] = allowed[i];
-        runtime.set_aicpu_allowed_cpu_count(static_cast<int32_t>(allowed.size()));
-        int32_t launch_n = static_cast<int32_t>(user_cpus.size());
-        if (launch_n > PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH) {
-            launch_n = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
-        }
-        runtime.set_aicpu_launch_count(launch_n);
-
-        std::string dump;
-        for (size_t i = 0; i < allowed.size(); ++i) {
-            if (i) dump += ", ";
-            dump += std::to_string(allowed[i]);
-            if (i + 1 == allowed.size()) dump += "(last)";
-        }
-        LOG_INFO(
-            "A2A3 AICPU ALLOWED_CPUS = [%s] (active=%d, launch=%d, user_cpus=%zu)", dump.c_str(),
-            runtime.get_aicpu_thread_num(), runtime.get_aicpu_launch_count(), user_cpus.size()
-        );
-    }
+    rc = prepare_aicpu_affinity(runtime, runtime.get_aicpu_thread_num(), stream_aicpu_);
+    if (rc != 0) return rc;
+    launch_aicpu_num = runtime.get_aicpu_thread_num();
 
     // Resolve the orchestration SO into a device-resident buffer and refresh
     // runtime metadata before the Runtime struct is uploaded to device.
@@ -950,6 +971,10 @@ int DeviceRunner::finalize() {
     if (device_id_ == -1) {
         return 0;
     }
+    if (execution_mode_latch().is_kernel()) {
+        const int device_rc = adopt_borrowed_device(device_id_);
+        if (device_rc != 0) return device_rc;
+    }
 
     // Fatal path: the ordinary stream completion/error boundary has already
     // reaped the submitted run. Stop host collector threads locally, drain and
@@ -988,13 +1013,20 @@ int DeviceRunner::finalize() {
         // (verified on a2a3). An SDMA-provisioned card gets a single attempt:
         // there a non-confirming reset already blocks on the driver's
         // remote-event timeout, which a retry only multiplies.
+        // A kernel-mode context owns neither the device nor its ACL state, so
+        // force_reset_device() refuses. Asking anyway would log that refusal
+        // once per attempt and then report a reset that "did not confirm
+        // clean", which reads as a failed reset rather than the designed
+        // refusal it is.
+        const bool owns_device_reset = !execution_mode_latch().is_kernel();
         constexpr int kFatalResetAttempts = 3;
-        int reset_rc = attempt_fatal_reset(
-            [this]() {
-                return force_reset_device();
-            },
-            sdma_provisioned ? 1 : kFatalResetAttempts
-        );
+        int reset_rc = owns_device_reset ? attempt_fatal_reset(
+                                               [this]() {
+                                                   return force_reset_device();
+                                               },
+                                               sdma_provisioned ? 1 : kFatalResetAttempts
+                                           ) :
+                                           0;
         const bool reset_confirmed = reset_rc == 0;
         if (!reset_confirmed) {
             LOG_ERROR(
@@ -1057,6 +1089,7 @@ int DeviceRunner::finalize() {
     // mem_alloc_.finalize(), and cached arena sizes.
     rc = finalize_common();
     if (rc == 0) rc = stream_rc;
+    if (rc != 0 && execution_mode_latch().is_kernel()) return rc;
 
     // Reset device AFTER all device memory is freed. Two paths:
     //

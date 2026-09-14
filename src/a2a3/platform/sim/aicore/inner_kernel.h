@@ -119,6 +119,8 @@ inline void wait_for_post_close_release(uint32_t *release) {
     }
 }
 
+inline uint32_t read_aicore_teardown_control(uint32_t *control) { return __atomic_load_n(control, __ATOMIC_ACQUIRE); }
+
 // =============================================================================
 // System Counter Simulation
 // =============================================================================
