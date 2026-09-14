@@ -42,6 +42,8 @@ freeze, allocate, mark ready or relax the ready-state requirement of launch.
 The owner serializes sealing/enqueue with close. A callback failure is returned
 unchanged; it is not evidence that any partially enqueued work has completed.
 The enclosing owner supplies partial-enqueue handling and readiness ordering.
+Any captured event wait requires its record inside the same capture; a
+PrepareTail recorded during capture-external preparation cannot supply that edge.
 
 ## Wire and publication
 

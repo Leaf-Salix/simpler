@@ -1520,10 +1520,10 @@ class ChipWorker:
         """Stage a callable for kernel-mode launches, outside ACLGraph capture.
 
         Returns the callable id it was staged under. ``caller_stream`` defaults
-        to the stream kernel_init() was given; pass one to stage on a different
-        stream. Preparation may enqueue asynchronous work on that stream but
-        never synchronizes it, so errors surface through the caller's own
-        warmup plus synchronize.
+        to the stream kernel_init() was given. The argument remains part of
+        the native ABI, but preparation uses the context's private AICPU
+        stream and synchronizes registration before returning. It neither
+        enqueues work on the caller stream nor leaves a launch-time wait.
         """
         stream = self._resolve_caller_stream(caller_stream)
         with self._registry_lock:

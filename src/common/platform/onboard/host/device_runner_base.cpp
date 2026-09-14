@@ -712,7 +712,7 @@ KernelCallableCache::Ops DeviceRunnerBase::kernel_callable_cache_ops() {
     };
 }
 
-int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id, const HostApi *api, void *caller_stream) {
+int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id, const HostApi *api) {
     rtStream_t control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
     if (control_stream == nullptr) {
         LOG_ERROR("prepare_kernel_callable: no live kernel context");
@@ -751,27 +751,7 @@ int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id, const HostApi
         return PTO_RUNTIME_ERR_INTERNAL;
     if (state.kernel_packet.prepare(callable) != simpler::kernel::InvocationStatus::Ok) return PTO_RUNTIME_ERR_INTERNAL;
 
-    int rc = 0;
-    if (state.host_dlopen_handle == nullptr) {
-        RegisterCallableArgs reg_args{};
-        reg_args.active_callable_id = callable_id;
-        reg_args.dev_orch_so_addr = state.dev_orch_so_addr;
-        reg_args.dev_orch_so_size = state.dev_orch_so_size;
-        snprintf(reg_args.device_orch_func_name, sizeof(reg_args.device_orch_func_name), "%s", state.func_name.c_str());
-        snprintf(
-            reg_args.device_orch_config_name, sizeof(reg_args.device_orch_config_name), "%s", state.config_name.c_str()
-        );
-        rc = launch_aicpu_payload(
-            control_stream, &reg_args, sizeof(reg_args), host::KernelNames::RegisterCallableName, 1
-        );
-        if (rc != 0) return rc;
-        rc = commit_device_register(callable_id);
-        if (rc != 0) return rc;
-    }
-    rc = aclrtRecordEvent(kernel_exec_state_.event(KernelEventKind::PrepareTail), control_stream);
-    if (rc != 0) return rc;
-    kernel_prepare_pending_ = true;
-    rc = aclrtStreamWaitEvent(caller_stream, kernel_exec_state_.event(KernelEventKind::PrepareTail));
+    const int rc = register_callable_on_device(callable_id, control_stream);
     if (rc != 0) return rc;
 
     return kernel_exec_state_.mark_ready_enqueued();

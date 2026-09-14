@@ -16,7 +16,7 @@ HBG 和 sim 的不支持判定发生在取得 kernel 身份之前。在这种未
 
 调用者先完成 ACL 初始化，并让当前线程持有所需设备。Kernel init 借用这个设备，
 不调用选卡、设备重置或 ACL 初始化/终止接口。init 可在 capture 之外同步自己的
-AICPU stream 完成启动；prepare 和 launch 不做 stream/device 同步。
+AICPU stream 完成启动；prepare 同步该私有 stream 完成注册，launch 不做 stream/device 同步。
 调用者负责串行执行同一 context 的 init、prepare、launch 和 finalize。
 
 ```cpp
@@ -36,9 +36,7 @@ int simpler_kernel_mode_launch(
 // 已完成 caller 的 ACL 初始化、选卡以及 simpler_kernel_mode_init。
 int rc = simpler_kernel_mode_prepare_callable(ctx, 7, callable, size, caller_stream);
 if (rc != 0) return rc;
-// 在 capture 之外完成 caller 的 warmup，并同步 caller_stream，检查异步准备结果。
-rc = caller_warmup_and_synchronize(caller_stream); // 调用者自己的逻辑
-if (rc != 0) return rc;
+// prepare 已完成私有 AICPU stream 上的注册，可直接进入 caller 的 capture。
 return simpler_kernel_mode_launch(ctx, 7, args, caller_stream);
 ```
 
@@ -84,7 +82,7 @@ arena_（底层分配由 MemoryAllocator 持有）
 
 上传只修补临时 `scratch` 中的子 `CoreCallable::resolved_addr_`，调用者镜像保持不变。
 当前缓存上传仍通过 `Ops.copy → rtMemcpy(..., RT_MEMCPY_HOST_TO_DEVICE)` 同步复制代码和
-描述符；这不同于后续 runtime 注册的异步执行，也不意味着 prepare 会同步 stream/device。
+描述符；后续 runtime 注册在私有 AICPU stream 上提交，prepare 等待其完成后才返回成功。
 
 Host 条目保存驻留信息、内容 hash、镜像副本、计费字节数和 `ready`。
 `resident_count()` 只统计 ready 项，`resident_bytes()` 包括未 commit 的计费占用。
@@ -100,14 +98,15 @@ program 模式继续使用原有上传与引用计数路径。
 TMR 的 `prepare_kernel_callable` 首次配置固定 runtime 区域、准备 `PersistentKernelArgs`，
 随后冻结配置。每个 callable 在此分配 Host dispatch packet 缓冲区，launch 只重写内容。
 
-设备注册在 context 专用的 AICPU stream 上发射 `RegisterCallableName`。
-提交成功后记录 `PrepareTail`，并让本次传入的 `caller_stream` 等待它。
-调用者同步 caller stream 即可观察注册完成或异步错误；prepare 本身不执行
-`aclrtSynchronizeStream*` 或 device synchronize。
+设备注册复用 `register_callable_on_device`，在 context 专用的 AICPU stream 上
+发射 `RegisterCallableName`，同步该 stream 成功后才提交注册账本。prepare 不向
+`caller_stream` 提交任务，也不把 capture 外记录的事件带入后续 capture。
+五参 ABI 仍要求有效的 caller stream，但本次 prepare 不使用或保留该 stream。
 
 context 随后转为 `ReadyEnqueued`，缓存通过 `commit(callable_id)` 发布 ready 条目。
-ready 表示准备已提交并建立依赖，设备工作仍可能在执行。第一次 launch 消费 `PrepareTail`；
-调用者仍须在 capture 之前完成自己的 warmup 和同步检查。
+该路径的 ready 表示设备注册已完成；同步失败则沿原错误路径 poison context，
+不发布 ready callable，也不提前回收可能仍在使用的资源。首次 launch 可以直接在
+capture 内调用，无须先做 eager warmup。launch 仍只有异步提交语义，不执行同步。
 
 HBG 内部准备包含资源计划、freeze 和 execution-slot 注册；公开 HBG init 已提前拒绝，
 不能通过公开 prepare 绕过 H4 缺失的限制。详见

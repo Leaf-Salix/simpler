@@ -81,7 +81,8 @@ simpler 没有调用过它们。
 init 期间的执行体加载和 prepare 期间的 callable 注册，会同步上下文自己的 AICPU
 stream。launch 路径不同步任何 stream。
 
-prepare 之后，测试自己同步一次 caller stream。prepare 若出错，会在这里暴露。
+prepare 的注册同步错误直接由该调用返回。eager 测试保留了额外 caller stream 同步，
+但后面的 cold capture 测试不依赖这一步，也不要求先执行 eager warmup。
 
 ## 5. 一次 launch 的时序
 
@@ -139,14 +140,15 @@ AICPU 入口 `simpler_aicpu_kernel_exec` 收到参数包后：
 | 1 | `i % 127` | 1.25 |
 | 2 | `i % 127 + 257` | -3.5 |
 
-launch 返回后立即清空主机侧参数，是为了证明参数快照在入队时就已取走：如果
-simpler 仍引用主机侧参数，本次执行会读到被清空的数据，结果不可能正确。
+launch 返回后立即清空主机侧参数，验证后续执行不借用调用者的参数对象。
+这一步本身不能证明 CANN 不借用 Simpler 内部的编码缓冲；两图使用同一 callable、
+不同地址/scalar，并在编码缓存被后一次 capture 改写后交替 replay，才覆盖该边界。
 
 ## 8. 图模式验证到哪一步
 
 上面的数值用例是 eager 调用，不包含任何 `aclmdlRICapture` 调用。
 
-图模式只在独立探针 `tests/st/a2a3/kernel_capture/` 中验证过：
+独立探针 `tests/st/a2a3/kernel_capture/` 的验证范围是：
 
 1. 在一条 warmup stream 上 eager 执行一遍。
 2. 在 caller stream 上 `aclmdlRICaptureBegin`，执行同一串操作，`aclmdlRICaptureEnd` 得到图。
@@ -157,10 +159,24 @@ simpler 仍引用主机侧参数，本次执行会读到被清空的数据，结
 手写 record / wait 序列，使用测试专用的小 kernel，不经过 TMR runtime，也不经过
 launch owner 与 binder。
 
-因此两件事是分开验证的：三流五事件原语能被 ACLGraph 正确 capture 与回放；公开
-launch 路径能在 eager 下算对。在 capture 窗口内调用 `simpler_kernel_mode_launch`
-并回放，目前还没有验证。补充方式是在现有 eager 用例上增加一段：在 capture 窗口内
-调用一次 launch，得到图后改写同一块输入显存，回放若干次并比对输出。
+真实 TMR 入口另由 `test_kernel_graph_capture_replays_public_launch` 验证，
+复用上述 scalar-add callable，在 capture 内调用 `simpler_kernel_mode_launch`。
+回放循环只调用 `aclmdlRIExecuteAsync`，不再次调用 Host launch。A2/A3 真机已通过：
+
+| 场景 | Host launch 次数 | replay 验证 |
+| ---- | ---------------- | ----------- |
+| cold | capture 内 1 次；没有 eager warmup 或额外 prepare 后 caller 同步 | 100 次，输入地址不变、内容每次变化 |
+| warm | eager 1 次、capture 内 1 次 | 100 次，逐元素精确比对 |
+| A/B/A | 同 callable 分别 capture 两张图，共 2 次 | 两组地址和不同 scalar，按 A/B/A 顺序共 100 次；非活动输出不能被覆盖 |
+
+原始集成快照的 cold 场景曾返回 `107024`：capture 内等待的 `PrepareTail`，
+对应 record 却发生在 capture 外。eager warmup 会消费这条依赖，因此 warm 场景
+无法暴露问题。prepare 在私有 AICPU stream 上完成同步注册后，production owner
+不再传递该依赖；公开五参 ABI、launch 的异步 fork/join 顺序均不变。
+
+每轮 replay 后同步 caller 再读结果。prepare 后、capture 后、每次 replay 后的
+`committed_device_memory_ctx` 相等，所有 graph 销毁之后才允许 finalize 和释放 tensor。
+这项计量不等于拦截过全部底层 alloc/free，也不包含 CANN 自己持有的 graph 内存。
 
 ## 9. 并入主线时的接口裁决
 
@@ -195,5 +211,5 @@ launch 路径能在 eager 下算对。在 capture 窗口内调用 `simpler_kerne
 - 公开 HBG kernel 执行尚未打通。H4 没有提交 PR，HBG 的 kernel 能力位为 0，init 返回 `UNSUPPORTED`。
 - A5 只经过编译、单元测试与仿真，没有真机结果。
 - 数值用例只覆盖一个固定形状的单算子，不覆盖多算子图、其他形状与并发 launch。
-- 公开 launch 路径尚未在 ACLGraph capture 窗口内验证，见第 8 节。
+- 公开 capture/replay 只覆盖第 8 节的单 context、单 caller、固定形状和串行场景；未验证单图多算子、任意跨图重叠、错误取消或 vLLM/PyPTO 混合执行。
 - 同一 host runtime 动态库内限制同一设备只能有一个活动 kernel 上下文；跨动态库副本或跨进程需要调用方自行串行化。

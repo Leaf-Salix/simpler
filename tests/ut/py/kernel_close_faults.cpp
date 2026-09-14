@@ -30,6 +30,9 @@ bool override_device_query = false;
 int device_query_result = 0;
 int reported_device = -1;
 int device_queries = 0;
+bool fail_stream_sync = false;
+int stream_sync_calls = 0;
+void *failed_sync_stream = nullptr;
 
 int forbidden(size_t index) {
     ++forbidden_calls[index];
@@ -102,6 +105,15 @@ extern "C" void arm_device_query_override(int result, int device) {
 extern "C" void clear_device_query_override() { override_device_query = false; }
 extern "C" int device_query_attempts() { return device_queries; }
 
+extern "C" void arm_stream_sync_failure() {
+    fail_stream_sync = true;
+    stream_sync_calls = 0;
+    failed_sync_stream = nullptr;
+}
+extern "C" void clear_stream_sync_failure() { fail_stream_sync = false; }
+extern "C" int stream_sync_attempts() { return stream_sync_calls; }
+extern "C" void *stream_sync_failed_stream() { return failed_sync_stream; }
+
 extern "C" int aclrtGetDevice(int *device) {
     ++device_queries;
     if (override_device_query) {
@@ -138,6 +150,15 @@ extern "C" int aclFinalize() {
 extern "C" int rtDeviceReset(int device) {
     if (guard_acl) return forbidden(5);
     return forward_cann("rtDeviceReset", device);
+}
+extern "C" int aclrtSynchronizeStreamWithTimeout(void *stream, int32_t timeout) {
+    ++stream_sync_calls;
+    if (fail_stream_sync) {
+        fail_stream_sync = false;
+        failed_sync_stream = stream;
+        return -4325;
+    }
+    return forward_cann("aclrtSynchronizeStreamWithTimeout", stream, timeout);
 }
 extern "C" int aclrtSynchronizeDeviceWithTimeout(int32_t timeout) {
     if (fake_device_drain) {

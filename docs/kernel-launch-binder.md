@@ -34,9 +34,13 @@ inside the lease and releases it even if native preflight rejects the packet.
 Native tail queries use `aclrtQueryEventStatus`; the injected query callback is
 used only by the generic entry.
 
-Preparation records `PrepareTail` after initialization and slot registration;
-ready publication means submitted, not completed. Events must be created outside
-launch with `ACL_EVENT_SYNC`; AICPU is a dedicated **non-hidden** stream and AICore
+The generic binder retains an optional `PrepareTail` edge. A captured wait
+requires its corresponding record in the same capture; a completed record from
+outside capture does not meet that requirement. The production TMR owner
+completes registration on its private AICPU stream during prepare and never
+activates this edge. Its ready publication therefore follows device registration
+completion. Events must be created outside launch with `ACL_EVENT_SYNC`;
+AICPU is a dedicated **non-hidden** stream and AICore
 is **hidden**. Caller is borrowed, and all three handles must differ. The binder
 validates distinct/non-null handles but cannot establish their creation flags.
 

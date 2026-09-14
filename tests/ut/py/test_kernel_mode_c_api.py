@@ -59,6 +59,7 @@ _ONBOARD_CASES = [
     for runtime in _RUNTIMES
 ]
 _ONBOARD_TMR_CASES = [case for case in _ONBOARD_CASES if case.values[1] == "tensormap_and_ringbuffer"]
+_CAPTURE_CASES = ("capture_cold", "capture_warm", "capture_aba")
 
 
 @pytest.fixture(scope="module")
@@ -83,7 +84,16 @@ def kernel_close_faults(tmp_path_factory):
 @pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_TMR_CASES)
 @pytest.mark.parametrize(
     "scenario",
-    ["repeat_init", "init_failure", "stream_close", "event_close", "destroy_unclosed", "prepare", "fatal_device"],
+    [
+        "repeat_init",
+        "init_failure",
+        "stream_close",
+        "event_close",
+        "destroy_unclosed",
+        "prepare",
+        "prepare_sync_failure",
+        "fatal_device",
+    ],
 )
 def test_kernel_lifecycle_retry(arch, runtime, scenario, kernel_close_faults, request):
     _binaries(arch, runtime)
@@ -399,12 +409,12 @@ def _check_lifecycle_retry(lib, faults, arch, runtime, device, scenario):
             lib.destroy_device_context(ctx)
             assert lib.ensure_acl_ready_ctx(ctx, device) == PTO_RUNTIME_ERR_INVALID_STATE
             assert lib.finalize_device(ctx) == 0
-        elif scenario == "prepare":
+        elif scenario in ("prepare", "prepare_sync_failure"):
             # The caller's packed buffer stops being configuration authority
             # when init returns; prepare uses its owned, validated snapshot.
             config.aicpu_thread_num = -1
             config.enable_dump_args = 1
-            _check_prepare_reuse(lib, ctx, arch, runtime)
+            _check_prepare_reuse(lib, ctx, arch, runtime, faults if scenario == "prepare_sync_failure" else None)
         elif scenario in ("repeat_init", "init_failure"):
             assert lib.simpler_kernel_mode_init(*init_args) == PTO_RUNTIME_ERR_INVALID_STATE
             assert lib.ensure_acl_ready_ctx(ctx, device) == PTO_RUNTIME_ERR_INVALID_STATE
@@ -430,7 +440,7 @@ def _check_lifecycle_retry(lib, faults, arch, runtime, device, scenario):
         assert {name: faults.acl_call_count(i) for i, name in enumerate(names)} == dict.fromkeys(names, 0)
 
 
-def _check_prepare_reuse(lib, ctx, arch, runtime):
+def _check_prepare_reuse(lib, ctx, arch, runtime, faults=None):
     import tempfile  # noqa: PLC0415
 
     from simpler.task_interface import ChipCallable  # noqa: PLC0415
@@ -451,6 +461,9 @@ def _check_prepare_reuse(lib, ctx, arch, runtime):
     lib.aclrtSynchronizeStreamWithTimeout.restype = ctypes.c_int
     caller_stream = ctypes.c_void_p()
     assert lib.aclrtCreateStream(ctypes.byref(caller_stream)) == 0
+    if faults is not None:
+        _check_prepare_sync_failure(lib, faults, ctx, image, caller_stream)
+        return
     before = lib.committed_device_memory_ctx(ctx)
     assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image), caller_stream) == 0
     assert lib.aclrtSynchronizeStreamWithTimeout(caller_stream, 60000) == 0
@@ -474,6 +487,50 @@ def _check_prepare_reuse(lib, ctx, arch, runtime):
         == PTO_RUNTIME_ERR_INVALID_STATE
     )
     assert lib.aclrtDestroyStream(caller_stream) == 0
+
+
+def _check_prepare_sync_failure(lib, faults, ctx, image, caller_stream):
+    from simpler.task_interface import ChipStorageTaskArgs  # noqa: PLC0415
+
+    for name, restype in (
+        ("arm_stream_sync_failure", None),
+        ("clear_stream_sync_failure", None),
+        ("stream_sync_attempts", ctypes.c_int),
+        ("stream_sync_failed_stream", ctypes.c_void_p),
+    ):
+        function = getattr(faults, name)
+        function.argtypes = []
+        function.restype = restype
+    lib.aclrtSynchronizeDeviceWithTimeout.argtypes = [ctypes.c_int32]
+    lib.aclrtSynchronizeDeviceWithTimeout.restype = ctypes.c_int
+    before = lib.committed_device_memory_ctx(ctx)
+    faults.arm_stream_sync_failure()
+    try:
+        rc = lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image), caller_stream)
+        assert rc == -4325, f"prepare rc={rc}, sync_attempts={faults.stream_sync_attempts()}"
+        assert faults.stream_sync_attempts() == 1
+        assert faults.stream_sync_failed_stream() not in (None, caller_stream.value)
+        retained = lib.committed_device_memory_ctx(ctx)
+        assert retained > before
+        args = ChipStorageTaskArgs()
+        assert lib.simpler_kernel_mode_launch(ctx, 0, args.__ptr__(), caller_stream) == PTO_RUNTIME_ERR_INVALID_STATE
+        assert (
+            lib.simpler_kernel_mode_prepare_callable(ctx, 1, image, len(image), caller_stream)
+            == PTO_RUNTIME_ERR_INVALID_STATE
+        )
+        assert faults.stream_sync_attempts() == 1
+        assert lib.committed_device_memory_ctx(ctx) == retained
+    finally:
+        faults.clear_stream_sync_failure()
+        # The injected return skips synchronization, not registration enqueue.
+        # Only a real device drain authorizes reclaiming those resources.
+        drain = lib.aclrtSynchronizeDeviceWithTimeout(60000)
+        if drain != 0:
+            print(f"prepare_sync_failure: device drain rc={drain}; retaining resources until process exit", flush=True)
+            os._exit(1)
+        assert lib.finalize_device(ctx) == 0
+        assert lib.committed_device_memory_ctx(ctx) == 0
+        assert lib.aclrtDestroyStream(caller_stream) == 0
 
 
 @pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)
@@ -602,16 +659,32 @@ def test_kernel_context_init_respects_runtime_support_on_a_borrowed_device(arch:
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
 def test_kernel_eager_launch_executes_fresh_tensor_and_scalar_snapshots(request):
+    _run_value_subprocess(request, "eager_values")
+
+
+@pytest.mark.requires_hardware
+@pytest.mark.platforms(["a2a3"])
+@pytest.mark.runtime("tensormap_and_ringbuffer")
+@pytest.mark.device_count(1)
+@pytest.mark.parametrize("scenario", _CAPTURE_CASES)
+def test_kernel_graph_capture_replays_public_launch(request, scenario):
+    result = _run_value_subprocess(request, scenario)
+    assert f"kernel_capture PASS scenario={scenario} replays=100" in result.stdout
+    print(result.stdout)
+
+
+def _run_value_subprocess(request, scenario):
     _binaries("a2a3", "tensormap_and_ringbuffer")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     result = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), "a2a3", "tensormap_and_ringbuffer", device, "eager_values"],
+        [sys.executable, str(Path(__file__).resolve()), "a2a3", "tensormap_and_ringbuffer", device, scenario],
         capture_output=True,
         text=True,
         timeout=300,
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    return result
 
 
 @pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_TMR_CASES)
@@ -691,13 +764,14 @@ def _check_device_query_rejection(lib, ctx, device, scenario, operation, *argume
         faults.clear_device_query_override()
 
 
-def _run_eager_values(arch, runtime, device, scenario="eager_values"):
+def _run_kernel_values(arch, runtime, device, scenario="eager_values"):
     import struct  # noqa: PLC0415
 
     from simpler.task_interface import ChipStorageTaskArgs, ChipTensor, DataType  # noqa: PLC0415
 
     chip = _build_eager_callable(arch, runtime)
-    check_device_query = scenario != "eager_values"
+    check_device_query = scenario in ("device_query_error", "device_mismatch")
+    capture = scenario in _CAPTURE_CASES
     lib = _load(arch, "onboard", runtime)
     acl_signatures = {
         "aclInit": [ctypes.c_char_p],
@@ -767,9 +841,19 @@ def _run_eager_values(arch, runtime, device, scenario="eager_values"):
         assert (
             lib.simpler_kernel_mode_prepare_callable(ctx, 0, chip.buffer_ptr(), chip.buffer_size(), caller_stream) == 0
         )
-        assert lib.aclrtSynchronizeStreamWithTimeout(caller_stream, 60000) == 0
+        if not capture:
+            assert lib.aclrtSynchronizeStreamWithTimeout(caller_stream, 60000) == 0
         committed = lib.committed_device_memory_ctx(ctx)
         assert committed > 0
+
+        if capture:
+            from kernel_capture_values import run_capture_values  # noqa: PLC0415
+
+            run_capture_values(lib, ctx, caller_stream, committed, allocations, scenario)
+            assert lib.finalize_device(ctx) == 0
+            initialized = False
+            assert lib.committed_device_memory_ctx(ctx) == 0
+            return
 
         count = 128 * 128
         host_array = ctypes.c_float * count
@@ -821,24 +905,38 @@ def _run_eager_values(arch, runtime, device, scenario="eager_values"):
         assert lib.finalize_device(ctx) == 0
         initialized = False
         assert lib.committed_device_memory_ctx(ctx) == 0
+    except BaseException:
+        if capture:
+            import traceback  # noqa: PLC0415
+
+            traceback.print_exc()
+            print("kernel_capture FAIL: retaining graph-visible resources until subprocess exit", flush=True)
+            sys.stderr.flush()
+            # Capture/enqueue/sync failures do not establish device quiescence.
+            os._exit(1)
+        raise
     finally:
-        if caller_stream:
-            lib.aclrtSynchronizeStreamWithTimeout(caller_stream, 60000)
-        if ctx:
-            if initialized:
-                lib.finalize_device(ctx)
-            lib.destroy_device_context(ctx)
-        for address in reversed(allocations):
-            assert lib.aclrtFree(address) == 0
-        if caller_stream:
-            assert lib.aclrtDestroyStream(caller_stream) == 0
-        if selected:
-            assert lib.aclrtResetDevice(device) == 0
-        assert lib.aclFinalize() == 0
+        _close_value_context(lib, ctx, initialized, allocations, caller_stream, device, selected)
+
+
+def _close_value_context(lib, ctx, initialized, allocations, caller_stream, device, selected):
+    if caller_stream:
+        lib.aclrtSynchronizeStreamWithTimeout(caller_stream, 60000)
+    if ctx:
+        if initialized:
+            lib.finalize_device(ctx)
+        lib.destroy_device_context(ctx)
+    for address in reversed(allocations):
+        assert lib.aclrtFree(address) == 0
+    if caller_stream:
+        assert lib.aclrtDestroyStream(caller_stream) == 0
+    if selected:
+        assert lib.aclrtResetDevice(device) == 0
+    assert lib.aclFinalize() == 0
 
 
 if __name__ == "__main__":
-    if sys.argv[4] in ("eager_values", "device_query_error", "device_mismatch"):
-        _run_eager_values(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4])
+    if sys.argv[4] in ("eager_values", "device_query_error", "device_mismatch", *_CAPTURE_CASES):
+        _run_kernel_values(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4])
     else:
         _run_lifecycle_retry(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4])

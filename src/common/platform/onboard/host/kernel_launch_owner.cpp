@@ -80,7 +80,6 @@ int DeviceRunnerBase::launch_kernel_callable(
         h.aicore_done = r.kernel_exec_state_.event(KernelEventKind::AicoreDone);
         h.aicpu_done = r.kernel_exec_state_.event(KernelEventKind::AicpuDone);
         h.serial_tail = r.kernel_exec_state_.event(KernelEventKind::SerialTail);
-        h.consume_prepare_tail = r.kernel_prepare_pending_;
         out->previous_caller_identity = r.kernel_previous_caller_;
         return 0;
     };
@@ -88,7 +87,6 @@ int DeviceRunnerBase::launch_kernel_callable(
         auto &s = *static_cast<Submission *>(context);
         if (result.status == 0) {
             s.runner->kernel_previous_caller_ = reinterpret_cast<uintptr_t>(s.caller);
-            s.runner->kernel_prepare_pending_ = false;
         } else if (result.enqueue_started) {
             s.runner->kernel_exec_state_.poison(result.status);
         }

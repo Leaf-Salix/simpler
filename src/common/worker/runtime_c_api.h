@@ -668,10 +668,10 @@ int simpler_kernel_mode_init(
  * image is hashed or uploaded is the implementation's obligation. Shared
  * entry validation checks the canonical image bounds, signature counts,
  * symbol names, alignment, and the callable id range. Preparation may
- * allocate persistent state and enqueue asynchronous device work on
- * `caller_stream`, but never synchronizes a stream or device - preparation
- * errors surface through the caller's own warmup plus synchronize. The
- * stream is borrowed for this call only.
+ * allocate persistent state and synchronizes registration on the context's
+ * private AICPU stream before publishing readiness. Preparation does not
+ * enqueue work on `caller_stream` or carry an event dependency into launch.
+ * The stream argument remains required by this ABI but is not retained.
  */
 int simpler_kernel_mode_prepare_callable(
     DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream

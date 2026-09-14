@@ -107,13 +107,13 @@ enum class KernelStreamKind : uint8_t {
  * becomes resident, and until it is the launch can still cancel a waiting
  * AICore without an AICPU having written the handshake.
  *
- * PrepareTail is recorded by preparation that enqueued device work of its own
- * and is consumed by the next launch, which is the only ordering a launch
- * needs against a prepare that did not stage on the caller's stream.
+ * PrepareTail is reserved for the generic binder's optional prepare edge.
+ * The production owner completes preparation on its private stream and
+ * never waits on this event inside capture.
  */
 enum class KernelEventKind : uint8_t {
     Start = 0,   /* caller → aicpu and caller → aicore fork */
-    PrepareTail, /* preparation → first launch */
+    PrepareTail, /* reserved optional preparation edge */
     AicoreDone,  /* aicore → caller join */
     AicpuDone,   /* aicpu → caller join */
     SerialTail,  /* caller-visible call tail; the stream-switch gate reads it */
