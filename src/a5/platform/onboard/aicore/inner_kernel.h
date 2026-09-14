@@ -17,8 +17,7 @@
  * running on real Ascend hardware with CANN compiler support.
  */
 
-#ifndef PLATFORM_A5_AICORE_INNER_KERNEL_H_
-#define PLATFORM_A5_AICORE_INNER_KERNEL_H_
+#pragma once
 
 #include <cstdint>
 
@@ -43,6 +42,10 @@
 
 // OUT_OF_ORDER_FULL_BARRIER - no-op on real hardware (dcci handles full cache coherency)
 #define OUT_OF_ORDER_FULL_BARRIER() ((void)0)
+
+__aicore__ inline uint32_t read_aicore_teardown_control(__gm__ uint32_t *control) {
+    return static_cast<uint32_t>(ld_dev(control, 0));
+}
 
 /**
  * Read an AICore register via SPR access
@@ -121,5 +124,3 @@ __aicore__ inline uint32_t get_physical_core_id() { return static_cast<uint32_t>
  * @return Hardware counter value (ticks)
  */
 __aicore__ __attribute__((always_inline)) inline uint64_t get_sys_cnt_aicore() { return get_sys_cnt(); }
-
-#endif  // PLATFORM_A5_AICORE_INNER_KERNEL_H_

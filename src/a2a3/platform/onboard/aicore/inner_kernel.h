@@ -44,6 +44,10 @@
 // OUT_OF_ORDER_FULL_BARRIER - no-op on real hardware (dcci handles full cache coherency)
 #define OUT_OF_ORDER_FULL_BARRIER() ((void)0)
 
+__aicore__ inline uint32_t read_aicore_teardown_control(__gm__ uint32_t *control) {
+    return static_cast<uint32_t>(ld_dev(control, 0));
+}
+
 // EXITED acknowledges quiescence, not permission to return. The AICPU owns
 // this isolated line; bypass reads must not allocate a cached handshake copy.
 __aicore__ inline void wait_for_post_close_release(__gm__ uint32_t *release) {

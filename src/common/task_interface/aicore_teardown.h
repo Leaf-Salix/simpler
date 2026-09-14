@@ -16,10 +16,14 @@
 #include <type_traits>
 
 constexpr uint32_t AICORE_POST_CLOSE_RELEASE = 1;
+constexpr uint32_t AICORE_PRE_WINDOW_HOST_CANCEL = UINT32_MAX;
+constexpr uint32_t AICORE_PRE_WINDOW_CANCEL_POLL_INTERVAL = 256;
+static_assert((AICORE_PRE_WINDOW_CANCEL_POLL_INTERVAL & (AICORE_PRE_WINDOW_CANCEL_POLL_INTERVAL - 1)) == 0);
 
-// A2/A3: AICPU resets this word before window-open and publishes it only after
-// window-close. AICore bypass-loads it after EXITED; no cached stores or dcci
-// may touch this line while the protocol is active. A5 leaves it unused.
+// A pre-window cancellation uses UINT32_MAX; ordinary A2/A3 retirement uses 1
+// after window-close. AICore only bypass-loads this isolated line. The host
+// clears it before launch and may cancel only before AICPU submission; AICPU
+// admission failures may cancel before opening any register window.
 struct alignas(64) AicoreTeardownControl {
     uint32_t post_close_release;
 };

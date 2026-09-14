@@ -131,6 +131,12 @@ nav:
       - TPUSH/TPOP: tpush-tpop.md
   - Launch and linking:
       - AICPU Kernel Launch: aicpu-kernel-launch-mechanisms.md
+      - Kernel Launch Binder: kernel-launch-binder.md
+      - Kernel Mode Integration Test (zh-cn): zh-cn/kernel-mode-integration-test.md
+      - Kernel Integration Validation: kernel-integration-validation.md
+      - Kernel Callable Residency (zh-cn): zh-cn/kernel-callable-residency.md
+      - HBG Kernel Resource Declarations: host-build-graph-kernel-contract.md
+      - HBG Execution-Slot Admission: host-build-graph-kernel-slot.md
       - Dynamic Linking: dynamic-linking.md
       - Callable Identity: callable-identity-registration.md
       - Callable IPC Registration: callable-ipc-dynamic-register.md

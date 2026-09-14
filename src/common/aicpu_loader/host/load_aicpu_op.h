@@ -42,8 +42,7 @@
  * fingerprint-named preinstall files).
  */
 
-#ifndef COMMON_HOST_LOAD_AICPU_OP_H_
-#define COMMON_HOST_LOAD_AICPU_OP_H_
+#pragma once
 
 #include <cstdint>
 #include <string>
@@ -119,6 +118,12 @@ public:
      */
     int Init(const std::vector<std::string> &extra_symbols);
 
+    // The borrowed handle remains valid until this loader is finalized.
+    rtFuncHandle BuiltInHandle(const std::string &name) const {
+        const auto it = func_handles_.find(name);
+        return it == func_handles_.end() ? nullptr : it->second;
+    }
+
     /** @brief Release binary handle + function handles + temporary JSON. */
     void Finalize();
 
@@ -167,5 +172,3 @@ constexpr const char *RegisterCallableName = "simpler_aicpu_register_callable";
 }  // namespace KernelNames
 
 }  // namespace host
-
-#endif  // COMMON_HOST_LOAD_AICPU_OP_H_

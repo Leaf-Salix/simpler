@@ -168,9 +168,8 @@ struct Task {
 struct alignas(64) DeviceRuntimeLaunchDesc {
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
-    // Post-close return gates, one isolated cache line per worker. The AICPU
-    // stores here only after that worker's register window is closed; the
-    // AICore bypass-loads its own entry and returns once it reads RELEASE.
+    // Return gates, one isolated cache line per worker: cancellation before
+    // window-open, or AICPU release after that worker's window has closed.
     // Separate from workers[] because the AICore flushes its whole Handshake
     // line, which would overwrite a gate sharing it.
     AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];

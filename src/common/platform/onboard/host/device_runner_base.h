@@ -71,6 +71,12 @@
 #include "host/host_phase_run_state.h"
 #include "host/kernel_entry_validation.h"
 #include "host/child_memory_host_view.h"
+#include "host/kernel_execution_state.h"
+#include "host/kernel_context_claim.h"
+#include "host/kernel_callable_cache.h"
+#include "worker/kernel_dispatch_packet.h"
+#include "kernel_persistent_args.h"
+#include "host/kernel_static_config.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
 #include "host/runtime_timeout_config.h"
@@ -142,12 +148,38 @@ public:
 
     /**
      * This context's execution identity, latched once by whichever init entry
-     * constructs it. Every kernel-mode guard on the ACL-lifecycle and arena
-     * paths keys on is_kernel(); `attach_current_thread` refuses outright on a
-     * kernel latch, which is what keeps the program-mode entries and the
-     * per-thread device bind off a borrowed device.
+     * constructs it. Every kernel-mode guard on the ACL-lifecycle and capacity
+     * paths keys on is_kernel() — the pooled arena regions here, and the trb
+     * retained temporary buffer through HostApiOps::is_kernel_mode, which
+     * carries this same latch into runtime code. `attach_current_thread`
+     * refuses outright on a kernel latch, which is what keeps the program-mode
+     * entries and the per-thread device bind off a borrowed device.
      */
     ExecutionModeLatch &execution_mode_latch() { return execution_mode_latch_; }
+
+    /** Context-lifetime streams and events, live only in kernel mode. */
+    KernelExecutionState &kernel_execution_state() { return kernel_exec_state_; }
+    bool has_persistent_kernel_args() const { return persistent_args_.has_live_resources(); }
+
+    /**
+     * Bring up a kernel-mode context on a device the caller already owns:
+     * adopt its identity without changing the caller's device binding, create
+     * the context's own streams and events, then bootstrap the inner AICPU SO
+     * and launch simpler_aicpu_init on the context's AICPU stream. Creates no
+     * async-DMA workspace — that channel belongs to program mode.
+     */
+    int init_kernel_context(int device_id, const CallConfig &config, uint64_t context_generation);
+
+    /**
+     * Register one callable on a kernel-mode context and make sure the
+     * context's persistent argument blocks exist. Idempotent in the part that
+     * matters: only the first callable pays for the argument blocks.
+     */
+    int prepare_kernel_callable(int32_t callable_id, const HostApi *api, void *caller_stream);
+    int launch_kernel_callable(int32_t callable_id, const ChipStorageTaskArgs &args, void *caller_stream);
+    std::mutex &kernel_submission_mutex() { return kernel_submission_mutex_; }
+    KernelCallableCache &kernel_callable_cache() { return kernel_callable_cache_; }
+    KernelCallableCache::Ops kernel_callable_cache_ops();
 
     /** Allocate / free / copy on the per-Worker `MemoryAllocator` + CANN runtime. */
     void *allocate_tensor(std::size_t bytes);
@@ -217,15 +249,19 @@ public:
      * is 0 for the hbg path (no prebuilt runtime arena) — the
      * corresponding arena stays uncommitted.
      *
-     * On failure to commit a later region, earlier committed regions are
-     * rolled back (a5's prior semantics). This is the safer default: a
+     * An allocation failure on any region rolls the whole bank back,
+     * earlier committed peers included. This is the safer default: a
      * partial commit otherwise leaves the caller with pooled pointers
      * that survive a "failure" return, masking the real error and risking
-     * later mismatched-arena bugs. (The a2a3 implementation that
-     * previously kept earlier committed peers alive on failure is
-     * normalized away.)
+     * later mismatched-arena bugs.
      *
-     * @return 0 on success, -1 on failure.
+     * A kernel-mode context's refusal to re-base or release a committed
+     * region is the one failure that does not roll back — every region
+     * stays committed and every cached size stays intact, because the
+     * rollback would free the addresses the refusal exists to hold still.
+     * A caller distinguishes the two by mode, not by the return code.
+     *
+     * @return 0 on success, PTO_RUNTIME_ERR_INTERNAL on failure.
      */
     int setup_static_arena(uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
 
@@ -714,6 +750,14 @@ public:
     virtual int finalize() = 0;
 
     /**
+     * Populate the device-side KernelArgs fields only this architecture knows
+     * how to produce: the per-core register table on both, plus a2a3's FFTS
+     * base address. Anything allocated here must come from `mem_alloc_`, which
+     * is what PersistentKernelArgs releases through. DFX fields stay zero.
+     */
+    virtual int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) = 0;
+
+    /**
      * Arm or disarm this thread's host-side dep_gen capture, from the run's own
      * config, before it binds.
      *
@@ -905,15 +949,27 @@ protected:
      */
     void configure_aicore_op_timeout();
 
+    /** The four operations PersistentKernelArgs is allowed to perform. */
+    PersistentArgsOps persistent_args_ops();
+    virtual int prepare_aicpu_affinity(Runtime &runtime, int requested, rtStream_t control_stream) = 0;
+
     /**
-     * Load AICPU SO and initialize device args. Called from
-     * `ensure_device_initialized()` after the persistent streams are
-     * created. Reads `aicpu_so_binary_` / `dispatcher_so_binary_` off
-     * the runner; releases both host buffers on success.
+     * Launch the AICPU callable registration on `control_stream` and wait for
+     * it. The device must already be up; launch_device_register() is the
+     * program-mode entry that brings it up first.
+     */
+    int register_callable_on_device(int32_t callable_id, rtStream_t control_stream);
+
+    /**
+     * Load AICPU SO and initialize device args. Called after the context's
+     * AICPU control stream exists, with that stream: it is `stream_aicpu_`
+     * for a program-mode context and the kernel context's own AICPU stream
+     * otherwise. Reads `aicpu_so_binary_` / `dispatcher_so_binary_` off the
+     * runner; releases both host buffers on success.
      *
      * @return 0 on success, error code on failure.
      */
-    int ensure_binaries_loaded();
+    int ensure_binaries_loaded(rtStream_t control_stream);
 
     /**
      * Initial launch of `simpler_aicpu_init`, latching the invariants (orch
@@ -924,7 +980,11 @@ protected:
      *
      * @return 0 on success, error code on failure.
      */
-    int ensure_aicpu_init_launched();
+    /**
+     * Launch simpler_aicpu_init on the context's AICPU control stream and
+     * wait for it. Same stream ownership rule as ensure_binaries_loaded().
+     */
+    int ensure_aicpu_init_launched(rtStream_t control_stream);
 
     /**
      * Provision the async-DMA workspaces this Worker asked for (see
@@ -1228,6 +1288,7 @@ protected:
         // common
         std::vector<std::pair<int, uint64_t>> kernel_addrs;
         std::vector<ArgDirection> signature;
+        simpler::kernel::KernelDispatchPacket kernel_packet;
         // hbg path (host already dlopen'd the orch SO)
         void *host_dlopen_handle{nullptr};
         void *host_orch_func_ptr{nullptr};
@@ -1282,6 +1343,22 @@ protected:
     // This context's execution identity. Write-once: the first init entry to
     // run latches it, and it never changes afterwards.
     ExecutionModeLatch execution_mode_latch_;
+    // Kernel-mode context state. These stay at their default-constructed
+    // values for a program-mode context, and none performs a runtime call
+    // on destruction.
+    KernelCallableCache kernel_callable_cache_;
+    KernelExecutionState kernel_exec_state_;
+    PersistentKernelArgs persistent_args_;
+    KernelStaticConfig kernel_static_config_;
+    KernelContextClaim kernel_context_claim_;
+    std::mutex kernel_submission_mutex_;
+    uintptr_t kernel_previous_caller_{0};
+    bool kernel_prepare_pending_{false};
+    rtFuncHandle kernel_aicpu_handle_{nullptr};
+    // The Runtime image a kernel-mode context uploads once. Its per-callable
+    // and per-invocation fields stay at the sentinels Runtime() sets; binding
+    // a callable into it is a later step's work.
+    Runtime kernel_runtime_;
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results

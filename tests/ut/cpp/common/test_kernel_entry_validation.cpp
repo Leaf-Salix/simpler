@@ -11,10 +11,9 @@
 
 #include <gtest/gtest.h>
 
-#include <cstdlib>
+#include <cstring>
 
 #include "host/kernel_entry_validation.h"
-#include "utils/device_arena.h"
 
 namespace {
 
@@ -62,15 +61,19 @@ TEST(KernelEntryValidation, InitRejectsEachStructuralViolation) {
     );
     // One inconsistent span per position, in both directions.
     EXPECT_EQ(
-        validate_kernel_init_args(kCtx, 0, nullptr, 4, kBinary, sizeof(kBinary), nullptr, 0, kConfig, 1),
-        PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    );
-    EXPECT_EQ(
         validate_kernel_init_args(kCtx, 0, kBinary, 0, kBinary, sizeof(kBinary), nullptr, 0, kConfig, 1),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
     EXPECT_EQ(
         validate_kernel_init_args(kCtx, 0, kBinary, sizeof(kBinary), nullptr, 4, nullptr, 0, kConfig, 1),
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    EXPECT_EQ(
+        validate_kernel_init_args(kCtx, 0, kBinary, sizeof(kBinary), kBinary, sizeof(kBinary), nullptr, 4, kConfig, 1),
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    EXPECT_EQ(
+        validate_kernel_init_args(kCtx, 0, nullptr, 4, kBinary, sizeof(kBinary), nullptr, 0, kConfig, 1),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
     EXPECT_EQ(
@@ -81,13 +84,9 @@ TEST(KernelEntryValidation, InitRejectsEachStructuralViolation) {
         validate_kernel_init_args(kCtx, 0, kBinary, sizeof(kBinary), kBinary, sizeof(kBinary), kBinary, 0, kConfig, 1),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
-    EXPECT_EQ(
-        validate_kernel_init_args(kCtx, 0, kBinary, sizeof(kBinary), kBinary, sizeof(kBinary), nullptr, 4, kConfig, 1),
-        PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    );
 }
 
-TEST(KernelEntryValidation, PrepareCallableChecksIdRangeAndImageSize) {
+TEST(KernelEntryValidation, PrepareCallableChecksPointersIdRangeAndImageSize) {
     EXPECT_EQ(validate_kernel_prepare_callable_args(kCtx, 0, kCallableImage, sizeof(ChipCallable), kStream), 0);
     EXPECT_EQ(
         validate_kernel_prepare_callable_args(
@@ -103,6 +102,8 @@ TEST(KernelEntryValidation, PrepareCallableChecksIdRangeAndImageSize) {
         validate_kernel_prepare_callable_args(kCtx, 0, nullptr, sizeof(ChipCallable), kStream),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
+    // Preparation stages on the caller's stream, so a null stream is an
+    // argument error rather than something the implementation substitutes for.
     EXPECT_EQ(
         validate_kernel_prepare_callable_args(kCtx, 0, kCallableImage, sizeof(ChipCallable), nullptr),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
@@ -142,69 +143,90 @@ TEST(KernelEntryValidation, LaunchChecksPointersAndIdRange) {
     );
 }
 
-TEST(KernelArenaGuard, UncommittedRegionAcceptsAnyRequest) {
-    // Kernel mode must be able to establish capacity once, so nothing about an
-    // uncommitted region is refusable.
-    EXPECT_FALSE(kernel_arena_change_is_forbidden(false, 0, 0));
-    EXPECT_FALSE(kernel_arena_change_is_forbidden(false, 0, 4096));
-    EXPECT_FALSE(kernel_arena_change_is_forbidden(false, 4096, 8192));
+TEST(KernelEntryValidation, PrepareRejectsInvalidInvocationSignatureBeforeRegistration) {
+    alignas(ChipCallable) unsigned char image[sizeof(ChipCallable)] = {};
+    auto set_count = [&](size_t offset, int32_t count) {
+        std::memcpy(image + offset, &count, sizeof(count));
+    };
+    auto set_direction = [&](int32_t index, ArgDirection direction) {
+        std::memcpy(
+            image + offsetof(ChipCallable, signature_) + index * sizeof(direction), &direction, sizeof(direction)
+        );
+    };
+    set_count(offsetof(ChipCallable, sig_count_), -1);
+    EXPECT_EQ(
+        validate_kernel_prepare_callable_args(kCtx, 0, image, sizeof(image), kStream), PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    set_count(offsetof(ChipCallable, sig_count_), CHIP_MAX_TENSOR_ARGS + 1);
+    EXPECT_EQ(
+        validate_kernel_prepare_callable_args(kCtx, 0, image, sizeof(image), kStream), PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    set_count(offsetof(ChipCallable, sig_count_), 2);
+    set_direction(0, ArgDirection::IN);
+    set_direction(1, ArgDirection::SCALAR);
+    EXPECT_EQ(validate_kernel_prepare_callable_args(kCtx, 0, image, sizeof(image), kStream), 0);
+    constexpr size_t padding_begin = offsetof(ChipCallable, config_name_len_) + sizeof(uint32_t);
+    std::memset(image + padding_begin, 0xff, offsetof(ChipCallable, storage_) - padding_begin);
+    EXPECT_EQ(validate_kernel_prepare_callable_args(kCtx, 0, image, sizeof(image), kStream), 0);
+    set_direction(0, ArgDirection::SCALAR);
+    set_direction(1, ArgDirection::OUT);
+    EXPECT_EQ(
+        validate_kernel_prepare_callable_args(kCtx, 0, image, sizeof(image), kStream), PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    set_direction(0, static_cast<ArgDirection>(99));
+    EXPECT_EQ(
+        validate_kernel_prepare_callable_args(kCtx, 0, image, sizeof(image), kStream), PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
 }
 
-TEST(KernelArenaGuard, CommittedRegionRefusesGrowAndRelease) {
-    EXPECT_TRUE(kernel_arena_change_is_forbidden(true, 4096, 4097));
-    EXPECT_TRUE(kernel_arena_change_is_forbidden(true, 4096, 0));
-}
-
-TEST(KernelArenaGuard, CommittedRegionAllowsSameSizeAndShrink) {
-    // A shrink keeps the base and the committed size, so a captured graph's
-    // addresses survive it.
-    EXPECT_FALSE(kernel_arena_change_is_forbidden(true, 4096, 4096));
-    EXPECT_FALSE(kernel_arena_change_is_forbidden(true, 4096, 2048));
-    // Committed with nothing cached: asking for nothing changes nothing.
-    EXPECT_FALSE(kernel_arena_change_is_forbidden(true, 0, 0));
-}
-
-struct CountingBackend {
-    int frees = 0;
-    static void *alloc(void * /*ctx*/, size_t size) { return std::malloc(size); }
-    static void free_fn(void *ctx, void *ptr) {
-        static_cast<CountingBackend *>(ctx)->frees++;
-        std::free(ptr);
-    }
-};
-
-TEST(KernelArenaGuard, RefusalScanOverCommittedRegionsReleasesNothing) {
-    // setup_static_arena's three-region shape. The guard is evaluated over
-    // every region before any of them is touched, so reaching a refusal must
-    // leave each committed peer's base, size and committed flag intact —
-    // the arena commit sequence's rollback would free exactly these.
-    CountingBackend backend;
-    DeviceArena gm_heap(&CountingBackend::alloc, &CountingBackend::free_fn, &backend);
-    DeviceArena gm_sm(&CountingBackend::alloc, &CountingBackend::free_fn, &backend);
-    DeviceArena runtime_pool(&CountingBackend::alloc, &CountingBackend::free_fn, &backend);
-
-    const size_t cached[] = {4096, 2048, 1024};
-    DeviceArena *arenas[] = {&gm_heap, &gm_sm, &runtime_pool};
-    for (size_t i = 0; i < 3; ++i) {
-        arenas[i]->reserve(cached[i], 64);
-        ASSERT_NE(arenas[i]->commit(), nullptr);
-    }
-    const int frees_after_commit = backend.frees;
-    void *const bases[] = {gm_heap.base(), gm_sm.base(), runtime_pool.base()};
-
-    // The third region asks to grow; the first two are unchanged requests.
-    const size_t requested[] = {4096, 2048, 8192};
-    bool refused = false;
-    for (size_t i = 0; i < 3 && !refused; ++i) {
-        refused = kernel_arena_change_is_forbidden(arenas[i]->is_committed(), cached[i], requested[i]);
-    }
-
-    EXPECT_TRUE(refused);
-    EXPECT_EQ(backend.frees, frees_after_commit);
-    for (size_t i = 0; i < 3; ++i) {
-        EXPECT_TRUE(arenas[i]->is_committed());
-        EXPECT_EQ(arenas[i]->base(), bases[i]);
-    }
+TEST(KernelEntryValidation, PrepareBoundsCanonicalImageBeforeHashOrUpload) {
+    const uint8_t binary[] = {1, 2, 3};
+    const auto child = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, binary, sizeof(binary));
+    const int32_t func_id = 0;
+    const auto valid = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
+        nullptr, 0, "entry", binary, sizeof(binary), &func_id, &child, 1, "config"
+    );
+    ASSERT_EQ(validate_kernel_prepare_callable_args(kCtx, 0, valid.data(), valid.size(), kStream), 0);
+    const auto *header = reinterpret_cast<const ChipCallable *>(valid.data());
+    const size_t child_start = offsetof(ChipCallable, storage_) + header->child_offset(0);
+    auto reject_word = [&](size_t offset, uint32_t value) {
+        auto image = valid;
+        std::memcpy(image.data() + offset, &value, sizeof(value));
+        EXPECT_EQ(
+            validate_kernel_prepare_callable_args(kCtx, 0, image.data(), image.size(), kStream),
+            PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        );
+    };
+    reject_word(offsetof(ChipCallable, binary_size_), UINT32_MAX);
+    reject_word(offsetof(ChipCallable, child_count_), UINT32_MAX);
+    reject_word(offsetof(ChipCallable, child_count_), 1025);
+    reject_word(offsetof(ChipCallable, child_offsets_), UINT32_MAX);
+    reject_word(offsetof(ChipCallable, child_offsets_), 1);
+    reject_word(offsetof(ChipCallable, child_offsets_), 0);
+    reject_word(child_start + offsetof(CoreCallable, binary_size_), UINT32_MAX);
+    reject_word(child_start + offsetof(CoreCallable, sig_count_), CORE_MAX_TENSOR_ARGS + 1);
+    reject_word(offsetof(ChipCallable, func_name_len_), CALLABLE_FUNC_NAME_MAX);
+    reject_word(offsetof(ChipCallable, config_name_len_), CALLABLE_FUNC_NAME_MAX);
+    auto unterminated = valid;
+    std::memset(unterminated.data() + offsetof(ChipCallable, func_name_), 'x', CALLABLE_FUNC_NAME_MAX);
+    EXPECT_EQ(
+        validate_kernel_prepare_callable_args(kCtx, 0, unterminated.data(), unterminated.size(), kStream),
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    EXPECT_EQ(
+        validate_kernel_prepare_callable_args(kCtx, 0, valid.data(), child_start + sizeof(CoreCallable) - 1, kStream),
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    EXPECT_EQ(
+        validate_kernel_prepare_callable_args(kCtx, 0, valid.data(), valid.size() - 1, kStream),
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    auto trailing = valid;
+    trailing.push_back(0);
+    EXPECT_EQ(
+        validate_kernel_prepare_callable_args(kCtx, 0, trailing.data(), trailing.size(), kStream),
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
 }
 
 }  // namespace

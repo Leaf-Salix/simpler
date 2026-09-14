@@ -26,8 +26,7 @@
  * signals AICore via DATA_MAIN_BASE.
  */
 
-#ifndef SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
-#define SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
+#pragma once
 
 #include <stddef.h>  // for offsetof
 #include <stdbool.h>
@@ -43,6 +42,7 @@
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "dispatch_payload.h"
+#include "aicore_teardown.h"
 #include "task_args.h"
 #include "tensormap_and_ringbuffer/entry_args.h"  // EntryArgsStorage
 
@@ -167,7 +167,9 @@ struct Task {
 struct alignas(64) DeviceRuntimeLaunchDesc {
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
-    int worker_count;                       // Number of active workers
+    // Isolated from the handshake lines AICore flushes when reporting ready.
+    AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];
+    int worker_count;  // Number of active workers
 
     // Execution parameters for AICPU scheduling.
     //
@@ -257,6 +259,7 @@ public:
     int get_aicpu_thread_num() const { return dev.aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { dev.aicpu_thread_num = n; }
     Handshake *get_workers() { return dev.workers; }
+    AicoreTeardownControl *get_teardown_gates() { return dev.teardown_gates; }
     int32_t get_aicpu_allowed_cpu_count() const { return dev.aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { dev.aicpu_allowed_cpu_count = n; }
     int32_t get_aicpu_launch_count() const { return dev.aicpu_launch_count; }
@@ -368,5 +371,3 @@ static_assert(
 // object). Defined per-runtime so the shared device_runner_helpers.cpp copy
 // path stays runtime-agnostic.
 size_t runtime_device_copy_size(const Runtime &rt);
-
-#endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
