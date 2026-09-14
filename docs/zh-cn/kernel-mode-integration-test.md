@@ -168,14 +168,29 @@ launch owner 与 binder。
 | cold | capture 内 1 次；没有 eager warmup 或额外 prepare 后 caller 同步 | 100 次，输入地址不变、内容每次变化 |
 | warm | eager 1 次、capture 内 1 次 | 100 次，逐元素精确比对 |
 | A/B/A | 同 callable 分别 capture 两张图，共 2 次 | 两组地址和不同 scalar，按 A/B/A 顺序共 100 次；非活动输出不能被覆盖 |
+| chain | 同一张图内 2 次 | `x → intermediate → output`，100 次；每轮毒化中间值和输出，同时检查两个节点的结果 |
+| batch | 两张图各 2 次，共 4 次 | 交替提交 100 次 replay，循环中只有图执行 API，批末只同步一次；检查反馈数值与各图执行计数 |
 
 原始集成快照的 cold 场景曾返回 `107024`：capture 内等待的 `PrepareTail`，
 对应 record 却发生在 capture 外。eager warmup 会消费这条依赖，因此 warm 场景
 无法暴露问题。prepare 在私有 AICPU stream 上完成同步注册后，production owner
 不再传递该依赖；公开五参 ABI、launch 的异步 fork/join 顺序均不变。
 
-每轮 replay 后同步 caller 再读结果。prepare 后、capture 后、每次 replay 后的
-`committed_device_memory_ctx` 相等，所有 graph 销毁之后才允许 finalize 和释放 tensor。
+除 batch 外，每轮 replay 后同步 caller 再读结果。batch 使用图 A 的 `y=x+1.25`、
+图 B 的 `x=y+2.75` 形成反馈，各图还用当前支持原地读写的小算子累加独立计数。
+从 `x=x0`、`y=-999` 和零计数出发，A/B 交替各执行 50 次后，
+必须得到 `x=x0+200`、`y=x0+197.25`、两个计数均为 50。Host oracle 测试
+逐位置验证单次漏执行、重复和相邻换序的可检出性；不声称覆盖任意组合故障。
+
+测试专用 `kernel_capture_observer.cpp` 使用正式 CANN 类型，只读观察并原样转发
+native AICore/AICPU launch，检查 KernelArgs 指针与 dispatch/K4 binding 相等且不变。
+capture 外、设备已静止时，按正式 KernelArgs 类型 D2H 读取 `runtime_args`、`regs`、
+`ffts_base_addr`，比较 replay 前后的静态地址。batch 提交循环内不做这类读取，
+也不做 memcpy、查询或同步。replay 前后 native launch 计数不增长；这不是每次
+replay 都回 Host 观察，更不是读取整个 Runtime 或 arena 的验证。
+
+prepare 后、capture 后、串行每轮及 batch 完成后的 `committed_device_memory_ctx` 相等，
+所有 graph 销毁之后才允许 finalize 和释放 tensor，正常 finalize 后 committed 为零。
 这项计量不等于拦截过全部底层 alloc/free，也不包含 CANN 自己持有的 graph 内存。
 
 ## 9. 并入主线时的接口裁决
@@ -210,6 +225,6 @@ launch owner 与 binder。
 
 - 公开 HBG kernel 执行尚未打通。H4 没有提交 PR，HBG 的 kernel 能力位为 0，init 返回 `UNSUPPORTED`。
 - A5 只经过编译、单元测试与仿真，没有真机结果。
-- 数值用例只覆盖一个固定形状的单算子，不覆盖多算子图、其他形状与并发 launch。
-- 公开 capture/replay 只覆盖第 8 节的单 context、单 caller、固定形状和串行场景；未验证单图多算子、任意跨图重叠、错误取消或 vLLM/PyPTO 混合执行。
+- 数值用例复用固定形状的 scalar-add callable，覆盖单节点、同图两节点及有序多图反馈，不代表任意算子或形状。
+- 公开 capture/replay 只覆盖第 8 节的单 context、单 caller、固定形状场景；连续入队仍由同一 stream 保序，不代表允许并发共享 workspace。未验证任意跨流/跨图重叠、原生错误取消或 vLLM/PyPTO 混合执行。
 - 同一 host runtime 动态库内限制同一设备只能有一个活动 kernel 上下文；跨动态库副本或跨进程需要调用方自行串行化。

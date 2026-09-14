@@ -59,7 +59,7 @@ _ONBOARD_CASES = [
     for runtime in _RUNTIMES
 ]
 _ONBOARD_TMR_CASES = [case for case in _ONBOARD_CASES if case.values[1] == "tensormap_and_ringbuffer"]
-_CAPTURE_CASES = ("capture_cold", "capture_warm", "capture_aba")
+_CAPTURE_CASES = ("capture_cold", "capture_warm", "capture_aba", "capture_chain", "capture_batch")
 
 
 @pytest.fixture(scope="module")
@@ -72,6 +72,39 @@ def kernel_close_faults(tmp_path_factory):
             "-fPIC",
             "-I" + str(_PROJECT_ROOT / "src/common/log/include"),
             str(Path(__file__).with_name("kernel_close_faults.cpp")),
+            "-ldl",
+            "-o",
+            str(output),
+        ],
+        check=True,
+    )
+    return output
+
+
+@pytest.fixture(scope="module")
+def kernel_capture_observer(tmp_path_factory):
+    import platform  # noqa: PLC0415
+
+    sdk = Path(os.environ["ASCEND_HOME_PATH"])
+    include_dirs = [
+        sdk / "include",
+        sdk / f"{platform.machine()}-linux/pkg_inc",
+        sdk / f"{platform.machine()}-linux/pkg_inc/runtime",
+        sdk / f"{platform.machine()}-linux/pkg_inc/runtime/runtime",
+        sdk / f"{platform.machine()}-linux/pkg_inc/profiling",
+        _PROJECT_ROOT / "src/a2a3/platform/include",
+        _PROJECT_ROOT / "src/common/platform/include",
+        _PROJECT_ROOT / "src/common",
+    ]
+    output = tmp_path_factory.mktemp("kernel-capture-observer") / "observer.so"
+    subprocess.run(
+        [
+            "c++",
+            "-std=c++17",
+            "-shared",
+            "-fPIC",
+            *[f"-I{path}" for path in include_dirs],
+            str(Path(__file__).with_name("kernel_capture_observer.cpp")),
             "-ldl",
             "-o",
             str(output),
@@ -667,21 +700,25 @@ def test_kernel_eager_launch_executes_fresh_tensor_and_scalar_snapshots(request)
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
 @pytest.mark.parametrize("scenario", _CAPTURE_CASES)
-def test_kernel_graph_capture_replays_public_launch(request, scenario):
-    result = _run_value_subprocess(request, scenario)
+def test_kernel_graph_capture_replays_public_launch(request, scenario, kernel_capture_observer):
+    result = _run_value_subprocess(request, scenario, kernel_capture_observer)
     assert f"kernel_capture PASS scenario={scenario} replays=100" in result.stdout
     print(result.stdout)
 
 
-def _run_value_subprocess(request, scenario):
+def _run_value_subprocess(request, scenario, observer=None):
     _binaries("a2a3", "tensormap_and_ringbuffer")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    env = dict(os.environ)
+    if observer is not None:
+        env["LD_PRELOAD"] = str(observer) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
     result = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), "a2a3", "tensormap_and_ringbuffer", device, scenario],
         capture_output=True,
         text=True,
         timeout=300,
         check=False,
+        env=env,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     return result
