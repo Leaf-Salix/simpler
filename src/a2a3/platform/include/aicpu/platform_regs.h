@@ -138,6 +138,9 @@ inline void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
  */
 void platform_init_aicore_regs(uint64_t reg_addr);
 
+uint64_t platform_aicore_exit_deadline();
+void platform_close_aicore_window(uint64_t reg_addr);
+
 /** Send the AICore exit signal without waiting for an acknowledgement. */
 void platform_signal_aicore_exit(uint64_t reg_addr);
 

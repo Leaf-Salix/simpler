@@ -70,3 +70,6 @@ int32_t platform_aicpu_affinity_thread_idx();
 // drops every sub-phase stamp. Must be called on the executing thread, before
 // any phase stamping.
 void platform_aicpu_affinity_set_thread_idx(int32_t idx);
+
+int32_t platform_aicpu_current_cpu();
+int platform_aicpu_prepare_kernel_thread();

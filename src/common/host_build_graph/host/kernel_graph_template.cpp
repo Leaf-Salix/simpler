@@ -257,14 +257,12 @@ int make_graph_launch_template(
     if (rc != 0) return rc;
     std::memcpy(payload, image, binding.runtime_image.capacity);
     SimplerKernelInvocationHeader invocation{};
-    invocation.abi_version = SIMPLER_KERNEL_INVOCATION_ABI_VERSION;
-    invocation.header_bytes = sizeof(invocation);
     invocation.mode = SIMPLER_MODE_KERNEL;
     invocation.callable_id = identity.callable_id;
     invocation.generation = identity.callable_generation;
     invocation.tensor_count = identity.tensor_count;
     invocation.scalar_count = identity.scalar_count;
-    invocation.payload_bytes = header.total_bytes;
+    invocation.payload_bytes = next.size_ - sizeof(invocation);
     std::memcpy(packet, &invocation, sizeof(invocation));
     std::memcpy(packet + sizeof(invocation), &header, sizeof(header));
     std::memcpy(

@@ -11,6 +11,11 @@
 
 #include "aicpu/platform_regs.h"
 
+int32_t platform_aicpu_current_cpu() { return 0; }
+int platform_aicpu_prepare_kernel_thread() { return 0; }
+void set_platform_regs(uint64_t) {}
+void platform_close_aicore_window(uint64_t) {}
+
 void write_reg(uint64_t base, RegId reg, uint64_t value) {
     reg_store_release(reinterpret_cast<volatile uint32_t *>(base + reg_offset(reg)), static_cast<uint32_t>(value));
 }

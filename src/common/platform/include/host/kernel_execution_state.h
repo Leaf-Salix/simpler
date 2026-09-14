@@ -17,6 +17,7 @@
 #include <mutex>
 
 #include "runtime_c_api.h"
+#include "host/kernel_device_resources.h"
 
 /**
  * Runtime operations owned by the kernel-context lifecycle — the complete
@@ -159,7 +160,28 @@ public:
     KernelExecutionState(const KernelExecutionState &) = delete;
     KernelExecutionState &operator=(const KernelExecutionState &) = delete;
 
-    int initialize(int requested_device_id, const KernelContextOps &ops);
+    // The two-argument form is retained for K1 callers and uses generation 1
+    // as the legacy context identity. New callers must pass a non-zero
+    // generation so resource bindings cannot cross context lifetimes.
+    int initialize(int requested_device_id, const KernelContextOps &ops) {
+        return initialize(requested_device_id, ops, 1);
+    }
+    int initialize(int requested_device_id, const KernelContextOps &ops, uint64_t context_generation);
+    int prepare_resources(const KernelResourceLayout &layout, const KernelResourceOps &ops);
+    int freeze_resources();
+    int bind_resources_for_launch(
+        int device_id, uint64_t generation, uint64_t schema, const uint64_t *required, size_t count,
+        KernelResourceBinding &out
+    ) const;
+    // HBG seals a graph slot immediately after FREEZE and before the ready
+    // publication transition. It uses the same frozen ledger, but deliberately
+    // does not require ReadyEnqueued like a launch binding does.
+    int inspect_frozen_resources(
+        int device_id, uint64_t generation, uint64_t schema, const uint64_t *required, size_t count,
+        KernelResourceBinding &out
+    ) const;
+    bool resources_prepared() const;
+    bool resources_frozen() const;
     int mark_ready_enqueued();
     void poison(int runtime_error);
     int close();
@@ -171,6 +193,7 @@ public:
     int unexpected_teardown_error() const;
     bool has_live_resources() const;
     void *hidden_stream(KernelStreamKind kind) const;
+    void *stream(KernelStreamKind kind) const { return hidden_stream(kind); }
     void *event(KernelEventKind kind) const;
 
 private:
@@ -180,6 +203,8 @@ private:
     mutable std::mutex mutex_;
     KernelContextPhase phase_{KernelContextPhase::New};
     int device_id_{-1};
+    uint64_t context_generation_{0};
+    KernelDeviceResources resources_;
     int last_runtime_error_{0};
     int unexpected_teardown_error_{0};
     KernelContextOps ops_{};

@@ -64,20 +64,14 @@ void platform_init_aicore_regs(uint64_t reg_addr) {
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
 }
 
-void platform_signal_aicore_exit(uint64_t reg_addr) { write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL); }
-
 uint64_t platform_aicore_exit_deadline() { return get_sys_cnt_aicpu() + inner_get_deinit_timeout_ticks(); }
 
 void platform_close_aicore_window(uint64_t reg_addr) {
-    // Initialize task dispatch register to idle state
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
-    // Close fast path control
-    write_reg(reg_addr, RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_CLOSE);
-    // Complete the posted MMIO close. A release store alone is not a
-    // device-write completion fence; the drain that pairs with this read is the
-    // caller's, so several windows share one.
-    (void)read_reg(reg_addr, RegId::FAST_PATH_ENABLE);
+    (void)read_reg(reg_addr, RegId::DATA_MAIN_BASE);
 }
+
+void platform_signal_aicore_exit(uint64_t reg_addr) { write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL); }
 
 int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t count, uint64_t deadline, bool *released) {
     // `released` is filled before anything can return, rejection included, so a

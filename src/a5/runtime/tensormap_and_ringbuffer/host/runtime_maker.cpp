@@ -492,6 +492,10 @@ static bool derive_arena_static_sizes(const ArenaSizingConfig &sizing, ArenaStat
     return true;
 }
 
+static bool build_and_cache_prebuilt_arena(
+    const HostApi *api, const ArenaSizingConfig &sizing, StaticArenaPtrs *out_ptrs, RuntimeArenaLayout *out_layout
+);
+
 int configure_kernel_runtime_impl(Runtime &runtime, bool serial_orch_sched) {
     runtime.dev.serial_orch_sched = serial_orch_sched;
     return 0;
@@ -540,6 +544,22 @@ extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, Pip
     };
     if (!is_valid_tmr_kernel_pipeline_contract(&candidate)) return PTO_RUNTIME_ERR_INTERNAL;
     *out = candidate;
+    return 0;
+}
+
+extern "C" int prepare_kernel_runtime_impl(Runtime *runtime, const HostApi *api, const CallConfig *config) {
+    if (runtime == nullptr || api == nullptr || config == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    ArenaSizingConfig sizing;
+    if (!resolve_arena_sizing(
+            config->runtime_env.ring_task_window, config->runtime_env.ring_heap, config->runtime_env.ring_dep_pool,
+            &sizing
+        ))
+        return PTO_RUNTIME_ERR_INTERNAL;
+    StaticArenaPtrs ptrs;
+    RuntimeArenaLayout layout;
+    if (!build_and_cache_prebuilt_arena(api, sizing, &ptrs, &layout)) return PTO_RUNTIME_ERR_INTERNAL;
+    runtime->set_gm_sm_ptr(ptrs.gm_sm);
+    runtime->set_prebuilt_arena(ptrs.runtime_arena_dev, layout.offsets.off_runtime);
     return 0;
 }
 
@@ -1070,7 +1090,11 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
 // device, so it exports simpler_aicpu_register_callable; the common AICPU loader
 // queries this so it carries no runtime-specific symbol knowledge.
 extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count) {
-    static const char *const kExtra[] = {"simpler_aicpu_register_callable", "simpler_aicpu_query_topology"};
+    static const char *const kExtra[] = {
+        "simpler_aicpu_register_callable", "simpler_aicpu_register_tmr_kernel_callable",
+        "simpler_aicpu_release_tmr_kernel_callable", "simpler_aicpu_prepare_tmr_context", "simpler_aicpu_release_tmr_context",
+        "simpler_aicpu_query_topology", "simpler_aicpu_kernel_exec"
+    };
     if (count != nullptr) {
         *count = sizeof(kExtra) / sizeof(kExtra[0]);
     }

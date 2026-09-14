@@ -282,6 +282,7 @@ class RuntimeCompiler:
         dispatcher_dest: Optional[Union[str, Path]] = None,
         sdma_warmup_dest: Optional[Union[str, Path]] = None,
         cmake_defines: Optional[dict[str, str]] = None,
+        kernel_aicore_dest: Optional[Union[str, Path]] = None,
     ) -> Union[bytes, Path]:
         """
         Compile binary for the specified target platform.
@@ -305,6 +306,8 @@ class RuntimeCompiler:
                         product). When None, or when the arch does not build the
                         warmup ELF at all, nothing is exported.
             cmake_defines: Additional CMake cache definitions for this target.
+            kernel_aicore_dest: Directory to stage the separate TMR kernel-mode
+                        AICore ELF when the onboard target builds it.
 
         Returns:
             If output_dir is set: Path to the compiled binary in output_dir.
@@ -378,6 +381,13 @@ class RuntimeCompiler:
                     dest_dir = Path(sdma_warmup_dest)
                     dest_dir.mkdir(parents=True, exist_ok=True)
                     place_binary(warmup_obj, dest_dir / warmup_name)
+            if target_platform == "aicore" and kernel_aicore_dest is not None and self.platform in ("a2a3", "a5"):
+                kernel_obj = Path(actual_build_dir) / "aicore_kernel_mode.o"
+                if not kernel_obj.is_file():
+                    raise FileNotFoundError(f"TMR kernel-mode AICore binary not found: {kernel_obj}")
+                dest_dir = Path(kernel_aicore_dest)
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                place_binary(kernel_obj, dest_dir / "aicore_kernel_mode.o")
             if output_dir is not None:
                 od = Path(output_dir)
                 od.mkdir(parents=True, exist_ok=True)

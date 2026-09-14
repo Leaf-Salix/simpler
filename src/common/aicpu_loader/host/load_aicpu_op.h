@@ -164,6 +164,10 @@ namespace KernelNames {
 constexpr const char *RunName = "simpler_aicpu_exec";   // multi-threaded exec
 constexpr const char *InitName = "simpler_aicpu_init";  // per-device one-shot invariants
 constexpr const char *RegisterCallableName = "simpler_aicpu_register_callable";
+constexpr const char *RegisterKernelCallableName = "simpler_aicpu_register_tmr_kernel_callable";
+constexpr const char *ReleaseKernelCallableName = "simpler_aicpu_release_tmr_kernel_callable";
+constexpr const char *PrepareTmrContextName = "simpler_aicpu_prepare_tmr_context";
+constexpr const char *ReleaseTmrContextName = "simpler_aicpu_release_tmr_context";
 }  // namespace KernelNames
 
 }  // namespace host

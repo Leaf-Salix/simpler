@@ -74,6 +74,7 @@ public:
     }
 
     size_t bytes() const noexcept { return template_.size(); }
+    void clear() noexcept { template_.clear(); }
 
 private:
     // Canonical packet with tensor addresses and scalar bits zeroed. Scope,

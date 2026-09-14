@@ -31,6 +31,9 @@
 #ifndef __aicore__
 #define __aicore__
 #endif
+#ifndef __gm__
+#define __gm__
+#endif
 
 // dcci (Data Cache Clean and Invalidate) - full fence in simulation
 // Hardware dcci has two roles:
@@ -56,6 +59,18 @@ typedef int mem_dsb_t;
 #define ENTIRE_DATA_CACHE 0
 #define SINGLE_CACHE_LINE 0
 #define CACHELINE_OUT 0
+
+template <typename T>
+__aicore__ inline T load_kernel_gm_word(T *address) {
+    (void)address;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    return *reinterpret_cast<volatile T *>(address);
+}
+template <typename T>
+__aicore__ inline void store_kernel_gm_word(T *address, T value) {
+    *reinterpret_cast<volatile T *>(address) = value;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+}
 
 // pipe_barrier - memory barrier in simulation (hardware pipeline synchronization)
 #define PIPE_ALL 0

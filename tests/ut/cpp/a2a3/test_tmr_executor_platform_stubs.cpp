@@ -11,6 +11,11 @@
 
 #include "aicpu/platform_regs.h"
 
+int32_t platform_aicpu_current_cpu() { return 0; }
+int platform_aicpu_prepare_kernel_thread() { return 0; }
+void set_platform_regs(uint64_t) {}
+void platform_close_aicore_window(uint64_t) {}
+
 int32_t platform_retire_aicore_group(const AicoreExitTarget *, size_t count, uint64_t, bool *released) {
     if (released != nullptr) {
         for (size_t i = 0; i < count; ++i)

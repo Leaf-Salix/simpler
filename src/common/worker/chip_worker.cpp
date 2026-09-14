@@ -177,6 +177,11 @@ void ChipWorker::init(
     if (device_id < 0) {
         throw std::runtime_error("ChipWorker::init requires a non-negative device_id");
     }
+    kernel_mode_ = !pending_kernel_aicore_path_.empty();
+    if (kernel_mode_ && pending_kernel_context_generation_ == 0) {
+        throw std::runtime_error("kernel-mode init requires a non-zero context generation");
+    }
+    const std::string &selected_aicore_path = kernel_mode_ ? pending_kernel_aicore_path_ : aicore_path;
     pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, {}};
 
     if (!sim_context_path.empty()) {
@@ -317,7 +322,7 @@ void ChipWorker::init(
     int init_rc = 0;
     try {
         std::vector<uint8_t> aicpu_bytes = read_binary_file(aicpu_path);
-        std::vector<uint8_t> aicore_bytes = read_binary_file(aicore_path);
+        std::vector<uint8_t> aicore_bytes = read_binary_file(selected_aicore_path);
         // dispatcher_path is empty on sim (no dispatcher) and on tests that
         // exercise _ChipWorker.init directly without a RuntimeBinaries.
         // simpler_init treats a null/empty buffer as "no dispatcher" — onboard
@@ -342,11 +347,19 @@ void ChipWorker::init(
         // `prewarm_config` (fork-constant, COW-delivered) rides simpler_init: the
         // platform builds + caches the prebuilt runtime-arena for its ring sizing
         // right after the device comes up. Null => no prewarm.
-        init_rc = simpler_init_fn_(
-            device_ctx_, device_id, aicpu_bytes.data(), aicpu_bytes.size(), aicore_bytes.data(), aicore_bytes.size(),
-            dispatcher_ptr, dispatcher_bytes.size(), prewarm_config, enable_sdma ? 1 : 0, warmup_ptr,
-            warmup_bytes.size()
-        );
+        if (kernel_mode_) {
+            init_rc = kernel_init_fn_(
+                device_ctx_, device_id, aicpu_bytes.data(), aicpu_bytes.size(), aicore_bytes.data(),
+                aicore_bytes.size(), dispatcher_ptr, dispatcher_bytes.size(), &pending_kernel_config_,
+                pending_kernel_context_generation_
+            );
+        } else {
+            init_rc = simpler_init_fn_(
+                device_ctx_, device_id, aicpu_bytes.data(), aicpu_bytes.size(), aicore_bytes.data(),
+                aicore_bytes.size(), dispatcher_ptr, dispatcher_bytes.size(), prewarm_config, enable_sdma ? 1 : 0,
+                warmup_ptr, warmup_bytes.size()
+            );
+        }
     } catch (...) {
         destroy_device_context_fn_(device_ctx_);
         device_ctx_ = nullptr;
@@ -568,7 +581,28 @@ void ChipWorker::finalize() {
     pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, {}};
     initialized_ = false;
     device_id_ = -1;
+    kernel_mode_ = false;
     finalized_ = true;
+}
+
+void ChipWorker::init_kernel_mode(
+    const std::string &host_lib_path, const std::string &aicpu_path, const std::string &kernel_aicore_path,
+    const std::string &dispatcher_path, int device_id, const CallConfig &config, uint64_t context_generation
+) {
+    if (kernel_aicore_path.empty() || context_generation == 0)
+        throw std::runtime_error("kernel-mode init requires a dedicated AICore ELF and generation");
+    pending_kernel_aicore_path_ = kernel_aicore_path;
+    pending_kernel_config_ = config;
+    pending_kernel_context_generation_ = context_generation;
+    try {
+        init(host_lib_path, aicpu_path, kernel_aicore_path, dispatcher_path, device_id, nullptr, false, "", "");
+    } catch (...) {
+        pending_kernel_aicore_path_.clear();
+        pending_kernel_context_generation_ = 0;
+        throw;
+    }
+    pending_kernel_aicore_path_.clear();
+    pending_kernel_context_generation_ = 0;
 }
 
 void ChipWorker::register_callable(int32_t callable_id, const void *callable) {
@@ -578,10 +612,23 @@ void ChipWorker::register_callable(int32_t callable_id, const void *callable) {
     if (callable == nullptr) {
         throw std::runtime_error("register_callable: callable must not be null");
     }
+    if (kernel_mode_) throw std::runtime_error("use prepare_kernel_callable in kernel mode");
     int rc = register_callable_fn_(device_ctx_, callable_id, callable);
     if (rc != 0) {
         throw std::runtime_error("register_callable failed with code " + std::to_string(rc));
     }
+}
+
+void ChipWorker::prepare_kernel_callable(int32_t callable_id, const void *callable, size_t callable_size) {
+    if (!initialized_ || !kernel_mode_) throw std::runtime_error("ChipWorker is not initialized in kernel mode");
+    if (callable == nullptr || callable_size == 0) throw std::runtime_error("kernel callable is empty");
+    const int rc = kernel_prepare_callable_fn_(device_ctx_, callable_id, callable, callable_size);
+    if (rc != 0) throw std::runtime_error("kernel prepare callable failed with code " + std::to_string(rc));
+}
+
+int ChipWorker::launch_kernel(int32_t callable_id, const void *args, void *caller_stream) {
+    if (!initialized_ || !kernel_mode_) return PTO_RUNTIME_ERR_INVALID_STATE;
+    return kernel_launch_fn_(device_ctx_, callable_id, args, caller_stream);
 }
 
 void ChipWorker::run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config) {
@@ -951,6 +998,7 @@ void ChipWorker::unregister_callable(int32_t callable_id) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
+    if (kernel_mode_) throw std::runtime_error("kernel callable release is owned by kernel context teardown");
     int rc = unregister_callable_fn_(device_ctx_, callable_id);
     if (rc != 0) {
         throw std::runtime_error("unregister_callable failed with code " + std::to_string(rc));

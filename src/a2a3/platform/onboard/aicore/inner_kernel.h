@@ -53,6 +53,19 @@ __aicore__ inline void wait_for_post_close_release(__gm__ uint32_t *release) {
     dsb(DSB_DDR);
 }
 
+template <typename T>
+__aicore__ inline T load_kernel_gm_word(__gm__ T *address) {
+    dcci(address, SINGLE_CACHE_LINE);
+    dsb(static_cast<mem_dsb_t>(0));
+    return *reinterpret_cast<volatile __gm__ T *>(address);
+}
+template <typename T>
+__aicore__ inline void store_kernel_gm_word(__gm__ T *address, T value) {
+    *reinterpret_cast<volatile __gm__ T *>(address) = value;
+    dcci(address, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb(static_cast<mem_dsb_t>(0));
+}
+
 /**
  * Read an AICore register via SPR access
  *

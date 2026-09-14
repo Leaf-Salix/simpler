@@ -93,6 +93,17 @@ public:
         bool enable_sdma = false, const std::string &sim_context_path = "", const std::string &sdma_warmup_path = ""
     );
 
+    void init_kernel_mode(
+        const std::string &host_lib_path, const std::string &aicpu_path, const std::string &kernel_aicore_path,
+        const std::string &dispatcher_path, int device_id, const CallConfig &config, uint64_t context_generation
+    );
+
+    // Kernel-mode entry points intentionally sit beside, rather than inside,
+    // the program run API. A non-empty kernel_aicore_path selects the
+    // dedicated kernel C ABI and never falls back to aicore_path.
+    void prepare_kernel_callable(int32_t callable_id, const void *callable, size_t callable_size);
+    int launch_kernel(int32_t callable_id, const void *args, void *caller_stream);
+
     /// Tear down everything: device resources and runtime library.
     /// Terminal — the object cannot be reused after this.
     void finalize();
@@ -432,4 +443,8 @@ private:
     int device_id_ = -1;
     bool initialized_ = false;
     bool finalized_ = false;
+    bool kernel_mode_ = false;
+    std::string pending_kernel_aicore_path_;
+    CallConfig pending_kernel_config_{};
+    uint64_t pending_kernel_context_generation_{0};
 };

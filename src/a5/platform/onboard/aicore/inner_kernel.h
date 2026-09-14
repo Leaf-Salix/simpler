@@ -50,6 +50,19 @@
  * @param reg  Register identifier
  * @return Register value (zero-extended to uint64_t)
  */
+template <typename T>
+__aicore__ inline T load_kernel_gm_word(__gm__ T *address) {
+    dcci(address, SINGLE_CACHE_LINE);
+    dsb(static_cast<mem_dsb_t>(0));
+    return *reinterpret_cast<volatile __gm__ T *>(address);
+}
+template <typename T>
+__aicore__ inline void store_kernel_gm_word(__gm__ T *address, T value) {
+    *reinterpret_cast<volatile __gm__ T *>(address) = value;
+    dcci(address, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb(static_cast<mem_dsb_t>(0));
+}
+
 __aicore__ inline uint64_t read_reg(RegId reg) {
     switch (reg) {
     case RegId::DATA_MAIN_BASE: {

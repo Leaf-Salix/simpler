@@ -47,6 +47,7 @@
 #include "host/acl_error_log.h"
 #include "kernel_platform_ops.h"
 #include "host/kernel_pipeline_contract.h"
+#include "host/kernel_binder.h"
 #include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
 #include "host_log.h"
@@ -64,8 +65,100 @@
 // the common AICPU loader carries no runtime-specific symbol knowledge. TMARB
 // returns simpler_aicpu_register_callable; host_build_graph returns none.
 extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count);
+extern "C" const HostApiOps *shared_host_api_ops();
+extern "C" __attribute__((weak)) int prepare_kernel_runtime_impl(
+    Runtime * /*runtime*/, const HostApi * /*api*/, const CallConfig * /*config*/
+);
+
+using simpler::tmr::encode_tmr_invocation;
+using simpler::tmr::enqueue_tmr_invocation_aicpu;
+using simpler::tmr::InvocationStatus;
+using simpler::tmr::PreparedInvocationView;
+using simpler::tmr::TmrEncodingCandidate;
+using simpler::tmr::TmrExecutionBindingView;
 
 namespace {
+
+struct KernelBinderInvocation {
+    DeviceRunnerBase *runner;
+    rtStream_t caller;
+    rtStream_t aicpu;
+    rtStream_t aicore;
+    const simpler::tmr::TmrKernelClearPlan *clear_plan;
+    void *workers;
+    size_t workers_bytes;
+    void *teardown_gates;
+    size_t teardown_gates_bytes;
+    TmrEncodingCandidate *candidate;
+    const PreparedInvocationView *callable;
+    const TmrExecutionBindingView *binding;
+    KernelArgs *kernel_args;
+    int32_t aicpu_num;
+
+    static aclrtEvent event(KernelBinderInvocation &ctx, KernelEventKind kind) {
+        return static_cast<aclrtEvent>(ctx.runner->kernel_execution_state().event(kind));
+    }
+    static int clear_round(void *opaque) noexcept {
+        auto &ctx = *static_cast<KernelBinderInvocation *>(opaque);
+        int rc = aclrtMemsetAsync(
+            reinterpret_cast<void *>(ctx.clear_plan->regions[0].address), ctx.clear_plan->regions[0].bytes, 0,
+            ctx.clear_plan->regions[0].bytes, ctx.caller
+        );
+        if (rc == 0)
+            rc = aclrtMemsetAsync(
+                reinterpret_cast<void *>(ctx.clear_plan->regions[1].address), ctx.clear_plan->regions[1].bytes, 0,
+                ctx.clear_plan->regions[1].bytes, ctx.caller
+            );
+        if (rc == 0 && ctx.workers != nullptr)
+            rc = aclrtMemsetAsync(ctx.workers, ctx.workers_bytes, 0, ctx.workers_bytes, ctx.caller);
+        if (rc == 0 && ctx.teardown_gates != nullptr)
+            rc =
+                aclrtMemsetAsync(ctx.teardown_gates, ctx.teardown_gates_bytes, 0, ctx.teardown_gates_bytes, ctx.caller);
+        return rc;
+    }
+    static int record_start(void *opaque) noexcept {
+        auto &ctx = *static_cast<KernelBinderInvocation *>(opaque);
+        return aclrtRecordEvent(event(ctx, KernelEventKind::Start), ctx.caller);
+    }
+    static int wait_aicore_start(void *opaque) noexcept {
+        auto &ctx = *static_cast<KernelBinderInvocation *>(opaque);
+        return aclrtStreamWaitEvent(ctx.aicore, event(ctx, KernelEventKind::Start));
+    }
+    static int launch_aicore(void *opaque) noexcept {
+        auto &ctx = *static_cast<KernelBinderInvocation *>(opaque);
+        return ctx.runner->launch_aicore_kernel(ctx.aicore, ctx.kernel_args);
+    }
+    static int record_aicore_done(void *opaque) noexcept {
+        auto &ctx = *static_cast<KernelBinderInvocation *>(opaque);
+        return aclrtRecordEvent(event(ctx, KernelEventKind::AicoreDone), ctx.aicore);
+    }
+    static int wait_aicpu_start(void *opaque) noexcept {
+        auto &ctx = *static_cast<KernelBinderInvocation *>(opaque);
+        return aclrtStreamWaitEvent(ctx.aicpu, event(ctx, KernelEventKind::Start));
+    }
+    static int launch_aicpu(void *opaque) noexcept {
+        auto &ctx = *static_cast<KernelBinderInvocation *>(opaque);
+        return enqueue_tmr_invocation_aicpu(
+            *ctx.runner, ctx.aicpu, ctx.aicpu_num, *ctx.candidate, *ctx.callable, *ctx.binding
+        );
+    }
+    static int record_aicpu_done(void *opaque) noexcept {
+        auto &ctx = *static_cast<KernelBinderInvocation *>(opaque);
+        return aclrtRecordEvent(event(ctx, KernelEventKind::AicpuDone), ctx.aicpu);
+    }
+    static int join_aicpu(void *opaque) noexcept {
+        auto &ctx = *static_cast<KernelBinderInvocation *>(opaque);
+        return aclrtStreamWaitEvent(ctx.caller, event(ctx, KernelEventKind::AicpuDone));
+    }
+    static int join_aicore(void *opaque) noexcept {
+        auto &ctx = *static_cast<KernelBinderInvocation *>(opaque);
+        return aclrtStreamWaitEvent(ctx.caller, event(ctx, KernelEventKind::AicoreDone));
+    }
+    static int record_tail(void *opaque) noexcept {
+        auto &ctx = *static_cast<KernelBinderInvocation *>(opaque);
+        return aclrtRecordEvent(event(ctx, KernelEventKind::SerialTail), ctx.caller);
+    }
+};
 
 HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
     RuntimeTimeoutConfig order_defaults{
@@ -634,6 +727,8 @@ int DeviceRunnerBase::ensure_device_initialized() {
 }
 
 int DeviceRunnerBase::init_kernel_context(int device_id, const CallConfig &config, uint64_t context_generation) {
+    if (kernel_context_provider_ != nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+    kernel_context_provider_ = std::make_unique<KernelContextProvider>();
     const char *serial_env = std::getenv("SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE");
     const bool serial = serial_env && (serial_env[0] == '1' || serial_env[0] == 't' || serial_env[0] == 'T');
     int rc = kernel_static_config_.initialize(&config, context_generation, serial);
@@ -641,7 +736,7 @@ int DeviceRunnerBase::init_kernel_context(int device_id, const CallConfig &confi
     rc = adopt_borrowed_device(device_id);
     if (rc != 0) return rc;
 
-    rc = kernel_exec_state_.initialize(device_id_, make_onboard_kernel_context_ops());
+    rc = kernel_exec_state_.initialize(device_id_, make_onboard_kernel_context_ops(), context_generation);
     if (rc != 0) {
         LOG_ERROR("init_kernel_context: context stream/event creation failed: %d", rc);
         return rc;
@@ -695,23 +790,493 @@ int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id) {
     }
 
     if (!kernel_static_config_.initialized()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    const auto report_prepare_failure = [](const char *stage, int status) {
+        if (status != 0) LOG_ERROR("prepare_kernel_callable: %s failed: %d", stage, status);
+        return status;
+    };
+    int rc = 0;
     if (!persistent_args_.is_prepared()) {
         if (persistent_args_.has_live_resources()) return PTO_RUNTIME_ERR_INVALID_STATE;
-        int rc = prepare_launch_shape(kernel_runtime_, kernel_static_config_.request());
-        if (rc != 0) return rc;
+        rc = prepare_launch_shape(kernel_runtime_, kernel_static_config_.request());
+        if (report_prepare_failure("prepare_launch_shape", rc) != 0) return rc;
         rc = prepare_aicpu_affinity(kernel_runtime_, kernel_static_config_.request().aicpu_thread_num, control_stream);
-        if (rc != 0) return rc;
+        if (report_prepare_failure("prepare_aicpu_affinity", rc) != 0) return rc;
+        // Kernel prepare does not pass through the program bind path, where
+        // activate_launch_shape() normally mirrors Runtime::worker_count into
+        // the runner.  Publish that derived count before sizing the TMR
+        // control/report storage.
+        activate_launch_shape(kernel_runtime_);
+        if (worker_count_ <= 0) {
+            // A runtime implementation may expose only its device prefix and
+            // not retain the host-side worker field after image preparation.
+            // The launch shape itself is already resolved above, so mirror it
+            // directly instead of accepting a zero-sized report region.
+            worker_count_ = max_block_dim_ * cores_per_blockdim_;
+            block_dim_ = max_block_dim_;
+        }
         rc = configure_kernel_runtime_impl(kernel_runtime_, kernel_static_config_.serial_orch_sched());
-        if (rc != 0) return rc;
+        if (report_prepare_failure("configure_kernel_runtime", rc) != 0) return rc;
+        const HostApi runtime_api(this, 0, 0, shared_host_api_ops());
+        rc = prepare_kernel_runtime_impl(&kernel_runtime_, &runtime_api, &kernel_static_config_.request());
+        if (report_prepare_failure("prepare_kernel_runtime", rc) != 0) return rc;
         rc = persistent_args_.prepare_once(kernel_runtime_, persistent_args_ops(), static_cast<uint64_t>(device_id_));
-        if (rc != 0) return rc;
+        if (report_prepare_failure("persistent_args_prepare", rc) != 0) return rc;
+        // prepare_once snapshots Runtime into device memory but must not be
+        // the source of the runner's derived worker count. Reassert the
+        // host-side launch shape after all prepare hooks have run.
+        activate_launch_shape(kernel_runtime_);
+    }
+    if (is_valid_tmr_kernel_pipeline_contract(&kernel_contract_)) {
+        // Keep these steps outside the persistent-args branch so a failed
+        // context publication can be retried without rebuilding the resident
+        // Runtime.  Every step is idempotent and remains under the caller's
+        // submission lease.
+        if (!kernel_binding_frozen_) {
+            rc = kernel_stable_device_binding(&kernel_binding_);
+            if (report_prepare_failure("stable_device_binding", rc) != 0) return rc;
+            kernel_binding_frozen_ = true;
+        }
+        if (aicore_bin_handle_ == nullptr) {
+            rc = ensure_aicore_kernel_registered();
+            if (report_prepare_failure("aicore_register", rc) != 0) return rc;
+        }
+        if (!kernel_static_config_.frozen()) {
+            rc = kernel_static_config_.freeze();
+            if (report_prepare_failure("static_config_freeze", rc) != 0) return rc;
+        }
+        if (!kernel_context_registered_) {
+            rc = prepare_kernel_context_storage();
+            if (report_prepare_failure("context_storage_prepare", rc) != 0) return rc;
+        }
+    } else if (!kernel_static_config_.frozen()) {
         rc = kernel_static_config_.freeze();
         if (rc != 0) return rc;
     }
-    int rc = register_callable_on_device(callable_id, control_stream);
-    if (rc != 0) return rc;
+    // Kernel mode has a separate AICPU registry entry.  Do not run the legacy
+    // program registration here: that path publishes an active Runtime slot
+    // and would make the TMR registration look like an attempt to replace a
+    // live program callable.  The TMR registration below loads the callable's
+    // orchestration SO from its already-uploaded ChipCallable image.
+    if (!execution_mode_latch_.is_kernel()) {
+        rc = register_callable_on_device(callable_id, control_stream);
+        if (rc != 0) return rc;
+    }
 
-    return kernel_exec_state_.mark_ready_enqueued();
+    rc = publish_kernel_callable_residency(callable_id);
+    if (report_prepare_failure("publish_callable_residency", rc) != 0) return rc;
+
+    rc = register_kernel_callable_residency(callable_id);
+    if (report_prepare_failure("register_callable_residency", rc) != 0) return rc;
+
+    return report_prepare_failure("mark_ready_enqueued", kernel_exec_state_.mark_ready_enqueued());
+}
+
+int DeviceRunnerBase::prepare_kernel_context_storage() {
+    if (kernel_context_registered_) return 0;
+    if (kernel_context_descriptor_ != nullptr || kernel_aicore_args_ != nullptr || kernel_callable_table_ != nullptr ||
+        kernel_control_ != nullptr || kernel_reports_ != nullptr) {
+        LOG_ERROR("prepare_kernel_context_storage: storage pointers already populated");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    if (!execution_mode_latch_.is_kernel() || !kernel_binding_frozen_ || !persistent_args_.is_prepared()) {
+        LOG_ERROR(
+            "prepare_kernel_context_storage: prerequisites missing kernel=%d binding=%d args=%d",
+            execution_mode_latch_.is_kernel(), kernel_binding_frozen_, persistent_args_.is_prepared()
+        );
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    const auto *heap = find_pipeline_resource(kernel_contract_, PTO_PIPELINE_GM_HEAP);
+    const auto *sm = find_pipeline_resource(kernel_contract_, PTO_PIPELINE_GM_SM);
+    const auto *arena = find_pipeline_resource(kernel_contract_, PTO_PIPELINE_RUNTIME_IMAGE);
+    if (heap == nullptr || sm == nullptr || arena == nullptr || worker_count_ <= 0) {
+        LOG_ERROR(
+            "prepare_kernel_context_storage: contract resources missing heap=%p sm=%p arena=%p workers=%d", heap, sm,
+            arena, worker_count_
+        );
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    const size_t report_bytes = static_cast<size_t>(worker_count_) * sizeof(simpler::tmr::TmrCoreReport);
+    const size_t table_bytes = static_cast<size_t>(MAX_REGISTERED_CALLABLE_IDS) * sizeof(KernelCallableDeviceResidency);
+    kernel_context_descriptor_ = mem_alloc_.alloc(sizeof(simpler::tmr::TmrKernelContextDescriptor));
+    kernel_aicore_args_ = mem_alloc_.alloc(sizeof(simpler::tmr::TmrKernelAicoreArgs));
+    kernel_callable_table_ = mem_alloc_.alloc(table_bytes);
+    kernel_control_ = mem_alloc_.alloc(sizeof(simpler::tmr::TmrLaunchControl));
+    kernel_reports_ = mem_alloc_.alloc(report_bytes);
+    if (kernel_context_descriptor_ == nullptr || kernel_aicore_args_ == nullptr || kernel_callable_table_ == nullptr ||
+        kernel_control_ == nullptr || kernel_reports_ == nullptr) {
+        if (kernel_reports_ != nullptr && mem_alloc_.free(kernel_reports_) == 0) kernel_reports_ = nullptr;
+        if (kernel_control_ != nullptr && mem_alloc_.free(kernel_control_) == 0) kernel_control_ = nullptr;
+        if (kernel_callable_table_ != nullptr && mem_alloc_.free(kernel_callable_table_) == 0)
+            kernel_callable_table_ = nullptr;
+        if (kernel_context_descriptor_ != nullptr && mem_alloc_.free(kernel_context_descriptor_) == 0)
+            kernel_context_descriptor_ = nullptr;
+        if (kernel_aicore_args_ != nullptr && mem_alloc_.free(kernel_aicore_args_) == 0) kernel_aicore_args_ = nullptr;
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    const auto rollback = [this]() {
+        if (kernel_reports_ != nullptr && mem_alloc_.free(kernel_reports_) == 0) kernel_reports_ = nullptr;
+        if (kernel_control_ != nullptr && mem_alloc_.free(kernel_control_) == 0) kernel_control_ = nullptr;
+        if (kernel_callable_table_ != nullptr && mem_alloc_.free(kernel_callable_table_) == 0)
+            kernel_callable_table_ = nullptr;
+        if (kernel_context_descriptor_ != nullptr && mem_alloc_.free(kernel_context_descriptor_) == 0)
+            kernel_context_descriptor_ = nullptr;
+        if (kernel_aicore_args_ != nullptr && mem_alloc_.free(kernel_aicore_args_) == 0) kernel_aicore_args_ = nullptr;
+    };
+    simpler::tmr::TmrKernelContextDescriptor descriptor{};
+    descriptor.version = simpler::tmr::kTmrKernelContextVersion;
+    descriptor.bytes = sizeof(descriptor);
+    descriptor.context_generation = kernel_static_config_.generation();
+    descriptor.self_address = reinterpret_cast<uint64_t>(kernel_context_descriptor_);
+    descriptor.resident_runtime = reinterpret_cast<uint64_t>(persistent_args_.args().runtime_args);
+    descriptor.resident_kernel_args = reinterpret_cast<uint64_t>(persistent_args_.device_k_args());
+    descriptor.heap_base = reinterpret_cast<uint64_t>(acquire_pooled_gm_heap(0));
+    descriptor.heap_capacity = heap->bytes_per_copy;
+    descriptor.heap_required = heap->bytes_per_copy;
+    descriptor.sm_base = kernel_binding_.sm_address;
+    descriptor.sm_capacity = kernel_binding_.sm_capacity;
+    descriptor.sm_required = sm->bytes_per_copy;
+    descriptor.arena_base = kernel_binding_.arena_address;
+    descriptor.arena_capacity = kernel_binding_.arena_capacity;
+    descriptor.arena_required = arena->bytes_per_copy;
+    descriptor.runtime_offset = kernel_binding_.runtime_offset;
+    descriptor.control_address = reinterpret_cast<uint64_t>(kernel_control_);
+    descriptor.control_bytes = sizeof(simpler::tmr::TmrLaunchControl);
+    descriptor.reports_address = reinterpret_cast<uint64_t>(kernel_reports_);
+    descriptor.reports_bytes = report_bytes;
+    descriptor.execution_threads = kernel_runtime_.get_aicpu_thread_num();
+    // The gate must rendezvous with every thread CANN launches.  The runtime
+    // launch count may include filtered helper threads; execution_threads is
+    // the smaller set that receives scheduler/orchestrator roles.
+    descriptor.launch_threads = kernel_runtime_.get_aicpu_launch_count();
+    descriptor.worker_count = worker_count_;
+    LOG_ERROR(
+        "prepare_kernel_context_storage: heap=%p/%zu sm=0x%llx/%zu arena=0x%llx/%zu launch=%d exec=%d workers=%d",
+        reinterpret_cast<void *>(descriptor.heap_base), descriptor.heap_capacity,
+        static_cast<unsigned long long>(descriptor.sm_base), descriptor.sm_capacity,
+        static_cast<unsigned long long>(descriptor.arena_base), descriptor.arena_capacity, descriptor.launch_threads,
+        descriptor.execution_threads, descriptor.worker_count
+    );
+    if (descriptor.launch_threads <= 0 || descriptor.execution_threads <= 0 || descriptor.heap_base == 0 ||
+        descriptor.heap_capacity == 0 || descriptor.sm_base == 0 || descriptor.sm_capacity == 0 ||
+        descriptor.arena_base == 0 || descriptor.arena_capacity == 0) {
+        LOG_ERROR("prepare_kernel_context_storage: invalid resident descriptor");
+        return rollback(), PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (kernel_context_provider_ == nullptr) {
+        LOG_ERROR("prepare_kernel_context_storage: provider missing");
+        return rollback(), PTO_RUNTIME_ERR_INTERNAL;
+    }
+    int provider_rc = kernel_context_provider_->prepare_borrowed_binding(kernel_binding_);
+    if (provider_rc == 0) provider_rc = kernel_context_provider_->freeze_borrowed_binding();
+    if (provider_rc != 0) {
+        LOG_ERROR("prepare_kernel_context_storage: provider binding failed: %d", provider_rc);
+        return rollback(), PTO_RUNTIME_ERR_INTERNAL;
+    }
+    provider_rc = kernel_context_provider_->publish_context_descriptor(descriptor);
+    if (provider_rc != 0) {
+        LOG_ERROR("prepare_kernel_context_storage: descriptor publish failed: %d", provider_rc);
+        return kernel_context_provider_->close(), rollback(), PTO_RUNTIME_ERR_INTERNAL;
+    }
+    simpler::tmr::TmrKernelClearBinding clear_binding{
+        descriptor.context_generation,
+        {descriptor.control_address, descriptor.control_bytes},
+        {descriptor.reports_address, descriptor.reports_bytes},
+        descriptor.worker_count
+    };
+    simpler::tmr::TmrKernelClearPlan clear_plan;
+    if (!simpler::tmr::build_tmr_kernel_clear_plan(clear_binding, &clear_plan) ||
+        kernel_context_provider_->publish_clear_plan(clear_plan) != 0) {
+        LOG_ERROR("prepare_kernel_context_storage: clear plan publish failed");
+        return kernel_context_provider_->close(), rollback(), PTO_RUNTIME_ERR_INTERNAL;
+    }
+    std::vector<uint8_t> zero_table(table_bytes, 0);
+    std::vector<uint8_t> zero_control(descriptor.control_bytes, 0);
+    std::vector<uint8_t> zero_reports(descriptor.reports_bytes, 0);
+    int rc =
+        rtMemcpy(kernel_callable_table_, table_bytes, zero_table.data(), zero_table.size(), RT_MEMCPY_HOST_TO_DEVICE);
+    if (rc == 0)
+        rc = rtMemcpy(
+            kernel_control_, descriptor.control_bytes, zero_control.data(), zero_control.size(),
+            RT_MEMCPY_HOST_TO_DEVICE
+        );
+    if (rc == 0)
+        rc = rtMemcpy(
+            kernel_reports_, descriptor.reports_bytes, zero_reports.data(), zero_reports.size(),
+            RT_MEMCPY_HOST_TO_DEVICE
+        );
+    if (rc == 0)
+        rc = rtMemcpy(
+            kernel_context_descriptor_, sizeof(descriptor), &descriptor, sizeof(descriptor), RT_MEMCPY_HOST_TO_DEVICE
+        );
+    if (rc != 0) {
+        LOG_ERROR("prepare_kernel_context_storage: zeroing device storage failed: %d", rc);
+        return kernel_context_provider_->close(), rollback(), rc;
+    }
+    simpler::tmr::TmrContextRegistrationArgs registration{
+        descriptor.self_address, descriptor.context_generation, reinterpret_cast<uint64_t>(kernel_callable_table_),
+        MAX_REGISTERED_CALLABLE_IDS, sizeof(KernelCallableDeviceResidency)
+    };
+    rtStream_t control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
+    rc = launch_aicpu_payload(
+        control_stream, &registration, sizeof(registration), host::KernelNames::PrepareTmrContextName, 1
+    );
+    if (rc == 0) rc = aclrtSynchronizeStreamWithTimeout(control_stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (rc != 0) {
+        LOG_ERROR("prepare_kernel_context_storage: TMR context registration failed: %d", rc);
+        return rollback(), rc;
+    }
+    if (kernel_context_provider_->adopt_tmr_storage(
+            KernelResourceOps::from_allocator(mem_alloc_), kernel_context_descriptor_, kernel_callable_table_,
+            kernel_control_, kernel_reports_
+        ) != 0) {
+        LOG_ERROR("prepare_kernel_context_storage: provider storage adoption failed");
+        return rollback(), PTO_RUNTIME_ERR_INTERNAL;
+    }
+    kernel_context_registered_ = true;
+    return 0;
+}
+
+int DeviceRunnerBase::publish_kernel_callable_residency(int32_t callable_id) {
+    if (!execution_mode_latch_.is_kernel() || callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    auto callable_it = callables_.find(callable_id);
+    if (callable_it == callables_.end()) return PTO_RUNTIME_ERR_INTERNAL;
+    auto &slot = kernel_residency_[static_cast<size_t>(callable_id)];
+    if (slot.descriptor != nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+    const auto &state = callable_it->second;
+    auto buffer_it = chip_callable_buffers_.find(state.chip_buffer_hash);
+    if (buffer_it == chip_callable_buffers_.end() || state.dev_orch_so_addr < offsetof(ChipCallable, storage_))
+        return PTO_RUNTIME_ERR_INTERNAL;
+    std::array<uint64_t, RUNTIME_MAX_FUNC_ID> table{};
+    for (const auto &entry : state.kernel_addrs) {
+        if (entry.first < 0 || entry.first >= RUNTIME_MAX_FUNC_ID) return PTO_RUNTIME_ERR_INTERNAL;
+        table[static_cast<size_t>(entry.first)] = entry.second;
+    }
+    void *table_dev = mem_alloc_.alloc(sizeof(table));
+    if (table_dev == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    int rc = rtMemcpy(table_dev, sizeof(table), table.data(), sizeof(table), RT_MEMCPY_HOST_TO_DEVICE);
+    if (rc != 0) {
+        mem_alloc_.free(table_dev);
+        return rc;
+    }
+    KernelStableDeviceBinding stable{};
+    if (kernel_stable_device_binding(&stable) != 0) {
+        mem_alloc_.free(table_dev);
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    KernelCallableDeviceResidency descriptor{};
+    uint64_t callable_generation = kernel_callable_generations_[static_cast<size_t>(callable_id)] + 1;
+    if (callable_generation == 0) {
+        mem_alloc_.free(table_dev);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    descriptor.generation = callable_generation;
+    descriptor.device_address = state.dev_orch_so_addr - offsetof(ChipCallable, storage_);
+    descriptor.bytes = buffer_it->second.total_size;
+    descriptor.callable_id = callable_id;
+    descriptor.context_generation = stable.context_generation;
+    descriptor.runtime_address = stable.runtime_address;
+    descriptor.sm_address = stable.sm_address;
+    descriptor.sm_capacity = stable.sm_capacity;
+    descriptor.arena_address = stable.arena_address;
+    descriptor.arena_capacity = stable.arena_capacity;
+    descriptor.runtime_offset = stable.runtime_offset;
+    descriptor.function_table_address = reinterpret_cast<uint64_t>(table_dev);
+    descriptor.function_table_count = RUNTIME_MAX_FUNC_ID;
+    // `CallConfig::aicpu_thread_num == 0` means platform default. The
+    // affinity preparation resolves that request and stores the actual
+    // worker count on the resident Runtime; publish the resolved value so
+    // device-side barriers never wait for zero workers.
+    descriptor.aicpu_thread_count = stable.aicpu_thread_count;
+    descriptor.context_generation = kernel_static_config_.generation();
+    if (kernel_callable_table_ == nullptr) {
+        mem_alloc_.free(table_dev);
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    auto *table_base = static_cast<uint8_t *>(kernel_callable_table_);
+    void *descriptor_dev = table_base + static_cast<size_t>(callable_id) * sizeof(KernelCallableDeviceResidency);
+    rc = rtMemcpy(descriptor_dev, sizeof(descriptor), &descriptor, sizeof(descriptor), RT_MEMCPY_HOST_TO_DEVICE);
+    if (rc != 0) {
+        mem_alloc_.free(table_dev);
+        return rc;
+    }
+    slot.descriptor = descriptor_dev;
+    slot.function_table = table_dev;
+    slot.generation = descriptor.generation;
+    kernel_callable_generations_[static_cast<size_t>(callable_id)] = callable_generation;
+    return 0;
+}
+
+int DeviceRunnerBase::register_kernel_callable_residency(int32_t callable_id) {
+    if (!execution_mode_latch_.is_kernel() || callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    const auto &slot = kernel_residency_[static_cast<size_t>(callable_id)];
+    if (slot.descriptor == nullptr || slot.generation == 0) return PTO_RUNTIME_ERR_INVALID_STATE;
+    simpler::tmr::TmrCallableRegistrationArgs registration{
+        kernel_static_config_.generation(), reinterpret_cast<uint64_t>(slot.descriptor), callable_id, 0, slot.generation
+    };
+    auto *control = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
+    if (control == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+    int rc = launch_aicpu_payload(
+        control, &registration, sizeof(registration), host::KernelNames::RegisterKernelCallableName, 1
+    );
+    if (rc != 0) return rc;
+    return aclrtSynchronizeStreamWithTimeout(control, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+}
+
+int DeviceRunnerBase::kernel_stable_device_binding(KernelStableDeviceBinding *out) const noexcept {
+    if (out != nullptr) {
+        if (kernel_context_provider_ != nullptr) {
+            if (const auto *published = kernel_context_provider_->binding_view(); published != nullptr) {
+                *out = *published;
+                return 0;
+            }
+        }
+    }
+    if (kernel_binding_frozen_) {
+        if (out == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+        *out = kernel_binding_;
+        return 0;
+    }
+    if (out == nullptr || !execution_mode_latch_.is_kernel() || !kernel_static_config_.initialized() ||
+        !persistent_args_.is_prepared() || !is_valid_tmr_kernel_pipeline_contract(&kernel_contract_)) {
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    KernelStableDeviceBinding next{};
+    next.context_generation = kernel_static_config_.generation();
+    next.runtime_address = reinterpret_cast<uint64_t>(persistent_args_.args().runtime_args);
+    next.sm_address = reinterpret_cast<uint64_t>(kernel_runtime_.get_gm_sm_ptr());
+    const auto *sm = find_pipeline_resource(kernel_contract_, PTO_PIPELINE_GM_SM);
+    const auto *arena = find_pipeline_resource(kernel_contract_, PTO_PIPELINE_RUNTIME_IMAGE);
+    next.sm_capacity = sm == nullptr ? 0 : sm->bytes_per_copy;
+    next.arena_address = reinterpret_cast<uint64_t>(kernel_runtime_.get_prebuilt_arena_base());
+    next.arena_capacity = arena == nullptr ? 0 : arena->bytes_per_copy;
+    next.runtime_offset = kernel_runtime_.get_prebuilt_runtime_offset();
+    next.aicpu_thread_count = static_cast<uint32_t>(kernel_runtime_.get_aicpu_thread_num());
+    if (!kernel_stable_device_binding_valid(next)) return PTO_RUNTIME_ERR_INVALID_STATE;
+    *out = next;
+    return 0;
+}
+
+int DeviceRunnerBase::synchronize_kernel_tail() noexcept {
+    if (!execution_mode_latch_.is_kernel() || !kernel_submission_state_.has_tail()) return 0;
+    // SerialTail is recorded on the borrowed caller stream.  The ACL event
+    // synchronize API has no timeout variant on the supported CANN release;
+    // synchronize the stream instead so a poisoned/deadlocked device cannot
+    // make finalize hang forever.  The stream remains caller-owned.
+    auto *caller = static_cast<aclrtStream>(kernel_submission_state_.previous_caller_stream());
+    if (caller == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+    const int rc = aclrtSynchronizeStreamWithTimeout(caller, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (rc != 0) {
+        LOG_ERROR("kernel round timeout state: reports_ptr=%p workers=%d", kernel_reports_, worker_count_);
+    }
+    if (rc == 0) kernel_submission_state_.clear_tail();
+    return rc;
+}
+
+uint64_t DeviceRunnerBase::kernel_callable_residency_address(int32_t callable_id) const {
+    if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) return 0;
+    return reinterpret_cast<uint64_t>(kernel_residency_[static_cast<size_t>(callable_id)].descriptor);
+}
+
+int DeviceRunnerBase::submit_kernel_invocation(int32_t callable_id, const void *args, void *caller_stream) {
+    if (!execution_mode_latch_.is_kernel() || !kernel_exec_state_.accepts_dispatch() || args == nullptr ||
+        caller_stream == nullptr || callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS ||
+        !kernel_context_registered_ || kernel_callable_table_ == nullptr)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    // The context owns one event set and one TMR working image. A second host
+    // stream cannot safely reuse them while the first graph is in flight;
+    // same-stream submissions remain ordered by the caller stream itself.
+    const auto caller_identity = reinterpret_cast<uintptr_t>(caller_stream);
+    if (kernel_submission_state_.has_tail() && kernel_submission_state_.previous_caller() != caller_identity)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    const auto callable_it = callables_.find(callable_id);
+    const auto &slot = kernel_residency_[static_cast<size_t>(callable_id)];
+    if (callable_it == callables_.end() || slot.descriptor == nullptr || slot.generation == 0)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    const auto &state = callable_it->second;
+    PreparedInvocationView callable{
+        callable_id,
+        static_cast<int32_t>(state.signature.size()),
+        0,
+        slot.generation,
+    };
+    for (const auto direction : state.signature)
+        if (direction == ArgDirection::SCALAR) ++callable.scalar_count;
+    callable.tensor_count -= callable.scalar_count;
+    if (callable.tensor_count < 0) return PTO_RUNTIME_ERR_INTERNAL;
+    TmrExecutionBindingView binding{kernel_callable_residency_address(callable_id), kernel_static_config_.generation()};
+    auto &cache = kernel_invocation_caches_[static_cast<size_t>(callable_id)];
+    TmrEncodingCandidate candidate;
+    const auto encode = encode_tmr_invocation(
+        *reinterpret_cast<const ChipStorageTaskArgs *>(args), callable, binding, cache, &candidate
+    );
+    if (encode != InvocationStatus::Ok) return PTO_RUNTIME_ERR_INTERNAL;
+
+    auto *caller = static_cast<rtStream_t>(caller_stream);
+    auto *aicpu = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
+    auto *aicore = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicore));
+    const auto *clear_plan =
+        kernel_context_provider_ == nullptr ? nullptr : kernel_context_provider_->clear_plan_view();
+    if (caller == nullptr || aicpu == nullptr || aicore == nullptr || clear_plan == nullptr)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    void *workers = nullptr;
+    void *teardown_gates = nullptr;
+    if (kernel_submission_state_.has_tail()) {
+        const auto *resident_runtime = persistent_args_.args().runtime_args;
+        const auto host_base = reinterpret_cast<uintptr_t>(&kernel_runtime_);
+        const auto device_base = reinterpret_cast<uintptr_t>(resident_runtime);
+        if (resident_runtime == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+        auto device_member = [host_base, device_base](const void *host_member) -> void * {
+            const auto host_addr = reinterpret_cast<uintptr_t>(host_member);
+            if (host_addr < host_base) return nullptr;
+            const auto offset = host_addr - host_base;
+            if (offset > UINTPTR_MAX - device_base) return nullptr;
+            return reinterpret_cast<void *>(device_base + offset);
+        };
+        workers = device_member(kernel_runtime_.get_workers());
+        teardown_gates = device_member(kernel_runtime_.get_teardown_gates());
+        if (workers == nullptr || teardown_gates == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    // Control/report lines are the only mutable K7 state shared by rounds.
+    // Clear them asynchronously on the caller stream before recording Start;
+    // its FIFO ordering is the round's reuse barrier, so no host synchronize is
+    // needed and no previous report can be mistaken for this round's OPEN.
+    KernelBinderInvocation binder_context{
+        this, caller, aicpu, aicore, clear_plan, workers, static_cast<size_t>(worker_count_) * sizeof(Handshake),
+        teardown_gates, static_cast<size_t>(worker_count_) * sizeof(AicoreTeardownControl), &candidate, &callable,
+        &binding, persistent_args_.device_k_args(),
+        // TMR's gate counts every thread CANN launches; admission later maps
+        // only the execution participants to scheduler/orchestrator roles.
+        kernel_runtime_.get_aicpu_launch_count()
+    };
+    KernelBinder::Operations binder_ops{
+        &binder_context,
+        KernelBinderInvocation::clear_round,
+        KernelBinderInvocation::record_start,
+        KernelBinderInvocation::wait_aicore_start,
+        KernelBinderInvocation::launch_aicore,
+        KernelBinderInvocation::record_aicore_done,
+        KernelBinderInvocation::wait_aicpu_start,
+        KernelBinderInvocation::launch_aicpu,
+        KernelBinderInvocation::record_aicpu_done,
+        KernelBinderInvocation::join_aicpu,
+        KernelBinderInvocation::join_aicore,
+        KernelBinderInvocation::record_tail,
+        [](void *context, int error) noexcept {
+            static_cast<KernelBinderInvocation *>(context)->runner->kernel_execution_state().poison(error);
+        },
+        nullptr,
+    };
+    const int rc = KernelBinder().submit(binder_ops);
+    if (rc == 0) {
+        // The candidate remains owned by this call until every enqueue in the
+        // fork/join sequence succeeds. Only then publish its structural
+        // template; a failed submission leaves the previous template intact.
+        cache.commit(std::move(candidate));
+        kernel_submission_state_.commit_tail(reinterpret_cast<uintptr_t>(caller), caller);
+    }
+    return rc;
 }
 
 int DeviceRunnerBase::ensure_aicpu_init_launched(rtStream_t control_stream) {
@@ -1151,9 +1716,30 @@ int DeviceRunnerBase::unregister_callable(int32_t callable_id) {
     if (it == callables_.end()) {
         return 0;
     }
+    if (execution_mode_latch_.is_kernel() && kernel_context_registered_ && callable_id >= 0 &&
+        callable_id < MAX_REGISTERED_CALLABLE_IDS) {
+        const auto &resident = kernel_residency_[static_cast<size_t>(callable_id)];
+        if (resident.descriptor == nullptr || resident.generation == 0) return PTO_RUNTIME_ERR_INVALID_STATE;
+        simpler::tmr::TmrCallableRegistrationArgs registration{
+            kernel_static_config_.generation(), reinterpret_cast<uint64_t>(resident.descriptor), callable_id, 0,
+            resident.generation
+        };
+        auto *control = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
+        if (control == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+        int release_rc = launch_aicpu_payload(
+            control, &registration, sizeof(registration), host::KernelNames::ReleaseKernelCallableName, 1
+        );
+        if (release_rc == 0) release_rc = aclrtSynchronizeStreamWithTimeout(control, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+        if (release_rc != 0) return release_rc;
+    }
     CallableState state = std::move(it->second);
     callables_.erase(it);
     aicpu_seen_callable_ids_.erase(callable_id);
+    if (callable_id >= 0 && callable_id < MAX_REGISTERED_CALLABLE_IDS) {
+        auto &resident = kernel_residency_[static_cast<size_t>(callable_id)];
+        if (resident.function_table != nullptr) mem_alloc_.free(resident.function_table);
+        resident = KernelResidentSlot{};
+    }
     release_chip_callable_buffer(state.chip_buffer_hash);
 
     if (state.host_dlopen_handle != nullptr) {
@@ -1445,6 +2031,12 @@ extern "C" __attribute__((weak)) int prewarm_config_impl(
     return 0;
 }
 
+extern "C" __attribute__((weak)) int prepare_kernel_runtime_impl(
+    Runtime * /*runtime*/, const HostApi * /*api*/, const CallConfig * /*config*/
+) {
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
 void DeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_chip_swimlane_enabled(config.enable_chip_swimlane);
     set_dump_args_enabled(config.enable_dump_args);
@@ -1567,11 +2159,20 @@ int DeviceRunnerBase::finalize_common() { return finalize_common_impl(false); }
 int DeviceRunnerBase::abandon_common_after_device_failure() { return finalize_common_impl(true); }
 
 int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
-    if (!abandon_device_resources && execution_mode_latch_.is_kernel()) {
-        const int args_rc = persistent_args_.finalize_once();
-        if (args_rc != 0) {
-            kernel_exec_state_.poison(args_rc);
-            return args_rc;
+    [[maybe_unused]] auto kernel_submission = kernel_submission_state_.lock();
+    if (execution_mode_latch_.is_kernel()) {
+        kernel_submission_state_.begin_close();
+        // A successful launch only means that the fork/join chain was
+        // enqueued.  Do not destroy hidden streams or release the descriptor
+        // while that chain (or a graph node referring to it) can still be in
+        // flight.  Fatal teardown is the explicit escape hatch: the device is
+        // already quarantined and its resources are abandoned as a group.
+        if (!abandon_device_resources && kernel_submission_state_.has_tail()) {
+            const int sync_rc = synchronize_kernel_tail();
+            if (sync_rc != 0) {
+                LOG_ERROR("kernel finalize refused while SerialTail is in flight: rc=%d", sync_rc);
+                return sync_rc;
+            }
         }
     }
     int rc = 0;
@@ -1580,6 +2181,34 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     };
 
     finish_clock_correlation_session(false, abandon_device_resources);
+
+    // The TMR AICPU registry borrows the context descriptor and callable table.
+    // Retire that registry while the hidden AICPU stream and DSO are still live,
+    // before their backing allocations are released below.  A fatal device
+    // teardown invalidates the registry together with the device, so no
+    // best-effort launch is attempted on that path.
+    if (!abandon_device_resources && kernel_context_registered_ && kernel_context_descriptor_ != nullptr &&
+        kernel_callable_table_ != nullptr) {
+        simpler::tmr::TmrContextRegistrationArgs registration{
+            reinterpret_cast<uint64_t>(kernel_context_descriptor_), kernel_static_config_.generation(),
+            reinterpret_cast<uint64_t>(kernel_callable_table_), MAX_REGISTERED_CALLABLE_IDS,
+            sizeof(KernelCallableDeviceResidency)
+        };
+        auto *control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
+        int release_rc = control_stream == nullptr ? PTO_RUNTIME_ERR_INVALID_STATE :
+                                                     launch_aicpu_payload(
+                                                         control_stream, &registration, sizeof(registration),
+                                                         host::KernelNames::ReleaseTmrContextName, 1
+                                                     );
+        if (release_rc == 0)
+            release_rc = aclrtSynchronizeStreamWithTimeout(control_stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+        if (release_rc != 0) {
+            capture(release_rc);
+            LOG_ERROR("TMR context release failed during finalize: rc=%d", release_rc);
+        } else {
+            kernel_context_registered_ = false;
+        }
+    }
 
     // Teardown invariant: finalize_common() is the single place that releases
     // every RTS/device-owning resource, and the subclass runs it BEFORE its
@@ -1668,6 +2297,27 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         }
     }
     chip_callable_buffers_.clear();
+    for (auto &slot : kernel_residency_) {
+        if (!abandon_device_resources && slot.function_table != nullptr) mem_alloc_.free(slot.function_table);
+        slot = KernelResidentSlot{};
+    }
+    if (!abandon_device_resources) {
+        if (kernel_context_provider_ != nullptr && !kernel_context_provider_->close())
+            capture(PTO_RUNTIME_ERR_INTERNAL);
+        if (kernel_aicore_args_ != nullptr && mem_alloc_.free(kernel_aicore_args_) == 0) kernel_aicore_args_ = nullptr;
+    }
+    if (kernel_context_provider_ == nullptr || !kernel_context_provider_->owns_tmr_storage()) {
+        kernel_callable_table_ = nullptr;
+        kernel_context_descriptor_ = nullptr;
+        kernel_aicore_args_ = nullptr;
+        kernel_control_ = nullptr;
+        kernel_reports_ = nullptr;
+        kernel_context_registered_ = false;
+    }
+    kernel_binding_ = KernelStableDeviceBinding{};
+    kernel_binding_frozen_ = false;
+    kernel_submission_state_.clear_tail();
+    kernel_callable_generations_.fill(0);
 
     // hbg path: dlclose any host orch handles callers forgot to unregister.
     // finalize() is the last chance; Worker.close() does not auto-unregister
@@ -1742,6 +2392,9 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         if (close_rc != 0 && rc == 0) rc = close_rc;
     }
 
+    for (auto &cache : kernel_invocation_caches_)
+        cache.clear();
+
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     if (!abandon_device_resources) {
         mem_alloc_.finalize();
@@ -1766,7 +2419,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     return rc;
 }
 
-int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args) {
+int DeviceRunnerBase::ensure_aicore_kernel_registered() {
     // Lazy-register the AICore binary on first call; reuse cached handle
     // thereafter. CANN has no public rtUnregisterAllKernel, so re-registering
     // every run would pin another device-side copy of the ELF and quickly
@@ -1775,7 +2428,11 @@ int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args
     if (aicore_bin_handle_ == nullptr) {
         if (aicore_kernel_binary_.empty()) {
             LOG_ERROR("AICore kernel binary is empty");
-            return PTO_RUNTIME_ERR_INTERNAL;
+            // Kernel mode must never fall back to the program AICore image.
+            // Treat a missing dedicated image as an admission/state error so
+            // callers can distinguish it from a malformed binary or RTS
+            // registration failure.
+            return PTO_RUNTIME_ERR_INVALID_STATE;
         }
         rtDevBinary_t binary;
         std::memset(&binary, 0, sizeof(binary));
@@ -1791,7 +2448,43 @@ int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args
             return rc;
         }
     }
+    return 0;
+}
 
+int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args) {
+    if (stream == nullptr || k_args == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (execution_mode_latch_.is_kernel()) {
+        // Kernel mode uses the dedicated 16-byte envelope.  Registration is a
+        // prepare-time operation; doing it lazily here would put an ELF upload
+        // and device allocation on the launch path and would also invoke the
+        // program entry with the wrong argument shape.
+        if (aicore_bin_handle_ == nullptr || kernel_context_descriptor_ == nullptr || kernel_aicore_args_ == nullptr)
+            return PTO_RUNTIME_ERR_INVALID_STATE;
+        simpler::tmr::TmrKernelAicoreArgs kernel_args{
+            reinterpret_cast<uint64_t>(k_args), reinterpret_cast<uint64_t>(kernel_context_descriptor_)
+        };
+        // The kernel entry receives a pointer into device parameter space.  A
+        // pointer to this host-stack envelope would be interpreted as an HBM
+        // address by AICore and causes an MTE fault before the round starts.
+        const int copy_rc = rtMemcpy(
+            kernel_aicore_args_, sizeof(kernel_args), &kernel_args, sizeof(kernel_args), RT_MEMCPY_HOST_TO_DEVICE
+        );
+        if (copy_rc != 0) return copy_rc;
+        struct Args {
+            simpler::tmr::TmrKernelAicoreArgs *args;
+        };
+        Args args = {static_cast<simpler::tmr::TmrKernelAicoreArgs *>(kernel_aicore_args_)};
+        rtArgsEx_t rt_args;
+        std::memset(&rt_args, 0, sizeof(rt_args));
+        rt_args.args = &args;
+        rt_args.argsSize = sizeof(args);
+        rtTaskCfgInfo_t cfg = {};
+        cfg.schemMode = RT_SCHEM_MODE_BATCH;
+        return rtKernelLaunchWithHandleV2(aicore_bin_handle_, 0, block_dim_, &rt_args, nullptr, stream, &cfg);
+    }
+
+    const int register_rc = ensure_aicore_kernel_registered();
+    if (register_rc != 0) return register_rc;
     struct Args {
         KernelArgs *k_args;
     };

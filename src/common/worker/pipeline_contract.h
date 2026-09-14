@@ -148,3 +148,19 @@ inline bool is_valid_tmr_kernel_pipeline_contract(const PipelineContract *contra
     }
     return true;
 }
+
+// HBG uses Host-owned graph/runtime images rather than the TMR scratch arena
+// contract. Keep this check beside the common structural validator so the two
+// producers can share framing rules without sharing their resource policy.
+inline bool is_valid_hbg_kernel_pipeline_contract(const PipelineContract *contract) {
+    if (!is_valid_pipeline_contract(contract, SIMPLER_MODE_KERNEL) || contract->pipeline_depth != 1 ||
+        contract->resource_count != 4 || !has_serviceable_arena_topology(*contract) ||
+        !has_serviceable_stream_topology(*contract)) {
+        return false;
+    }
+    const auto *heap = find_pipeline_resource(*contract, PTO_PIPELINE_GM_HEAP);
+    const auto *image = find_pipeline_resource(*contract, PTO_PIPELINE_RUNTIME_IMAGE);
+    return heap != nullptr && image != nullptr && heap->resource_class == PTO_PIPELINE_HOST_PER_RUN &&
+           image->resource_class == PTO_PIPELINE_HOST_PER_RUN &&
+           heap->bytes_per_copy <= UINT64_MAX - image->bytes_per_copy;
+}

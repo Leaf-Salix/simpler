@@ -12,6 +12,30 @@
 #pragma once
 
 #include "worker/runtime_c_api.h"
+#include "worker/pipeline_contract.h"
+
+// Borrowed, call-local role bindings. This helper validates aliases and
+// contract topology only; it never creates or retains a stream.
+struct KernelStreamBinding {
+    void *caller_stream{nullptr};
+    void *aicpu_stream{nullptr};
+    void *aicore_stream{nullptr};
+};
+
+inline int bind_kernel_stream_roles(
+    const PipelineContract *contract, void *caller_stream, void *aicpu_stream, void *hidden_aicore_stream,
+    KernelStreamBinding &out
+) {
+    if (contract == nullptr || !is_valid_pipeline_contract(contract, SIMPLER_MODE_KERNEL) ||
+        !has_serviceable_arena_topology(*contract) || !has_serviceable_stream_topology(*contract) ||
+        caller_stream == nullptr || aicpu_stream == nullptr || hidden_aicore_stream == nullptr ||
+        caller_stream == aicpu_stream || caller_stream == hidden_aicore_stream ||
+        aicpu_stream == hidden_aicore_stream) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    out = {caller_stream, aicpu_stream, hidden_aicore_stream};
+    return 0;
+}
 
 // Internal host-runtime hook, not a dlsym lifecycle API. Input is borrowed and
 // immutable during the call; output is caller-exclusive and unchanged on error.

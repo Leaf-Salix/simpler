@@ -659,16 +659,16 @@ struct ResourceContextPlatform {
                 *device = static_cast<ResourceContextPlatform *>(ctx)->current_device;
                 return 0;
             },
-            [](void *ctx, KernelStreamKind kind, void **stream) {
+            [](void *ctx, void **stream) {
                 auto &self = *static_cast<ResourceContextPlatform *>(ctx);
-                self.stream_kinds.push_back(kind);
                 *stream = reinterpret_cast<void *>(self.next_handle++);
                 return 0;
             },
-            [](void *, KernelStreamKind, void *) {
+            [](void *, void *) {
                 return 0;
             },
-            [](void *ctx, void **event) {
+            0,
+            [](void *ctx, uint32_t, void **event) {
                 *event = reinterpret_cast<void *>(static_cast<ResourceContextPlatform *>(ctx)->next_handle++);
                 return 0;
             },
@@ -702,9 +702,6 @@ TEST_F(HostGraphBuildTest, KernelPrepareOwnsActualGraphCapacityAndLaunchOnlyBorr
     ResourceContextPlatform provider;
     KernelExecutionState context;
     ASSERT_EQ(context.initialize(0, provider.context_ops(), 19), 0);
-    ASSERT_EQ(
-        provider.stream_kinds, (std::vector<KernelStreamKind>{KernelStreamKind::Aicpu, KernelStreamKind::Aicore})
-    );
     ASSERT_GE(build(graph_entry), 0);
     hbg::GraphResourceRequirements graph;
     ASSERT_EQ(hbg::get_graph_resource_requirements(result, layout, graph), 0);
@@ -1197,10 +1194,10 @@ TEST_F(HbgGraphPacketTest, RejectsMalformedEnvelopeHeaderRegionsAndContents) {
     using Mutate = void (*)(SimplerKernelInvocationHeader &, hbg::GraphPacketHeader &, hbg::GraphImageRegion &);
     const Mutate mutations[] = {
         [](auto &e, auto &, auto &) {
-            e.abi_version++;
+            e.mode = 99;
         },
         [](auto &e, auto &, auto &) {
-            e.header_bytes--;
+            e.payload_bytes = UINT64_MAX;
         },
         [](auto &e, auto &, auto &) {
             e.mode = SIMPLER_MODE_PROGRAM;
@@ -1221,7 +1218,7 @@ TEST_F(HbgGraphPacketTest, RejectsMalformedEnvelopeHeaderRegionsAndContents) {
             e.host_copy_tensor_count = 1;
         },
         [](auto &e, auto &, auto &) {
-            e.reserved[1] = 1;
+            e.host_copy_tensor_count = 1;
         },
         [](auto &e, auto &, auto &) {
             e.payload_bytes--;

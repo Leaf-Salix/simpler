@@ -56,6 +56,8 @@ file(GLOB COMMON_SOURCES CONFIGURE_DEPENDS
 list(APPEND AICPU_SOURCES ${COMMON_SOURCES})
 list(APPEND AICPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/log/host_log.cpp")
 
+list(FILTER AICPU_SOURCES EXCLUDE REGEX "/common/platform/shared/aicpu/kernel_dispatch\\.cpp$")
+
 # Then, collect sources from CUSTOM_SOURCE_DIRS (runtime sources)
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})

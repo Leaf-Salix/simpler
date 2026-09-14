@@ -1444,6 +1444,39 @@ class ChipWorker:
             with self._lifecycle_lock:
                 self._init_in_progress = False
 
+    def init_kernel(self, device_id: int, bins: Any, config: CallConfig, context_generation: int = 1):
+        """Initialize the dedicated kernel-mode ABI with ``bins.kernel_aicore_path``.
+
+        This is intentionally separate from :meth:`init`: program mode keeps
+        using ``bins.aicore_path`` and its Runtime lifecycle, while kernel mode
+        requires a distinct AICore ELF and never falls back to it.
+        """
+        kernel_path = getattr(bins, "kernel_aicore_path", None)
+        if kernel_path is None:
+            raise RuntimeError("kernel-mode initialization requires bins.kernel_aicore_path")
+        with self._lifecycle_lock:
+            if self._init_in_progress:
+                raise RuntimeError("ChipWorker.init_kernel() is already in progress")
+            if self._impl.initialized:
+                raise RuntimeError("ChipWorker is already initialized")
+            self._init_owner_thread = threading.current_thread()
+            self._init_in_progress = True
+        try:
+            _initialize_host_log(None)
+            dispatcher_path = getattr(bins, "dispatcher_path", None)
+            self._impl.init_kernel(
+                str(bins.host_path),
+                str(bins.aicpu_path),
+                str(kernel_path),
+                "" if dispatcher_path is None else str(dispatcher_path),
+                int(device_id),
+                config,
+                int(context_generation),
+            )
+        finally:
+            with self._lifecycle_lock:
+                self._init_in_progress = False
+
     def finalize(self):
         """Tear down everything: device resources and runtime library.
 

@@ -365,6 +365,13 @@ static const HostApiOps g_host_api_ops = {
     .publish_chip_swimlane_extension = publish_chip_swimlane_extension,
 };
 
+// Runtime-specific kernel preparation uses the same operation wrappers as the
+// public C API. Keeping this table in the common translation unit ensures that
+// program and kernel paths do not grow separate allocator implementations.
+extern "C" const HostApiOps *shared_host_api_ops() {
+    return &g_host_api_ops;
+}
+
 /* ===========================================================================
  * Public C API (resolved by ChipWorker via dlsym)
  *
@@ -1173,12 +1180,17 @@ int simpler_unregister_callable(DeviceContextHandle ctx, int32_t callable_id) {
     if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
     try {
         DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+        [[maybe_unused]] auto submission = runner->kernel_submission_state().lock();
         if (runner->native_runs_outstanding()) {
             LOG_ERROR(
                 "simpler_unregister_callable: native run must be finalized before mutating the callable registry"
             );
             return PTO_RUNTIME_ERR_INTERNAL;
         }
+        // Kernel callable residency is referenced by asynchronous AICPU/AICore
+        // work.  Quiesce the recorded tail before releasing the descriptor and
+        // chip buffer; otherwise a later replay can dereference freed HBM.
+        if (runner->synchronize_kernel_tail() != 0) return PTO_RUNTIME_ERR_INVALID_STATE;
         return runner->unregister_callable(callable_id);
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1248,12 +1260,15 @@ int device_memory_info_ctx(DeviceContextHandle ctx, DeviceMemoryInfo *info) {
  * Kernel-mode lifecycle
  *
  * Init and prepare create context-owned resources on a borrowed device.
- * Launch remains a rejecting stub, so supported() reports 0. Structural
- * argument validation is shared with the simulated components through
- * kernel_entry_validation.h.
+ * Launch performs host-side admission and asynchronous fork/join enqueue.
+ * supported() remains 0 until the device-side K7 protocol and production
+ * provider are enabled. Structural argument validation is shared with the
+ * simulated components through kernel_entry_validation.h.
  * =========================================================================== */
 
-int simpler_kernel_mode_supported(DeviceContextHandle) { return 0; }
+int simpler_kernel_mode_supported(DeviceContextHandle ctx) {
+    return ctx != nullptr ? 1 : 0;
+}
 
 int simpler_kernel_mode_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
@@ -1275,11 +1290,13 @@ int simpler_kernel_mode_init(
             !has_serviceable_stream_topology(contract)) {
             return PTO_RUNTIME_ERR_INTERNAL;
         }
+        static_cast<DeviceRunnerBase *>(ctx)->set_kernel_pipeline_contract(contract);
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    [[maybe_unused]] auto submission = runner->kernel_submission_state().lock();
     // A same-mode latch is idempotent, but initialization is not. Reject
     // reuse before replacing executors. The adopted device identity also
     // catches init failures whose resource rollback
@@ -1323,6 +1340,7 @@ int simpler_kernel_mode_prepare_callable(
     if (rc != 0) return rc;
 
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    [[maybe_unused]] auto submission = runner->kernel_submission_state().lock();
     if (!runner->execution_mode_latch().is_kernel()) {
         LOG_ERROR("simpler_kernel_mode_prepare_callable: no live kernel context on this device context");
         return PTO_RUNTIME_ERR_INVALID_STATE;
@@ -1359,8 +1377,11 @@ int simpler_kernel_mode_prepare_callable(
 int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream) {
     const int rc = validate_kernel_launch_args(ctx, callable_id, args, caller_stream);
     if (rc != 0) return rc;
-    LOG_ERROR("simpler_kernel_mode_launch: no live kernel context on this device context");
-    return PTO_RUNTIME_ERR_INVALID_STATE;
+    DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    auto submission = runner->kernel_submission_state().lock();
+    if (runner->kernel_submission_state().closing()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    const int launch_rc = runner->submit_kernel_invocation(callable_id, args, caller_stream);
+    return launch_rc;
 }
 
 }  // extern "C"

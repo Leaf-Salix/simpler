@@ -278,6 +278,14 @@ def _run_lifecycle_retry(arch, runtime, device, scenario):
     assert lib.rtSetDevice(device) == 0
     aicpu, aicore, dispatcher = _binaries(arch, runtime)
     config = CallConfig()
+    # Use an explicit, small-but-real TMR arena request for the onboard
+    # lifecycle/prepare path.  Zeroed packed ring fields exercise the default
+    # resolver, but do not provide a useful device descriptor for this
+    # hardware smoke.
+    for ring in range(4):
+        config.runtime_env[ring] = 64
+        config.runtime_env[4 + ring] = 1 << 20
+        config.runtime_env[8 + ring] = 1024
     ctx = lib.create_device_context()
     init_args = (
         ctx,
@@ -458,9 +466,12 @@ def test_simulated_components_report_kernel_mode_unsupported(arch: str, runtime:
 
 @pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_CASES)
 def test_kernel_context_brings_up_and_closes_on_a_borrowed_device(arch: str, runtime: str, request):
-    """A kernel context comes up on a device the caller owns, refuses the
-    program-mode entry for the rest of its life, and releases everything it
-    created on close."""
+    """Exercise the onboard kernel entry according to the runtime boundary.
+
+    TMR owns the kernel contract in this stage and must bring up/close a
+    borrowed context.  HBG has a link-complete kernel stub and must reject the
+    same request without claiming the context.
+    """
     lib = _load(arch, "onboard", runtime)
     aicpu, aicore, dispatcher = _binaries(arch, runtime)
     config = CallConfig()
@@ -472,7 +483,7 @@ def test_kernel_context_brings_up_and_closes_on_a_borrowed_device(arch: str, run
     ctx = lib.create_device_context()
     assert ctx
     try:
-        assert (
+        rc = (
             lib.simpler_kernel_mode_init(
                 ctx,
                 device_id,
@@ -485,8 +496,13 @@ def test_kernel_context_brings_up_and_closes_on_a_borrowed_device(arch: str, run
                 ctypes.byref(config),
                 1,
             )  # fmt: skip
-            == 0
         )
+        if runtime == "host_build_graph":
+            # HBG's kernel builder is intentionally a link-complete stub in
+            # this stage; only the TMR runtime owns the kernel contract.
+            assert rc == PTO_RUNTIME_ERR_UNSUPPORTED
+            return
+        assert rc == 0
         # The claim is exclusive for the context's whole life.
         assert (
             lib.simpler_init(
@@ -510,6 +526,83 @@ def test_kernel_context_brings_up_and_closes_on_a_borrowed_device(arch: str, run
         # Destroying after a clean close is allowed; an unclosed kernel
         # context would be refused and leaked instead.
         lib.destroy_device_context(ctx)
+
+
+@pytest.mark.requires_hardware
+@pytest.mark.platforms(["a2a3"])
+@pytest.mark.runtime("tensormap_and_ringbuffer")
+@pytest.mark.device_count(1)
+def test_kernel_eager_launch_executes_fresh_tensor_and_scalar_snapshots(request):
+    """Run one real TMR AIV callable through the public kernel C ABI."""
+    import struct
+    import tempfile
+
+    from simpler.task_interface import ArgDirection, ChipStorageTaskArgs, ChipTensor, CoreCallable, ChipCallable, DataType
+    from simpler_setup.elf_parser import extract_text_section
+    from simpler_setup.kernel_compiler import KernelCompiler
+    from simpler_setup.pto_isa import ensure_pto_isa_root
+
+    device = int(str(request.config.getoption("--device")).split("-")[0].split(",")[0])
+    root = _PROJECT_ROOT
+    compiler = KernelCompiler("a2a3")
+    kernel = root / "examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels/aiv/kernel_add_scalar.cpp"
+    print("[eager] compile-start", flush=True)
+    with tempfile.TemporaryDirectory(prefix="kernel-eager-") as build_dir:
+        orchestration = compiler.compile_orchestration(
+            "tensormap_and_ringbuffer", str(Path(__file__).with_name("kernel_eager_orchestration.cpp")), build_dir=build_dir
+        )
+        incore = compiler.compile_incore(
+            str(kernel), core_type="aiv", pto_isa_root=ensure_pto_isa_root(),
+            extra_include_dirs=compiler.get_orchestration_include_dirs("tensormap_and_ringbuffer"), build_dir=build_dir
+        )
+    print("[eager] compile-done", flush=True)
+    signature = [ArgDirection.IN, ArgDirection.OUT, ArgDirection.SCALAR]
+    child = CoreCallable.build(signature=signature, binary=extract_text_section(incore))
+    chip = ChipCallable.build(signature=signature, func_name="kernel_eager_orchestration", binary=orchestration, children=[(0, child)])
+
+    lib = _load("a2a3", "onboard", "tensormap_and_ringbuffer")
+    for name, argtypes in {
+        "aclInit": [ctypes.c_char_p], "aclFinalize": [], "aclrtSetDevice": [ctypes.c_int],
+        "aclrtResetDevice": [ctypes.c_int], "aclrtCreateStream": [ctypes.POINTER(ctypes.c_void_p)],
+        "aclrtDestroyStream": [ctypes.c_void_p], "aclrtSynchronizeStreamWithTimeout": [ctypes.c_void_p, ctypes.c_int32],
+        "aclrtMalloc": [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_int],
+        "aclrtFree": [ctypes.c_void_p], "aclrtMemcpy": [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int],
+    }.items():
+        fn = getattr(lib, name); fn.argtypes = argtypes; fn.restype = ctypes.c_int
+    assert lib.aclInit(None) == 0
+    print("[eager] acl-init-done", flush=True)
+    stream = ctypes.c_void_p(); ctx = None; allocs = []
+    try:
+        assert lib.aclrtSetDevice(device) == 0
+        assert lib.aclrtCreateStream(ctypes.byref(stream)) == 0
+        ctx = lib.create_device_context(); assert ctx
+        config = CallConfig()
+        for ring in range(4):
+            config.runtime_env[ring] = 64; config.runtime_env[4 + ring] = 1 << 20; config.runtime_env[8 + ring] = 1024
+        aicpu, aicore, dispatcher = _binaries("a2a3", "tensormap_and_ringbuffer")
+        assert lib.simpler_kernel_mode_init(ctx, device, aicpu, len(aicpu), aicore, len(aicore), dispatcher, len(dispatcher), ctypes.byref(config), 71) == 0
+        print("[eager] kernel-init-done", flush=True)
+        assert lib.simpler_kernel_mode_supported(ctx) == 1
+        print("[eager] prepare-start", flush=True)
+        assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, chip.buffer_ptr(), chip.buffer_size()) == 0
+        print("[eager] prepare-done", flush=True)
+        count = 128 * 128; array = ctypes.c_float * count; nbytes = ctypes.sizeof(array)
+        for round_index, scalar in enumerate((1.25, -3.5)):
+            src = ctypes.c_void_p(); dst = ctypes.c_void_p(); assert lib.aclrtMalloc(ctypes.byref(src), nbytes, 0) == 0; assert lib.aclrtMalloc(ctypes.byref(dst), nbytes, 0) == 0
+            allocs.extend((src, dst)); values = [float(i % 127 + round_index * 257) for i in range(count)]
+            host_in = array(*values); host_out = array(*([-999.0] * count))
+            assert lib.aclrtMemcpy(src, nbytes, host_in, nbytes, 1) == 0
+            args = ChipStorageTaskArgs(); args.add_tensor(ChipTensor.make(src.value, (count,), DataType.FLOAT32, child_memory=True)); args.add_tensor(ChipTensor.make(dst.value, (count,), DataType.FLOAT32, child_memory=True)); args.add_scalar(int.from_bytes(struct.pack("<f", scalar), "little"))
+            assert lib.simpler_kernel_mode_launch(ctx, 0, args.__ptr__(), stream) == 0
+            args.clear(); assert lib.aclrtSynchronizeStreamWithTimeout(stream, 60000) == 0
+            assert lib.aclrtMemcpy(host_out, nbytes, dst, nbytes, 2) == 0
+            assert list(host_out) == [value + scalar for value in values]
+        assert lib.finalize_device(ctx) == 0; ctx = None
+    finally:
+        if ctx: lib.finalize_device(ctx); lib.destroy_device_context(ctx)
+        for ptr in reversed(allocs): lib.aclrtFree(ptr)
+        if stream: lib.aclrtDestroyStream(stream)
+        lib.aclrtResetDevice(device); lib.aclFinalize()
 
 
 if __name__ == "__main__":

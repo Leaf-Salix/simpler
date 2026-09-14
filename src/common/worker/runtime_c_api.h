@@ -59,7 +59,6 @@
 #include <stdint.h>
 
 #include "device_memory_info.h"
-#include "../task_interface/execution_mode.h"
 
 // simpler_run takes a pointer to the C++ CallConfig POD (task_interface/
 // call_config.h). Forward-declared so this C-linkage header needn't pull the
@@ -110,6 +109,8 @@ enum {
        context's lifecycle (e.g. launch on a context with no live kernel
        claim). */
     PTO_RUNTIME_ERR_INVALID_STATE = PTO_RUNTIME_ERR_BASE - 3,
+    /* A validated request does not fit the frozen resource capacity. */
+    PTO_RUNTIME_ERR_CAPACITY_EXCEEDED = PTO_RUNTIME_ERR_BASE - 4,
 };
 
 /** Return values from simpler_poll_run(). */
@@ -138,8 +139,7 @@ typedef enum PipelineResourceClass {
     /* Not rewritten per run: whoever populates it does so once, and device ops
        run one at a time, so a single instance is reused across runs. */
     PTO_PIPELINE_DEVICE_SCRATCH = 1,
-    /* Execution role. Kernel mode owns a dedicated non-hidden AICPU stream
-       and a hidden AICore stream; both are distinct from borrowed caller. */
+    /* Execution context (stream) a run owns while its op runs and is reaped. */
     PTO_PIPELINE_EXEC_HANDLE = 2,
 } PipelineResourceClass;
 
@@ -645,21 +645,4 @@ int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, con
 
 #ifdef __cplusplus
 }
-#endif
-
-#ifdef __cplusplus
-#include <type_traits>
-
-static_assert(
-    std::is_trivially_copyable_v<SimplerKernelCtxControl> && std::is_standard_layout_v<SimplerKernelCtxControl>
-);
-static_assert(offsetof(SimplerKernelCtxControl, abi_version) == 0);
-static_assert(offsetof(SimplerKernelCtxControl, struct_size) == 4);
-static_assert(offsetof(SimplerKernelCtxControl, action) == 8);
-static_assert(offsetof(SimplerKernelCtxControl, mode) == 12);
-static_assert(offsetof(SimplerKernelCtxControl, gm_heap_bytes) == 16);
-static_assert(offsetof(SimplerKernelCtxControl, gm_sm_bytes) == 24);
-static_assert(offsetof(SimplerKernelCtxControl, runtime_arena_bytes) == 32);
-static_assert(offsetof(SimplerKernelCtxControl, reserved) == 40);
-static_assert(sizeof(SimplerKernelCtxControl) == 72);
 #endif

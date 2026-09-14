@@ -19,6 +19,7 @@
 #include "host_build_graph/kernel_graph_slot_wire.h"
 #include "worker/pipeline_contract.h"
 #include "host/kernel_execution_state.h"
+#include "host/kernel_device_resources.h"
 #include "utils/device_arena.h"
 
 namespace hbg {

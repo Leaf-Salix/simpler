@@ -11,6 +11,10 @@
 
 #include "tmr_kernel_invocation.h"
 
+#include <cstring>
+#include <vector>
+
+#include "kernel_dispatch_args.h"
 #include "device_runner_base.h"
 
 namespace simpler::tmr {
@@ -26,8 +30,25 @@ int enqueue_tmr_invocation_aicpu(
     if (status != InvocationStatus::Ok) return PTO_RUNTIME_ERR_INTERNAL;
     try {
         const auto packet = candidate.packet();
+        if (packet.size < sizeof(SimplerKernelInvocationHeader)) return PTO_RUNTIME_ERR_INTERNAL;
+        // The public K9 header remains the only invocation identity. The outer
+        // dispatch prefix adds the trusted residency descriptor address; its
+        // payload is the K9 payload (binding ref + descriptors + scalars), not
+        // a second copy of the K9 header.
+        SimplerKernelDispatchArgs dispatch{};
+        std::memcpy(&dispatch.invocation, packet.data, sizeof(dispatch.invocation));
+        dispatch.residency_address = binding.device_binding_addr;
+        dispatch.round_epoch = runner.next_kernel_round_epoch();
+        dispatch.invocation.payload_bytes = packet.size - sizeof(SimplerKernelInvocationHeader);
+        dispatch.packet_bytes = sizeof(dispatch) + dispatch.invocation.payload_bytes;
+        std::vector<uint8_t> launch_packet(static_cast<size_t>(dispatch.packet_bytes));
+        std::memcpy(launch_packet.data(), &dispatch, sizeof(dispatch));
+        std::memcpy(
+            launch_packet.data() + sizeof(dispatch), packet.data + sizeof(SimplerKernelInvocationHeader),
+            static_cast<size_t>(dispatch.invocation.payload_bytes)
+        );
         return runner.launch_aicpu_payload(
-            stream, const_cast<uint8_t *>(packet.data), packet.size, TmrKernelInvocationName, aicpu_num
+            stream, launch_packet.data(), launch_packet.size(), TmrKernelInvocationName, aicpu_num
         );
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;

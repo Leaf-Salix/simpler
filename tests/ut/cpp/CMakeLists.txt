@@ -137,6 +137,7 @@ function(add_a2a3_hbg_runtime_test name src)
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+        ${CMAKE_SOURCE_DIR}/../../../src/common/worker
         ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
         ${CMAKE_SOURCE_DIR}/../../../src/common
         # Mirrors the runtime's own include path: the runtime-agnostic platform and
@@ -168,6 +169,7 @@ function(add_a5_hbg_runtime_test name src)
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+        ${CMAKE_SOURCE_DIR}/../../../src/common/worker
         ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
         ${CMAKE_SOURCE_DIR}/../../../src/common
         # Mirrors the runtime's own include path: the runtime-agnostic platform and
@@ -530,18 +532,33 @@ target_link_libraries(test_kernel_entry_validation PRIVATE ${GTEST_MAIN_LIB} ${G
 add_test(NAME test_kernel_entry_validation COMMAND test_kernel_entry_validation)
 set_tests_properties(test_kernel_entry_validation PROPERTIES LABELS "no_hardware")
 
+add_executable(test_kernel_context_provider
+    common/test_kernel_context_provider.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_device_resources.cpp)
+target_include_directories(test_kernel_context_provider PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+target_link_libraries(test_kernel_context_provider PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_kernel_context_provider COMMAND test_kernel_context_provider)
+set_tests_properties(test_kernel_context_provider PROPERTIES LABELS "no_hardware")
+
 # Kernel-mode phase machine and restricted-vocabulary tables, table-driven with
 # fake ops: init/close balance, poison, sticky CLOSING with retry, and the
 # separate runtime-error vs teardown-error slots.
 add_executable(test_kernel_execution_state
     common/test_kernel_execution_state.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_execution_state.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_device_resources.cpp
 )
 target_include_directories(test_kernel_execution_state PRIVATE
     ${GTEST_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/worker
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${CMAKE_SOURCE_DIR}/../../../src/common
 )
 target_link_libraries(test_kernel_execution_state PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
 add_test(NAME test_kernel_execution_state COMMAND test_kernel_execution_state)
@@ -596,6 +613,8 @@ add_task_interface_test(test_call_config types/test_call_config.cpp)
 add_task_interface_test(test_kernel_invocation_header types/test_kernel_invocation_header.cpp)
 add_task_interface_test(test_kernel_invocation_validation types/test_kernel_invocation_validation.cpp)
 add_common_utils_test(test_tmr_kernel_invocation common/test_tmr_kernel_invocation.cpp)
+add_common_utils_test(test_kernel_submission_state common/test_kernel_submission_state.cpp)
+add_common_utils_test(test_kernel_binder common/test_kernel_binder.cpp)
 target_include_directories(test_tmr_kernel_invocation PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
 )
@@ -635,6 +654,33 @@ target_include_directories(test_runtime_orch_so PRIVATE
 )
 add_common_utils_test(test_device_arena common/test_device_arena.cpp)
 add_common_utils_test(test_thread_completion_gate common/test_thread_completion_gate.cpp)
+add_common_utils_test(test_tmr_kernel_round_gate common/test_tmr_kernel_round_gate.cpp)
+target_include_directories(test_tmr_kernel_round_gate PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+)
+set_tests_properties(test_tmr_kernel_round_gate PROPERTIES TIMEOUT 60)
+add_common_utils_test(test_tmr_kernel_clear_plan common/test_tmr_kernel_clear_plan.cpp)
+foreach(k7_target kernel_execution_round)
+    add_common_utils_test(test_tmr_${k7_target} common/test_tmr_${k7_target}.cpp)
+    target_include_directories(test_tmr_${k7_target} PRIVATE
+        $<TARGET_PROPERTY:a2a3_rt_objs,INTERFACE_INCLUDE_DIRECTORIES>
+    )
+    set_tests_properties(test_tmr_${k7_target} PROPERTIES TIMEOUT 30)
+endforeach()
+add_common_utils_test(test_tmr_kernel_core_group common/test_tmr_kernel_core_group.cpp)
+target_include_directories(test_tmr_kernel_core_group PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+add_common_utils_test(test_tmr_kernel_aicore common/test_tmr_kernel_aicore.cpp)
+target_include_directories(test_tmr_kernel_aicore PRIVATE
+    $<TARGET_PROPERTY:a2a3_rt_objs,INTERFACE_INCLUDE_DIRECTORIES>
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/aicore
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/aicore
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+set_tests_properties(test_tmr_kernel_aicore PROPERTIES TIMEOUT 60)
 add_common_utils_test(test_fatal_shutdown_latch common/test_fatal_shutdown_latch.cpp)
 add_common_utils_test(test_buffer_pool_manager common/test_buffer_pool_manager.cpp)
 target_sources(test_buffer_pool_manager PRIVATE
@@ -688,7 +734,8 @@ add_common_utils_test(test_file_marker_handshake common/test_file_marker_handsha
 # free of CANN.
 set(KERNEL_PERSISTENT_ARGS_SRC
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host/kernel_persistent_args.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_execution_state.cpp)
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_execution_state.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_device_resources.cpp)
 
 add_executable(test_kernel_persistent_args
     common/test_kernel_persistent_args.cpp

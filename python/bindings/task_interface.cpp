@@ -3179,6 +3179,30 @@ NB_MODULE(_task_interface, m) {
         )
         .def("finalize", &ChipWorker::finalize)
         .def(
+            "init_kernel",
+            [](ChipWorker &self, const std::string &host_lib_path, const std::string &aicpu_path,
+               const std::string &kernel_aicore_path, const std::string &dispatcher_path, int device_id,
+               const CallConfig &config, uint64_t context_generation) {
+                self.init_kernel_mode(
+                    host_lib_path, aicpu_path, kernel_aicore_path, dispatcher_path, device_id, config,
+                    context_generation
+                );
+            },
+            nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("kernel_aicore_path"), nb::arg("dispatcher_path"),
+            nb::arg("device_id"), nb::arg("config"), nb::arg("context_generation"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Initialize dedicated kernel mode; the kernel AICore ELF is mandatory and never falls back to the program "
+            "image."
+        )
+        .def(
+            "prepare_kernel_callable", &ChipWorker::prepare_kernel_callable, nb::arg("callable_id"),
+            nb::arg("callable"), nb::arg("callable_size")
+        )
+        .def(
+            "launch_kernel", &ChipWorker::launch_kernel, nb::arg("callable_id"), nb::arg("args"),
+            nb::arg("caller_stream")
+        )
+        .def(
             "register_callable",
             [](ChipWorker &self, int32_t callable_id, const PyChipCallable &callable) {
                 self.register_callable(callable_id, callable.buffer_.data());

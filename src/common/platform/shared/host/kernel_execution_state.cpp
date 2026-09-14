@@ -11,10 +11,12 @@
 
 #include "host/kernel_execution_state.h"
 
-int KernelExecutionState::initialize(int requested_device_id, const KernelContextOps &ops) {
+int KernelExecutionState::initialize(
+    int requested_device_id, const KernelContextOps &ops, uint64_t context_generation
+) {
     std::scoped_lock lock(mutex_);
     if (phase_ != KernelContextPhase::New) return PTO_RUNTIME_ERR_INVALID_STATE;
-    if (requested_device_id < 0 || !ops.valid()) return PTO_RUNTIME_ERR_INTERNAL;
+    if (requested_device_id < 0 || context_generation == 0 || !ops.valid()) return PTO_RUNTIME_ERR_INTERNAL;
 
     int current_device = -1;
     int rc = ops.get_current_device(ops.context, &current_device);
@@ -24,6 +26,7 @@ int KernelExecutionState::initialize(int requested_device_id, const KernelContex
     phase_ = KernelContextPhase::Initializing;
     ops_ = ops;
     device_id_ = requested_device_id;
+    context_generation_ = context_generation;
 
     for (auto &stream : hidden_streams_) {
         rc = ops_.create_hidden_stream(ops_.context, &stream);
@@ -43,6 +46,7 @@ int KernelExecutionState::initialize(int requested_device_id, const KernelContex
         } else {
             phase_ = KernelContextPhase::New;
             device_id_ = -1;
+            context_generation_ = 0;
             ops_ = {};
         }
         return rc;
@@ -95,6 +99,11 @@ int KernelExecutionState::close() {
 }
 
 int KernelExecutionState::cleanup_owned_resources_locked() {
+    // Device arenas must be released before their owner is considered closed.
+    // A failed release leaves the allocation ledger intact, so close() can be
+    // retried without losing ownership or destroying the stream vocabulary.
+    const int resource_error = resources_.close();
+    if (resource_error != 0) return resource_error;
     int first_error = 0;
     for (size_t i = events_.size(); i > 0; --i) {
         void *&event = events_[i - 1];
@@ -150,6 +159,7 @@ bool KernelExecutionState::has_live_resources() const {
 }
 
 bool KernelExecutionState::has_live_resources_locked() const {
+    if (resources_.has_live_resources()) return true;
     for (void *stream : hidden_streams_) {
         if (stream != nullptr) return true;
     }
@@ -167,4 +177,65 @@ void *KernelExecutionState::hidden_stream(KernelStreamKind kind) const {
 void *KernelExecutionState::event(KernelEventKind kind) const {
     std::scoped_lock lock(mutex_);
     return events_[static_cast<size_t>(kind)];
+}
+
+int KernelExecutionState::prepare_resources(const KernelResourceLayout &layout, const KernelResourceOps &ops) {
+    std::scoped_lock lock(mutex_);
+    if (phase_ != KernelContextPhase::Collecting && phase_ != KernelContextPhase::ReadyEnqueued)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    int current_device = -1;
+    const int current_rc = ops_.get_current_device(ops_.context, &current_device);
+    if (current_rc != 0) return current_rc;
+    if (current_device != device_id_) return PTO_RUNTIME_ERR_INVALID_STATE;
+    int rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        rc = resources_.prepare(layout, ops);
+    } catch (...) {
+        // Resource layout vectors are host-only and may throw before a device
+        // allocation is acquired; expose a C-style failure at this boundary.
+    }
+    if (resources_.closing()) {
+        phase_ = KernelContextPhase::Closing;
+        if (unexpected_teardown_error_ == 0) unexpected_teardown_error_ = resources_.cleanup_error();
+    }
+    return rc;
+}
+
+int KernelExecutionState::freeze_resources() {
+    std::scoped_lock lock(mutex_);
+    if (phase_ != KernelContextPhase::Collecting && phase_ != KernelContextPhase::ReadyEnqueued)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    return resources_.freeze();
+}
+
+int KernelExecutionState::bind_resources_for_launch(
+    int device_id, uint64_t generation, uint64_t schema, const uint64_t *required, size_t count,
+    KernelResourceBinding &out
+) const {
+    std::scoped_lock lock(mutex_);
+    if (phase_ != KernelContextPhase::ReadyEnqueued || device_id != device_id_ || generation != context_generation_)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    return resources_.bind(schema, required, count, out);
+}
+
+int KernelExecutionState::inspect_frozen_resources(
+    int device_id, uint64_t generation, uint64_t schema, const uint64_t *required, size_t count,
+    KernelResourceBinding &out
+) const {
+    std::scoped_lock lock(mutex_);
+    if ((phase_ != KernelContextPhase::Collecting && phase_ != KernelContextPhase::ReadyEnqueued) ||
+        device_id != device_id_ || generation != context_generation_) {
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    return resources_.bind(schema, required, count, out);
+}
+
+bool KernelExecutionState::resources_prepared() const {
+    std::scoped_lock lock(mutex_);
+    return resources_.prepared();
+}
+
+bool KernelExecutionState::resources_frozen() const {
+    std::scoped_lock lock(mutex_);
+    return resources_.frozen();
 }

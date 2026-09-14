@@ -119,6 +119,8 @@ def capture_probe(tmp_path_factory):
         )
     ]
     pkg = cann / f"{platform.machine()}-linux/pkg_inc"
+    driver_lib = cann.parent / "driver" / "lib64" / "driver"
+    platform_lib = cann / f"{platform.machine()}-linux" / "lib64"
     host_includes += [
         cann / "include",
         pkg,
@@ -130,6 +132,7 @@ def capture_probe(tmp_path_factory):
     sources = [
         _SOURCE / "driver.cpp",
         _ROOT / "src/common/platform/shared/host/kernel_execution_state.cpp",
+        _ROOT / "src/common/platform/shared/host/kernel_device_resources.cpp",
         _ROOT / "src/common/platform/onboard/host/kernel_platform_ops.cpp",
         _ROOT / "src/common/aicpu_loader/host/load_aicpu_op.cpp",
         _ROOT / "src/common/log/unified_log_host.cpp",
@@ -144,6 +147,8 @@ def capture_probe(tmp_path_factory):
             *map(str, sources),
             *[f"-I{path}" for path in host_includes],
             f"-L{cann / 'lib64'}",
+            *([f"-L{driver_lib}", "-lascend_hal", "-ldrvdsmi_host"] if driver_lib.is_dir() else []),
+            *([f"-L{platform_lib}", "-lplatform"] if platform_lib.is_dir() else []),
             f"-Wl,-rpath,{cann / 'lib64'}",
             "-lascendcl",
             "-lruntime",

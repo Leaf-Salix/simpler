@@ -57,6 +57,7 @@
 #include "arg_direction.h"
 #include "call_config.h"
 #include "callable.h"
+#include "callable_protocol.h"
 #include "common/device_phase.h"
 #include "common/dma_workspace.h"
 #include "common/chip_swimlane_profiling.h"
@@ -68,8 +69,11 @@
 #include "host/host_phase_records.h"
 #include "host/execution_mode_latch.h"
 #include "host/kernel_execution_state.h"
+#include "host/kernel_context_provider.h"
+#include "host/kernel_submission_state.h"
 #include "kernel_persistent_args.h"
 #include "host/kernel_static_config.h"
+#include "kernel_callable_residency.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
 #include "host/runtime_timeout_config.h"
@@ -78,6 +82,9 @@
 #include "prepare_callable_common.h"
 #include "runtime_c_api.h"
 #include "native_run_execution.h"
+#include "tmr_kernel_invocation.h"
+#include "task_interface/tmr_kernel_context.h"
+#include "task_interface/tmr_kernel_control.h"
 
 struct HostApi;  // common/host_api.h — fwd-declared to keep task_interface headers out
 
@@ -150,6 +157,7 @@ public:
 
     /** Context-lifetime streams and events, live only in kernel mode. */
     KernelExecutionState &kernel_execution_state() { return kernel_exec_state_; }
+    KernelSubmissionState &kernel_submission_state() { return kernel_submission_state_; }
     bool has_persistent_kernel_args() const { return persistent_args_.has_live_resources(); }
 
     /**
@@ -160,6 +168,7 @@ public:
      * async-DMA workspace — that channel belongs to program mode.
      */
     int init_kernel_context(int device_id, const CallConfig &config, uint64_t context_generation);
+    void set_kernel_pipeline_contract(const PipelineContract &contract) { kernel_contract_ = contract; }
 
     /**
      * Register one callable on a kernel-mode context and make sure the
@@ -167,6 +176,22 @@ public:
      * matters: only the first callable pays for the argument blocks.
      */
     int prepare_kernel_callable(int32_t callable_id);
+    int publish_kernel_callable_residency(int32_t callable_id);
+    int register_kernel_callable_residency(int32_t callable_id);
+    int prepare_kernel_context_storage();
+    // K3 provider view. The caller holds the submission gate; the returned
+    // addresses remain valid until kernel close and are never inferred from a
+    // launch packet.
+    int kernel_stable_device_binding(KernelStableDeviceBinding *out) const noexcept;
+    /** Wait for the last kernel submission before releasing callable state. */
+    int synchronize_kernel_tail() noexcept;
+    uint64_t kernel_callable_residency_address(int32_t callable_id) const;
+    int submit_kernel_invocation(int32_t callable_id, const void *args, void *caller_stream);
+    uint64_t next_kernel_round_epoch() noexcept {
+        uint64_t next = kernel_round_epoch_.fetch_add(1, std::memory_order_relaxed);
+        if (next == 0) next = kernel_round_epoch_.fetch_add(1, std::memory_order_relaxed);
+        return next;
+    }
 
     /** Allocate / free / copy on the per-Worker `MemoryAllocator` + CANN runtime. */
     void *allocate_tensor(std::size_t bytes);
@@ -737,19 +762,24 @@ public:
     int launch_aicpu_payload(rtStream_t stream, void *args, size_t args_size, const char *kernel_name, int aicpu_num);
 
     /**
-     * Launch an AICore kernel. Lazy-registers the kernel binary
-     * (`aicore_kernel_binary_`) on first call via `rtRegisterAllKernel`
-     * and caches the resulting `aicore_bin_handle_`; subsequent calls
-     * reuse the cached handle. CANN has no public
+     * Launch an AICore kernel. Program mode lazy-registers the kernel binary
+     * (`aicore_kernel_binary_`) on first call; kernel mode requires the handle
+     * to have been prepared already and submits the dedicated 16-byte TMR
+     * envelope. Both paths cache `aicore_bin_handle_`; CANN has no public
      * `rtUnregisterAllKernel`, so re-registering on every run would pin
      * another device-side copy of the ELF and quickly exhaust HBM —
      * manifested in CI as 207001 at `rtKernelLaunchWithHandleV2` with a
      * 507899 cascade at `rtStreamCreate`.
      *
-     * `k_args` reaches the AICore kernel through `rtArgsEx_t` as a
-     * device-resident KernelArgs payload pointer.
+     * Program mode passes a device-resident KernelArgs payload pointer; kernel
+     * mode passes `TmrKernelAicoreArgs{resident_kernel_args, context_descriptor}`.
      */
     int launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args);
+
+    // Register the kernel-mode AICore image during prepare. This is separate
+    // from enqueue: registration publishes a stable handle but does not issue
+    // device work, so launch/replay never has to perform a first-use mutation.
+    int ensure_aicore_kernel_registered();
 
     /**
      * Walk the SDMA control path once per channel, so the first TPREFETCH_ASYNC
@@ -1215,6 +1245,34 @@ protected:
         void *host_orch_func_ptr{nullptr};
     };
     std::unordered_map<int32_t, CallableState> callables_;
+    struct KernelResidentSlot {
+        void *descriptor{nullptr};
+        void *function_table{nullptr};
+        uint64_t generation{0};
+    };
+    std::array<KernelResidentSlot, MAX_REGISTERED_CALLABLE_IDS> kernel_residency_{};
+    void *kernel_context_descriptor_{nullptr};
+    // Device-resident argument envelope consumed by the dedicated kernel-mode
+    // AICore ELF.  The launch ABI passes a device pointer (never a pointer to
+    // a host stack envelope), so this small block is allocated once at
+    // prepare and reused after each invocation has completed.
+    void *kernel_aicore_args_{nullptr};
+    void *kernel_callable_table_{nullptr};
+    void *kernel_control_{nullptr};
+    void *kernel_reports_{nullptr};
+    bool kernel_context_registered_{false};
+    std::array<uint64_t, MAX_REGISTERED_CALLABLE_IDS> kernel_callable_generations_{};
+    std::array<simpler::tmr::TmrEncodingCache, MAX_REGISTERED_CALLABLE_IDS> kernel_invocation_caches_{};
+    std::atomic<uint64_t> kernel_round_epoch_{1};
+    PipelineContract kernel_contract_{};
+    // Snapshot published once after K5 resident preparation. Launches borrow
+    // this immutable binding; they never recompute or mutate resource bases.
+    KernelStableDeviceBinding kernel_binding_{};
+    bool kernel_binding_frozen_{false};
+    // Kernel-only publication owner; program mode never consults this view.
+    // Constructed only by the kernel-mode init path. Program mode has no
+    // provider object and therefore cannot accidentally enter K3/TMR cleanup.
+    std::unique_ptr<KernelContextProvider> kernel_context_provider_{};
     // Opaque provider handle from dma_workspace_provision(), owned for the
     // Worker's life and released by finalize_common(). Null unless the Worker
     // was created with SDMA enabled.
@@ -1268,6 +1326,7 @@ protected:
     // values for a program-mode context, and neither performs a runtime call
     // on destruction.
     KernelExecutionState kernel_exec_state_;
+    KernelSubmissionState kernel_submission_state_;
     PersistentKernelArgs persistent_args_;
     KernelStaticConfig kernel_static_config_;
     // The Runtime image a kernel-mode context uploads once. Its per-callable
@@ -1302,8 +1361,8 @@ protected:
     // the cached `rtFuncHandle` on `LoadAicpuOp`, not the host bytes.
     std::vector<uint8_t> aicpu_so_binary_;
     std::vector<uint8_t> aicore_kernel_binary_;
-    // AICore kernel handle from `rtRegisterAllKernel` — lazily
-    // populated by the subclass's `launch_aicore_kernel()` and reused
+    // AICore kernel handle from `rtRegisterAllKernel` — populated during
+    // kernel prepare before the first callable is published and reused
     // across all runs. `nullptr` means not yet registered. Reset to
     // `nullptr` in `finalize()`; CANN releases the device-side state
     // implicitly when the device context tears down.

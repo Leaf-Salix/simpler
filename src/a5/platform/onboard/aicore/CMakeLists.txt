@@ -127,3 +127,46 @@ add_custom_target(aicore_kernel ALL
     BYPRODUCTS ${AICORE_KERNEL_OBJ}
     COMMENT "Linking AICore kernel binary"
 )
+
+# Keep the kernel-mode entry in a separate ELF.  The program entry and the
+# kernel entry use different argument layouts and must never share entry 0.
+foreach(SRC_FILE ${ALL_SOURCES})
+    if(SRC_FILE MATCHES "/tensormap_and_ringbuffer/aicore/aicore_executor\\.cpp$")
+        set(TMR_KERNEL_MODE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/kernel_mode_kernel.cpp")
+        set(TMR_KERNEL_MODE_AIC "${CMAKE_CURRENT_BINARY_DIR}/kernel_mode_kernel_aic.o")
+        set(TMR_KERNEL_MODE_AIV "${CMAKE_CURRENT_BINARY_DIR}/kernel_mode_kernel_aiv.o")
+        set(TMR_KERNEL_MODE_OBJ "${CMAKE_CURRENT_BINARY_DIR}/aicore_kernel_mode.o")
+        set(TMR_KERNEL_MODE_OBJECTS ${ALL_AIC_OBJECTS} ${ALL_AIV_OBJECTS})
+        list(REMOVE_ITEM TMR_KERNEL_MODE_OBJECTS
+            "${CMAKE_CURRENT_BINARY_DIR}/kernel_aic.o"
+            "${CMAKE_CURRENT_BINARY_DIR}/kernel_aiv.o"
+        )
+        set(TMR_KERNEL_WIRE_HEADERS
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface/tmr_kernel_context.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface/tmr_kernel_control.h"
+        )
+        add_custom_command(
+            OUTPUT ${TMR_KERNEL_MODE_AIC}
+            COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS}
+                    --cce-aicore-arch=dav-c310-cube -o ${TMR_KERNEL_MODE_AIC} ${TMR_KERNEL_MODE_SRC}
+            DEPENDS ${TMR_KERNEL_MODE_SRC} ${TMR_KERNEL_WIRE_HEADERS}
+            COMMENT "Compiling kernel-mode entry for AIC"
+        )
+        add_custom_command(
+            OUTPUT ${TMR_KERNEL_MODE_AIV}
+            COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS}
+                    --cce-aicore-arch=dav-c310-vec -o ${TMR_KERNEL_MODE_AIV} ${TMR_KERNEL_MODE_SRC}
+            DEPENDS ${TMR_KERNEL_MODE_SRC} ${TMR_KERNEL_WIRE_HEADERS}
+            COMMENT "Compiling kernel-mode entry for AIV"
+        )
+        add_custom_target(aicore_kernel_mode ALL
+            DEPENDS ${TMR_KERNEL_MODE_OBJECTS} ${TMR_KERNEL_MODE_AIC} ${TMR_KERNEL_MODE_AIV}
+            COMMAND ${BISHENG_LD} -m aicorelinux -Ttext=0 -static -n
+                    -o ${TMR_KERNEL_MODE_OBJ} ${TMR_KERNEL_MODE_OBJECTS}
+                    ${TMR_KERNEL_MODE_AIC} ${TMR_KERNEL_MODE_AIV}
+            BYPRODUCTS ${TMR_KERNEL_MODE_OBJ}
+            COMMENT "Linking TMR kernel-mode AICore binary"
+        )
+        break()
+    endif()
+endforeach()
