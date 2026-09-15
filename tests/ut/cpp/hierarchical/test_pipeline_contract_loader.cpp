@@ -9,13 +9,17 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include <dlfcn.h>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include <gtest/gtest.h>
 
 #include "chip_worker.h"
 #include "chip_run_lane.h"
 #include "pipeline_contract.h"
+#include "common/host_log_state.h"
+#include "common/log_level.h"
 
 namespace {
 
@@ -94,6 +98,31 @@ TEST(PipelineContractLoader, LegalProgramDeclarationReachesRealFactoryCall) {
 }
 
 TEST(KernelPipelineEntry, RealSimVariantsValidateWithoutClaimingOrCommitting) {
+    std::vector<std::string> runtime_paths;
+    for (const char *arch : {"a2a3", "a5"}) {
+        for (const char *runtime : {"tensormap_and_ringbuffer", "host_build_graph"}) {
+            runtime_paths.push_back(
+                std::string(RUNTIME_LIBRARY_ROOT) + "/" + arch + "/sim/" + runtime + "/libhost_runtime.so"
+            );
+        }
+    }
+    size_t present = std::filesystem::exists(SIM_CONTEXT_PATH) ? 1 : 0;
+    std::string missing;
+    if (present == 0) missing = SIM_CONTEXT_PATH;
+    for (const auto &path : runtime_paths) {
+        if (std::filesystem::exists(path)) {
+            ++present;
+        } else {
+            missing += "\n" + path;
+        }
+    }
+    if (present == 0) {
+        GTEST_SKIP() << "Sim runtimes not built; build build_package_sim before running real entry tests.\n" << missing;
+    }
+    ASSERT_EQ(present, runtime_paths.size() + 1) << "Incomplete sim runtime artifacts; missing:\n" << missing;
+    // No writer or file sink: diagnostics are synchronous on stderr. The state
+    // outlives any runtime DSO whose unload is deferred by the platform loader.
+    static SimplerHostLogState log_state{static_cast<int32_t>(simpler::log::LogLevel::ERROR)};
     // Sim hooks must remain global for every host runtime loaded beneath them.
     LoadedRuntime sim_context(SIM_CONTEXT_PATH, RTLD_NOW | RTLD_GLOBAL);
     for (const char *arch : {"a2a3", "a5"}) {
@@ -102,6 +131,8 @@ TEST(KernelPipelineEntry, RealSimVariantsValidateWithoutClaimingOrCommitting) {
                 std::string(RUNTIME_LIBRARY_ROOT) + "/" + arch + "/sim/" + runtime + "/libhost_runtime.so";
             SCOPED_TRACE(path);
             LoadedRuntime library(path.c_str());
+            auto bind_log = symbol<SimplerHostLogBindStateFn>(library.handle, "simpler_host_log_bind_state");
+            ASSERT_EQ(bind_log(&log_state), 0);
             auto create = symbol<decltype(&create_device_context)>(library.handle, "create_device_context");
             auto destroy = symbol<decltype(&destroy_device_context)>(library.handle, "destroy_device_context");
             auto init = symbol<decltype(&simpler_kernel_mode_init)>(library.handle, "simpler_kernel_mode_init");
@@ -128,7 +159,11 @@ TEST(KernelPipelineEntry, RealSimVariantsValidateWithoutClaimingOrCommitting) {
                                                                                       PTO_RUNTIME_ERR_UNSUPPORTED
             );
             config.runtime_env.ring_task_window[0] = 0;
-            EXPECT_EQ(invoke(&config), PTO_RUNTIME_ERR_UNSUPPORTED);
+            testing::internal::CaptureStderr();
+            const int init_result = invoke(&config);
+            const std::string diagnostic = testing::internal::GetCapturedStderr();
+            EXPECT_EQ(init_result, PTO_RUNTIME_ERR_UNSUPPORTED);
+            EXPECT_NE(diagnostic.find("kernel mode is not supported"), std::string::npos) << diagnostic;
             EXPECT_EQ(supported(ctx), 0);
             EXPECT_EQ(committed(ctx), 0u);
             // A structurally valid launch still cannot run after unsupported init.

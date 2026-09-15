@@ -225,7 +225,12 @@ typedef struct NativeRunDescriptor {
  * Public API (resolved by ChipWorker via dlsym)
  * =========================================================================== */
 
-/** Return this runtime's immutable pipeline resource declaration. */
+/**
+ * Return this runtime's immutable program-mode resource declaration.
+ * Program resources have bytes_per_copy == 0. Both AICPU_STREAM and
+ * AICORE_STREAM must appear exactly once, each with class EXEC_HANDLE.
+ * ChipWorker rejects unserviceable declarations before creating a context.
+ */
 const PipelineContract *get_pipeline_contract(void);
 
 /**
@@ -616,6 +621,13 @@ int simpler_kernel_mode_supported(DeviceContextHandle ctx);
  * is context-static; launches never mutate it. `context_generation` is a
  * nonzero host-process-unique identity minted by the caller for sequential
  * contexts; generation zero is invalid.
+ *
+ * Structural argument errors and invalid TMR sizing configurations return
+ * PTO_RUNTIME_ERR_INVALID_ARGUMENT. Invalid generated resource contracts or
+ * C++ exceptions during admission return PTO_RUNTIME_ERR_INTERNAL.
+ * The current TMR/HBG implementations return PTO_RUNTIME_ERR_UNSUPPORTED
+ * after successful admission or when no kernel contract is available;
+ * neither case establishes kernel resources or changes the context's mode.
  */
 int simpler_kernel_mode_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,

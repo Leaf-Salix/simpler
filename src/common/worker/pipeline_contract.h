@@ -30,7 +30,7 @@
  * Rejects a contract whose ABI version is not the one compiled in, that
  * declares more resources than fit, that asks for a pipeline depth outside
  * the supported range, or whose resources carry an unspecified or out-of-range kind, an
- * out-of-range class, or a byte count incompatible with the mode and kind.
+ * out-of-range class, or a byte count incompatible with the mode and resource class.
  *
  * The unspecified-kind rule is what catches a `resource_count` larger than the
  * entries a runtime actually filled in: the trailing entries are still zeroed,
@@ -60,6 +60,7 @@ inline bool is_valid_pipeline_contract(const PipelineContract *contract, uint32_
     return true;
 }
 
+// Program-mode compatibility overload.
 inline bool is_valid_pipeline_contract(const PipelineContract *contract) {
     return is_valid_pipeline_contract(contract, SIMPLER_MODE_PROGRAM);
 }
@@ -138,15 +139,21 @@ inline bool has_serviceable_stream_topology(const PipelineContract &contract) {
 
 // Complete TMR kernel admission, including structural checks before any lookup.
 inline bool is_valid_tmr_kernel_pipeline_contract(const PipelineContract *contract) {
+    // Exact cardinality plus required-kind checks excludes extra TASK_ARGS
+    // entries, which neither the arena nor stream topology check covers.
     if (!is_valid_pipeline_contract(contract, SIMPLER_MODE_KERNEL) || contract->resource_count != 6 ||
         !has_serviceable_arena_topology(*contract) || !has_serviceable_stream_topology(*contract)) {
         return false;
     }
-    for (uint32_t kind = PTO_PIPELINE_GM_HEAP; kind <= PTO_PIPELINE_TASK_ARGS; ++kind) {
-        const auto *resource = find_pipeline_resource(*contract, kind);
-        const auto expected_class =
-            kind == PTO_PIPELINE_TASK_ARGS ? PTO_PIPELINE_HOST_PER_RUN : PTO_PIPELINE_DEVICE_SCRATCH;
-        if (resource == nullptr || resource->resource_class != expected_class) return false;
+    constexpr PipelineResource REQUIRED_STORAGE[] = {
+        {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DEVICE_SCRATCH, 0},
+        {PTO_PIPELINE_GM_SM, PTO_PIPELINE_DEVICE_SCRATCH, 0},
+        {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DEVICE_SCRATCH, 0},
+        {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, 0},
+    };
+    for (const auto &required : REQUIRED_STORAGE) {
+        const auto *resource = find_pipeline_resource(*contract, required.kind);
+        if (resource == nullptr || resource->resource_class != required.resource_class) return false;
     }
     return true;
 }

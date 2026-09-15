@@ -1073,9 +1073,9 @@ int simpler_kernel_mode_init(
     try {
         PipelineContract contract{};
         const int rc = build_kernel_pipeline_contract_impl(config, &contract);
-        if (rc != 0) return rc;
-        if (!is_valid_pipeline_contract(&contract, SIMPLER_MODE_KERNEL) || !has_serviceable_arena_topology(contract) ||
-            !has_serviceable_stream_topology(contract)) {
+        if (rc != 0 && rc != PTO_RUNTIME_ERR_UNSUPPORTED) return rc;
+        if (rc == 0 && (!is_valid_pipeline_contract(&contract, SIMPLER_MODE_KERNEL) ||
+                        !has_serviceable_arena_topology(contract) || !has_serviceable_stream_topology(contract))) {
             return PTO_RUNTIME_ERR_INTERNAL;
         }
     } catch (...) {

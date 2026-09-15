@@ -276,6 +276,19 @@ TEST(PipelineContract, KernelRequiresExactlyItsSupportedResourceShape) {
     EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(nullptr));
 }
 
+TEST(PipelineContract, TmrRequiredKindsAreOrderIndependentAndRejectExtraArgs) {
+    auto c = kernel_contract();
+    const auto first = c.resources[0];
+    c.resources[0] = c.resources[3];
+    c.resources[3] = first;
+    EXPECT_TRUE(is_valid_tmr_kernel_pipeline_contract(&c));
+    c.resources[c.resource_count++] = c.resources[0];
+    ASSERT_TRUE(is_valid_pipeline_contract(&c, SIMPLER_MODE_KERNEL));
+    ASSERT_TRUE(has_serviceable_arena_topology(c));
+    ASSERT_TRUE(has_serviceable_stream_topology(c));
+    EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&c));
+}
+
 TEST(PipelineContract, StreamServiceabilityDoesNotChangeStructuralRules) {
     auto c = accepted_contract();
     EXPECT_TRUE(has_serviceable_stream_topology(c));
