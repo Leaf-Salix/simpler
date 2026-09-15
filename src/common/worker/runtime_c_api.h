@@ -672,6 +672,9 @@ int simpler_kernel_mode_init(
  * `caller_stream`, but never synchronizes a stream or device - preparation
  * errors surface through the caller's own warmup plus synchronize. The
  * stream is borrowed for this call only.
+ * Before capturing launches, the caller must complete preparation outside
+ * capture, for example by synchronizing this caller stream. An eager launch
+ * is not required to establish this preparation boundary.
  */
 int simpler_kernel_mode_prepare_callable(
     DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream
