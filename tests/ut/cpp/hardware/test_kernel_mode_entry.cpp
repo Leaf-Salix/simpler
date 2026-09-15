@@ -14,9 +14,10 @@
  * entries reached through a real libhost_runtime.so, on a device and stream the
  * test owns rather than simpler.
  *
- * The borrowing is the point. Every case here does its own aclInit +
- * aclrtSetDevice + aclrtCreateStream and hands that stream in, so what is under
- * test is the borrowed-device shape a kernel-mode caller presents. A test that
+ * The borrowing is the point. The cases that reach a device bind it themselves
+ * (aclInit + aclrtSetDevice) and create any stream themselves, and launch is the
+ * only entry handed one, so what is under test is the borrowed-device shape a
+ * kernel-mode caller presents. A test that
  * let simpler stand the device up would exercise the program-mode shape and
  * pass for the wrong reason.
  *
@@ -58,7 +59,6 @@
 #include "acl/acl.h"
 #include "call_config.h"
 #include "callable.h"
-#include "callable_protocol.h"
 // ChipWorker holds a unique_ptr<ChipRunLane>, whose deleter needs the complete
 // type wherever a ChipWorker is destroyed.
 #include "chip_run_lane.h"
@@ -146,9 +146,8 @@ std::vector<int> read_ctest_devices() {
 }
 
 /// A zeroed, correctly aligned ChipCallable image. The entry validation checks
-/// alignment, the size floor and the callable id range; it does not walk the
-/// flexible-array offsets. It is used only for entry rejection checks, never
-/// as a successfully registered device orchestration callable.
+/// alignment, the size floor and the output pointer; it does not walk the
+/// flexible-array offsets, so a zeroed header is an image it accepts.
 struct AlignedCallableImage {
     alignas(ChipCallable) unsigned char bytes[sizeof(ChipCallable)];
 
@@ -206,6 +205,17 @@ private:
     bool device_set_{false};
     aclrtStream stream_{nullptr};
 };
+
+/// Runs `call` and checks that it throws a ChipWorkerError carrying `code`.
+template <typename Call>
+void expect_chip_worker_error(Call &&call, int code) {
+    try {
+        call();
+        ADD_FAILURE() << "expected a ChipWorkerError with code " << code;
+    } catch (const ChipWorkerError &error) {
+        EXPECT_EQ(error.code(), code) << error.what();
+    }
+}
 
 class KernelModeEntryTest : public ::testing::Test {
 protected:
@@ -344,15 +354,21 @@ TEST_F(KernelModeEntryTest, MalformedArgumentsAreRejectedBeforeTheStateCheck) {
 
     AlignedCallableImage image;
     int32_t minted = 99;
-    // Registration mints the id, so the out parameter is the only way back.
     EXPECT_EQ(
-        api.prepare_callable(ctx, image.data(), AlignedCallableImage::size(), nullptr), PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        api.prepare_callable(ctx, nullptr, AlignedCallableImage::size(), &minted), PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
+    EXPECT_EQ(minted, -1);
     // Below the size floor the image cannot hold a ChipCallable header.
+    minted = 99;
     EXPECT_EQ(
         api.prepare_callable(ctx, image.data(), sizeof(ChipCallable) - 1, &minted), PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
     EXPECT_EQ(minted, -1);
+    // Registration mints the id, so without somewhere to write it the call
+    // cannot report one.
+    EXPECT_EQ(
+        api.prepare_callable(ctx, image.data(), AlignedCallableImage::size(), nullptr), PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
 
     ChipStorageTaskArgs args{};
     EXPECT_EQ(api.launch(ctx, 0, &args, nullptr), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
@@ -386,7 +402,7 @@ TEST_F(KernelModeEntryTest, WorkerKernelInitAndClosePreserveBorrowedDeviceAndStr
             PTO_HOST_RUNTIME_LIB_PATH, PTO_KERNEL_UT_AICPU_PATH, PTO_KERNEL_UT_AICORE_PATH,
             PTO_KERNEL_UT_DISPATCHER_PATH, device_id_, config, ChipWorker::next_kernel_context_generation()
         ),
-        std::runtime_error
+        ChipWorkerError
     );
     EXPECT_FALSE(refused.initialized());
     EXPECT_EQ(refused.device_id(), -1);
@@ -398,6 +414,13 @@ TEST_F(KernelModeEntryTest, WorkerKernelInitAndClosePreserveBorrowedDeviceAndStr
     EXPECT_THROW((void)worker.kernel_prepare_callable(image.data(), AlignedCallableImage::size()), std::runtime_error);
     ChipStorageTaskArgs args{};
     EXPECT_THROW(worker.kernel_launch(0, &args, borrowed.stream()), std::runtime_error);
+    // Only launch takes a caller stream, and a null one never reaches the runtime.
+    expect_chip_worker_error(
+        [&] {
+            worker.kernel_launch(0, &args, nullptr);
+        },
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
 
     EXPECT_NO_THROW(worker.finalize());
     EXPECT_FALSE(worker.initialized());
@@ -412,31 +435,36 @@ TEST_F(KernelModeEntryTest, WorkerKernelStateMachineRejectsOutOfOrderUse) {
     AlignedCallableImage image;
     ChipStorageTaskArgs args{};
 
-    // Before any init there is no runtime to reach, so the host half refuses.
+    // Before any init no runtime is bound: supported() reports false, and the
+    // entries that need a context refuse with INVALID_STATE on the host side.
     {
         ChipWorker worker;
-        EXPECT_THROW(worker.kernel_mode_supported(), std::runtime_error);
-        EXPECT_THROW(
-            (void)worker.kernel_prepare_callable(image.data(), AlignedCallableImage::size()), std::runtime_error
+        EXPECT_FALSE(worker.kernel_mode_supported());
+        expect_chip_worker_error(
+            [&] {
+                worker.kernel_prepare_callable(image.data(), AlignedCallableImage::size());
+            },
+            PTO_RUNTIME_ERR_INVALID_STATE
         );
-        EXPECT_THROW(worker.kernel_launch(0, &args, borrowed.stream()), std::runtime_error);
+        expect_chip_worker_error(
+            [&] {
+                worker.kernel_launch(0, &args, borrowed.stream());
+            },
+            PTO_RUNTIME_ERR_INVALID_STATE
+        );
     }
 
-    // A null stream never reaches the runtime. Only launch takes one.
+    // Generation zero is not a valid context identity.
     {
         ChipWorker worker;
-        EXPECT_THROW(worker.kernel_launch(0, &args, nullptr), std::runtime_error);
-    }
-
-    // Generation zero is refused on the host side, before the C ABI would.
-    {
-        ChipWorker worker;
-        EXPECT_THROW(
-            worker.kernel_init(
-                PTO_HOST_RUNTIME_LIB_PATH, PTO_KERNEL_UT_AICPU_PATH, PTO_KERNEL_UT_AICORE_PATH,
-                PTO_KERNEL_UT_DISPATCHER_PATH, device_id_, config, 0
-            ),
-            std::runtime_error
+        expect_chip_worker_error(
+            [&] {
+                worker.kernel_init(
+                    PTO_HOST_RUNTIME_LIB_PATH, PTO_KERNEL_UT_AICPU_PATH, PTO_KERNEL_UT_AICORE_PATH,
+                    PTO_KERNEL_UT_DISPATCHER_PATH, device_id_, config, 0
+                );
+            },
+            PTO_RUNTIME_ERR_INVALID_ARGUMENT
         );
     }
 
@@ -444,12 +472,15 @@ TEST_F(KernelModeEntryTest, WorkerKernelStateMachineRejectsOutOfOrderUse) {
     {
         ChipWorker worker;
         worker.finalize();
-        EXPECT_THROW(
-            worker.kernel_init(
-                PTO_HOST_RUNTIME_LIB_PATH, PTO_KERNEL_UT_AICPU_PATH, PTO_KERNEL_UT_AICORE_PATH,
-                PTO_KERNEL_UT_DISPATCHER_PATH, device_id_, config, ChipWorker::next_kernel_context_generation()
-            ),
-            std::runtime_error
+        EXPECT_FALSE(worker.kernel_mode_supported());
+        expect_chip_worker_error(
+            [&] {
+                worker.kernel_init(
+                    PTO_HOST_RUNTIME_LIB_PATH, PTO_KERNEL_UT_AICPU_PATH, PTO_KERNEL_UT_AICORE_PATH,
+                    PTO_KERNEL_UT_DISPATCHER_PATH, device_id_, config, ChipWorker::next_kernel_context_generation()
+                );
+            },
+            PTO_RUNTIME_ERR_INVALID_STATE
         );
     }
 }

@@ -828,3 +828,74 @@ the window widens rather than a new failure appearing.
 
 **Affects.** #2176 and #2190 (their registration path adopted); D14 item 5
 (now true of the implementation).
+
+---
+
+## D20 - Take #2185's entry hardening; its refusal model is the correct one
+
+**Problem.** D15 took only the test hardening from #2185's refreshed head and
+deferred the rest as accompanying a signature change. D16 then adopted that
+signature independently, so what is left of #2185's newer head is no longer a
+signature question: a status-carrying exception type, a non-throwing capability
+query, and bookkeeping for a refused init or a failed teardown.
+
+**Finding.** One of those is not a preference. This line's `kernel_init` drops
+the device context on any refused init, under a comment saying a refused kernel
+init "has adopted nothing — it took no ACL state and bound no thread". That is
+false here. `init_kernel_context` acquires the context claim, then
+`kernel_exec_state_.initialize` creates two streams and five events, and the
+four steps after it — `ensure_binaries_loaded`, `ensure_aicpu_init_launched`,
+`prepare_launch_shape`, `prepare_aicpu_affinity` — each return a failure
+without unwinding them; only the claim has a rollback guard. A refusal from any
+of those therefore reaches `ChipWorker` with live resources, where
+`destroy_device_context` refuses the context and returns void, and the
+`DlHandleGuard` then `dlclose`s the library whose release routines are the only
+way back to them. The streams and events leak for the life of the process, and
+the log line saying so is the only trace.
+
+**Choice.** Adopt #2185's model, its Python and C++ tests with it.
+
+1. **`ChipWorkerError` carries a status code**, `UnsupportedRuntimeOperation`
+   derives from it, and the nanobind layer registers both with translators that
+   copy the code onto the Python exception. `PTO_RUNTIME_ERR_*` become module
+   attributes. The registered `UnsupportedRuntimeOperation` subclasses
+   `NotImplementedError` as well, so the ad-hoc conversion on
+   `device_memory_info` is deleted rather than duplicated.
+2. **A refused kernel init calls `finalize_device` first**, and when that fails
+   keeps the handle, the bindings and the library, records
+   `device_teardown_owed_`, and refuses any later init until a `finalize()`
+   succeeds. `INVALID_ARGUMENT` and `UNSUPPORTED` are refusals the entry returns
+   before taking anything, so they skip the teardown.
+3. **`kernel_mode_supported()` answers rather than throws.** It is false
+   whenever no runtime is bound, which `initialized()` already distinguishes
+   from a bound runtime without kernel support.
+4. **A failed `finalize()` on a kernel context raises and is retriable.**
+   `kernel_context_` scopes that to contexts that entered
+   `simpler_kernel_mode_init`; the Python wrapper's registries already
+   documented this behaviour for a raising finalize that could not yet happen.
+5. **Kernel callables get their own registry.** `_callable_registry` keys are
+   program slots that `init()` replays into `register_callable` and that
+   `_allocate_slot_locked` reads as occupancy; a runtime-minted kernel id has
+   neither meaning.
+
+**Kept against #2185.** Four places where this line is right and its head is an
+artifact of its own stub platform:
+
+- **The capability gate stays.** D14 item 6 kept `ChipWorker` resolving the
+  kernel entries only when `simpler_kernel_mode_supported` is nonzero, so a
+  runtime reporting no support never reaches `simpler_kernel_mode_init`. The
+  adopted tests build fake runtimes that must now declare support to exercise
+  the entry.
+- **A program-mode teardown failure is reported, not swallowed.** #2185 lets it
+  fall through silently. The runner releases what it can and gives up its
+  device either way, so there is nothing to retry and nothing to raise — but the
+  status is still the only evidence, so it goes to stderr.
+- **`kernel_init` succeeding is the a2a3 case.** TMR implements kernel mode
+  here, so the hardware test keeps the live-context scenario; #2185's twin
+  expects `UNSUPPORTED` because its platform side is a stub. The Python twin
+  keeps loading `host_build_graph` to get a genuine refusal.
+- **`validate_kernel_prepare_callable_args` and the entry signature** are
+  already D16's shape, so #2185's delta to them is empty here.
+
+**Affects.** #2185 (the remainder of its refreshed head adopted); D15 (its
+deferral of this PR closed).

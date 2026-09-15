@@ -56,11 +56,17 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAX_TENSOR_DIMS,
     PROV_DESCRIPTOR_MISMATCH,
     PROV_NOT_LIVE,
+    PTO_RUNTIME_ERR_INTERNAL,
+    PTO_RUNTIME_ERR_INVALID_ARGUMENT,
+    PTO_RUNTIME_ERR_INVALID_STATE,
+    PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE,
+    PTO_RUNTIME_ERR_UNSUPPORTED,
     ArgDirection,
     CallConfig,
     ChipCallable,
     ChipStorageTaskArgs,
     ChipTensor,
+    ChipWorkerError,
     CoreCallable,
     DataType,
     DeviceMemoryInfo,
@@ -70,6 +76,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     TaskHandle,
     TaskState,
     TensorArgType,
+    UnsupportedRuntimeOperation,
     WorkerType,
     _ChipWorker,
     _Worker,
@@ -173,6 +180,13 @@ _assert_bindings_match_source_tree()
 from .global_comm_domain import GlobalDomainAttachment, GlobalDomainBuffer, GlobalDomainMember  # noqa: E402
 
 __all__ = [
+    "ChipWorkerError",
+    "UnsupportedRuntimeOperation",
+    "PTO_RUNTIME_ERR_INTERNAL",
+    "PTO_RUNTIME_ERR_UNSUPPORTED",
+    "PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE",
+    "PTO_RUNTIME_ERR_INVALID_STATE",
+    "PTO_RUNTIME_ERR_INVALID_ARGUMENT",
     "DataType",
     "DeviceMemoryInfo",
     "get_element_size",
@@ -1388,6 +1402,10 @@ class ChipWorker:
         self._init_in_progress = False
         self._registry_lock = threading.Lock()
         self._callable_registry: dict[int, ChipCallable] = {}
+        # Callables staged through kernel_prepare_callable, keyed by the ID the
+        # runtime minted. Separate from _callable_registry, whose keys are program
+        # slots that init() replays into the program ABI.
+        self._kernel_callables: dict[int, ChipCallable] = {}
         self._identity_registry: dict[bytes, Any] = {}
         self._live_handles: dict[int, bytes] = {}
         self._next_handle_id = 0
@@ -1525,25 +1543,30 @@ class ChipWorker:
 
     @property
     def kernel_mode_supported(self) -> bool:
-        """Whether the bound runtime can execute kernel-mode launches."""
+        """Whether the bound runtime can execute kernel-mode launches.
+
+        ``False`` whenever ``initialized`` is ``False``: before ``init()`` or
+        ``kernel_init()``, after an init that failed, after a kernel teardown
+        that failed, and after ``finalize()``. ``initialized`` distinguishes
+        that case from a bound runtime without kernel-mode support.
+        """
         return bool(self._impl.kernel_mode_supported)
 
     def kernel_prepare_callable(self, chip_callable: ChipCallable) -> int:
         """Register a callable for kernel-mode launches, outside ACLGraph capture.
 
-        Returns the context-local id simpler minted for it. Registration is
-        pure: the same callable registered twice takes two distinct, equally
-        valid ids, and there is no lookup. It takes no stream — registration
-        enqueues on the context's own AICPU stream, which every later launch
-        also enqueues on, so stream FIFO orders registration ahead of each
-        launch. Errors surface through the caller's own warmup plus
-        synchronize.
+        Returns the ID the runtime minted for it. Registration is pure: the same
+        callable registered twice takes two distinct, equally valid IDs, and
+        there is no lookup. It takes no stream — registration enqueues on the
+        context's own AICPU stream, which every later launch also enqueues on,
+        so stream FIFO orders registration ahead of each launch. The callable
+        stays referenced under its ID until finalize() succeeds.
         """
         callable_id = int(self._impl.kernel_prepare_callable(chip_callable))
         # The registry owns the image for the life of the context: the device
         # holds addresses into a buffer this object keeps alive.
         with self._registry_lock:
-            self._callable_registry[callable_id] = chip_callable
+            self._kernel_callables[callable_id] = chip_callable
         return callable_id
 
     def kernel_launch(self, callable_id: int, args, caller_stream: int):
@@ -1552,7 +1575,8 @@ class ChipWorker:
         ``caller_stream`` is this call's execution stream, taken per call
         rather than remembered from init: a framework caller's current stream
         is a property of the call, so a stream fixed at init would keep
-        enqueueing onto a stale one.
+        enqueueing onto a stale one. It is borrowed for this call only and is
+        never stored or destroyed by simpler.
 
         Returning means the sequence was enqueued on that stream; device
         execution may still be in flight and may still fail asynchronously.
@@ -1565,7 +1589,12 @@ class ChipWorker:
     def finalize(self):
         """Tear down everything: device resources and runtime library.
 
-        Terminal operation — the object cannot be reused after this.
+        After a successful call the object cannot be initialized again. For a
+        kernel context, a failed device teardown raises ``ChipWorkerError``
+        carrying the ``finalize_device`` status and keeps the context and the
+        runtime library loaded; ``initialized`` reads ``False`` and calling
+        ``finalize()`` again retries the teardown. A program-mode teardown
+        status is not raised.
         """
         with self._lifecycle_lock:
             owner = self._init_owner_thread
@@ -1586,6 +1615,7 @@ class ChipWorker:
         # everything released while the runtime still owned it.
         with self._registry_lock:
             self._callable_registry.clear()
+            self._kernel_callables.clear()
             self._identity_registry.clear()
             self._live_handles.clear()
 

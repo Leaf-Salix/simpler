@@ -11,11 +11,12 @@
 
 The Python twin of tests/ut/cpp/hardware/test_kernel_mode_entry.cpp, and the
 inverse of test_platform_comm.py's contract: there ChipWorker owns ACL bring-up
-and stream lifetime internally, here the *caller* owns both and lends the stream
-in. That inversion is what kernel mode is, so the test does its own device bind
-and stream creation through ``_acl_bind_device`` / ``_acl_create_stream`` and
-hands the resulting integer address to kernel_init. In production that integer
-comes from the framework instead — torch_npu.npu.current_stream().npu_stream.
+and stream lifetime internally, here the *caller* owns both. That inversion is
+what kernel mode is, so the test does its own device bind and stream creation
+through ``_acl_bind_device`` / ``_acl_create_stream``. kernel_init runs on that
+already-bound device and takes no stream; the stream's integer address goes
+only to kernel_launch. In production that integer comes from the framework
+instead — torch_npu.npu.current_stream().npu_stream.
 
 tensormap_and_ringbuffer implements kernel mode, so its cases claim the borrowed
 stream and check that a second claim on the same device is refused.
@@ -70,10 +71,11 @@ def _run_case(case: str, device_id: int, platform: str, queue) -> None:
             # UNSUPPORTED is the pass: a call that never arrived would raise
             # something else.
             unsupported_bins = builder.get_binaries("host_build_graph", build=False)
-            with pytest.raises(Exception) as excinfo:  # noqa: PT011
+            with pytest.raises(native.UnsupportedRuntimeOperation) as excinfo:
                 worker.kernel_init(device_id, unsupported_bins, config)
             result["error"] = str(excinfo.value)
-            result["reached_abi"] = "kernel mode" in str(excinfo.value)
+            result["code"] = excinfo.value.code
+            result["reached_abi"] = excinfo.value.code == native.PTO_RUNTIME_ERR_UNSUPPORTED
             result["initialized_after"] = bool(worker._impl.initialized)
             worker.finalize()
             result["ok"] = bool(result["reached_abi"]) and not result["initialized_after"]
@@ -105,7 +107,7 @@ def _run_case(case: str, device_id: int, platform: str, queue) -> None:
             )
 
         elif case == "null_stream_rejected":
-            # The execution stream belongs to launch, not to init, so this is
+            # kernel_launch is the only entry that takes a stream, so this is
             # where a null one has to be named. Rejecting at the Python boundary
             # names the argument instead of surfacing a bare ABI code.
             with pytest.raises(ValueError) as excinfo:
@@ -120,18 +122,28 @@ def _run_case(case: str, device_id: int, platform: str, queue) -> None:
             result["ok"] = first != 0 and second > first
 
         elif case == "uninitialized_surface_refuses":
-            errors = []
+            # No runtime is bound: supported() reports False, and the entries that
+            # need a context refuse with INVALID_STATE before reaching the runtime.
+            result["supported"] = worker.kernel_mode_supported
+            chip_callable = native.ChipCallable.build(signature=[], func_name="probe", binary=b"\x00", children=[])
+            codes = {}
             for label, fn in (
-                ("supported", lambda: worker.kernel_mode_supported),
-                ("launch", lambda: worker.kernel_launch(0, None, stream)),
+                ("prepare", lambda: worker.kernel_prepare_callable(chip_callable)),
+                ("launch", lambda: worker.kernel_launch(0, native.ChipStorageTaskArgs(), stream)),
             ):
                 try:
                     fn()
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(label)
+                    codes[label] = None
+                except native.ChipWorkerError as exc:
+                    codes[label] = exc.code
                     result[f"err_{label}"] = str(exc)
-            result["refused"] = errors
-            result["ok"] = errors == ["supported", "launch"]
+            result["codes"] = codes
+            expected = native.PTO_RUNTIME_ERR_INVALID_STATE
+            result["ok"] = (
+                result["supported"] is False
+                and codes == {"prepare": expected, "launch": expected}
+                and worker._kernel_callables == {}
+            )
 
         elif case == "program_init_still_works":
             # The program path must be unchanged by the kernel additions, and
@@ -156,10 +168,10 @@ def _run_case(case: str, device_id: int, platform: str, queue) -> None:
         result["error"] = f"{type(exc).__name__}: {exc}"
         result["traceback"] = traceback.format_exc()
     finally:
-        # Destroying the stream is the one operation that touches it *after*
-        # kernel_init ran, so it is the evidence that the borrowed stream came
-        # through intact. Swallowing its failure here would let a kernel_init
-        # that destroyed or invalidated the caller's stream still report ok.
+        # Destroying the caller's stream after kernel_init and finalize() is the
+        # evidence that neither reset the device nor finalized ACL, either of
+        # which would invalidate a stream simpler was never given. Swallowing its
+        # failure here would let such a teardown still report ok.
         if stream:
             try:
                 import _task_interface as native
@@ -219,11 +231,12 @@ def test_kernel_mode_surface_on_borrowed_stream(case, st_platform, st_device_ids
 @pytest.mark.device_count(1)
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 def test_borrowed_stream_survives_a_refused_kernel_init(st_platform, st_device_ids):
-    """A refused kernel_init must leave the caller's stream usable.
+    """A refused kernel_init must leave the caller's device and stream usable.
 
-    This is the guarantee a framework caller depends on: simpler failing to come
-    up cannot take the caller's stream down with it. Destroying the stream after
-    the refusal is what proves it was neither destroyed nor invalidated.
+    kernel_init never receives the stream, so what this checks is the device-level
+    guarantee a framework caller depends on: simpler failing to come up neither
+    resets the device nor finalizes ACL. Destroying the caller's stream after the
+    refusal and finalize() is what proves the stream is still valid.
     """
     assert st_device_ids
     result = _run_in_subprocess("init_refused", int(st_device_ids[0]), st_platform)

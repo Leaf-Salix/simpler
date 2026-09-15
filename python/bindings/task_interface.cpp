@@ -1914,6 +1914,21 @@ void check_access_subset(uint8_t granted, TensorArgType tag) {
     }
 }
 
+// Raises the Python exception type in `payload` for a ChipWorkerError of type T,
+// carrying the C++ status code as its `code` attribute. Translators run with
+// the GIL held: a call_guard<gil_scoped_release> has already unwound.
+template <typename T>
+void translate_chip_worker_error(const std::exception_ptr &error, void *payload) {
+    try {
+        std::rethrow_exception(error);
+    } catch (const T &e) {
+        nb::handle type(static_cast<PyObject *>(payload));
+        nb::object value = type(e.what());
+        value.attr("code") = e.code();
+        PyErr_SetObject(type.ptr(), value.ptr());
+    }
+}
+
 }  // namespace
 
 // ============================================================================
@@ -3358,6 +3373,26 @@ NB_MODULE(_task_interface, m) {
             nb::call_guard<nb::gil_scoped_release>()
         );
 
+    // --- ChipWorker errors ---
+    // nanobind tries translators newest first, so the subclass is registered
+    // after its base and is matched before it.
+    nb::exception<ChipWorkerError> chip_worker_error(m, "ChipWorkerError", PyExc_RuntimeError);
+    // Only a native raise carries a status; an instance constructed in Python
+    // reads the class default.
+    chip_worker_error.attr("code") = nb::none();
+    nb::register_exception_translator(translate_chip_worker_error<ChipWorkerError>, chip_worker_error.ptr());
+    nb::exception<UnsupportedRuntimeOperation> unsupported_runtime_operation(
+        m, "UnsupportedRuntimeOperation", nb::make_tuple(chip_worker_error, nb::handle(PyExc_NotImplementedError))
+    );
+    nb::register_exception_translator(
+        translate_chip_worker_error<UnsupportedRuntimeOperation>, unsupported_runtime_operation.ptr()
+    );
+    m.attr("PTO_RUNTIME_ERR_INTERNAL") = static_cast<int>(PTO_RUNTIME_ERR_INTERNAL);
+    m.attr("PTO_RUNTIME_ERR_UNSUPPORTED") = static_cast<int>(PTO_RUNTIME_ERR_UNSUPPORTED);
+    m.attr("PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE") = static_cast<int>(PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE);
+    m.attr("PTO_RUNTIME_ERR_INVALID_STATE") = static_cast<int>(PTO_RUNTIME_ERR_INVALID_STATE);
+    m.attr("PTO_RUNTIME_ERR_INVALID_ARGUMENT") = static_cast<int>(PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+
     // --- ChipWorker ---
     nb::class_<ChipWorker>(m, "_ChipWorker")
         .def(nb::init<>())
@@ -3641,15 +3676,7 @@ NB_MODULE(_task_interface, m) {
             "from their cache budget (it may be invisible to aclrtGetMemInfo)."
         )
         .def(
-            "device_memory_info",
-            [](const ChipWorker &self) {
-                try {
-                    return self.device_memory_info();
-                } catch (const UnsupportedRuntimeOperation &e) {
-                    PyErr_SetString(PyExc_NotImplementedError, e.what());
-                    throw nb::python_error();
-                }
-            },
+            "device_memory_info", &ChipWorker::device_memory_info,
             "Return the ACL_HBM_MEM free/total byte snapshot for this worker's device."
         )
         .def("malloc", &ChipWorker::malloc, nb::arg("size"))

@@ -47,9 +47,24 @@ class ChipRun;
 class ChipRunLane;
 struct ChipRunLaneState;
 
-class UnsupportedRuntimeOperation : public std::runtime_error {
+/// A ChipWorker failure that carries a status code, so a caller can classify
+/// it without parsing the message. The code is a PTO_RUNTIME_ERR_* value from
+/// runtime_c_api.h or the status a runtime C entry returned.
+class ChipWorkerError : public std::runtime_error {
 public:
-    using std::runtime_error::runtime_error;
+    ChipWorkerError(int code, const std::string &what) :
+        std::runtime_error(what),
+        code_(code) {}
+    int code() const noexcept { return code_; }
+
+private:
+    int code_;
+};
+
+class UnsupportedRuntimeOperation : public ChipWorkerError {
+public:
+    explicit UnsupportedRuntimeOperation(const std::string &what) :
+        ChipWorkerError(PTO_RUNTIME_ERR_UNSUPPORTED, what) {}
 };
 
 class ChipWorker {
@@ -122,15 +137,20 @@ public:
         const std::string &sim_context_path = ""
     );
 
-    /// Whether the bound runtime can execute kernel-mode launches. Requires a
-    /// bound runtime, so it answers for the runtime this worker actually
-    /// loaded rather than for the build as a whole.
+    /// Whether the bound runtime can execute kernel-mode launches. The answer
+    /// belongs to the runtime library init() or kernel_init() bound, so it is
+    /// false whenever the worker is not initialized: before either init, after
+    /// an init that failed, after a kernel teardown that failed, and after
+    /// finalize(). initialized() distinguishes that case from a bound runtime
+    /// without kernel-mode support.
     bool kernel_mode_supported() const;
 
-    /// Stage one callable for kernel-mode launches on a borrowed stream.
-    /// `callable` is a canonical ChipCallable image of `callable_size` bytes;
-    /// `caller_stream` is the caller's aclrtStream, borrowed for this call
-    /// only and never stored or destroyed here.
+    /// Stage one callable for kernel-mode launches and return the ID the runtime
+    /// minted for it. `callable` is a canonical ChipCallable image of
+    /// `callable_size` bytes. Every successful call yields a new context-local
+    /// ID, identical content included, and the ID is valid only on this worker's
+    /// context. Takes no stream: the platform prepares on streams the context
+    /// owns.
     int32_t kernel_prepare_callable(const void *callable, size_t callable_size);
 
     /// Enqueue one bounded asynchronous kernel-mode invocation on the caller's
@@ -143,8 +163,10 @@ public:
     /// counter starts at one.
     static uint64_t next_kernel_context_generation();
 
-    /// Tear down everything: device resources and runtime library.
-    /// Terminal — the object cannot be reused after this.
+    /// Tear down everything: device resources and runtime library. The worker
+    /// cannot be initialized again afterwards. When a kernel context's device
+    /// teardown fails, this throws ChipWorkerError and keeps the context and the
+    /// runtime library loaded; calling finalize() again retries the teardown.
     void finalize();
 
     // Launch a cid previously staged via register_callable. `args` is the runtime.so-ABI POD, which
@@ -495,4 +517,15 @@ private:
     int device_id_ = -1;
     bool initialized_ = false;
     bool finalized_ = false;
+    /// A kernel context still holds resources that no completed teardown
+    /// released: its init or its finalize() failed after the entry took them.
+    /// `initialized_` is false, so no other entry reaches the context;
+    /// finalize() still attempts the teardown, and no init runs until one
+    /// succeeds.
+    bool device_teardown_owed_ = false;
+    /// This worker entered simpler_kernel_mode_init. finalize() raises a failed
+    /// device teardown only for such a context: a kernel context keeps its
+    /// resources on that failure and a retry can release them, whereas a
+    /// program-mode runner gives up its device even when it reports a failure.
+    bool kernel_context_ = false;
 };

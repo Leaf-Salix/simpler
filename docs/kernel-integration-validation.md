@@ -531,6 +531,58 @@ hardware suites that reach that path are the two listed.
 worktree and PyPI is unreachable from this host. The change adds no page and
 changes no nav entry.
 
+## Entry-layer hardening revalidation (2026-09-15)
+
+The remainder of #2185's refreshed head is adopted: a status-carrying
+`ChipWorkerError` with its nanobind translators and `PTO_RUNTIME_ERR_*` module
+attributes, a non-throwing `kernel_mode_supported()`, the owed-teardown
+bookkeeping for a refused init or a failed close, and a kernel-only callable
+registry. The decisions are D20 in the integration log.
+
+One of those closes a leak rather than changing a preference. This line's
+`kernel_init` dropped the device context on any refused init, on the stated
+ground that a refused kernel init has adopted nothing. `init_kernel_context`
+creates the context's two streams and five events before four steps that can
+still fail, and unwinds only its context claim, so a refusal from any of them
+arrived at `ChipWorker` with live resources — where `destroy_device_context`
+refuses the context and returns void and the library holding their release
+routines is then unloaded. Registration now calls `finalize_device` first and,
+when that fails, keeps the handle, the bindings and the library and records the
+teardown as owed.
+
+Four things stay as this line has them, each an artifact of #2185's stub
+platform rather than a divergence worth closing: the D14 item 6 capability gate
+(so the adopted fake runtimes declare support to reach the entry), a
+program-mode teardown status reported on stderr instead of dropped, the
+successful-`kernel_init` scenario in the a2a3 hardware test, and the Python twin
+loading `host_build_graph` for a genuine `UNSUPPORTED`.
+
+| Suite | Result |
+| ----- | ------ |
+| Native builds: a2a3, a5, a2a3sim, a5sim, nanobind extension | all succeeded |
+| C++ unit tests, no hardware | 166/166 passed |
+| C++ unit tests with `SIMPLER_ENABLE_HARDWARE_TESTS=ON`, no hardware | the two added targets passed |
+| C++ hardware, `test_kernel_mode_entry` with a CTest resource spec | passed |
+| Python unit tests, `tests/ut -m "not requires_hardware"` | 2448 passed |
+| Python hardware unit tests, `tests/ut -m requires_hardware --platform a2a3` | 21/21 scheduled cases passed |
+| a2a3sim scenes | 82 passed, 8 skipped |
+| pre-commit hooks on changed files | passed |
+
+The Python unit count is the 2432 baseline this line reached after PR #2242,
+plus the sixteen cases #2185 adds to `tests/ut/py/test_chip_worker.py`; every
+other count matches the baseline exactly. The suites ran twice: once on
+`29a1cd40`, and again after rebasing onto `4a5f28c9`, the head that carries the
+merged PRs #2245 and #2242.
+
+Not re-run: the a2a3 onboard scene phases, the SDMA phase, a5sim scenes, and
+`tests/ut/py/test_kernel_mode_c_api.py`. The change is confined to the
+`ChipWorker` entry layer, its bindings and its tests, and does not reach the
+platform entries those suites exercise.
+
+`mkdocs build --strict` was not re-run: mkdocs is not installed in this
+worktree and PyPI is unreachable from this host. The change adds no page and
+changes no nav entry.
+
 ## Remaining boundaries
 
 - H4 has no submitted PR in the supplied pipeline. HBG kernel capability is
