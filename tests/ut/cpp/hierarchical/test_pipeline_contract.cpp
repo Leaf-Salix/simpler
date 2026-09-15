@@ -261,8 +261,10 @@ TEST(PipelineContract, KernelRequiresExactlyItsSupportedResourceShape) {
         EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&duplicate)) << i;
     }
     auto invalid = c;
-    // Depth is the runtime's choice across the supported range: a pipelined
-    // eager context needs more than one slot, a capture-only one needs one.
+    // Depth is the runtime's choice across the supported range; the validator
+    // bounds it rather than fixing it. What a given depth costs, and how a
+    // captured graph maps its calls onto banks, are decided where the resources
+    // are established, not here.
     invalid.pipeline_depth = 1;
     EXPECT_TRUE(is_valid_tmr_kernel_pipeline_contract(&invalid));
     invalid.pipeline_depth = 0;

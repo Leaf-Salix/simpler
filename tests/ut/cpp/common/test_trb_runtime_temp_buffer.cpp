@@ -632,9 +632,7 @@ TEST_F(TrbRuntimeTempBufferTest, LargestRingCountsOnlyReserveLayout) {
 }
 
 // Sizing reads only its own config and writes only its own output: no static or
-// thread-local state backs it. Init calls the builder once per context, so this
-// guards that one call against another context's rather than sanctioning a
-// recompute of a context's own contract.
+// thread-local state backs it, so concurrent calls cannot interfere.
 TEST(KernelPipelineBuilder, SizingKeepsNoSharedState) {
     constexpr size_t count = 4;
     std::array<CallConfig, count> configs;

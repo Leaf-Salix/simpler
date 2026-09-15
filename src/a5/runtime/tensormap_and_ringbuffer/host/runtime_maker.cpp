@@ -543,6 +543,12 @@ extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, Pip
     ArenaStaticSizes sizes;
     if (!derive_arena_static_sizes(sizing, &sizes)) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
 
+    // TASK_ARGS covers this runtime's current per-run host argument storage and
+    // nothing else. A full device publication needs more than this — banked
+    // launch state and device KernelArgs, handshake and domain control, a
+    // graph's stable update slot with its versions and staging, and resident
+    // profiling metadata — each of which is accounted for where it is
+    // established. These six entries are not a complete capacity manifest.
     const PipelineContract candidate = {
         PTO_PIPELINE_CONTRACT_ABI_VERSION,
         6,

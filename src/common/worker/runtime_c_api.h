@@ -158,11 +158,14 @@ typedef enum PipelineResourceKind {
 typedef struct PipelineResource {
     uint32_t kind;
     uint32_t resource_class;
-    /* Program: reserved, must be 0. Kernel: every resource that occupies
-       storage declares nonzero required usable bytes per copy — the device
-       arenas and the per-run host argument buffer alike — which is a per-copy
-       requirement, not committed HBM or a capacity budget. An EXEC_HANDLE is
-       not storage and must be 0. */
+    /* Program: reserved, must be 0 — a transitional rule, because program
+       declarations predate sized resources, not because program resources
+       occupy nothing. Kernel: every resource that occupies storage declares
+       nonzero required usable bytes per copy, and an EXEC_HANDLE declares 0.
+       The number is a per-copy requirement for the resource named by `kind`:
+       it is neither committed HBM nor a capacity budget, and the set of
+       declared resources is not a complete manifest of what a context
+       ultimately commits. */
     uint64_t bytes_per_copy;
 } PipelineResource;
 

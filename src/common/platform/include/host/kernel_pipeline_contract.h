@@ -17,12 +17,11 @@
 // immutable during the call; output is caller-exclusive and unchanged on error.
 // No device resources are acquired or retained.
 //
-// A context's kernel contract is a pure function of its context-static config,
-// so the init entry calls this once per context and the answer holds for that
-// context's lifetime. The implementations keep no static or thread-local state,
-// which is what makes that single call free of ordering constraints against any
-// other context's — it is not an invitation to recompute a context's own
-// contract on a later path.
+// The result is a pure function of the config, and the implementations keep no
+// static or thread-local state, so calls carry no ordering constraints against
+// each other. Today the only caller is kernel-mode init, which computes the
+// contract, admits it and drops it — nothing yet retains a resolved contract,
+// because nothing yet establishes the resources it describes.
 //
 // TMR rejects invalid config with INVALID_ARGUMENT and a null output or invalid
 // generated contract with INTERNAL. Unsupported implementations return UNSUPPORTED.

@@ -51,9 +51,13 @@ inline bool is_valid_pipeline_contract(const PipelineContract *contract, uint32_
             resource.resource_class > PTO_PIPELINE_EXEC_HANDLE) {
             return false;
         }
-        // A kernel-mode resource that occupies bytes states how many per copy;
-        // an execution handle is not a buffer and carries none. The partition is
-        // the resource class, so adding a kind cannot change which rule applies.
+        // Transitional rule, not the destination: program declarations predate
+        // sized resources and still carry zero, so the byte requirement is
+        // gated on mode. The resource model both modes will share decides
+        // "does this resource occupy storage" from the resource itself; until
+        // program declarations carry sizes, mode stands in for that. Within
+        // kernel mode the partition is already the resource class, so adding a
+        // kind cannot change which rule applies.
         const bool sized = mode == SIMPLER_MODE_KERNEL && resource.resource_class != PTO_PIPELINE_EXEC_HANDLE;
         if (sized ? resource.bytes_per_copy == 0 : resource.bytes_per_copy != 0) return false;
     }
