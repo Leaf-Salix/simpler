@@ -55,6 +55,8 @@
 #include "runtime_c_api.h"
 #include "task_args_wire.h"
 #include "utils/elf_build_id.h"
+
+static_assert(KERNEL_MAX_FUNC_ID == RUNTIME_MAX_FUNC_ID, "Kernel child function ID bounds must match runtime");
 // `runtime.h` (pulled in via `device_runner_helpers.h` in the base header)
 // supplies the per-arch `Handshake` + `Runtime` types used by
 // `print_handshake_results` / `bind_callable_to_runtime` /
@@ -712,7 +714,7 @@ KernelCallableCache::Ops DeviceRunnerBase::kernel_callable_cache_ops() {
     };
 }
 
-int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id, const HostApi *api, void *caller_stream) {
+int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id, const HostApi *api) {
     rtStream_t control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
     if (control_stream == nullptr) {
         LOG_ERROR("prepare_kernel_callable: no live kernel context");
@@ -743,7 +745,7 @@ int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id, const HostApi
     auto it = callables_.find(callable_id);
     if (it == callables_.end()) return PTO_RUNTIME_ERR_CALLABLE_NOT_RESIDENT;
     auto &state = it->second;
-    simpler::kernel::PreparedInvocationView callable{callable_id, 0, 0, kernel_callable_cache_.generation()};
+    simpler::kernel::PreparedInvocationView callable{callable_id, 0, 0};
     if (simpler::kernel::derive_invocation_counts(
             state.signature.data(), static_cast<int32_t>(state.signature.size()), &callable.tensor_count,
             &callable.scalar_count
@@ -768,12 +770,6 @@ int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id, const HostApi
         rc = commit_device_register(callable_id);
         if (rc != 0) return rc;
     }
-    rc = aclrtRecordEvent(kernel_exec_state_.event(KernelEventKind::PrepareTail), control_stream);
-    if (rc != 0) return rc;
-    kernel_prepare_pending_ = true;
-    rc = aclrtStreamWaitEvent(caller_stream, kernel_exec_state_.event(KernelEventKind::PrepareTail));
-    if (rc != 0) return rc;
-
     return kernel_exec_state_.mark_ready_enqueued();
 }
 
@@ -949,7 +945,7 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     const ChipCallableLayout layout = compute_chip_callable_layout(callable);
 
     if (execution_mode_latch_.is_kernel()) {
-        return kernel_callable_cache_.uploaded_address(layout.content_hash);
+        return kernel_callable_cache_.pending_uploaded_address();
     }
 
     // Content-hash dedup: identical bytes → return cached chip_dev.

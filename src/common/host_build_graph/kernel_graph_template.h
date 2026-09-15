@@ -27,7 +27,6 @@ struct GraphInvocationIdentity {
     int32_t callable_id{-1};
     int32_t tensor_count{0};
     int32_t scalar_count{0};
-    uint64_t callable_generation{0};
     uint64_t callable_hash{0};
     uint64_t argument_hash{0};
     uint64_t function_hash{0};

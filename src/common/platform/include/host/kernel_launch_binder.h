@@ -48,16 +48,15 @@ struct KernelLaunchHandles {
     void *caller{nullptr};
     void *aicpu{nullptr};
     void *aicore{nullptr};
-    void *prepare_tail{nullptr};
     void *start{nullptr};
+    void *aicore_start{nullptr};
     void *aicore_done{nullptr};
     void *aicpu_done{nullptr};
     void *serial_tail{nullptr};
-    bool consume_prepare_tail{false};
 
     bool valid() const {
         if (!caller || !aicpu || !aicore || caller == aicpu || caller == aicore || aicpu == aicore) return false;
-        const void *events[] = {prepare_tail, start, aicore_done, aicpu_done, serial_tail};
+        const void *events[] = {start, aicore_start, aicore_done, aicpu_done, serial_tail};
         for (size_t i = 0; i < 5; ++i) {
             if (!events[i]) return false;
             for (size_t j = 0; j < i; ++j)
@@ -70,17 +69,17 @@ struct KernelLaunchHandles {
 enum class KernelLaunchStep : uint8_t {
     Validate,
     QueryTail,
-    PrepareWait,
-    Clear,
     Start,
+    AicpuWait,
+    Clear,
+    AicoreStart,
     AicoreWait,
     AicoreLaunch,
     AicoreDone,
-    AicpuWait,
     AicpuLaunch,
+    JoinAicore,
     AicpuDone,
     JoinAicpu,
-    JoinAicore,
     SerialTail
 };
 
@@ -101,7 +100,7 @@ struct KernelLaunchAdmission {
 // it checks context phase, device/registration affinity, frozen capacity, packet
 // ABI and runtime bindings, and returns handles plus prior submission state.
 // Failure retains no lease. Success is paired with exactly one finish call.
-// finish commits caller/tail/prepare state on success, poisons on enqueue failure,
+// finish commits caller and tail state on success, poisons on enqueue failure,
 // preserves clean rejections, and releases the lease. Neither callback enqueues,
 // allocates, synchronizes, or queries capture. The owner also serializes close.
 struct KernelLaunchGateOps {

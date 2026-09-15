@@ -22,7 +22,7 @@ TEST(KernelBinder, ThreeStreamSuccessAndSteadyStateHaveExactTrace) {
         const auto result = f.launch();
         EXPECT_EQ(result.status, 0);
         EXPECT_TRUE(result.tail_recorded);
-        EXPECT_EQ(f.fake.trace, (std::vector<Step>(success.begin() + 1, success.end())));
+        EXPECT_EQ(f.fake.trace, success);
     }
     EXPECT_EQ(f.fake.queries, 0);
     EXPECT_EQ(f.fake.acquisitions, 11);
@@ -45,7 +45,7 @@ TEST(KernelBinder, StreamSwitchQueriesButNeverWaitsOldTail) {
     f.fake.query_error = 0;
     EXPECT_EQ(f.launch(ptr(101)).status, 0);
     EXPECT_EQ(f.fake.queries, 3);
-    EXPECT_EQ(f.fake.trace, (std::vector<Step>(success.begin() + 1, success.end())));
+    EXPECT_EQ(f.fake.trace, success);
     f.fake.clear_trace();
     EXPECT_EQ(f.launch(ptr(101)).status, 0);
     EXPECT_EQ(f.fake.queries, 3);
@@ -97,7 +97,6 @@ TEST(KernelBinder, ReadOnlyRejectionsReleaseOwnerAndPreservePrepareDependency) {
         EXPECT_FALSE(f.fake.poisoned);
         EXPECT_EQ(f.fake.acquisitions, f.fake.finishes);
         EXPECT_EQ(f.fake.previous_caller, 0u);
-        EXPECT_TRUE(f.fake.pending_prepare);
         f.fake.validation_error = 0;
         f.fake.ready = f.fake.frozen = true;
         f.fake.handles.aicpu_done = ptr(6);
@@ -116,11 +115,17 @@ TEST(KernelBinder, EveryEnqueueFailurePoisonsWithExactCompensationTrace) {
         EXPECT_EQ(result.status, -1700 - fail);
         EXPECT_EQ(result.failed_step, success[fail - 1]);
         auto expected = std::vector<Step>(success.begin(), success.begin() + fail);
-        if (fail == 6) expected.insert(expected.end(), {Cancel, Step::AicoreDone, Step::JoinAicore, Step::SerialTail});
-        if (fail == 7) expected.insert(expected.end(), {Cancel, Step::JoinAicore, Step::SerialTail});
+        // Only a failure between the AICore launch and the AICPU launch can
+        // leave AICore spinning on a handshake no AICPU will write, so only
+        // those two sites cancel and then drive the chain back to the caller.
+        if (fail == 7)
+            expected.insert(
+                expected.end(),
+                {Cancel, Step::AicoreDone, Step::JoinAicore, Step::AicpuDone, Step::JoinAicpu, Step::SerialTail}
+            );
         if (fail == 8)
             expected.insert(
-                expected.end(), {Cancel, Step::AicpuDone, Step::JoinAicpu, Step::JoinAicore, Step::SerialTail}
+                expected.end(), {Cancel, Step::JoinAicore, Step::AicpuDone, Step::JoinAicpu, Step::SerialTail}
             );
         EXPECT_EQ(f.fake.trace, expected);
         EXPECT_TRUE(f.fake.poisoned);
@@ -133,8 +138,8 @@ TEST(KernelBinder, EveryEnqueueFailurePoisonsWithExactCompensationTrace) {
 }
 
 TEST(KernelBinder, CompensationFailuresKeepBothErrorsAndStopAtFailure) {
-    for (int primary : {6, 7, 8}) {
-        const int cleanup_steps = primary == 6 ? 4 : primary == 7 ? 3 : 5;
+    for (int primary : {7, 8}) {
+        const int cleanup_steps = primary == 7 ? 6 : 5;
         for (int step = 1; step <= cleanup_steps; ++step) {
             SCOPED_TRACE(primary * 100 + step);
             Fixture f;
@@ -170,15 +175,5 @@ TEST(KernelBinder, ConcurrentHostLaunchIsRejectedWithoutTouchingArgs) {
     EXPECT_EQ(first.get().status, 0);
     EXPECT_EQ(f.fake.acquisitions, 1);
     EXPECT_EQ(f.fake.finishes, 1);
-}
-
-TEST(KernelBinder, NewPrepareTailIsConsumedExactlyOnce) {
-    Fixture f;
-    ASSERT_NO_FATAL_FAILURE(f.initialize());
-    ASSERT_EQ(f.launch().status, 0);
-    f.fake.pending_prepare = true;
-    f.fake.clear_trace();
-    EXPECT_EQ(f.launch().status, 0);
-    EXPECT_EQ(f.fake.trace, success);
 }
 }  // namespace kernel_binder_test

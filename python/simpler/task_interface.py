@@ -99,6 +99,9 @@ from _task_interface import (
 from _task_interface import (
     _start_host_log_writer as _native_start_host_log_writer,
 )
+from _task_interface import (
+    scalar_to_uint64 as _native_scalar_to_uint64,
+)
 
 from .buffer import Buffer, Tensor
 
@@ -957,26 +960,46 @@ assert ctypes.sizeof(_CommContextStruct) == 1056
 def scalar_to_uint64(value) -> int:
     """Convert a scalar value to ``uint64``.
 
-    *value* can be a Python int, float, a ctypes scalar (``c_int64``,
-    ``c_float``, etc.), or any object convertible to ``int``.
+    *value* can be a Python int, float, bool, a numpy integer scalar, an
+    ``IntEnum`` member, or a ctypes scalar.
 
-    Python float values are converted to IEEE 754 single precision (32-bit)
-    and their bit pattern is zero-extended to uint64. This may cause a loss of
-    precision. For double precision, use ``ctypes.c_double``.
+    The accepted ctypes types are the integer widths (``c_int8`` ..
+    ``c_uint64``), ``c_float``, ``c_double`` and ``c_bool``, and any subclass
+    of one of them. A pointer or character type (``c_void_p``, ``c_char_p``,
+    ``c_char``, ``c_wchar``) is refused: its buffer holds an address or a
+    character rather than a number a slot can carry.
+
+    A byte-order-qualified variant (``c_uint32.__ctype_be__`` on a
+    little-endian host, and its ``__ctype_le__`` counterpart on a big-endian
+    one) is also refused. Its bytes are stored in the opposite order, so
+    copying them would encode a different number than the same value written
+    from orchestration, and ``to_u64`` has no reversed-order form to agree
+    with.
+
+    The encoding matches C++ ``to_u64()`` bit for bit, so a slot written from
+    Python and one written from orchestration read back identically.
+
+    A ctypes scalar is read at its own width and **zero-extended**, never
+    sign-extended: ``c_int8(-1)`` is ``0xFF``, matching ``to_u64(int8_t{-1})``.
+    Reading it back with the matching width (``scalar<int8_t>``) still yields
+    ``-1``.
+
+    Python float values (and ``numpy.float64``, which is itself a ``float``
+    subclass) are converted to IEEE 754 single precision (32-bit) and their
+    bit pattern is zero-extended to uint64. This may cause a loss of
+    precision. A finite value outside single-precision range (``1e100``)
+    raises rather than being stored as an infinity; ``inf`` and ``nan`` pass
+    through as themselves. For double precision, use ``ctypes.c_double`` -- a
+    bare Python float carries no width, so this is the one encoding that
+    cannot align with its C++ counterpart, where ``to_u64(1.5)`` is a double.
+    A narrower numpy float (e.g. ``numpy.float32``) is rejected rather than
+    silently coerced through ``int()`` -- wrap it in ``float(...)`` first if
+    that narrowing is what you want.
+
+    An integer outside the 64-bit two's-complement range raises rather than
+    truncating to its low 64 bits.
     """
-    import struct as _struct
-
-    if isinstance(value, float):
-        bits = _struct.unpack("<I", _struct.pack("<f", value))[0]
-        return bits
-    import ctypes as _ct
-
-    if isinstance(value, _ct._SimpleCData):
-        if isinstance(value, (_ct.c_float, _ct.c_double)):
-            uint_type = _ct.c_uint32 if isinstance(value, _ct.c_float) else _ct.c_uint64
-            return uint_type.from_buffer_copy(value).value
-        return int(value.value) & 0xFFFFFFFFFFFFFFFF
-    return int(value) & 0xFFFFFFFFFFFFFFFF
+    return _native_scalar_to_uint64(value)
 
 
 @dataclass
@@ -1368,9 +1391,6 @@ class ChipWorker:
         self._identity_registry: dict[bytes, Any] = {}
         self._live_handles: dict[int, bytes] = {}
         self._next_handle_id = 0
-        # The stream a kernel-mode caller lent at kernel_init, as an integer
-        # address. Zero on a program-mode worker and on one not yet initialized.
-        self._kernel_caller_stream = 0
 
     def init(
         self,
@@ -1452,7 +1472,6 @@ class ChipWorker:
         device_id: int,
         bins: Any,
         config: CallConfig,
-        caller_stream: int,
         context_generation: int | None = None,
         log_level: int | None = None,
     ):
@@ -1469,16 +1488,10 @@ class ChipWorker:
                 host_path / aicpu_path / aicore_path / dispatcher_path /
                 sim_context_path.
             config: context-static CallConfig; launches never mutate it.
-            caller_stream: the caller's aclrtStream as an integer address, e.g.
-                torch_npu.npu.current_stream().npu_stream. Validated as nonzero
-                here because the C ABI rejects a null stream, and failing at the
-                Python boundary names the argument.
             context_generation: nonzero and unique within this process. Minted
                 here when omitted.
             log_level: as for init().
         """
-        if not caller_stream:
-            raise ValueError("ChipWorker.kernel_init() requires a non-null caller_stream")
         with self._lifecycle_lock:
             if self._init_in_progress:
                 raise RuntimeError("ChipWorker.init() is already in progress")
@@ -1506,7 +1519,6 @@ class ChipWorker:
                 generation,
                 "" if sim_context_path is None else str(sim_context_path),
             )
-            self._kernel_caller_stream = int(caller_stream)
         finally:
             with self._lifecycle_lock:
                 self._init_in_progress = False
@@ -1516,41 +1528,39 @@ class ChipWorker:
         """Whether the bound runtime can execute kernel-mode launches."""
         return bool(self._impl.kernel_mode_supported)
 
-    def kernel_prepare_callable(self, chip_callable: ChipCallable, caller_stream: int | None = None) -> int:
-        """Stage a callable for kernel-mode launches, outside ACLGraph capture.
+    def kernel_prepare_callable(self, chip_callable: ChipCallable) -> int:
+        """Register a callable for kernel-mode launches, outside ACLGraph capture.
 
-        Returns the callable id it was staged under. ``caller_stream`` defaults
-        to the stream kernel_init() was given; pass one to stage on a different
-        stream. Preparation may enqueue asynchronous work on that stream but
-        never synchronizes it, so errors surface through the caller's own
-        warmup plus synchronize.
+        Returns the context-local id simpler minted for it. Registration is
+        pure: the same callable registered twice takes two distinct, equally
+        valid ids, and there is no lookup. It takes no stream — registration
+        enqueues on the context's own AICPU stream, which every later launch
+        also enqueues on, so stream FIFO orders registration ahead of each
+        launch. Errors surface through the caller's own warmup plus
+        synchronize.
         """
-        stream = self._resolve_caller_stream(caller_stream)
+        callable_id = int(self._impl.kernel_prepare_callable(chip_callable))
+        # The registry owns the image for the life of the context: the device
+        # holds addresses into a buffer this object keeps alive.
         with self._registry_lock:
-            callable_id = self._allocate_slot_locked()
             self._callable_registry[callable_id] = chip_callable
-        try:
-            self._impl.kernel_prepare_callable(int(callable_id), chip_callable, stream)
-        except BaseException:
-            with self._registry_lock:
-                self._callable_registry.pop(callable_id, None)
-            raise
         return callable_id
 
-    def kernel_launch(self, callable_id: int, args, caller_stream: int | None = None):
+    def kernel_launch(self, callable_id: int, args, caller_stream: int):
         """Enqueue one bounded asynchronous kernel-mode invocation.
 
-        Returning means the sequence was enqueued on the caller's stream; device
+        ``caller_stream`` is this call's execution stream, taken per call
+        rather than remembered from init: a framework caller's current stream
+        is a property of the call, so a stream fixed at init would keep
+        enqueueing onto a stale one.
+
+        Returning means the sequence was enqueued on that stream; device
         execution may still be in flight and may still fail asynchronously.
         """
-        stream = self._resolve_caller_stream(caller_stream)
-        self._impl.kernel_launch(int(callable_id), args, stream)
-
-    def _resolve_caller_stream(self, caller_stream: int | None) -> int:
-        stream = self._kernel_caller_stream if caller_stream is None else int(caller_stream)
+        stream = int(caller_stream)
         if not stream:
-            raise RuntimeError("no caller stream: pass caller_stream, or call kernel_init() first to record one")
-        return stream
+            raise ValueError("kernel_launch requires a non-null caller_stream")
+        self._impl.kernel_launch(int(callable_id), args, stream)
 
     def finalize(self):
         """Tear down everything: device resources and runtime library.

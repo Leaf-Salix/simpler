@@ -291,7 +291,7 @@ class TestChipWorkerKernelSymbols:
             assert worker.device_id == 0
             chip = ChipCallable.build(signature=[], func_name="unused", binary=b"", children=[])
             with pytest.raises(RuntimeError, match="does not support kernel mode"):
-                worker.kernel_prepare_callable(0, chip, 1)
+                worker.kernel_prepare_callable(chip)
             with pytest.raises(RuntimeError, match="does not support kernel mode"):
                 worker.kernel_launch(0, ChipStorageTaskArgs(), 1)
         finally:

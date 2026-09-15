@@ -36,8 +36,10 @@ void configure_kernel_platform(const KernelArgs &args) {
 }  // namespace
 
 int consume_kernel_invocation(
-    const SimplerKernelDispatchArgs &args, const KernelCallableDeviceResidency &resident, const void *payload,
+    const SimplerKernelDispatchArgs &args, const ChipCallable &callable, size_t callable_bytes, const void *payload,
     size_t payload_bytes
 ) {
-    return simpler::tmr::execute_tmr_kernel_dispatch(args, resident, payload, payload_bytes, configure_kernel_platform);
+    return simpler::tmr::execute_tmr_kernel_dispatch(
+        args, callable, callable_bytes, payload, payload_bytes, configure_kernel_platform
+    );
 }

@@ -20,7 +20,6 @@
 #include "callable.h"
 #include "common/kernel_args.h"
 #include "kernel_dispatch_args.h"
-#include "kernel_callable_residency.h"
 #include "kernel_execution_inputs.h"
 
 namespace simpler::tmr {
@@ -71,20 +70,20 @@ private:
 };
 
 inline InvocationStatus admit_kernel_dispatch(
-    const SimplerKernelDispatchArgs &args, const KernelCallableDeviceResidency &residency, Runtime *runtime,
+    const SimplerKernelDispatchArgs &args, const ChipCallable &image, size_t callable_bytes, Runtime *runtime,
     KernelDispatchGroup &group
 ) {
-    if (!readable_kernel_region(residency.device_address, residency.bytes, alignof(ChipCallable)) ||
-        residency.bytes < sizeof(ChipCallable))
+    if (!readable_kernel_region(reinterpret_cast<uint64_t>(&image), callable_bytes, alignof(ChipCallable)) ||
+        callable_bytes < sizeof(ChipCallable))
         return InvocationStatus::InvalidBinding;
 
-    const auto *callable = reinterpret_cast<const ChipCallable *>(residency.device_address);
+    const auto *callable = &image;
     cache_invalidate_range(callable, sizeof(*callable));
     int32_t tensors = 0;
     int32_t scalars = 0;
     auto status = kernel::derive_invocation_counts(callable->signature_, callable->sig_count_, &tensors, &scalars);
     if (status != InvocationStatus::Ok) return status;
-    const uint64_t storage_bytes = residency.bytes - sizeof(ChipCallable);
+    const uint64_t storage_bytes = callable_bytes - sizeof(ChipCallable);
     if (callable->binary_size_ > storage_bytes || callable->child_count_ < 0 ||
         callable->child_count_ > RUNTIME_MAX_FUNC_ID)
         return InvocationStatus::InvalidBinding;
@@ -114,7 +113,7 @@ inline InvocationStatus admit_kernel_dispatch(
         runtime->get_prebuilt_runtime_offset()
     };
     const KernelCallableView prepared{
-        {residency.callable_id, tensors, scalars, residency.generation}, {group.functions, RUNTIME_MAX_FUNC_ID}
+        {args.invocation.callable_id, tensors, scalars}, {group.functions, RUNTIME_MAX_FUNC_ID}
     };
     static_assert(offsetof(SimplerKernelDispatchArgs, invocation) + sizeof(args.invocation) == sizeof(args));
     return admit_kernel_execution(
@@ -125,7 +124,7 @@ inline InvocationStatus admit_kernel_dispatch(
 }
 
 inline int execute_tmr_kernel_dispatch(
-    const SimplerKernelDispatchArgs &args, const KernelCallableDeviceResidency &residency, const void *payload,
+    const SimplerKernelDispatchArgs &args, const ChipCallable &image, size_t callable_bytes, const void *payload,
     size_t payload_bytes, void (*configure_platform)(const KernelArgs &)
 ) {
     if (!readable_kernel_region(args.binding_address, sizeof(KernelArgs), alignof(KernelArgs)))
@@ -161,7 +160,7 @@ inline int execute_tmr_kernel_dispatch(
     static KernelDispatchGroup group;
     if (leader) {
         configure_platform(kernel_args);
-        const auto status = admit_kernel_dispatch(args, residency, runtime, group);
+        const auto status = admit_kernel_dispatch(args, image, callable_bytes, runtime, group);
         group.reset_status(status == InvocationStatus::Ok ? 0 : static_cast<int>(KernelDispatchStatus::InvalidArgs));
         if (status != InvocationStatus::Ok) cancel_uninitialized_kernel_cores(*runtime);
     }

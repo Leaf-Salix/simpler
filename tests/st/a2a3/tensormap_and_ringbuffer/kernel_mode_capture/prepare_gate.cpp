@@ -12,36 +12,16 @@
 #include <acl/acl.h>
 #include <acl/error_codes/rt_error_codes.h>
 #include <pthread.h>
-#include <dlfcn.h>
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstdio>
 #include <cstdlib>
-#include <initializer_list>
 #include <mutex>
 #include <thread>
 
 namespace {
-void *resolve(const char *name) {
-    if (auto *p = dlsym(RTLD_NEXT, name)) return p;
-    for (auto *library : {"libascendcl.so", "libruntime.so"}) {
-        auto *handle = dlopen(library, RTLD_NOLOAD | RTLD_NOW);
-        if (!handle) continue;
-        auto *p = dlsym(handle, name);
-        dlclose(handle);
-        if (p) return p;
-    }
-    std::fprintf(stderr, "cannot resolve %s\n", name);
-    std::abort();
-}
-using Query = decltype(&aclrtQueryEventStatus);
-Query real_query() {
-    static auto fn = reinterpret_cast<Query>(resolve("aclrtQueryEventStatus"));
-    return fn;
-}
-bool arm_record = false;
+bool armed = false;
 struct Gate {
     std::mutex mutex;
     std::condition_variable changed;
@@ -49,7 +29,6 @@ struct Gate {
     std::atomic<bool> stop{false};
     aclError subscribe_rc = 0, process_rc = 0;
     aclrtStream stream = nullptr;
-    aclrtEvent event = nullptr;
     uint64_t tid = 0;
     std::thread reporter;
 };
@@ -112,13 +91,7 @@ aclError install_gate(aclrtStream stream) {
 }
 }  // namespace
 
-extern "C" void capture_gate_arm() { arm_record = true; }
-extern "C" int capture_gate_pending() {
-    if (arm_record || !gate.event) return -4902;
-    aclrtEventRecordedStatus status{};
-    auto rc = real_query()(gate.event, &status);
-    return rc ? -4903 : status == ACL_EVENT_RECORDED_STATUS_NOT_READY;
-}
+extern "C" void capture_gate_arm() { armed = true; }
 extern "C" int capture_gate_blocked() {
     std::lock_guard<std::mutex> lock(gate.mutex);
     return gate.entered && !gate.released && !gate.timed_out;
@@ -140,9 +113,8 @@ extern "C" int capture_gate_finish() {
     return gate.process_rc ? gate.process_rc : unsubscribed;
 }
 
-extern "C" aclError capture_gate_before_record(aclrtEvent event, aclrtStream stream) {
-    if (!arm_record) return 0;
-    arm_record = false;
-    gate.event = event;
+extern "C" aclError capture_gate_before_register(aclrtStream stream) {
+    if (!armed) return 0;
+    armed = false;
     return install_gate(stream);
 }

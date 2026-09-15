@@ -36,7 +36,6 @@ loads host_build_graph, which every a2a3 build produces.
 from __future__ import annotations
 
 import multiprocessing as mp
-import os
 import traceback
 
 import pytest
@@ -72,7 +71,7 @@ def _run_case(case: str, device_id: int, platform: str, queue) -> None:
             # something else.
             unsupported_bins = builder.get_binaries("host_build_graph", build=False)
             with pytest.raises(Exception) as excinfo:  # noqa: PT011
-                worker.kernel_init(device_id, unsupported_bins, config, stream)
+                worker.kernel_init(device_id, unsupported_bins, config)
             result["error"] = str(excinfo.value)
             result["reached_abi"] = "kernel mode" in str(excinfo.value)
             result["initialized_after"] = bool(worker._impl.initialized)
@@ -82,13 +81,13 @@ def _run_case(case: str, device_id: int, platform: str, queue) -> None:
         elif case == "init_claims_borrowed_stream":
             # One kernel context per device and runtime: the first claim holds,
             # and a second worker is refused without disturbing the owner.
-            worker.kernel_init(device_id, bins, config, stream)
+            worker.kernel_init(device_id, bins, config)
             result["stage"] = "kernel_init"
             result["initialized"] = bool(worker._impl.initialized)
             result["kernel_supported"] = bool(worker.kernel_mode_supported)
             refused = ChipWorker()
             try:
-                refused.kernel_init(device_id, bins, config, stream)
+                refused.kernel_init(device_id, bins, config)
                 result["second_claim_refused"] = False
             except RuntimeError as exc:
                 result["second_claim_refused"] = True
@@ -106,9 +105,11 @@ def _run_case(case: str, device_id: int, platform: str, queue) -> None:
             )
 
         elif case == "null_stream_rejected":
-            # Named at the Python boundary rather than deep in the C ABI.
+            # The execution stream belongs to launch, not to init, so this is
+            # where a null one has to be named. Rejecting at the Python boundary
+            # names the argument instead of surfacing a bare ABI code.
             with pytest.raises(ValueError) as excinfo:
-                worker.kernel_init(device_id, bins, config, 0)
+                worker.kernel_launch(0, None, 0)
             result["error"] = str(excinfo.value)
             result["ok"] = "caller_stream" in str(excinfo.value)
 
@@ -140,7 +141,7 @@ def _run_case(case: str, device_id: int, platform: str, queue) -> None:
             result["initialized"] = bool(worker._impl.initialized)
             result["kernel_supported"] = bool(worker.kernel_mode_supported)
             try:
-                worker.kernel_init(device_id, bins, config, stream)
+                worker.kernel_init(device_id, bins, config)
                 result["second_init_refused"] = False
             except RuntimeError:
                 result["second_init_refused"] = True
@@ -155,13 +156,20 @@ def _run_case(case: str, device_id: int, platform: str, queue) -> None:
         result["error"] = f"{type(exc).__name__}: {exc}"
         result["traceback"] = traceback.format_exc()
     finally:
+        # Destroying the stream is the one operation that touches it *after*
+        # kernel_init ran, so it is the evidence that the borrowed stream came
+        # through intact. Swallowing its failure here would let a kernel_init
+        # that destroyed or invalidated the caller's stream still report ok.
         if stream:
             try:
                 import _task_interface as native
 
                 native._acl_destroy_stream(stream)
-            except Exception:  # noqa: BLE001, S110
-                pass
+                result["stream_destroyed"] = True
+            except BaseException as exc:  # noqa: BLE001
+                result["stream_destroyed"] = False
+                result["stream_teardown_error"] = f"{type(exc).__name__}: {exc}"
+                result["ok"] = False
         queue.put(result)
 
 
@@ -171,7 +179,15 @@ def _run_in_subprocess(case: str, device_id: int, platform: str) -> dict:
     proc = ctx.Process(target=_run_case, args=(case, device_id, platform, queue))
     proc.start()
     proc.join(timeout=300)
-    assert proc.exitcode is not None, f"case {case} did not exit within 300s"
+    if proc.is_alive():
+        # A hung child is non-daemon, so failing without reaping it would leave
+        # the test process waiting on it until the CI job timeout.
+        proc.terminate()
+        proc.join(timeout=10)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        pytest.fail(f"case {case} did not exit within 300s")
     assert not queue.empty(), f"case {case} produced no result (exitcode={proc.exitcode})"
     return queue.get()
 
@@ -213,4 +229,9 @@ def test_borrowed_stream_survives_a_refused_kernel_init(st_platform, st_device_i
     result = _run_in_subprocess("init_refused", int(st_device_ids[0]), st_platform)
     assert result.get("stream_nonzero"), f"test never obtained a stream: {result}"
     assert result["ok"], f"refused init did not behave per contract: {result}"
-    assert os.path.exists("/proc/self"), "sanity: subprocess reported back to a live parent"
+    # The assertion that makes this case distinct from init_refused: an
+    # operation on the stream issued after the failed init has to succeed.
+    assert result.get("stream_destroyed") is True, (
+        f"the caller's stream did not survive a refused kernel_init: {result}"
+    )
+    assert "stream_teardown_error" not in result, f"post-init stream operation failed: {result}"

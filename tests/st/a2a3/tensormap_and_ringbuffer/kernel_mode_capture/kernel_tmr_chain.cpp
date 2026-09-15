@@ -8,14 +8,24 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#include "aicpu/kernel_invocation_consumer.h"
-#include "kernel_dispatch_args.h"
 
-__attribute__((weak)) void prepare_kernel_aicpu_thread() {}
+#include "orchestration_api.h"
 
-// Runtimes with a kernel invocation protocol provide a strong consumer.
-// Program-mode aicpu_execute is not a fallback for an unsupported runtime.
-__attribute__((weak)) int
-consume_kernel_invocation(const SimplerKernelDispatchArgs &, const ChipCallable &, size_t, const void *, size_t) {
-    return static_cast<int>(KernelDispatchStatus::UnsupportedPayload);
+extern "C" void kernel_tmr_chain(const ChipTaskArgs &args) {
+    SIMPLER_SCOPE_GUARD();
+    uint32_t shape[] = {128 * 128};
+    TensorCreateInfo intermediate(shape, 1, DataType::FLOAT32);
+    auto previous = args.tensor(0).ref();
+    for (int step = 0; step < 16; ++step) {
+        CoreTaskArgs task;
+        task.add_input(previous);
+        if (step == 15) {
+            task.add_output(args.tensor(1).ref());
+        } else {
+            task.add_output(intermediate);
+        }
+        task.add_scalar(args.scalar(0));
+        auto outputs = rt_submit_aiv_task(0, task);
+        if (step < 15) previous = outputs.get_ref(0);
+    }
 }

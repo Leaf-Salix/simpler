@@ -173,8 +173,8 @@ int make_graph_launch_template(
         return PTO_RUNTIME_ERR_INVALID_STATE;
     if (identity.callable_id < 0 || identity.tensor_count < 0 || identity.scalar_count < 0 ||
         identity.tensor_count > CHIP_MAX_TENSOR_ARGS || identity.scalar_count > CHIP_MAX_SCALAR_ARGS ||
-        identity.callable_generation == 0 || identity.callable_hash == 0 || identity.argument_hash == 0 ||
-        identity.function_hash == 0 || runtime_binary_id == 0)
+        identity.callable_hash == 0 || identity.argument_hash == 0 || identity.function_hash == 0 ||
+        runtime_binary_id == 0)
         return PTO_RUNTIME_ERR_INTERNAL;
     RuntimeArenaLayout layout{};
     int rc = make_kernel_graph_layout(build.task_capacity, layout);
@@ -259,7 +259,6 @@ int make_graph_launch_template(
     SimplerKernelInvocationHeader invocation{};
     invocation.mode = SIMPLER_MODE_KERNEL;
     invocation.callable_id = identity.callable_id;
-    invocation.generation = identity.callable_generation;
     invocation.tensor_count = identity.tensor_count;
     invocation.scalar_count = identity.scalar_count;
     invocation.payload_bytes = header.total_bytes;

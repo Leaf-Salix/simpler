@@ -109,7 +109,7 @@ protected:
     std::array<float, 8> data{};
     uint64_t identity{0};
     KernelBindingView binding{};
-    const PreparedInvocationView callable{3, 1, 1, 17};
+    const PreparedInvocationView callable{3, 1, 1};
 };
 
 TEST_F(KernelExecutionInputsTest, ConfigAndOrchestrationShareStableBorrowedArguments) {
@@ -164,7 +164,7 @@ TEST_F(KernelExecutionInputsTest, FailureDoesNotPublishOrModifyPreviousInputs) {
     invalid.identity.context_generation++;
     EXPECT_EQ(state->admit(packet.packet(), {callable, {}}, invalid), InvocationStatus::InvalidBinding);
     auto stale = callable;
-    stale.slot_generation++;
+    stale.callable_id++;
     EXPECT_EQ(state->admit(packet.packet(), {stale, {}}, binding), InvocationStatus::StaleCallable);
     EXPECT_FALSE(state->active());
     EXPECT_EQ(state->inputs().args, nullptr);

@@ -6,14 +6,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Cold capture of the public asynchronous TMR preparation/launch contract."""
+"""Real TMR kernel-mode eager and ACLGraph lifecycle/ordering coverage."""
 
 import ctypes
 import os
 import platform
-import struct
 import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -26,13 +28,14 @@ MODULE = "tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture"
 RUNTIME = "tensormap_and_ringbuffer"
 SCENARIOS = (
     "cold_synced",
+    "cold_unsynced",
     "warm",
     "multi_callable",
     "cross_stream",
     "prepare_again",
-    "query_error",
-    "pending_same",
-    "pending_cross",
+    "prepare_after_capture",
+    "stream_query_error",
+    "stream_busy",
     "blocked_same",
     "blocked_cross",
     "replay_stream",
@@ -42,8 +45,13 @@ SCENARIOS = (
     "feedback_batch",
     "eager_replay",
     "prepare_fail_register",
-    "prepare_fail_record",
-    "prepare_fail_wait",
+    "eager_batch",
+    "eager_multi_callable",
+    "eager_rejections",
+    "graph_recreate",
+    "long_chain",
+    "tmr_dag",
+    "eager_dag",
 )
 
 
@@ -88,9 +96,13 @@ def capture_observer(tmp_path_factory):
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.device_count(1)
 @pytest.mark.parametrize("scenario", SCENARIOS)
-def test_async_prepare_cold_capture(st_platform, st_device_ids, scenario, capture_observer, tmp_path):
+def test_tmr_kernel_mode(st_platform, st_device_ids, scenario, capture_observer):
     _binaries(st_platform, RUNTIME)
     device = str(st_device_ids[0])
+    artifacts = ROOT / "outputs" / "kernel_mode"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    # Forked pytest workers can recreate basetemp between cases.
+    tmp_path = Path(tempfile.mkdtemp(prefix=scenario + "-", dir=artifacts))
     env = dict(os.environ)
     env["LD_PRELOAD"] = str(capture_observer) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
     logs = tmp_path / "ascend"
@@ -113,11 +125,13 @@ def test_async_prepare_cold_capture(st_platform, st_device_ids, scenario, captur
     assert result.returncode == 0, f"{output}\nArtifacts: {tmp_path}"
     if scenario.startswith("prepare_fail_"):
         assert f"PASS {scenario} rejected_after_failure=1 forbidden_sync=0" in output
+    elif scenario.startswith("eager_") and scenario != "eager_replay":
+        assert f"PASS {scenario} eager=100 forbidden_sync=0" in output
     else:
         assert f"PASS {scenario} replays=100 forbidden_sync=0" in output
 
 
-def _build_callable(build_dir, alternate=False):
+def _build_callable(build_dir, alternate=False, dag=False):
     from simpler.task_interface import ArgDirection, ChipCallable, CoreCallable  # noqa: PLC0415
 
     from simpler_setup.elf_parser import extract_text_section  # noqa: PLC0415
@@ -131,6 +145,8 @@ def _build_callable(build_dir, alternate=False):
         if alternate
         else ROOT / "tests/ut/py/kernel_eager_orchestration.cpp"
     )
+    if dag:
+        source = Path(__file__).with_name("kernel_tmr_chain.cpp")
     orchestration = compiler.compile_orchestration(RUNTIME, str(source), build_dir=str(build_dir))
     incore = compiler.compile_incore(
         str(ROOT / "examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels/aiv/kernel_add_scalar.cpp"),
@@ -143,7 +159,9 @@ def _build_callable(build_dir, alternate=False):
     child = CoreCallable.build(signature=signature, binary=extract_text_section(incore))
     return ChipCallable.build(
         signature=signature,
-        func_name="kernel_capture_alternate" if alternate else "kernel_eager_orchestration",
+        func_name="kernel_tmr_chain"
+        if dag
+        else ("kernel_capture_alternate" if alternate else "kernel_eager_orchestration"),
         binary=orchestration,
         children=[(0, child)],
     )
@@ -178,7 +196,7 @@ def _config():
 
 
 def _bind_observer_guards(observer):
-    for name in ("arm", "release", "pending", "blocked", "finish"):
+    for name in ("arm", "release", "blocked", "finish"):
         function = getattr(observer, "capture_gate_" + name)
         function.argtypes = []
         function.restype = None if name in ("arm", "release") else ctypes.c_int
@@ -192,7 +210,7 @@ def _bind_observer_guards(observer):
     observer.capture_observer_override_query.restype = None
     observer.capture_observer_fail_prepare.argtypes = [ctypes.c_int]
     observer.capture_observer_fail_prepare.restype = None
-    for name in ("query_calls", "total_queries", "waits", "records", "clears", "prepare_waits", "prepare_failures"):
+    for name in ("query_calls", "total_queries", "waits", "records", "clears", "prepare_failures"):
         function = getattr(observer, "capture_observer_" + name)
         function.argtypes = []
         function.restype = ctypes.c_uint64
@@ -215,21 +233,6 @@ def _check_steady_launch(observer, launch, *arguments, **keywords):
     before = observer.capture_observer_total_queries()
     launch(*arguments, **keywords)
     assert observer.capture_observer_total_queries() == before, "steady same-caller launch queried an old event"
-
-
-def _check_query_branch(scenario, observer, launch):
-    if scenario == "query_error":
-        before = _submission_counts(observer)
-        observer.capture_observer_override_query(1)
-        launch(0, expected=-4332)
-        assert observer.capture_observer_query_calls() == 1
-        assert _submission_counts(observer) == before, "query error submitted device work"
-        launch(0)
-    elif scenario in ("pending_same", "pending_cross"):
-        observer.capture_observer_override_query(2)
-        launch(0)
-        assert observer.capture_observer_query_calls() == 1
-        assert observer.capture_observer_prepare_waits() == 1, "pending prepare lost its native event wait"
 
 
 def _close(lib, ctx, allocations, streams, device, graphs=()):
@@ -260,9 +263,8 @@ def _fail():
 def _check_prepare_failure(scenario, observer, lib, ctx, prepare, launch):
     from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.kernel_capture_values import _check  # noqa: PLC0415
 
-    kind = {"prepare_fail_register": 1, "prepare_fail_record": 2, "prepare_fail_wait": 3}[scenario]
     before = lib.committed_device_memory_ctx(ctx)
-    observer.capture_observer_fail_prepare(kind)
+    observer.capture_observer_fail_prepare(1)
     prepare(0, expected=-4333)
     assert observer.capture_observer_prepare_failures() == 1
     retained = lib.committed_device_memory_ctx(ctx)
@@ -273,7 +275,7 @@ def _check_prepare_failure(scenario, observer, lib, ctx, prepare, launch):
     assert _submission_counts(observer) == submission
     assert observer.capture_observer_prepare_failures() == 1
     assert lib.committed_device_memory_ctx(ctx) == retained
-    # A failed caller wait cannot cover work already queued on the hidden stream.
+    # Previously enqueued initialization still belongs to the poisoned context.
     _check(lib.aclrtSynchronizeDevice(), "external drain before poisoned-context close")
     assert lib.committed_device_memory_ctx(ctx) == retained
 
@@ -297,8 +299,8 @@ def _initialize(device, scenario, build_dir):
         _check,
     )
 
-    chips = [_build_callable(build_dir / "callable-a")]
-    if scenario in ("multi_callable", "prepare_again"):
+    chips = [_build_callable(build_dir / "callable-a", dag=scenario in ("tmr_dag", "eager_dag"))]
+    if scenario in ("multi_callable", "prepare_again", "prepare_after_capture", "eager_multi_callable"):
         chips.append(_build_callable(build_dir / "callable-b", alternate=True))
     lib = _load("a2a3", "onboard", RUNTIME)
     _bind_acl(lib)
@@ -307,7 +309,7 @@ def _initialize(device, scenario, build_dir):
     streams = [ctypes.c_void_p(), ctypes.c_void_p()]
     for stream in streams:
         _check(lib.aclrtCreateStream(ctypes.byref(stream)), "create stream")
-    caller = streams[int(scenario in ("cross_stream", "pending_cross", "blocked_cross"))]
+    caller = streams[int(scenario == "blocked_cross")]
     ctx = lib.create_device_context()
     assert ctx
     config = _config()
@@ -332,12 +334,10 @@ def _prepare_initial(scenario, observer, prepare, launch):
     prepare(0)
     if blocked:
         assert observer.capture_gate_blocked() == 1
-        assert observer.capture_gate_pending() == 1
         before = observer.capture_observer_total_queries()
         launch(0)
-        assert observer.capture_observer_total_queries() == before + 1
+        assert observer.capture_observer_total_queries() == before
         assert observer.capture_gate_blocked() == 1, "launch waited for blocked prepare"
-        assert observer.capture_gate_pending() == 1
         observer.capture_gate_release()
         _check(observer.capture_gate_finish(), "finish prepare gate")
     return blocked
@@ -351,6 +351,116 @@ def _verify_values(io, pairs, initial, counter, scenario):
     io.verify(counter, [187.5 if scenario == "two_graphs" else 125.0] * _COUNT)
 
 
+@dataclass
+class _Context:
+    lib: ctypes.CDLL
+    handle: int
+    streams: list
+    caller: ctypes.c_void_p
+    observer: ctypes.CDLL
+
+
+def _configure(context, scenario, prepare, launch, sync, io, pairs, initial):
+    from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.kernel_capture_values import _check  # noqa: PLC0415
+
+    lib, observer, streams, caller = context.lib, context.observer, context.streams, context.caller
+    if scenario == "stream_busy":
+        observer.capture_gate_arm()
+    if _prepare_initial(scenario, observer, prepare, launch):
+        sync(caller)
+        io.verify(pairs[0][1], [value + 1.25 for value in initial])
+    if scenario in ("multi_callable", "eager_multi_callable"):
+        prepare(1)
+    if scenario not in ("cold_unsynced", "stream_busy"):
+        _check(lib.aclrtSynchronizeDevice(), "external preparation drain")
+    if scenario == "cross_stream":
+        launch(0)
+        sync(caller)
+        caller = streams[1]
+    if scenario in ("stream_query_error", "stream_busy"):
+        launch(0, stream=caller)
+        if scenario == "stream_query_error":
+            sync(caller)
+            observer.capture_observer_override_query(1)
+        else:
+            assert observer.capture_gate_blocked() == 1
+        caller = streams[1]
+        before = _submission_counts(observer)
+        launch(0, stream=caller, expected=-4332 if scenario == "stream_query_error" else -1002)
+        assert _submission_counts(observer) == before
+        if scenario == "stream_busy":
+            assert observer.capture_gate_blocked() == 1
+            observer.capture_gate_release()
+            _check(observer.capture_gate_finish(), "finish registration gate")
+        sync(streams[0])
+        launch(0, stream=caller)
+        sync(caller)
+    if scenario in ("warm", "prepare_again"):
+        launch(0, stream=caller)
+        sync(caller)
+    if scenario == "prepare_again":
+        prepare(1)
+        _check(lib.aclrtSynchronizeDevice(), "external preparation drain")
+    return caller
+
+
+def _execute_eager(context, scenario, guarded, io, launch, sync, pairs, initial, cid):
+    lib, ctx, caller, observer = context.lib, context.handle, context.caller, context.observer
+    from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.eager_cases import (  # noqa: PLC0415
+        run_eager_case,
+    )
+
+    def reject(cid, rejected_args, null_stream, expected):
+        before = _submission_counts(observer)
+        observer.capture_observer_invocation_scope(1)
+        try:
+            guarded(
+                lib.simpler_kernel_mode_launch,
+                ctx,
+                cid,
+                rejected_args.__ptr__(),
+                None if null_stream else caller,
+                expected=expected,
+            )
+        finally:
+            observer.capture_observer_invocation_scope(0)
+        assert _submission_counts(observer) == before
+
+    run_eager_case(
+        scenario,
+        io,
+        launch,
+        lambda: sync(caller),
+        pairs,
+        initial,
+        reject,
+        cid,
+    )
+
+
+def _guarded(observer, operation, *arguments, expected=0):
+    observer.capture_observer_guard_sync(1)
+    try:
+        result = operation(*arguments)
+    finally:
+        observer.capture_observer_guard_sync(0)
+    assert observer.capture_observer_sync_calls() == 0, "prepare/launch performed an internal sync"
+    assert result == expected, f"guarded native operation rc={result}, expected={expected}"
+
+
+def _replay(context, graph, stream=None):
+    from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.kernel_capture_values import _check  # noqa: PLC0415
+
+    observer = context.observer
+    before = observer.capture_observer_total_queries()
+    observer.capture_observer_invocation_scope(1)
+    try:
+        _check(context.lib.aclmdlRIExecuteAsync(graph, context.caller if stream is None else stream), "replay")
+    finally:
+        observer.capture_observer_invocation_scope(0)
+    assert observer.capture_observer_total_queries() == before
+
+
 def _run(device, scenario, build_dir):
     from simpler.task_interface import ChipStorageTaskArgs, ChipTensor, DataType  # noqa: PLC0415
 
@@ -362,47 +472,54 @@ def _run(device, scenario, build_dir):
     )
 
     chips, lib, streams, caller, ctx, observer = _initialize(device, scenario, build_dir)
+    context = _Context(lib, ctx, streams, caller, observer)
     allocations = []
     io = _TensorIO(lib, allocations)
     pairs, initial, counter = _seed_tensors(io, chips)
     args = ChipStorageTaskArgs()
     host_launches = 0
     graphs = []
+    callable_ids = {}
 
-    def guarded(operation, *arguments, expected=0):
-        observer.capture_observer_guard_sync(1)
-        try:
-            result = operation(*arguments)
-        finally:
-            observer.capture_observer_guard_sync(0)
-        assert observer.capture_observer_sync_calls() == 0, "prepare/launch performed an internal sync"
-        assert result == expected, f"guarded native operation rc={result}, expected={expected}"
+    guarded = partial(_guarded, observer)
 
     def prepare(cid, expected=0):
         chip = chips[cid]
+        minted = ctypes.c_int32(99)
         guarded(
             lib.simpler_kernel_mode_prepare_callable,
             ctx,
-            cid,
             chip.buffer_ptr(),
             chip.buffer_size(),
-            streams[0],
+            ctypes.byref(minted),
             expected=expected,
         )
+        if expected == 0:
+            assert minted.value >= 0 and minted.value not in callable_ids.values()
+            callable_ids[cid] = minted.value
+        else:
+            assert minted.value == -1
 
     def sync(stream):
         _check(lib.aclrtSynchronizeStreamWithTimeout(stream, 10000), "external sync")
 
-    def launch(cid, tensors=None, expected=0, scalar=1.25):
+    def launch(cid, tensors=None, expected=0, scalar=1.25, stream=None):
         nonlocal host_launches
         source, destination = pairs[cid] if tensors is None else tensors
         args.clear()
         args.add_tensor(ChipTensor.make(source.value, (_COUNT,), DataType.FLOAT32, child_memory=True))
         args.add_tensor(ChipTensor.make(destination.value, (_COUNT,), DataType.FLOAT32, child_memory=True))
-        args.add_scalar(int.from_bytes(struct.pack("<f", scalar), "little"))
+        args.add_scalar(ctypes.c_float(scalar / 16 if scenario in ("tmr_dag", "eager_dag") else scalar))
         observer.capture_observer_invocation_scope(1)
         try:
-            guarded(lib.simpler_kernel_mode_launch, ctx, cid, args.__ptr__(), caller, expected=expected)
+            guarded(
+                lib.simpler_kernel_mode_launch,
+                ctx,
+                callable_ids.get(cid, cid),
+                args.__ptr__(),
+                caller if stream is None else stream,
+                expected=expected,
+            )
         finally:
             observer.capture_observer_invocation_scope(0)
         args.clear()
@@ -425,13 +542,7 @@ def _run(device, scenario, build_dir):
         return record_nodes([(cid, None, 1.25) for cid in cids] + [(0, (counter, counter), increment)])
 
     def replay(graph, stream=None):
-        before = observer.capture_observer_total_queries()
-        observer.capture_observer_invocation_scope(1)
-        try:
-            _check(lib.aclmdlRIExecuteAsync(graph, caller if stream is None else stream), "replay")
-        finally:
-            observer.capture_observer_invocation_scope(0)
-        assert observer.capture_observer_total_queries() == before
+        return _replay(context, graph, stream)
 
     try:
         if scenario.startswith("prepare_fail_"):
@@ -439,30 +550,43 @@ def _run(device, scenario, build_dir):
             _close(lib, ctx, allocations, streams, device)
             print(f"PASS {scenario} rejected_after_failure=1 forbidden_sync=0", flush=True)
             return
-        if _prepare_initial(scenario, observer, prepare, launch):
-            sync(caller)
-            io.verify(pairs[0][1], [value + 1.25 for value in initial])
-        if scenario == "multi_callable":
-            prepare(1)
-        sync(streams[0])
-        if scenario in ("query_error", "pending_same", "pending_cross"):
-            _check_query_branch(scenario, observer, launch)
-            sync(caller)
-        if scenario in ("warm", "prepare_again"):
-            launch(0)
-            sync(caller)
-        if scenario == "prepare_again":
-            prepare(1)
-            sync(streams[0])
+        caller = _configure(context, scenario, prepare, launch, sync, io, pairs, initial)
+        context.caller = caller
         committed = lib.committed_device_memory_ctx(ctx)
-        if scenario in ("fresh_inputs", "chain", "feedback_batch", "eager_replay"):
-            run_graph_case(scenario, io, record_nodes, replay, launch, lambda: sync(caller))
+        if scenario.startswith("eager_") and scenario != "eager_replay":
+            _execute_eager(
+                context,
+                scenario,
+                guarded,
+                io,
+                launch,
+                sync,
+                pairs,
+                initial,
+                callable_ids[0],
+            )
+            _check_resident(observer, host_launches)
+            assert lib.committed_device_memory_ctx(ctx) == committed
+            _close(lib, ctx, allocations, streams, device)
+            print(f"PASS {scenario} eager=100 forbidden_sync=0", flush=True)
+            return
+        if scenario in ("fresh_inputs", "chain", "feedback_batch", "eager_replay", "graph_recreate", "long_chain"):
+
+            def destroy(graph):
+                _check(lib.aclmdlRIDestroy(graph), "destroy graph")
+                graphs.remove(graph)
+
+            run_graph_case(scenario, io, record_nodes, replay, launch, lambda: sync(caller), destroy)
             _check_resident(observer, host_launches)
             assert lib.committed_device_memory_ctx(ctx) == committed
             _close(lib, ctx, allocations, streams, device, graphs)
             print(f"PASS {scenario} replays=100 forbidden_sync=0 host_launches={host_launches}", flush=True)
             return
-        record([0, 1, 0] if len(chips) == 2 else [0])
+        record([0, 1, 0] if len(callable_ids) == 2 else [0])
+        if scenario == "prepare_after_capture":
+            prepare(1)
+            record([1])
+            committed = lib.committed_device_memory_ctx(ctx)
         if scenario == "two_graphs":
             record([0], increment=2.5)
         _check_resident(observer, host_launches)

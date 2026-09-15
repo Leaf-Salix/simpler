@@ -28,7 +28,7 @@ def batch_expected(sequence, initial=0.0):
     return x, y, *counts
 
 
-def run_graph_case(scenario, io, record, replay, launch, sync):
+def run_graph_case(scenario, io, record, replay, launch, sync, destroy):
     x, y, z, count_a, count_b = [io.allocate() for _ in range(5)]
     initial = [float(i % 127) for i in range(_COUNT)]
     io.write(x, initial)
@@ -37,7 +37,25 @@ def run_graph_case(scenario, io, record, replay, launch, sync):
     for address in (count_a, count_b):
         io.write(address, [0.0] * _COUNT)
 
-    if scenario == "feedback_batch":
+    if scenario == "graph_recreate":
+        for iteration in range(REPLAYS):
+            scalar = float(iteration + 1)
+            graph = record([(0, (x, y), scalar)])
+            replay(graph)
+            sync()
+            io.verify(y, [value + scalar for value in initial])
+            destroy(graph)
+    elif scenario == "long_chain":
+        nodes = [(0, (x, y), 1.0)]
+        nodes.extend((0, (y, y), 1.0) for _ in range(15))
+        nodes.append((0, (count_a, count_a), 1.0))
+        graph = record(nodes)
+        for _ in range(REPLAYS):
+            replay(graph)
+        sync()
+        io.verify(y, [value + 16.0 for value in initial])
+        io.verify(count_a, [float(REPLAYS)] * _COUNT)
+    elif scenario == "feedback_batch":
         graph_a = record([(0, (x, y), 1.25), (0, (count_a, count_a), 1.0)])
         graph_b = record([(0, (y, x), 2.75), (0, (count_b, count_b), 1.0)])
         sequence = (0, 1) * (REPLAYS // 2)

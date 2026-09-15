@@ -67,7 +67,7 @@ public:
         ops.destroy_hidden_stream = [](void *, void *) noexcept {
             return 0;
         };
-        ops.create_event = [](void *, uint32_t, void **event) noexcept {
+        ops.create_event = [](void *, void **event) noexcept {
             *event = &fake;
             return 0;
         };

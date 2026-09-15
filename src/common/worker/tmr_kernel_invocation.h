@@ -103,7 +103,6 @@ inline InvocationStatus encode_tmr_invocation(
         std::memset(&header, 0, sizeof(header));
         header.mode = SIMPLER_MODE_KERNEL;
         header.callable_id = callable.callable_id;
-        header.generation = callable.slot_generation;
         header.payload_bytes = bytes - sizeof(header);
         header.tensor_count = callable.tensor_count;
         header.scalar_count = callable.scalar_count;

@@ -27,7 +27,7 @@ inline void *ptr(uintptr_t n) { return reinterpret_cast<void *>(n); }
 
 struct Fake {
     std::mutex mutex;
-    bool ready{true}, frozen{true}, poisoned{false}, complete{true}, pending_prepare{true};
+    bool ready{true}, frozen{true}, poisoned{false}, complete{true};
     uintptr_t previous_caller{0};
     void *candidate_caller{nullptr};
     int calls{0}, fail_at{0}, second_fail_at{0}, query_error{0}, validation_error{0};
@@ -35,7 +35,7 @@ struct Fake {
     std::vector<Step> trace;
     std::promise<void> *entered{nullptr};
     std::shared_future<void> release;
-    KernelLaunchHandles handles{nullptr, ptr(1), ptr(2), ptr(3), ptr(4), ptr(5), ptr(6), ptr(7), true};
+    KernelLaunchHandles handles{nullptr, ptr(1), ptr(2), ptr(3), ptr(4), ptr(5), ptr(6), ptr(7)};
     Fake() { trace.reserve(128); }
     int append(Step step) noexcept {
         trace.push_back(step);
@@ -55,7 +55,6 @@ struct Fake {
                 ++f.acquisitions;
                 f.candidate_caller = caller;
                 *out = {f.handles, f.previous_caller};
-                out->handles.consume_prepare_tail = f.pending_prepare;
                 if (f.entered) {
                     f.entered->set_value();
                     f.release.wait();
@@ -67,7 +66,6 @@ struct Fake {
                 ++f.finishes;
                 if (result.status == 0) {
                     f.previous_caller = reinterpret_cast<uintptr_t>(f.candidate_caller);
-                    f.pending_prepare = false;
                 } else if (result.enqueue_started) {
                     f.poisoned = true;
                     f.runtime_error = result.status;
@@ -88,10 +86,11 @@ struct Fake {
             this,
             [](void *p, void *stream, void *event) noexcept {
                 auto &f = *static_cast<Fake *>(p);
-                const auto step = event == ptr(3) ? Step::PrepareWait :
-                                  event == ptr(4) ? (stream == ptr(2) ? Step::AicoreWait : Step::AicpuWait) :
+                const auto step = event == ptr(3) ? Step::AicpuWait :
+                                  event == ptr(4) ? Step::AicoreWait :
                                   event == ptr(6) ? Step::JoinAicpu :
                                                     Step::JoinAicore;
+                (void)stream;
                 return f.append(step);
             },
             [](void *p, void *) noexcept {
@@ -99,7 +98,8 @@ struct Fake {
             },
             [](void *p, void *event, void *) noexcept {
                 return static_cast<Fake *>(p)->append(
-                    event == ptr(4) ? Step::Start :
+                    event == ptr(3) ? Step::Start :
+                    event == ptr(4) ? Step::AicoreStart :
                     event == ptr(5) ? Step::AicoreDone :
                     event == ptr(6) ? Step::AicpuDone :
                                       Step::SerialTail
@@ -122,9 +122,9 @@ struct Fake {
     }
 };
 
-const std::vector<Step> success{Step::PrepareWait,  Step::Clear,      Step::Start,      Step::AicoreWait,
-                                Step::AicoreLaunch, Step::AicoreDone, Step::AicpuWait,  Step::AicpuLaunch,
-                                Step::AicpuDone,    Step::JoinAicpu,  Step::JoinAicore, Step::SerialTail};
+const std::vector<Step> success{Step::Start,      Step::AicpuWait,    Step::Clear,      Step::AicoreStart,
+                                Step::AicoreWait, Step::AicoreLaunch, Step::AicoreDone, Step::AicpuLaunch,
+                                Step::JoinAicore, Step::AicpuDone,    Step::JoinAicpu,  Step::SerialTail};
 struct Fixture {
     Fake fake;
     std::array<uint64_t, 10> packet{};

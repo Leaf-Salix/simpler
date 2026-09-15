@@ -34,11 +34,13 @@ inside the lease and releases it even if native preflight rejects the packet.
 Native tail queries use `aclrtQueryEventStatus`; the injected query callback is
 used only by the generic entry.
 
-Preparation records `PrepareTail` after initialization and slot registration;
-ready publication means submitted, not completed. Events must be created outside
-launch with `ACL_EVENT_SYNC`; AICPU is a dedicated **non-hidden** stream and AICore
-is **hidden**. Caller is borrowed, and all three handles must differ. The binder
-validates distinct/non-null handles but cannot establish their creation flags.
+Preparation enqueues on the context's own AICPU stream and publishes no event
+for a launch to consume: every launch enqueues on that same stream, so stream
+FIFO already orders registration ahead of it. Ready publication means submitted,
+not completed. Events must be created outside launch with `ACL_EVENT_SYNC`;
+AICPU is a dedicated **non-hidden** stream and AICore is **hidden**. Caller is
+borrowed, and all three handles must differ. The binder validates
+distinct/non-null handles but cannot establish their creation flags.
 
 The owner retains device resources and function/stream/event handles until all
 executions and captured graphs end and external quiescence is established.
@@ -57,24 +59,35 @@ Not-ready/distinct-handle rejection uses the existing
 
 | Stream | Operations in Host submission order |
 | ------ | ----------------------------------- |
-| caller | Optionally wait PrepareTail, asynchronously clear prepared launch/handshake/report regions, record Start |
-| hidden AICore | Wait Start, launch AICore, record AicoreDone |
-| non-hidden AICPU | Wait Start, launch with HostArgs, record AicpuDone |
-| caller | Wait AicpuDone, wait AicoreDone, record SerialTail |
+| caller | Record Start |
+| non-hidden AICPU | Wait Start, asynchronously clear prepared launch/handshake/report regions, record AicoreStart |
+| hidden AICore | Wait AicoreStart, launch AICore, record AicoreDone |
+| non-hidden AICPU | Launch with HostArgs, wait AicoreDone, record AicpuDone |
+| caller | Wait AicpuDone, record SerialTail |
 
-AICore-first avoids a waiting AICPU scheduler obstructing its AICore SQE and
-permits pre-AICPU cancellation after checking the core branch submissions.
-Both branches remain gated by Start. Host success means submission only.
+The chain is caller ⇄ AICPU ⇄ AICore: caller and AICore are never adjacent, so
+ACLGraph capture propagates in two hops rather than forking from the caller.
+`AicoreStart` must be recorded before the AICPU launch — the AICPU orchestrator
+spins on AICore's handshake report, so recording it after would close a cycle.
+AICore-first in Host enqueue order also permits pre-AICPU cancellation after
+checking the core branch submissions; device cooperation still runs through the
+handshake protocol, and the event chain fixes only entry and exit order. Host
+success means submission only.
 
 ## Failure behavior
 
 Every failure after entry into the enqueue sequence tells the owner to poison.
-Before successful AICore launch, stop. Failure recording AicoreDone cancels the
-waiting core, retries the record once, then joins and records SerialTail.
-AICPU Start-wait failure cancels and joins core. AICPU launch failure additionally
-records/joins the already-forked AICPU wait branch. Cancellation is one all-ones
-async fill of the prepared 32-bit cancel words, publishing `UINT32_MAX`.
-After successful AICPU launch, stop on errors without Host cancel.
+Before successful AICore launch, stop. Only a failure between the AICore launch
+and the AICPU launch can leave AICore spinning on a handshake no AICPU will
+write, so only those sites compensate. Failure recording AicoreDone cancels the
+waiting core and retries the record once; AICPU launch failure cancels with
+AicoreDone already recorded. Both then drive the chain back to the caller —
+AICPU waits AicoreDone, records AicpuDone, the caller waits it and records
+SerialTail — because AicpuDone is the caller's only path to a tail.
+Cancellation is one all-ones async fill of the prepared 32-bit cancel words,
+publishing `UINT32_MAX`, issued on the caller's stream, which carries nothing
+but Start at that point. After successful AICPU launch, stop on errors without
+Host cancel.
 
 Compensation stops on its first error. `cleanup_status` never replaces the
 original `status`, and `tail_recorded` identifies whether a tail was established.

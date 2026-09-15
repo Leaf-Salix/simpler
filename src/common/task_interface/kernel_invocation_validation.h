@@ -41,12 +41,10 @@ enum class InvocationStatus {
 
 // Values come from an independently validated, live prepared registration.
 // The resource owner protects publication and borrowing through consumption.
-// slot_generation versions callable residency, not its execution context.
 struct PreparedInvocationView {
     int32_t callable_id;
     int32_t tensor_count;
     int32_t scalar_count;
-    uint64_t slot_generation;
 };
 
 inline bool valid_invocation_counts(int32_t tensors, int32_t scalars) noexcept {
@@ -84,7 +82,7 @@ inline InvocationStatus derive_invocation_counts(
 }
 
 inline bool valid_prepared_invocation(const PreparedInvocationView &view) noexcept {
-    return view.callable_id >= 0 && view.callable_id < MAX_REGISTERED_CALLABLE_IDS && view.slot_generation != 0 &&
+    return view.callable_id >= 0 && view.callable_id < MAX_REGISTERED_CALLABLE_IDS &&
            valid_invocation_counts(view.tensor_count, view.scalar_count);
 }
 
@@ -96,14 +94,13 @@ inline InvocationStatus validate_invocation_header(
     SimplerKernelInvocationHeader header{};
     std::memcpy(&header, packet.data, sizeof(header));
     if (header.mode != SIMPLER_MODE_KERNEL || header.callable_id < 0 ||
-        header.callable_id >= MAX_REGISTERED_CALLABLE_IDS || header.generation == 0 || header.reserved_ != 0)
+        header.callable_id >= MAX_REGISTERED_CALLABLE_IDS || header.reserved_ != 0)
         return InvocationStatus::InvalidHeader;
     if (!valid_invocation_counts(header.tensor_count, header.scalar_count) || header.host_copy_tensor_count != 0)
         return InvocationStatus::InvalidCounts;
     if (header.payload_bytes != packet.size - sizeof(header)) return InvocationStatus::InvalidSize;
     if (!valid_prepared_invocation(trusted)) return InvocationStatus::InvalidArgument;
-    if (header.callable_id != trusted.callable_id || header.generation != trusted.slot_generation)
-        return InvocationStatus::StaleCallable;
+    if (header.callable_id != trusted.callable_id) return InvocationStatus::StaleCallable;
     if (header.tensor_count != trusted.tensor_count || header.scalar_count != trusted.scalar_count)
         return InvocationStatus::InvalidCounts;
     *out = header;

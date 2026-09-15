@@ -58,11 +58,11 @@ int destroy_hidden_stream(void *, void *stream) noexcept {
     return 0;
 }
 
-int create_event(void *, uint32_t flag, void **event) noexcept {
+int create_event(void *, void **event) noexcept {
     aclrtEvent created = nullptr;
-    const aclError rc = aclrtCreateEventExWithFlag(&created, flag);
+    const aclError rc = aclrtCreateEventExWithFlag(&created, ACL_EVENT_SYNC);
     if (rc != ACL_SUCCESS) {
-        LOG_ERROR("kernel context: aclrtCreateEventExWithFlag(flag=0x%x) failed: %d", flag, static_cast<int>(rc));
+        LOG_ERROR("kernel context: aclrtCreateEventExWithFlag failed: %d", static_cast<int>(rc));
         ACL_LOG_ERROR_DETAIL(rc);
         return static_cast<int>(rc);
     }
@@ -87,7 +87,6 @@ KernelContextOps make_onboard_kernel_context_ops() {
     ops.get_current_device = &get_current_device;
     ops.create_hidden_stream = &create_hidden_stream;
     ops.destroy_hidden_stream = &destroy_hidden_stream;
-    ops.event_flag = ACL_EVENT_SYNC;
     ops.create_event = &create_event;
     ops.destroy_event = &destroy_event;
     return ops;

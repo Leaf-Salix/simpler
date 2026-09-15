@@ -124,7 +124,7 @@ TEST(KernelPipelineEntry, RealSimVariantsValidateWithoutClaimingOrCommitting) {
             EXPECT_EQ(init(ctx, 0, nullptr, 0, nullptr, 0, &binary, 0, &config, 1), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
             config.runtime_env.ring_task_window[0] = 3;
             EXPECT_EQ(
-                invoke(&config), std::string(runtime) == "tensormap_and_ringbuffer" ? PTO_RUNTIME_ERR_INTERNAL :
+                invoke(&config), std::string(runtime) == "tensormap_and_ringbuffer" ? PTO_RUNTIME_ERR_INVALID_ARGUMENT :
                                                                                       PTO_RUNTIME_ERR_UNSUPPORTED
             );
             config.runtime_env.ring_task_window[0] = 0;

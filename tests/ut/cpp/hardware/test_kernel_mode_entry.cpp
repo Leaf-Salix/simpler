@@ -253,10 +253,11 @@ TEST_F(KernelModeEntryTest, SupportsBorrowedContextAndRejectsUnpreparedEntries) 
     EXPECT_EQ(api.supported(ctx), 1);
 
     AlignedCallableImage image;
+    int32_t minted = 99;
     EXPECT_EQ(
-        api.prepare_callable(ctx, 0, image.data(), AlignedCallableImage::size(), borrowed.stream()),
-        PTO_RUNTIME_ERR_INVALID_STATE
+        api.prepare_callable(ctx, image.data(), AlignedCallableImage::size(), &minted), PTO_RUNTIME_ERR_INVALID_STATE
     ) << "no kernel context is live on this device context";
+    EXPECT_EQ(minted, -1) << "a refused registration must not leave a usable id behind";
 
     ChipStorageTaskArgs args{};
     EXPECT_EQ(api.launch(ctx, 0, &args, borrowed.stream()), PTO_RUNTIME_ERR_INVALID_STATE)
@@ -269,9 +270,9 @@ TEST_F(KernelModeEntryTest, SupportsBorrowedContextAndRejectsUnpreparedEntries) 
     // before registration enqueues any device work.
     reinterpret_cast<ChipCallable *>(image.bytes)->binary_size_ = 1;
     EXPECT_EQ(
-        api.prepare_callable(ctx, 0, image.data(), AlignedCallableImage::size(), borrowed.stream()),
-        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        api.prepare_callable(ctx, image.data(), AlignedCallableImage::size(), &minted), PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
+    EXPECT_EQ(minted, -1);
     EXPECT_EQ(api.launch(ctx, 0, &args, borrowed.stream()), PTO_RUNTIME_ERR_INVALID_STATE);
     ASSERT_EQ(api.finalize_device(ctx), 0);
     EXPECT_EQ(api.launch(ctx, 0, &args, borrowed.stream()), PTO_RUNTIME_ERR_INVALID_STATE);
@@ -342,22 +343,16 @@ TEST_F(KernelModeEntryTest, MalformedArgumentsAreRejectedBeforeTheStateCheck) {
     );
 
     AlignedCallableImage image;
-    // A null stream cannot be borrowed.
+    int32_t minted = 99;
+    // Registration mints the id, so the out parameter is the only way back.
     EXPECT_EQ(
-        api.prepare_callable(ctx, 0, image.data(), AlignedCallableImage::size(), nullptr),
-        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        api.prepare_callable(ctx, image.data(), AlignedCallableImage::size(), nullptr), PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
     // Below the size floor the image cannot hold a ChipCallable header.
     EXPECT_EQ(
-        api.prepare_callable(ctx, 0, image.data(), sizeof(ChipCallable) - 1, borrowed.stream()),
-        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        api.prepare_callable(ctx, image.data(), sizeof(ChipCallable) - 1, &minted), PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
-    EXPECT_EQ(
-        api.prepare_callable(
-            ctx, MAX_REGISTERED_CALLABLE_IDS, image.data(), AlignedCallableImage::size(), borrowed.stream()
-        ),
-        PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    );
+    EXPECT_EQ(minted, -1);
 
     ChipStorageTaskArgs args{};
     EXPECT_EQ(api.launch(ctx, 0, &args, nullptr), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
@@ -400,10 +395,7 @@ TEST_F(KernelModeEntryTest, WorkerKernelInitAndClosePreserveBorrowedDeviceAndStr
 
     AlignedCallableImage image;
     reinterpret_cast<ChipCallable *>(image.bytes)->binary_size_ = 1;
-    EXPECT_THROW(
-        worker.kernel_prepare_callable(0, image.data(), AlignedCallableImage::size(), borrowed.stream()),
-        std::runtime_error
-    );
+    EXPECT_THROW((void)worker.kernel_prepare_callable(image.data(), AlignedCallableImage::size()), std::runtime_error);
     ChipStorageTaskArgs args{};
     EXPECT_THROW(worker.kernel_launch(0, &args, borrowed.stream()), std::runtime_error);
 
@@ -425,18 +417,14 @@ TEST_F(KernelModeEntryTest, WorkerKernelStateMachineRejectsOutOfOrderUse) {
         ChipWorker worker;
         EXPECT_THROW(worker.kernel_mode_supported(), std::runtime_error);
         EXPECT_THROW(
-            worker.kernel_prepare_callable(0, image.data(), AlignedCallableImage::size(), borrowed.stream()),
-            std::runtime_error
+            (void)worker.kernel_prepare_callable(image.data(), AlignedCallableImage::size()), std::runtime_error
         );
         EXPECT_THROW(worker.kernel_launch(0, &args, borrowed.stream()), std::runtime_error);
     }
 
-    // A null stream never reaches the runtime.
+    // A null stream never reaches the runtime. Only launch takes one.
     {
         ChipWorker worker;
-        EXPECT_THROW(
-            worker.kernel_prepare_callable(0, image.data(), AlignedCallableImage::size(), nullptr), std::runtime_error
-        );
         EXPECT_THROW(worker.kernel_launch(0, &args, nullptr), std::runtime_error);
     }
 

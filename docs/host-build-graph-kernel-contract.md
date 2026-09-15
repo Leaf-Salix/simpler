@@ -113,7 +113,7 @@ hbg::KernelResourcePlan::create(graphs, graph_count, plan);
 plan.prepare(context, KernelResourceOps::from_allocator(allocator));
 context.freeze_resources();
 hbg::prepare_graph_execution_slot(context, device_id, generation, runtime_binary_id, prepare_ops);
-// Order PrepareTail after all device initialization/registration tasks.
+// The AICPU stream's FIFO orders these tasks ahead of every later launch.
 context.mark_ready_enqueued();
 
 // Resource portion of each launch: no allocator argument is available here.
@@ -163,9 +163,10 @@ output on error. `KernelLaunchHandles::valid()` also checks these handles at
 the shared launch binder. The context retains each
 execution stream under `KernelStreamKind`; its creation/destruction callbacks
 keep the existing `KernelContextOps` signature. The context event set is
-`PrepareTail`, `Start`, `AicoreDone`, `AicpuDone`, and `SerialTail`.
-The shared binder submits AICore before AICPU. HBG's owner still needs to
-connect this event protocol to graph registration and restore.
+`Start`, `AicoreStart`, `AicoreDone`, `AicpuDone`, and `SerialTail`, chained
+caller ⇄ AICPU ⇄ AICore. The shared binder submits AICore before AICPU. HBG's
+owner still needs to connect this event protocol to graph registration and
+restore.
 
 The no-argument C `get_pipeline_contract()` remains the static program contract
 with zero byte fields. The internal TMR-shaped

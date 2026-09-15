@@ -175,7 +175,7 @@ public:
      * context's persistent argument blocks exist. Idempotent in the part that
      * matters: only the first callable pays for the argument blocks.
      */
-    int prepare_kernel_callable(int32_t callable_id, const HostApi *api, void *caller_stream);
+    int prepare_kernel_callable(int32_t callable_id, const HostApi *api);
     int launch_kernel_callable(int32_t callable_id, const ChipStorageTaskArgs &args, void *caller_stream);
     std::mutex &kernel_submission_mutex() { return kernel_submission_mutex_; }
     KernelCallableCache &kernel_callable_cache() { return kernel_callable_cache_; }
@@ -1353,7 +1353,6 @@ protected:
     KernelContextClaim kernel_context_claim_;
     std::mutex kernel_submission_mutex_;
     uintptr_t kernel_previous_caller_{0};
-    bool kernel_prepare_pending_{false};
     rtFuncHandle kernel_aicpu_handle_{nullptr};
     // The Runtime image a kernel-mode context uploads once. Its per-callable
     // and per-invocation fields stay at the sentinels Runtime() sets; binding

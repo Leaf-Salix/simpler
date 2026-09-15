@@ -167,8 +167,9 @@ int simpler_kernel_mode_init(
 }
 
 int simpler_kernel_mode_prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream
+    DeviceContextHandle ctx, const void *callable, size_t callable_size, int32_t *out_callable_id
 ) {
+    if (out_callable_id != nullptr) *out_callable_id = -1;
     return PTO_RUNTIME_ERR_INTERNAL;
 }
 

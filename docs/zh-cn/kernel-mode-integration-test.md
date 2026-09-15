@@ -74,8 +74,8 @@ simpler 没有调用过它们。
 | 入口 | 做什么 |
 | ---- | ------ |
 | `simpler_kernel_mode_init` | 用 `aclrtGetDevice` 确认当前卡与传入卡号一致，只核对不设置；用 `rtStreamCreate` 创建两条私有 stream（AICPU、AICore）和 5 个 event；加载 AICPU 执行体。容量配置此时固定 |
-| `simpler_kernel_mode_prepare_callable` | 上传 callable 镜像，把编排 .so 注册到设备；首次调用时提交 pooled arena，上传常驻 Runtime 与 KernelArgs |
-| `simpler_kernel_mode_launch` | 校验上下文与 callable 驻留，编码本次参数包，在三条 stream 上排布一串异步操作后返回 |
+| `simpler_kernel_mode_prepare_callable` | 上传 callable 镜像并铸造 callable_id（出参返回），把编排 .so 注册到设备；首次调用时提交 pooled arena，上传常驻 Runtime 与 KernelArgs |
+| `simpler_kernel_mode_launch` | 校验上下文与 callable 驻留，把本次参数连同该 callable 的设备镜像地址与长度编码进参数包，在三条 stream 上排布一串异步操作后返回 |
 | `finalize_device` | 释放上下文拥有的资源；测试断言 committed memory 归零 |
 
 init 期间的执行体加载和 prepare 期间的 callable 注册，会同步上下文自己的 AICPU
@@ -89,32 +89,37 @@ launch 在 `src/common/platform/onboard/host/kernel_launch_owner.cpp` 中实现�
 binder，在三条 stream 上排布如下操作：
 
 ```text
-caller stream              AICore 私有 stream             AICPU 私有 stream
-清零握手区与 gate
+caller stream              AICPU 私有 stream              AICore 私有 stream
 record(Start)
                            wait(Start)
-                           rtKernelLaunchWithHandleV2
-                           record(AicoreDone)
-                                                          wait(Start)
-                                                          rtsLaunchCpuKernel(参数包)
-                                                          record(AicpuDone)
+                           清零握手区与 gate
+                           record(AicoreStart)
+                                                          wait(AicoreStart)
+                                                          rtKernelLaunchWithHandleV2
+                                                          record(AicoreDone)
+                           rtsLaunchCpuKernel(参数包)
+                           wait(AicoreDone)
+                           record(AicpuDone)
 wait(AicpuDone)
-wait(AicoreDone)
 record(SerialTail)
 ```
 
-launch 只负责入队，全部入队成功即返回 0，此时设备上可能尚未开始执行。caller
-stream 上排有等待两个 done 事件的操作，所以调用方同步 caller stream 时，会一直
-等到 AICPU 与 AICore 两侧都完成。内部不同步、错误由调用方同步暴露，就是这样实现的。
+链式串联 caller ⇄ AICPU ⇄ AICore：caller 与 AICore 之间没有直接 event 边，
+ACLGraph capture 分两跳传播。launch 只负责入队，全部入队成功即返回 0，此时设备上
+可能尚未开始执行。caller stream 上排有等待 `AicpuDone` 的操作，而 AICPU 侧又等
+`AicoreDone`，所以调用方同步 caller stream 时会一直等到两侧都完成。内部不同步、
+错误由调用方同步暴露，就是这样实现的。
 
-AICore 先于 AICPU 提交：AICPU 上的调度器会自旋等待 AICore 的握手，AICore 的任务
-必须先排在它的 stream 上。
+`AicoreStart` 必须在 AICPU launch 之前 record：AICPU 上的调度器会自旋等待 AICore
+的握手，若在其后 record，就会形成 AICPU 等握手、AICore 等 event 的环。Host 入队
+顺序上仍是 AICore 先于 AICPU，这也保留了 AICPU 尚未驻留时取消等待中 AICore 的窗口。
 
 ## 6. 设备侧执行
 
 AICPU 入口 `simpler_aicpu_kernel_exec` 收到参数包后：
 
-1. 校验包头，读取 callable 的驻留描述符并比对 generation，不匹配即拒绝。
+1. 校验包头，以及参数包里 callable 镜像跨度的合法性（非零、按 `ChipCallable`
+   对齐、不小于 `sizeof(ChipCallable)`、加上长度不回绕），不合法即拒绝。
 2. 进入 TMR 执行路径，从参数包中的 binding 地址读出常驻 KernelArgs 与 Runtime。
 3. 设置平台寄存器，由 leader 线程接纳本次调用，多个 AICPU 线程在 barrier 汇合。
 4. 运行编排函数，编排提交的 AIV 任务经握手区派发给 AICore。
@@ -169,11 +174,13 @@ launch 路径能在 eager 下算对。在 capture 窗口内调用 `simpler_kerne
 
 | 事项 | 结论 |
 | ---- | ---- |
-| 主机错误码编号 | 采用主线编号：`INVALID_ARGUMENT` 为 `BASE - 4`；集成线新增的 callable 与容量错误码顺延为 `BASE - 5` 至 `BASE - 9` |
+| 主机错误码编号 | 采用主线编号：`INVALID_ARGUMENT` 为 `BASE - 4`；集成线新增的 callable 与容量错误码顺延为 `BASE - 5` 至 `BASE - 8`（`CALLABLE_STALE` 随 callable generation 一并退役，`BASE - 8` 由 `CAPACITY_EXCEEDED` 占用） |
 | launch 的 callable id 越界 | 返回 `INVALID_ARGUMENT`，与 prepare 一致 |
 | kernel 入口符号解析 | 每个 runtime 仍导出全部四个入口；ChipWorker 只在 `supported` 非零时解析 init、prepare、launch |
 | kernel 模式容量规则 | 使用 K3 的共享 static arena bank，同时覆盖 onboard 与仿真 |
-| 同步语义说明 | init 与 prepare 会同步上下文自己的 AICPU stream，launch 路径不同步 |
+| 同步语义说明 | init 会同步上下文自己的 AICPU stream，prepare 与 launch 路径不同步 |
+| callable id 与版本 | prepare 铸 id 经出参返回，失败写 `-1`；纯注册不去重，id 在 context 内不复用、close 后整体失效，不带 generation |
+| 设备侧如何找到 callable | 参数包直接携带该 callable 的设备镜像地址与长度，由 binder 从本 context 已提交的驻留信息填入；不再有独立的驻留描述符 |
 
 完整错误码表：
 
@@ -187,8 +194,7 @@ launch 路径能在 eager 下算对。在 capture 窗口内调用 `simpler_kerne
 | `PTO_RUNTIME_ERR_CALLABLE_COUNT_EXCEEDED` | -1005 |
 | `PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED` | -1006 |
 | `PTO_RUNTIME_ERR_CALLABLE_NOT_RESIDENT` | -1007 |
-| `PTO_RUNTIME_ERR_CALLABLE_STALE` | -1008 |
-| `PTO_RUNTIME_ERR_CAPACITY_EXCEEDED` | -1009 |
+| `PTO_RUNTIME_ERR_CAPACITY_EXCEEDED` | -1008 |
 
 ## 10. 已知边界
 

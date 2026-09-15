@@ -35,7 +35,7 @@ int KernelExecutionState::initialize(
     }
     if (rc == 0) {
         for (auto &event : events_) {
-            rc = ops_.create_event(ops_.context, ops_.event_flag, &event);
+            rc = ops_.create_event(ops_.context, &event);
             if (rc != 0) break;
         }
     }

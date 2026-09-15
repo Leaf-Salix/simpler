@@ -23,7 +23,7 @@
 #include "task_interface/kernel_dispatch_args.h"
 #include "tensormap_and_ringbuffer/kernel_invocation.h"
 
-extern "C" aclError capture_gate_before_record(aclrtEvent event, aclrtStream stream);
+extern "C" aclError capture_gate_before_register(aclrtStream stream);
 
 namespace {
 enum class ObserverError : int {
@@ -55,8 +55,6 @@ int query_override{0};
 uint64_t query_override_calls{0};
 uint64_t total_queries{0};
 uint64_t event_waits{0}, event_records{0}, async_clears{0};
-aclrtEvent overridden_event{nullptr};
-uint64_t overridden_event_waits{0};
 int prepare_failure{0};
 uint64_t prepare_failure_calls{0};
 
@@ -142,15 +140,12 @@ extern "C" uint64_t capture_observer_sync_calls() { return forbidden_sync_calls;
 extern "C" void capture_observer_override_query(int kind) {
     query_override = kind;
     query_override_calls = 0;
-    overridden_event = nullptr;
-    overridden_event_waits = 0;
 }
 extern "C" uint64_t capture_observer_query_calls() { return query_override_calls; }
 extern "C" uint64_t capture_observer_total_queries() { return total_queries; }
 extern "C" uint64_t capture_observer_waits() { return event_waits; }
 extern "C" uint64_t capture_observer_records() { return event_records; }
 extern "C" uint64_t capture_observer_clears() { return async_clears; }
-extern "C" uint64_t capture_observer_prepare_waits() { return overridden_event_waits; }
 extern "C" void capture_observer_fail_prepare(int kind) {
     prepare_failure = kind;
     prepare_failure_calls = 0;
@@ -162,7 +157,6 @@ extern "C" aclError aclrtQueryEventStatus(aclrtEvent event, aclrtEventRecordedSt
     if (invocation_scope && query_override != 0) {
         const int kind = query_override;
         query_override = 0;
-        overridden_event = event;
         ++query_override_calls;
         if (kind == 1) return -4332;
         *status = ACL_EVENT_RECORDED_STATUS_NOT_READY;
@@ -174,17 +168,13 @@ extern "C" aclError aclrtQueryEventStatus(aclrtEvent event, aclrtEventRecordedSt
 }
 
 extern "C" aclError aclrtStreamWaitEvent(aclrtStream stream, aclrtEvent event) {
-    if (fail_prepare_step(3)) return -4333;
     if (invocation_scope) ++event_waits;
-    if (invocation_scope && event == overridden_event) ++overridden_event_waits;
     static const auto real =
         reinterpret_cast<decltype(&aclrtStreamWaitEvent)>(resolve_cann_symbol("aclrtStreamWaitEvent"));
     return real == nullptr ? -4330 : real(stream, event);
 }
 
 extern "C" aclError aclrtRecordEvent(aclrtEvent event, aclrtStream stream) {
-    if (fail_prepare_step(2)) return -4333;
-    if (const auto rc = capture_gate_before_record(event, stream); rc != 0) return rc;
     if (invocation_scope) ++event_records;
     static const auto real = reinterpret_cast<decltype(&aclrtRecordEvent)>(resolve_cann_symbol("aclrtRecordEvent"));
     return real == nullptr ? -4330 : real(event, stream);
@@ -292,6 +282,9 @@ extern "C" rtError_t rtsLaunchCpuKernel(
     rtCpuKernelArgs_t *args
 ) {
     if (fail_prepare_step(1)) return -4333;
+    if (forbid_sync && !invocation_scope) {
+        if (const auto rc = capture_gate_before_register(stream); rc != 0) return rc;
+    }
     if (observer.armed && invocation_scope) observe_cpu(args);
     static const auto real = reinterpret_cast<decltype(&rtsLaunchCpuKernel)>(resolve_cann_symbol("rtsLaunchCpuKernel"));
     return real == nullptr ? -4330 : real(function, blocks, stream, config, args);

@@ -13,6 +13,7 @@
 #include <cstring>
 #include <vector>
 
+#include "task_interface/callable.h"
 #include "task_interface/kernel_dispatch_args.h"
 #include "task_interface/task_args.h"
 #include "tensormap_and_ringbuffer/kernel_invocation.h"
@@ -33,24 +34,24 @@ public:
     }
 
     InvocationStatus encode(
-        const ChipStorageTaskArgs &args, uint64_t residency, const tmr::TmrExecutionBindingView &binding,
-        size_t sm_bytes, size_t arena_bytes
+        const ChipStorageTaskArgs &args, uint64_t callable_address, size_t callable_bytes,
+        const tmr::TmrExecutionBindingView &binding, size_t sm_bytes, size_t arena_bytes
     ) noexcept {
-        if (bytes_.empty() || residency == 0 || binding.device_binding_addr == 0 || binding.context_generation == 0 ||
-            sm_bytes == 0 || arena_bytes == 0)
+        if (bytes_.empty() || callable_address == 0 || callable_bytes < sizeof(ChipCallable) ||
+            binding.device_binding_addr == 0 || binding.context_generation == 0 || sm_bytes == 0 || arena_bytes == 0)
             return InvocationStatus::InvalidBinding;
         if (args.tensor_count() != callable_.tensor_count || args.scalar_count() != callable_.scalar_count)
             return InvocationStatus::InvalidCounts;
         SimplerKernelDispatchArgs prefix{};
         prefix.packet_bytes = bytes_.size();
-        prefix.residency_address = residency;
+        prefix.chip_callable_address = callable_address;
+        prefix.chip_callable_bytes = callable_bytes;
         prefix.binding_address = binding.device_binding_addr;
         prefix.context_generation = binding.context_generation;
         prefix.sm_bytes = sm_bytes;
         prefix.arena_bytes = arena_bytes;
         prefix.invocation.mode = SIMPLER_MODE_KERNEL;
         prefix.invocation.callable_id = callable_.callable_id;
-        prefix.invocation.generation = callable_.slot_generation;
         prefix.invocation.payload_bytes = bytes_.size() - sizeof(prefix);
         prefix.invocation.tensor_count = callable_.tensor_count;
         prefix.invocation.scalar_count = callable_.scalar_count;

@@ -1343,7 +1343,6 @@ int simpler_kernel_mode_init(
             std::vector<uint8_t> dispatcher_vec(dispatcher_binary, dispatcher_binary + dispatcher_size);
             runner->set_dispatcher_binary(std::move(dispatcher_vec));
         }
-        runner->kernel_callable_cache().set_generation(context_generation);
         rc = runner->init_kernel_context(device_id, *config, context_generation);
     } catch (...) {
         rc = PTO_RUNTIME_ERR_INTERNAL;
@@ -1356,9 +1355,13 @@ int simpler_kernel_mode_init(
 }
 
 int simpler_kernel_mode_prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream
+    DeviceContextHandle ctx, const void *callable, size_t callable_size, int32_t *out_callable_id
 ) {
-    int rc = validate_kernel_prepare_callable_args(ctx, callable_id, callable, callable_size, caller_stream);
+    if (out_callable_id != nullptr) *out_callable_id = -1;
+    int rc = validate_kernel_prepare_callable_args(ctx, callable, callable_size, out_callable_id);
+    if (rc != 0) return rc;
+    if (callable_size > KernelCallableCache::kByteLimit) return PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED;
+    rc = validate_kernel_callable_image(callable, callable_size);
     if (rc != 0) return rc;
 
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
@@ -1379,24 +1382,23 @@ int simpler_kernel_mode_prepare_callable(
         if (rc != 0) return rc;
 
         auto &cache = runner->kernel_callable_cache();
-        SimplerCallableHandle prepared{-1, 0};
+        int32_t minted = -1;
         rc = cache.stage(
-            static_cast<const ChipCallable *>(callable), callable_size, runner->kernel_callable_cache_ops(),
-            callable_id, prepared
+            static_cast<const ChipCallable *>(callable), callable_size, runner->kernel_callable_cache_ops(), minted
         );
         if (rc != 0) {
             LOG_ERROR(
-                "kernel callable admission failed: cid=%d bytes=%zu resident=%zu/%d used=%zu/%zu rc=%d", callable_id,
-                callable_size, cache.resident_count(), MAX_REGISTERED_CALLABLE_IDS, cache.resident_bytes(),
+                "kernel callable admission failed: bytes=%zu resident=%zu/%d used=%zu/%zu rc=%d", callable_size,
+                cache.resident_count(), MAX_REGISTERED_CALLABLE_IDS, cache.resident_bytes(),
                 KernelCallableCache::kByteLimit, rc
             );
             return rc;
         }
-        auto rollback = RAIIScopeGuard([&cache, prepared]() {
-            cache.rollback(prepared.callable_id);
+        auto rollback = RAIIScopeGuard([&cache, minted]() {
+            cache.rollback(minted);
         });
         bool needs_aicpu_register = false;
-        rc = record_callable_on_runner(runner, prepared.callable_id, callable, &needs_aicpu_register);
+        rc = record_callable_on_runner(runner, minted, callable, &needs_aicpu_register);
         if (rc != 0) return rc;
 
         // Registration may enqueue work before reporting failure. Its addresses
@@ -1404,7 +1406,7 @@ int simpler_kernel_mode_prepare_callable(
         rollback.dismiss();
         try {
             const HostApi kernel_api(runner, 0, 0, &g_host_api_ops);
-            rc = runner->prepare_kernel_callable(prepared.callable_id, &kernel_api, caller_stream);
+            rc = runner->prepare_kernel_callable(minted, &kernel_api);
         } catch (...) {
             runner->kernel_execution_state().poison(PTO_RUNTIME_ERR_INTERNAL);
             throw;
@@ -1413,7 +1415,8 @@ int simpler_kernel_mode_prepare_callable(
             runner->kernel_execution_state().poison(rc);
             return rc;
         }
-        cache.commit(prepared.callable_id);
+        cache.commit(minted);
+        *out_callable_id = minted;
         return 0;
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;

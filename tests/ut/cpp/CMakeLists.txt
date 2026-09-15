@@ -542,32 +542,16 @@ target_link_libraries(test_kernel_callable_cache PRIVATE ${GTEST_MAIN_LIB} ${GTE
 add_test(NAME test_kernel_callable_cache COMMAND test_kernel_callable_cache)
 set_tests_properties(test_kernel_callable_cache PROPERTIES LABELS "no_hardware")
 
-add_executable(test_kernel_dispatch
-    common/test_kernel_dispatch.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/kernel_dispatch.cpp
-)
-target_include_directories(test_kernel_dispatch PRIVATE
-    ${GTEST_INCLUDE_DIRS}
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
-)
-target_link_libraries(test_kernel_dispatch PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
-add_test(NAME test_kernel_dispatch COMMAND test_kernel_dispatch)
-set_tests_properties(test_kernel_dispatch PROPERTIES LABELS "no_hardware")
-
-add_executable(test_kernel_dispatch_unavailable
-    common/test_kernel_dispatch_unavailable.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/kernel_dispatch.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/kernel_invocation_consumer.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu/cache_ops.cpp
-)
-target_include_directories(test_kernel_dispatch_unavailable PRIVATE
-    ${GTEST_INCLUDE_DIRS}
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
-)
-target_link_libraries(test_kernel_dispatch_unavailable PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
-add_test(NAME test_kernel_dispatch_unavailable COMMAND test_kernel_dispatch_unavailable)
+# The entry no longer reads a device descriptor, so it needs no cache
+# primitive; both targets compile the production entry unchanged.
+foreach(dispatch_test test_kernel_dispatch test_kernel_dispatch_unavailable)
+    add_common_utils_test(${dispatch_test} common/${dispatch_test}.cpp)
+    target_sources(${dispatch_test} PRIVATE
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/kernel_dispatch.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/kernel_invocation_consumer.cpp)
+    target_include_directories(${dispatch_test} PRIVATE
+        ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface)
+endforeach()
 set_tests_properties(test_kernel_dispatch_unavailable PROPERTIES LABELS "no_hardware")
 
 # Kernel-mode phase machine and restricted-vocabulary tables, table-driven with
