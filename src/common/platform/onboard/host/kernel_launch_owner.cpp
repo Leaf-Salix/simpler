@@ -81,6 +81,12 @@ int DeviceRunnerBase::launch_kernel_callable(
         h.aicpu_done = r.kernel_exec_state_.event(KernelEventKind::AicpuDone);
         h.serial_tail = r.kernel_exec_state_.event(KernelEventKind::SerialTail);
         h.consume_prepare_tail = r.kernel_prepare_pending_;
+        if (h.consume_prepare_tail) {
+            aclrtEventRecordedStatus status{};
+            const int rc = aclrtQueryEventStatus(h.prepare_tail, &status);
+            if (rc != 0) return rc;
+            h.consume_prepare_tail = status != ACL_EVENT_RECORDED_STATUS_COMPLETE;
+        }
         out->previous_caller_identity = r.kernel_previous_caller_;
         return 0;
     };
