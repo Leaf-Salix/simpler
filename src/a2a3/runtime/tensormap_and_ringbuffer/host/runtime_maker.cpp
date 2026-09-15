@@ -381,9 +381,14 @@ struct ArenaSizingConfig {
     int32_t dep_pool_capacities[CHIP_MAX_RING_DEPTH];
 };
 
+// The three device regions one bind commits, in bytes. Derived from ring
+// sizing alone, so a config resolves to the same three numbers whichever entry
+// asks: the program path hands them to setup_static_arena, kernel-mode init
+// declares them as its resource requirements.
 struct ArenaStaticSizes {
     uint64_t total_heap;
     uint64_t sm_size;
+    uint64_t runtime_image_size;
 };
 
 // Device pointers to the per-Worker static pools that DeviceRunner keeps alive
@@ -489,6 +494,36 @@ static bool derive_arena_static_sizes(const ArenaSizingConfig &sizing, ArenaStat
         out->total_heap += sizing.heap_sizes[r];
     }
     out->sm_size = SharedMemoryHandle::calculate_size_per_ring(sizing.task_window_sizes);
+
+    uint64_t total_window = 0;
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
+        total_window += sizing.task_window_sizes[r];
+    }
+    // OrchestratorLayout stores the sum in int32_t and asserts before narrowing.
+    if (total_window > static_cast<uint64_t>(INT32_MAX)) {
+        LOG_ERROR("Total task window %" PRIu64 " exceeds the int32 layout bound", total_window);
+        return false;
+    }
+
+    // A region's committed span is forward-aligned to the arena's base alignment,
+    // so a size within that much of SIZE_MAX cannot be committed.
+    // Layout has a fixed number of regions; window/dep counts are int32-bounded.
+    // Their reserve-only size arithmetic requires the platform's 64-bit size_t.
+    static_assert(sizeof(size_t) == sizeof(uint64_t));
+    constexpr size_t max_usable = std::numeric_limits<size_t>::max() - (DeviceArena::kDefaultBaseAlign - 1);
+    if (out->total_heap > max_usable || out->sm_size > max_usable) {
+        LOG_ERROR("Heap or shared-memory size leaves no room for base alignment");
+        return false;
+    }
+
+    DeviceArena sizing_arena;  // discarded; only its computed arena_size is read
+    const RuntimeArenaLayout layout =
+        runtime_reserve_layout(sizing_arena, sizing.task_window_sizes, sizing.heap_sizes, sizing.dep_pool_capacities);
+    if (layout.offsets.arena_size > max_usable) {
+        LOG_ERROR("Runtime image size leaves no room for base alignment");
+        return false;
+    }
+    out->runtime_image_size = layout.offsets.arena_size;
     return true;
 }
 
@@ -496,6 +531,8 @@ extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, Pip
     if (out == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     if (config == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
 
+    // The same two steps the program bind path runs, so both entries accept the
+    // same configs and request the same three sizes.
     ArenaSizingConfig sizing;
     if (!resolve_arena_sizing(
             config->runtime_env.ring_task_window, config->runtime_env.ring_heap, config->runtime_env.ring_dep_pool,
@@ -503,23 +540,8 @@ extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, Pip
         )) {
         return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     }
-    uint64_t total_window = 0;
-    for (int r = 0; r < CHIP_MAX_RING_DEPTH; ++r)
-        total_window += sizing.task_window_sizes[r];
-    // OrchestratorLayout stores the sum in int32_t and asserts before narrowing.
-    if (total_window > static_cast<uint64_t>(INT32_MAX)) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-
-    // Layout has a fixed number of regions; window/dep counts are int32-bounded.
-    // Their reserve-only size arithmetic requires the platform's 64-bit size_t.
-    static_assert(sizeof(size_t) == sizeof(uint64_t));
     ArenaStaticSizes sizes;
     if (!derive_arena_static_sizes(sizing, &sizes)) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    constexpr size_t max_usable = std::numeric_limits<size_t>::max() - (DeviceArena::kDefaultBaseAlign - 1);
-    if (sizes.total_heap > max_usable || sizes.sm_size > max_usable) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    DeviceArena arena;
-    const auto layout =
-        runtime_reserve_layout(arena, sizing.task_window_sizes, sizing.heap_sizes, sizing.dep_pool_capacities);
-    if (layout.offsets.arena_size > max_usable) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
 
     const PipelineContract candidate = {
         PTO_PIPELINE_CONTRACT_ABI_VERSION,
@@ -529,7 +551,7 @@ extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, Pip
             {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, sizeof(ChipStorageTaskArgs)},
             {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DEVICE_SCRATCH, sizes.total_heap},
             {PTO_PIPELINE_GM_SM, PTO_PIPELINE_DEVICE_SCRATCH, sizes.sm_size},
-            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DEVICE_SCRATCH, layout.offsets.arena_size},
+            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DEVICE_SCRATCH, sizes.runtime_image_size},
             {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
             {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
         }
@@ -641,18 +663,12 @@ static void apply_orch_sched_env_flags(Runtime *runtime) {
 // per-(cid,config): reserve and acquire the static device pools. GM heap, shared memory
 // shared memory, and the prebuilt runtime arena all live in one backing
 // allocation; setup_static_arena reserves the three regions and commits in one
-// shot. The runtime-arena size is recovered by replaying the (pure, cheap)
-// reserve sequence on a throwaway host arena. Idempotent across runs — the
-// pools are owned by DeviceRunner and freed in DeviceRunner::finalize().
-static bool ensure_static_arenas(
-    const HostApi *api, const ArenaSizingConfig &sizing, const ArenaStaticSizes &sizes, StaticArenaPtrs *out
-) {
-    DeviceArena sizing_arena;  // discarded; only its computed arena_size is read
-    RuntimeArenaLayout layout =
-        runtime_reserve_layout(sizing_arena, sizing.task_window_sizes, sizing.heap_sizes, sizing.dep_pool_capacities);
-
+// shot, at the sizes derive_arena_static_sizes already resolved. Idempotent
+// across runs — the pools are owned by DeviceRunner and freed in
+// DeviceRunner::finalize().
+static bool ensure_static_arenas(const HostApi *api, const ArenaStaticSizes &sizes, StaticArenaPtrs *out) {
     int64_t t_setup_start = _now_ms();
-    if (api->setup_static_arena(sizes.total_heap, sizes.sm_size, layout.offsets.arena_size) != 0) {
+    if (api->setup_static_arena(sizes.total_heap, sizes.sm_size, sizes.runtime_image_size) != 0) {
         LOG_ERROR("Failed to setup pooled static arena");
         return false;
     }
@@ -780,7 +796,7 @@ static bool build_and_cache_prebuilt_arena(
     }
 
     StaticArenaPtrs ptrs;
-    if (!ensure_static_arenas(api, sizing, sizes, &ptrs)) {
+    if (!ensure_static_arenas(api, sizes, &ptrs)) {
         return false;
     }
 
