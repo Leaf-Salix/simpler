@@ -91,6 +91,7 @@ def kernel_close_faults(tmp_path_factory):
         "persistent_free_close",
         "destroy_unclosed",
         "prepare",
+        "register_failure",
         "fatal_device",
     ],
 )
@@ -418,6 +419,9 @@ def _check_lifecycle_retry(lib, faults, arch, runtime, device, scenario):
             config.enable_dump_args = 1
             _check_prepare_reuse(lib, ctx, arch, runtime)
             finalized = True
+        elif scenario == "register_failure":
+            _check_register_failure(lib, ctx)
+            finalized = True
         elif scenario == "persistent_free_close":
             _check_prepare_reuse(lib, ctx, arch, runtime, close=False)
             # The first rtFree releases the callable upload. Fail the next
@@ -464,6 +468,31 @@ def _check_lifecycle_retry(lib, faults, arch, runtime, device, scenario):
             "rtSetDevice",
         )
         assert {name: faults.acl_call_count(i) for i, name in enumerate(names)} == dict.fromkeys(names, 0)
+
+
+def _check_register_failure(lib, ctx):
+    from simpler.task_interface import ChipCallable  # noqa: PLC0415
+
+    # Host validation reads the image's sizes, offsets and names and never the
+    # orchestration binary, so bytes that are not a loadable SO are admitted and
+    # uploaded. The AICPU's own dlopen is the first refusal, and registration
+    # waits on the context's AICPU stream for it, so it is this call's status.
+    chip = ChipCallable.build(
+        signature=[], func_name="kernel_prepare_orchestration", binary=b"\x00" * 4096, children=[]
+    )
+    image = ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size()))
+    minted = ctypes.c_int32(99)
+    assert lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), ctypes.byref(minted)) != 0
+    assert minted.value == -1
+    # The failure poisons the context, which keeps its storage until an explicit
+    # close: no further registration is accepted, and finalize still reclaims.
+    assert (
+        lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), ctypes.byref(minted))
+        == PTO_RUNTIME_ERR_INVALID_STATE
+    )
+    assert minted.value == -1
+    assert lib.finalize_device(ctx) == 0
+    assert lib.committed_device_memory_ctx(ctx) == 0
 
 
 def _check_prepare_reuse(lib, ctx, arch, runtime, *, close=True):

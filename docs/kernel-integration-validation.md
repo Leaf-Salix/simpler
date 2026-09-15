@@ -43,6 +43,8 @@ source import as runtime evidence.
 - Lifecycle failures: failed initialization, event/stream cleanup retry,
   forgotten close, fatal-device abandonment, invalid current device and
   device-query errors. Rejected work preserves the context and can recover.
+- Registration failure: an orchestration image the AICPU cannot load is
+  `prepare_callable`'s own status, poisons the context, and still closes clean.
 - Invocation transport: 24 gated asynchronous minimum/maximum packets with
   host buffers overwritten before device consumption; common header, residency,
   malformed input, stale generation and reserved-field rejection.
@@ -467,6 +469,63 @@ recording-refusal tests that assert on it stop throwing. And the C++ hardware
 tests need `--resource-spec-file`, built from `TASK_DEVICE` the way
 `.github/workflows/_ut-npu-a2a3.yml` builds it; without it `test_comm_lifecycle`
 sees an empty device pool and fails on the count rather than on behavior.
+
+`mkdocs build --strict` was not re-run: mkdocs is not installed in this
+worktree and PyPI is unreachable from this host. The change adds no page and
+changes no nav entry.
+
+## Registration wait revalidation (2026-09-15)
+
+Another divergence from #2190 was found after the newest-head review, in the one
+thing that review did not compare: not what registration sends, but whether
+`prepare_callable` waits for it. #2176 and #2190 both reach registration through
+`register_callable_on_device`, whose three steps are launch, synchronize with
+`PLATFORM_STREAM_SYNC_TIMEOUT_MS`, commit. This line inlined the first and third
+into `prepare_kernel_callable` and dropped the second, so registration was
+enqueued and the call reported success without it having run. The kernel path
+now calls `register_callable_on_device`, which program mode already used, and
+the inlined copy is gone. The decisions are D19 in the integration log.
+
+Three documents described the behaviour and did not agree with each other.
+`runtime_c_api.h` said preparation never synchronizes and that registration
+errors surface through the caller's own warmup plus synchronize; D14 item 5 said
+callable registration synchronizes the context's own AICPU stream;
+`docs/zh-cn/kernel-mode-integration-test.md` said both, four sections apart. The
+implementation matched the first. All three now state the wait.
+
+Ordering never rested on the divergence: the AICPU stream's FIFO orders
+registration ahead of every launch either way, which is what D16's chained
+topology relies on. What it cost was the report.
+`simpler_aicpu_register_callable` returns its `load_orch_so` status on both
+arches, so a device-side `dlopen` of the orchestration SO that failed had
+nowhere to surface — `prepare_callable` returned 0, nothing poisoned the
+context, and the failure reappeared later as a launch fault on a context that
+looked healthy.
+
+A regression case covers exactly that.
+`test_kernel_lifecycle_retry[register_failure]` registers a `ChipCallable` whose
+orchestration binary is 4 KiB of zeroes. Host admission reads sizes, offsets and
+names, and `register_callable_impl` copies the image without parsing it, so the
+first refusal is the AICPU's own `dlopen`. The case asserts that the refusal is
+`prepare_callable`'s status, that `out_callable_id` is -1, that the poisoned
+context refuses the next registration with `INVALID_STATE`, and that close still
+returns committed device memory to zero. Against a build with the inlined path
+restored it fails on its first assertion, with `prepare_callable` returning 0.
+
+| Suite | Result |
+| ----- | ------ |
+| Native builds: a2a3, a5, a2a3sim, a5sim, nanobind extension | all succeeded |
+| C++ unit tests, no hardware | 166/166 passed |
+| a2a3 hardware, `tests/ut/py/test_kernel_mode_c_api.py` | 14/14 passed, the new case included |
+| a2a3 hardware, `tests/st/a2a3/kernel_capture` | passed, 100 replays |
+| The new case against a build with the inlined path restored | failed as intended |
+| pre-commit hooks on changed files | passed |
+
+The suites this section does not list were not re-run: the full Python unit
+sweep, the onboard and simulation scene phases, the SDMA phase, the C++ hardware
+targets, and the hardware-enabled C++ unit build. The change is confined to the
+onboard kernel registration path and the documents describing it, and the two
+hardware suites that reach that path are the two listed.
 
 `mkdocs build --strict` was not re-run: mkdocs is not installed in this
 worktree and PyPI is unreachable from this host. The change adds no page and

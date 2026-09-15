@@ -15,8 +15,8 @@ HBG 和 sim 的不支持判定发生在取得 kernel 身份之前。在这种未
 结构合法的 prepare / launch 返回 `INVALID_STATE`。能力查询不替代 context 初始化或生命周期检查。
 
 调用者先完成 ACL 初始化，并让当前线程持有所需设备。Kernel init 借用这个设备，
-不调用选卡、设备重置或 ACL 初始化/终止接口。init 可在 capture 之外同步自己的
-AICPU stream 完成启动；prepare 和 launch 不做 stream/device 同步。
+不调用选卡、设备重置或 ACL 初始化/终止接口。init 和 prepare 可在 capture 之外
+同步 context 自己的 AICPU stream；launch 不做 stream/device 同步。
 调用者负责串行执行同一 context 的 init、prepare、launch 和 finalize。
 
 ```cpp
@@ -95,8 +95,8 @@ blocks_（每块的底层分配由 MemoryAllocator 持有）
 各自的错误码（`CALLABLE_COUNT_EXCEEDED` / `CALLABLE_BYTES_EXCEEDED`）。
 
 上传只修补临时 `scratch` 中的子 `CoreCallable::resolved_addr_`，调用者镜像保持不变。
-当前缓存上传仍通过 `Ops.copy → rtMemcpy(..., RT_MEMCPY_HOST_TO_DEVICE)` 同步复制，
-这不同于后续 runtime 注册的异步执行，也不意味着 prepare 会同步 stream/device。
+缓存上传通过 `Ops.copy → rtMemcpy(..., RT_MEMCPY_HOST_TO_DEVICE)` 同步复制；随后的
+设备注册是异步下发，由 prepare 在返回前同步 AICPU stream 等它完成。
 
 Host 条目保存驻留信息、镜像副本、计费字节数和 `ready`。
 `resident_count()` 只统计 ready 项，`resident_bytes()` 包括未 commit 的计费占用。
@@ -113,11 +113,12 @@ TMR 的 `prepare_kernel_callable` 首次配置固定 runtime 区域、准备 `Pe
 
 设备注册在 context 专用的 AICPU stream 上发射 `RegisterCallableName`。
 每次 launch 也把 AICPU 任务发在同一条流上，FIFO 因此保证注册排在每次 launch 之前，
-不需要事件，prepare 也不接触 caller stream。调用者同步自己的 stream 即可观察注册
-完成或异步错误；prepare 本身不执行 `aclrtSynchronizeStream*` 或 device synchronize。
+不需要事件，prepare 也不接触 caller stream。prepare 在提交该 callable 之前同步这条
+AICPU stream，设备侧注册失败因此由 prepare 自己的返回值报告；它不同步 caller stream，
+也不做 device synchronize。
 
 context 随后转为 `ReadyEnqueued`，缓存通过 `commit(callable_id)` 发布 ready 条目。
-ready 表示准备已提交并建立依赖，设备工作仍可能在执行。
+ready 表示注册已在设备上完成并建立依赖。
 调用者仍须在 capture 之前完成自己的 warmup 和同步检查。
 
 HBG 内部准备包含资源计划、freeze 和 execution-slot 注册；公开 HBG init 已提前拒绝，

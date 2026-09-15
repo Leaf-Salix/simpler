@@ -765,3 +765,66 @@ then mis-dispatch.
 **Affects.** #2190 (its shape adopted, closing the divergence this line had
 recorded against it); the simulation `prepare_callable` ordering remains the one
 deliberate difference.
+
+---
+
+## D19 - Registration waits for the device, as #2176 and #2190 do
+
+**Problem.** Three statements about kernel-mode registration disagreed.
+`runtime_c_api.h` said preparation "never synchronizes a stream or device -
+registration errors surface through the caller's own warmup plus synchronize";
+D14 item 5 said "init bootstrap and callable registration synchronize the
+context's own AICPU stream"; `docs/zh-cn/kernel-mode-integration-test.md` said
+both, in two sections. The implementation matched the first: this line inlined
+the `RegisterCallableArgs` build and its `launch_aicpu_payload` into
+`prepare_kernel_callable` and kept `commit_device_register` after it, dropping
+the `aclrtSynchronizeStreamWithTimeout` that sits between them in
+`register_callable_on_device`.
+
+**Finding.** Both source PRs wait. #2176 and #2190 reach registration through
+`register_callable_on_device(callable_id, control_stream)`, whose three steps
+are launch, synchronize with `PLATFORM_STREAM_SYNC_TIMEOUT_MS`, commit — the
+timeout classified separately from any other failure. That function is still on
+this line, still synchronizing, and program mode still calls it through
+`launch_device_register`. Only the kernel path had a second, divergent copy.
+
+Nothing rests on the divergence. Registration is ordered ahead of every launch
+by the AICPU stream's FIFO either way, which is what D16's chained topology
+relies on; what the missing synchronize costs is the report. A device-side
+`dlopen` of the orchestration SO that fails, or a registration that does not
+complete within the timeout, leaves `prepare_callable` returning 0 and surfaces
+later as a launch failure on a context nothing poisoned. The header's own
+promise that "a registration that fails on the device poisons the context"
+cannot hold without the wait, because there is nothing to observe before the
+call returns.
+
+**Choice.** The kernel path calls `register_callable_on_device`, deleting the
+inlined copy. A device-side registration failure, timeout included, is
+`prepare_callable`'s own status, and the entry poisons the context on it.
+
+1. `DeviceRunnerBase::prepare_kernel_callable` replaces its inlined launch and
+   commit with that call. The `host_dlopen_handle != nullptr` early return the
+   inline copy open-coded is the callee's first branch, so HBG-style host
+   orchestration still registers nothing.
+2. `runtime_c_api.h` states the wait: registration synchronizes the context's
+   own AICPU stream before committing the callable, and synchronizes no caller
+   stream and no device.
+3. `docs/zh-cn/kernel-callable-residency.md` and
+   `docs/zh-cn/kernel-mode-integration-test.md` drop their claims that
+   preparation synchronizes nothing, each of which contradicted a neighbouring
+   section of the same document.
+
+**Reason.** One registration path for both modes is the same consolidation D18
+made for the `func_id` bound: the divergence bought nothing and hid a report.
+Synchronizing an internal stream does not touch capture — prepare is outside
+ACLGraph capture by contract, and the caller's stream is still never
+synchronized, so the launch path D16 made capturable is unchanged.
+
+The cost is that prepare now blocks for one AICPU round trip, under
+`kernel_submission_mutex`, so a concurrent `launch` on another thread meets a
+held lock and returns `INVALID_STATE` for that window. Launch already takes that
+mutex with `try_to_lock` and reports the same code when preparation holds it, so
+the window widens rather than a new failure appearing.
+
+**Affects.** #2176 and #2190 (their registration path adopted); D14 item 5
+(now true of the implementation).

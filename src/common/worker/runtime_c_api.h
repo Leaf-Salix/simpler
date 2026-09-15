@@ -663,11 +663,12 @@ int simpler_kernel_mode_init(
  * `callable_size` bytes. Validating every flexible-array offset before the
  * image is uploaded is the implementation's obligation. Shared entry
  * validation checks the canonical image bounds, signature counts, symbol
- * names and alignment. Registration enqueues its asynchronous device work on
- * the context's own AICPU stream, which every later launch also enqueues on,
- * so stream FIFO orders registration ahead of each launch and no caller
- * stream is involved. It never synchronizes a stream or device - registration
- * errors surface through the caller's own warmup plus synchronize.
+ * names and alignment. Registration enqueues its device work on the context's
+ * own AICPU stream, which every later launch also enqueues on, so stream FIFO
+ * orders registration ahead of each launch and no caller stream is involved.
+ * It synchronizes that stream before committing the callable, so a device-side
+ * registration failure is this call's own status; it synchronizes no caller
+ * stream and no device.
  */
 int simpler_kernel_mode_prepare_callable(
     DeviceContextHandle ctx, const void *callable, size_t callable_size, int32_t *out_callable_id

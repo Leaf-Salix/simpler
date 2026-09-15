@@ -81,7 +81,8 @@ simpler 没有调用过它们。
 init 期间的执行体加载和 prepare 期间的 callable 注册，会同步上下文自己的 AICPU
 stream。launch 路径不同步任何 stream。
 
-prepare 之后，测试自己同步一次 caller stream。prepare 若出错，会在这里暴露。
+prepare 之后，测试自己同步一次 caller stream 再读 committed memory。prepare 的设备侧
+注册错误由它自己的返回值报告，不依赖这次同步。
 
 ## 5. 一次 launch 的时序
 
@@ -178,7 +179,7 @@ launch 路径能在 eager 下算对。在 capture 窗口内调用 `simpler_kerne
 | launch 的 callable id 越界 | 返回 `INVALID_ARGUMENT`，与 prepare 一致 |
 | kernel 入口符号解析 | 每个 runtime 仍导出全部四个入口；ChipWorker 只在 `supported` 非零时解析 init、prepare、launch |
 | kernel 模式容量规则 | 使用 K3 的共享 static arena bank，同时覆盖 onboard 与仿真 |
-| 同步语义说明 | init 会同步上下文自己的 AICPU stream，prepare 与 launch 路径不同步 |
+| 同步语义说明 | init 与 prepare 会同步上下文自己的 AICPU stream，launch 路径不同步 |
 | callable id 与版本 | prepare 铸 id 经出参返回，失败写 `-1`；纯注册不去重，id 在 context 内不复用、close 后整体失效，不带 generation |
 | 设备侧如何找到 callable | 参数包直接携带该 callable 的设备镜像地址与长度，由 binder 从本 context 已提交的驻留信息填入；不再有独立的驻留描述符 |
 
