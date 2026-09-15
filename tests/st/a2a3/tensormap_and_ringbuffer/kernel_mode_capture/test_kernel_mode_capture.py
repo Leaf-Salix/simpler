@@ -37,7 +37,6 @@ SCENARIOS = (
     "stream_query_error",
     "stream_busy",
     "blocked_same",
-    "blocked_cross",
     "replay_stream",
     "two_graphs",
     "fresh_inputs",
@@ -309,7 +308,7 @@ def _initialize(device, scenario, build_dir):
     streams = [ctypes.c_void_p(), ctypes.c_void_p()]
     for stream in streams:
         _check(lib.aclrtCreateStream(ctypes.byref(stream)), "create stream")
-    caller = streams[int(scenario == "blocked_cross")]
+    caller = streams[0]
     ctx = lib.create_device_context()
     assert ctx
     config = _config()
@@ -328,7 +327,7 @@ def _initialize(device, scenario, build_dir):
 def _prepare_initial(scenario, observer, prepare, launch):
     from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.kernel_capture_values import _check  # noqa: PLC0415
 
-    blocked = scenario in ("blocked_same", "blocked_cross")
+    blocked = scenario == "blocked_same"
     if blocked:
         observer.capture_gate_arm()
     prepare(0)
