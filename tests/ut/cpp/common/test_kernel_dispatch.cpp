@@ -13,17 +13,18 @@
 #include <limits>
 
 #include "kernel_dispatch_args.h"
+#include "callable_protocol.h"
+#include "chip_callable_layout.h"
 #include "aicpu/kernel_invocation_consumer.h"
 
 namespace {
 int consumed;
-int invalidations;
-const void *invalidated_address;
-KernelCallableDeviceResidency published;
-bool publish_on_invalidate;
-int consumer_result;
 const void *seen_payload;
-uint64_t seen_generation;
+int32_t seen_id;
+const ChipCallable *seen_callable;
+size_t seen_callable_bytes;
+uint64_t seen_function;
+int32_t seen_function_id;
 uint64_t seen_binding;
 uint64_t seen_context_generation;
 uint64_t seen_sm_bytes;
@@ -34,63 +35,158 @@ struct Packet {
 };
 class KernelDispatch : public testing::Test {
 protected:
-    KernelCallableDeviceResidency resident{17, 0x100000, 128, 3, 0};
     Packet packet{};
+    std::vector<uint8_t> image;
     void SetUp() override {
-        consumed = invalidations = 0;
-        invalidated_address = seen_payload = nullptr;
-        publish_on_invalidate = false;
-        consumer_result = 0;
-        seen_generation = 0;
+        consumed = 0;
+        seen_payload = nullptr;
         seen_binding = seen_context_generation = seen_sm_bytes = seen_arena_bytes = 0;
+        const uint8_t code[] = {1, 2, 3};
+        const int32_t func_id = 7;
+        auto child = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, code, sizeof(code));
+        image = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
+            nullptr, 0, "orch", code, sizeof(code), &func_id, &child, 1, ""
+        );
+        const auto *callable = reinterpret_cast<const ChipCallable *>(image.data());
+        patch_chip_callable_scratch_for_device(
+            callable, compute_chip_callable_layout(callable), reinterpret_cast<uint64_t>(image.data()), image.data()
+        );
+        packet.args.chip_callable_address = reinterpret_cast<uint64_t>(image.data());
+        packet.args.chip_callable_bytes = image.size();
         packet.args.packet_bytes = sizeof(packet);
-        packet.args.residency_address = reinterpret_cast<uint64_t>(&resident);
         packet.args.invocation.mode = SIMPLER_MODE_KERNEL;
-        packet.args.invocation.callable_id = 3;
-        packet.args.invocation.generation = 17;
+        packet.args.invocation.callable_id = 63;
         packet.args.invocation.payload_bytes = sizeof(packet.payload);
         packet.payload = 42;
     }
     int run() { return simpler_aicpu_kernel_exec(&packet); }
+    void invalid() {
+        EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
+        EXPECT_EQ(consumed, 0);
+    }
 };
 }  // namespace
 
-// Link substitutes for the production consumer and platform cache primitive.
-// The exported entry itself is compiled from the production .cpp unchanged.
-namespace aicpu_cache_maintenance {
-void invalidate_range_impl(const void *address, size_t size) {
-    EXPECT_EQ(size, sizeof(KernelCallableDeviceResidency));
-    ++invalidations;
-    invalidated_address = address;
-    if (publish_on_invalidate) std::memcpy(const_cast<void *>(address), &published, sizeof(published));
-}
-}  // namespace aicpu_cache_maintenance
+// The exported production entry forwards to this test consumer.
 int consume_kernel_invocation(
-    const SimplerKernelDispatchArgs &args, const KernelCallableDeviceResidency &resident, const void *payload,
+    const SimplerKernelDispatchArgs &args, const ChipCallable &callable, size_t callable_bytes, const void *payload,
     size_t bytes
 ) {
     const auto &invocation = args.invocation;
     ++consumed;
-    EXPECT_GE(invalidations, consumed);
-    EXPECT_EQ(bytes, sizeof(uint64_t));
-    EXPECT_EQ(*static_cast<const uint64_t *>(payload), 42);
-    EXPECT_EQ(invocation.generation, resident.generation);
-    seen_payload = payload;
-    seen_generation = invocation.generation;
     seen_binding = args.binding_address;
     seen_context_generation = args.context_generation;
     seen_sm_bytes = args.sm_bytes;
     seen_arena_bytes = args.arena_bytes;
-    return consumer_result;
+    seen_callable = &callable;
+    seen_callable_bytes = callable_bytes;
+    seen_function_id = callable.child_func_ids_[0];
+    seen_function = callable.child(0).resolved_addr();
+    seen_payload = payload;
+    seen_id = invocation.callable_id;
+    EXPECT_EQ(bytes, sizeof(uint64_t));
+    EXPECT_EQ(*static_cast<const uint64_t *>(payload), 42);
+    return -83;
 }
 
-TEST_F(KernelDispatch, ValidPacketReachesConsumerAndPropagatesItsResult) {
-    consumer_result = -83;
+TEST_F(KernelDispatch, ValidSnapshotReachesConsumerAndPropagatesResult) {
+    const Packet before = packet;
+    const auto original_image = image;
     EXPECT_EQ(run(), -83);
-    EXPECT_EQ(consumed, 1);
+    EXPECT_EQ(run(), -83);
+    EXPECT_EQ(consumed, 2);
     EXPECT_EQ(seen_payload, &packet.payload);
-    EXPECT_EQ(seen_generation, 17);
-    EXPECT_EQ(invalidated_address, &resident);
+    EXPECT_EQ(seen_id, 63);
+    EXPECT_EQ(seen_callable, reinterpret_cast<const ChipCallable *>(image.data()));
+    EXPECT_EQ(seen_callable_bytes, image.size());
+    EXPECT_EQ(seen_function_id, 7);
+    EXPECT_EQ(
+        seen_function, packet.args.chip_callable_address + offsetof(ChipCallable, storage_) +
+                           seen_callable->child_offset(0) + CoreCallable::binary_data_offset()
+    );
+    EXPECT_EQ(image, original_image);
+    EXPECT_EQ(std::memcmp(&packet, &before, sizeof(packet)), 0);
+}
+TEST_F(KernelDispatch, RejectsInvalidIdentityBeforeConsumingPayload) {
+    for (int id : {-1, MAX_REGISTERED_CALLABLE_IDS, std::numeric_limits<int32_t>::max()}) {
+        packet.args.invocation.callable_id = id;
+        invalid();
+    }
+    packet.args.invocation.callable_id = 0;
+    packet.args.invocation.mode = SIMPLER_MODE_PROGRAM;
+    invalid();
+}
+TEST_F(KernelDispatch, RejectsMalformedEnvelope) {
+    EXPECT_EQ(simpler_aicpu_kernel_exec(nullptr), static_cast<int>(KernelDispatchStatus::InvalidArgs));
+    EXPECT_EQ(
+        simpler_aicpu_kernel_exec(reinterpret_cast<char *>(&packet) + 1),
+        static_cast<int>(KernelDispatchStatus::InvalidArgs)
+    );
+    for (uint64_t bytes :
+         {uint64_t(0), uint64_t(sizeof(SimplerKernelDispatchArgs) - 1), std::numeric_limits<uint64_t>::max()}) {
+        packet.args.packet_bytes = bytes;
+        invalid();
+    }
+    packet.args.packet_bytes = sizeof(packet);
+    packet.args.invocation.payload_bytes++;
+    invalid();
+}
+TEST_F(KernelDispatch, RejectsInvalidCountsAndReservedFields) {
+    const auto valid = packet.args.invocation;
+    for (int count : {-1, 257}) {
+        packet.args.invocation.tensor_count = count;
+        invalid();
+    }
+    packet.args.invocation = valid;
+    for (int count : {-1, 129}) {
+        packet.args.invocation.scalar_count = count;
+        invalid();
+    }
+    packet.args.invocation.tensor_count = 256;
+    packet.args.invocation.scalar_count = 1;
+    invalid();
+    packet.args.invocation = valid;
+    packet.args.invocation.host_copy_tensor_count = 1;
+    invalid();
+    packet.args.invocation = valid;
+    packet.args.invocation.reserved_ = 1;
+    invalid();
+}
+
+TEST_F(KernelDispatch, RejectsInvalidCallableSpanBeforeConsumer) {
+    const auto address = packet.args.chip_callable_address;
+    for (uint64_t bad : {uint64_t(0), address + 1, std::numeric_limits<uint64_t>::max() - 15}) {
+        packet.args.chip_callable_address = bad;
+        invalid();
+    }
+    packet.args.chip_callable_address = address;
+    packet.args.chip_callable_bytes = sizeof(ChipCallable) - 1;
+    invalid();
+    packet.args.chip_callable_bytes = std::numeric_limits<uint64_t>::max();
+    invalid();
+}
+
+TEST_F(KernelDispatch, EachInvocationReceivesItsOwnCallableFunctionMapping) {
+    EXPECT_EQ(run(), -83);
+    const auto first_function = seen_function;
+    auto other = image;
+    auto *callable = reinterpret_cast<ChipCallable *>(other.data());
+    callable->child_func_ids_[0] = 19;
+    patch_chip_callable_scratch_for_device(
+        callable, compute_chip_callable_layout(callable), reinterpret_cast<uint64_t>(other.data()), other.data()
+    );
+    packet.args.chip_callable_address = reinterpret_cast<uint64_t>(other.data());
+    packet.args.invocation.callable_id = 3;
+    EXPECT_EQ(run(), -83);
+    EXPECT_EQ(seen_id, 3);
+    EXPECT_EQ(seen_function_id, 19);
+    EXPECT_NE(seen_function, first_function);
+    EXPECT_EQ(seen_callable, callable);
+    packet.args.chip_callable_address = reinterpret_cast<uint64_t>(image.data());
+    packet.args.invocation.callable_id = 63;
+    EXPECT_EQ(run(), -83);
+    EXPECT_EQ(seen_function_id, 7);
+    EXPECT_EQ(seen_function, first_function);
 }
 
 TEST_F(KernelDispatch, ForwardsContextBindingAndRegionExtentsToRuntimeConsumer) {
@@ -98,105 +194,9 @@ TEST_F(KernelDispatch, ForwardsContextBindingAndRegionExtentsToRuntimeConsumer) 
     packet.args.context_generation = 83;
     packet.args.sm_bytes = 4096;
     packet.args.arena_bytes = 8192;
-    EXPECT_EQ(run(), 0);
+    EXPECT_EQ(run(), -83);
     EXPECT_EQ(seen_binding, 0x200000u);
     EXPECT_EQ(seen_context_generation, 83u);
     EXPECT_EQ(seen_sm_bytes, 4096u);
     EXPECT_EQ(seen_arena_bytes, 8192u);
-}
-TEST_F(KernelDispatch, RejectsStaleBeforePayloadOrCodeAccess) {
-    packet.args.invocation.generation = 16;
-    resident.device_address = 1;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::Stale));
-    EXPECT_EQ(consumed, 0);
-    EXPECT_EQ(invalidations, 1);
-}
-TEST_F(KernelDispatch, ReplayReadsUpdatedSlotBeforeComparison) {
-    EXPECT_EQ(run(), 0);
-    published = resident;
-    published.generation = 18;
-    publish_on_invalidate = true;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::Stale));
-    EXPECT_EQ(packet.args.invocation.generation, 17);
-    EXPECT_EQ(invalidations, 2);
-    EXPECT_EQ(consumed, 1);
-    packet.args.invocation.generation = 18;
-    EXPECT_EQ(run(), 0);
-    EXPECT_EQ(consumed, 2);
-}
-TEST_F(KernelDispatch, WrongSlotAndEmptySlotNeverConsume) {
-    resident.callable_id = 4;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::NotResident));
-    resident.callable_id = 3;
-    resident.generation = 0;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::NotResident));
-    resident.generation = 17;
-    resident.device_address = 0;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::NotResident));
-    EXPECT_EQ(consumed, 0);
-}
-TEST_F(KernelDispatch, InvalidIdentityNeverReadsDescriptor) {
-    packet.args.residency_address = 8;
-    for (int id : {-1, 64, 1000}) {
-        packet.args.invocation.callable_id = id;
-        EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
-    }
-    packet.args.invocation.callable_id = 3;
-    packet.args.invocation.generation = 0;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
-    packet.args.invocation.generation = 17;
-    packet.args.invocation.mode = SIMPLER_MODE_PROGRAM;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
-    EXPECT_EQ(invalidations, 0);
-    EXPECT_EQ(consumed, 0);
-}
-TEST_F(KernelDispatch, MalformedEnvelopeNeverReadsDescriptor) {
-    EXPECT_EQ(simpler_aicpu_kernel_exec(nullptr), static_cast<int>(KernelDispatchStatus::InvalidArgs));
-    EXPECT_EQ(
-        simpler_aicpu_kernel_exec(reinterpret_cast<char *>(&packet) + 1),
-        static_cast<int>(KernelDispatchStatus::InvalidArgs)
-    );
-    packet.args.packet_bytes = sizeof(SimplerKernelDispatchArgs) - 1;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
-    packet.args.packet_bytes = sizeof(packet);
-    packet.args.invocation.payload_bytes++;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
-    packet.args.invocation.payload_bytes--;
-    packet.args.invocation.host_copy_tensor_count = 1;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
-    packet.args.invocation.host_copy_tensor_count = 0;
-    packet.args.invocation.reserved_ = 1;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
-    packet.args.invocation.reserved_ = 0;
-    packet.args.residency_address = 0;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
-    packet.args.residency_address = std::numeric_limits<uint64_t>::max() - 7;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
-    EXPECT_EQ(invalidations, 0);
-    EXPECT_EQ(consumed, 0);
-}
-
-TEST_F(KernelDispatch, CountsAreRejectedBeforeReadingResidency) {
-    packet.args.residency_address = 8;
-    packet.args.invocation.tensor_count = -1;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
-    packet.args.invocation.tensor_count = 257;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
-    packet.args.invocation.tensor_count = 0;
-    packet.args.invocation.scalar_count = -1;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
-    packet.args.invocation.scalar_count = 129;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
-    packet.args.invocation.scalar_count = 1;
-    packet.args.invocation.tensor_count = 256;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
-    EXPECT_EQ(invalidations, 0);
-    EXPECT_EQ(consumed, 0);
-}
-TEST_F(KernelDispatch, RepeatedValidInvocationDoesNotChangeSnapshot) {
-    EXPECT_EQ(run(), 0);
-    EXPECT_EQ(run(), 0);
-    EXPECT_EQ(packet.args.invocation.generation, 17);
-    EXPECT_EQ(consumed, 2);
-    EXPECT_EQ(invalidations, 2);
 }

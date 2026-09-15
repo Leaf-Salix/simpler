@@ -33,8 +33,10 @@ The control sequence outside capture is:
    registration enqueue operation on the dedicated non-hidden AICPU stream.
    The operation deep-copies the Host record before returning and must enqueue
    device initialization, registration and binding in that order.
-6. The enclosing owner orders PrepareTail and marks ready after all preparation
-   tasks have been enqueued. Caller, AICPU and hidden AICore remain distinct streams.
+6. The enclosing owner marks ready after all preparation tasks have been
+   enqueued. Registration and every later launch share the AICPU stream, so its
+   FIFO carries that ordering and no event is published for a launch to consume.
+   Caller, AICPU and hidden AICore remain distinct streams.
 
 `inspect_frozen_resources` only reads frozen context views in Collecting or
 ReadyEnqueued state, checking device, generation and resource schema. It does not

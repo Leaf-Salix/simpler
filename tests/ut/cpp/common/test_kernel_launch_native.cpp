@@ -62,16 +62,14 @@ extern "C" aclError aclrtQueryEventStatus(aclrtEvent event, aclrtEventRecordedSt
     return f.query_error;
 }
 extern "C" aclError aclrtStreamWaitEvent(aclrtStream stream, aclrtEvent event) {
-    if (event == ptr(4)) {
-        EXPECT_TRUE(stream == ptr(1) || stream == ptr(2));
-    } else {
-        EXPECT_EQ(stream, ptr(100));
-    }
+    // Start and AicoreDone are consumed by aicpu, AicoreStart by aicore, and
+    // only AicpuDone reaches the caller: caller and aicore never share an edge.
+    EXPECT_EQ(stream, event == ptr(4) ? ptr(2) : event == ptr(6) ? ptr(100) : ptr(1));
     const auto ops = active->fixture.fake.ops();
     return ops.wait_event(ops.context, stream, event);
 }
 extern "C" aclError aclrtRecordEvent(aclrtEvent event, aclrtStream stream) {
-    EXPECT_EQ(stream, event == ptr(5) ? ptr(2) : event == ptr(6) ? ptr(1) : ptr(100));
+    EXPECT_EQ(stream, event == ptr(5) ? ptr(2) : (event == ptr(4) || event == ptr(6)) ? ptr(1) : ptr(100));
     const auto ops = active->fixture.fake.ops();
     return ops.record_event(ops.context, event, stream);
 }
@@ -79,7 +77,9 @@ extern "C" aclError aclrtMemsetAsync(void *address, size_t maximum, int32_t valu
     EXPECT_EQ(address, active->handshake.data());
     EXPECT_EQ(maximum, sizeof(active->handshake));
     EXPECT_EQ(count, maximum);
-    EXPECT_EQ(stream, ptr(100));
+    // The handshake clear belongs to the AICPU branch; only the cancel that
+    // compensation issues runs on the caller's stream.
+    EXPECT_EQ(stream, value == 0xff ? ptr(100) : ptr(1));
     active->memset_values.push_back(value);
     return active->fixture.fake.append(value == 0xff ? Cancel : Step::Clear);
 }

@@ -102,15 +102,16 @@ void sequence(
     const auto &p = buffers.slots;
     core_launch(binary, caller, {p[0], nullptr, p[1], 3});
     record(state, KernelEventKind::Start, caller);
-    wait(state, KernelEventKind::Start, core);
+    wait(state, KernelEventKind::Start, cpu);
+    record(state, KernelEventKind::AicoreStart, cpu);
+    wait(state, KernelEventKind::AicoreStart, core);
     core_launch(binary, core, {p[1], nullptr, p[3], 11});
     record(state, KernelEventKind::AicoreDone, core);
-    wait(state, KernelEventKind::Start, cpu);
     CaptureArgs cpu_args{p[1], nullptr, p[2], 7};
     check(loader.LaunchBuiltInOp(cpu, &cpu_args, sizeof(cpu_args), 1, host::KernelNames::RunName), "AICPU launch");
+    wait(state, KernelEventKind::AicoreDone, cpu);
     record(state, KernelEventKind::AicpuDone, cpu);
     wait(state, KernelEventKind::AicpuDone, caller);
-    wait(state, KernelEventKind::AicoreDone, caller);
     record(state, KernelEventKind::SerialTail, caller);
     core_launch(binary, caller, {p[2], p[3], p[4], 0});
 }

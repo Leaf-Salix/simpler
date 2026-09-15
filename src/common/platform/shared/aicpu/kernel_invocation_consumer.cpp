@@ -15,8 +15,7 @@ __attribute__((weak)) void prepare_kernel_aicpu_thread() {}
 
 // Runtimes with a kernel invocation protocol provide a strong consumer.
 // Program-mode aicpu_execute is not a fallback for an unsupported runtime.
-__attribute__((weak)) int consume_kernel_invocation(
-    const SimplerKernelDispatchArgs &, const KernelCallableDeviceResidency &, const void *, size_t
-) {
+__attribute__((weak)) int
+consume_kernel_invocation(const SimplerKernelDispatchArgs &, const ChipCallable &, size_t, const void *, size_t) {
     return static_cast<int>(KernelDispatchStatus::UnsupportedPayload);
 }

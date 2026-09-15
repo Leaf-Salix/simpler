@@ -34,14 +34,7 @@ struct KernelContextOps {
     int (*get_current_device)(void *context, int *device_id) noexcept {nullptr};
     int (*create_hidden_stream)(void *context, void **stream) noexcept {nullptr};
     int (*destroy_hidden_stream)(void *context, void *stream) noexcept {nullptr};
-    /**
-     * Creation flag every context event is born with, forwarded verbatim to
-     * create_event. The platform constant it carries is knowledge of whoever
-     * builds this table; KernelExecutionState only relays it, so a host-only
-     * test observes the flag the platform actually asked for.
-     */
-    uint32_t event_flag{0};
-    int (*create_event)(void *context, uint32_t flag, void **event) noexcept {nullptr};
+    int (*create_event)(void *context, void **event) noexcept {nullptr};
     int (*destroy_event)(void *context, void *event) noexcept {nullptr};
 
     bool valid() const {
@@ -98,23 +91,28 @@ enum class KernelStreamKind : uint8_t {
 };
 
 /**
- * One event per edge of the launch's fork and join, plus the call tail.
+ * One event per edge of the chained caller ⇄ aicpu ⇄ aicore synchronization,
+ * plus the call tail. Caller and aicore are never adjacent, so no event joins
+ * them directly and ACLGraph capture propagates in two hops.
  *
- * Both device branches fork from the caller's Start and rejoin the caller
- * directly, so the aicpu and aicore streams are siblings rather than a chain.
- * AICore is submitted before AICPU: the AICPU orchestrator spins on AICore's
- * handshake report, so AICore's SQE has to be on its stream before AICPU
- * becomes resident, and until it is the launch can still cancel a waiting
- * AICore without an AICPU having written the handshake.
+ * AicoreStart is recorded on the aicpu stream *before* the AICPU launch: the
+ * AICPU orchestrator spins on AICore's handshake report, so an AicoreStart
+ * recorded after the launch could only fire once the AICPU task completed,
+ * which is a deadlock.
  *
- * PrepareTail is recorded by preparation that enqueued device work of its own
- * and is consumed by the next launch, which is the only ordering a launch
- * needs against a prepare that did not stage on the caller's stream.
+ * An event may persist across many captured graphs, but each wait must share
+ * the capture context of that event's most recent record. Waiting during
+ * capture on a record issued before capture crosses the capture boundary and
+ * is rejected by CANN (107024). Launch therefore enqueues every record and its
+ * matching wait inside the same capture, and preparation publishes no tail for
+ * a later captured launch to consume: it enqueues on the context's own aicpu
+ * stream, which every launch also enqueues on, so stream FIFO carries that
+ * ordering instead.
  */
 enum class KernelEventKind : uint8_t {
-    Start = 0,   /* caller → aicpu and caller → aicore fork */
-    PrepareTail, /* preparation → first launch */
-    AicoreDone,  /* aicore → caller join */
+    Start = 0,   /* caller → aicpu fork */
+    AicoreStart, /* aicpu → aicore fork */
+    AicoreDone,  /* aicore → aicpu join */
     AicpuDone,   /* aicpu → caller join */
     SerialTail,  /* caller-visible call tail; the stream-switch gate reads it */
     Count,

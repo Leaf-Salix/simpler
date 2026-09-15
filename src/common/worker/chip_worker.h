@@ -131,7 +131,7 @@ public:
     /// `callable` is a canonical ChipCallable image of `callable_size` bytes;
     /// `caller_stream` is the caller's aclrtStream, borrowed for this call
     /// only and never stored or destroyed here.
-    void kernel_prepare_callable(int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream);
+    int32_t kernel_prepare_callable(const void *callable, size_t callable_size);
 
     /// Enqueue one bounded asynchronous kernel-mode invocation on the caller's
     /// stream. Returning means the sequence was enqueued; device execution may

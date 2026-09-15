@@ -21,6 +21,7 @@ namespace {
 int failure_kind = 0;
 int attempts = 0;
 bool pending = false;
+int failures_to_skip = 0;
 SimplerHostLogState test_log_state{};
 bool guard_acl = false;
 std::array<int, 7> forbidden_calls{};
@@ -64,7 +65,7 @@ int forward_cann(const char *symbol, Args... args) {
 int destroy(const char *symbol, void *handle, int kind) {
     if (failure_kind == kind) {
         ++attempts;
-        if (pending) {
+        if (pending && attempts > failures_to_skip) {
             pending = false;
             return -4321;
         }
@@ -77,6 +78,14 @@ extern "C" void arm_destroy_failure(int kind) {
     failure_kind = kind;
     attempts = 0;
     pending = true;
+    failures_to_skip = 0;
+}
+
+extern "C" void arm_destroy_failure_after(int kind, int skip) {
+    failure_kind = kind;
+    attempts = 0;
+    pending = true;
+    failures_to_skip = skip;
 }
 
 extern "C" int destroy_attempts() { return attempts; }
@@ -162,6 +171,7 @@ extern "C" int bind_test_log(void *runtime) {
 
 extern "C" int rtStreamDestroy(void *stream) { return destroy("rtStreamDestroy", stream, 1); }
 extern "C" int aclrtDestroyEvent(void *event) { return destroy("aclrtDestroyEvent", event, 2); }
+extern "C" int rtFree(void *ptr) { return destroy("rtFree", ptr, 4); }
 
 extern "C" int aclrtCreateEventExWithFlag(void **event, uint32_t flag) {
     if (failure_kind == 3 && pending) {

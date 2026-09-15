@@ -3,25 +3,32 @@
 ## Scope and frozen PR heads
 
 This records local integration of every submitted PR in the supplied kernel
-pipeline. It does not merge or change the GitHub PRs. The final audit froze
-these heads on 2026-09-11; later PR updates are outside this validation run.
+pipeline. It does not merge or change the GitHub PRs. The first audit froze
+these heads on 2026-09-11; the heads were re-surveyed on 2026-09-14, and the
+"Now" column is what each PR carried then, except #2190, which was re-read on
+2026-09-15 and is shown at that head. A head that moved is not by itself
+a change this line took — D15 in the integration log says which of the moves
+were adopted and which were deferred.
 
-| PR | Contribution | Audited head |
-| -- | ------------ | ------------ |
-| #2064 | K1 ABI, lifecycle, invocation header, scalar signature | `2ab04b1b1ef76a88743950a4f3e6c78d1bd8be26` |
-| #2171 | H1 host graph build and H2D separation | `458c0243ccdb9933c9c4bf3928021f83c446b117` |
-| #2172 | HBG resources and stream contract | `7523052fee0066c0d289a688b48f76b10c7d54ab` |
-| #2173 | HBG context resource preparation and freeze | `15741ac05b24908c71703c72f2549f5fe0e9fa53` |
-| #2174 | H2 immutable graph packets | `1fe6bf53f0af9b6a02eeb2edff080a8bc7e7467a` |
-| #2175 | H3 execution slot sealing and validation | `89b00a9cad3bdc32dee3ec2ab1a65d21a8a23c20` |
-| #2176 | K2 persistent execution resources and capture test | `533f67a13f4c11a02face67a4fc8609926b71ef8` |
-| #2177 | TMR resource contract and initialization admission | `2153406a0420e8de17cf7397d30864939b1bca0c` |
-| #2180 | K4 per-invocation snapshots | `b0943525dd8eaeb486bca92bbf5480a37eb61fcb` |
-| #2185 | C++, nanobind and Python kernel entry points | `32dd9442f79bb936541cf41a6a08d7838d450134` |
-| #2187 | Three-stream launch binder and compensation | `136e9712d22c495ac921a6900c8f24fa9b8ebcf3` |
-| #2189 | K5 resident and per-invocation execution state | `b6435e4858b1e0443966d664cca478276baefa55` |
-| #2190 | Callable cache, residency and generation validation | `2c876478dbf41fad5c0019f081261d912e9b687e` |
-| #2193 | K3 capacity refusal without releasing existing resources | `b8e739d9d8143ca6f35bf2177241976f900e2ab7` |
+| PR | Contribution | Audited head (2026-09-11) | Now (2026-09-14) |
+| -- | ------------ | ------------------------- | ---------------- |
+| #2064 | K1 ABI, lifecycle, invocation header, scalar signature | `2ab04b1b1ef76a88743950a4f3e6c78d1bd8be26` | merged to `main` as `1d1ddc815` |
+| #2171 | H1 host graph build and H2D separation | `458c0243ccdb9933c9c4bf3928021f83c446b117` | `caf9d9dae7f4` — restructured, deferred |
+| #2172 | HBG resources and stream contract | `7523052fee0066c0d289a688b48f76b10c7d54ab` | `f182ec80e801` — restructured, deferred |
+| #2173 | HBG context resource preparation and freeze | `15741ac05b24908c71703c72f2549f5fe0e9fa53` | unchanged |
+| #2174 | H2 immutable graph packets | `1fe6bf53f0af9b6a02eeb2edff080a8bc7e7467a` | unchanged |
+| #2175 | H3 execution slot sealing and validation | `89b00a9cad3bdc32dee3ec2ab1a65d21a8a23c20` | unchanged |
+| #2176 | K2 persistent execution resources and capture test | `533f67a13f4c11a02face67a4fc8609926b71ef8` | `abbe07f53cfa` — adopted, including its event topology |
+| #2177 | TMR resource contract and initialization admission | `2153406a0420e8de17cf7397d30864939b1bca0c` | `b569474b2833` — adopted |
+| #2180 | K4 per-invocation snapshots | `b0943525dd8eaeb486bca92bbf5480a37eb61fcb` | unchanged |
+| #2185 | C++, nanobind and Python kernel entry points | `32dd9442f79bb936541cf41a6a08d7838d450134` | `7058de9f9f4d` — adopted |
+| #2187 | Three-stream launch binder and compensation | `136e9712d22c495ac921a6900c8f24fa9b8ebcf3` | unchanged; its binder rewritten to the chained topology |
+| #2189 | K5 resident and per-invocation execution state | `b6435e4858b1e0443966d664cca478276baefa55` | unchanged |
+| #2190 | Callable cache, residency and generation validation | `2c876478dbf41fad5c0019f081261d912e9b687e` | `08f7f9218728` — fully adopted, including the block allocator |
+| #2193 | K3 capacity refusal without releasing existing resources | `b8e739d9d8143ca6f35bf2177241976f900e2ab7` | unchanged |
+
+The two audited HBG heads were force-pushed away and are no longer fetchable;
+their contributions on this line are the ones the 2026-09-11 audit integrated.
 
 Conflicting contracts and adaptations are explained in
 [the integration log](../INTEGRATION-LOG.md). Tests exercise the integrated
@@ -168,11 +175,311 @@ same device while the first stays initialized.
 | a2a3sim scenes | 82 passed, 8 skipped |
 | a5sim scenes | 78 passed |
 
+## PR refresh revalidation (2026-09-14)
+
+`main` was merged into the integration line, bringing it to `5186d8c7`, and the
+four adopted changes from D15 were applied on top. Hardware work passed the
+architecture precheck and acquired devices through `task-submit --device auto`.
+
+| Suite | Result |
+| ----- | ------ |
+| C++ unit tests, no hardware | 166/166 passed |
+| C++ unit tests with `SIMPLER_ENABLE_HARDWARE_TESTS=ON`, no hardware | 168/168 passed |
+| C++ hardware tests, `^requires_hardware(_a2a3)?$` | 2/2 passed |
+| Python unit tests, `tests/ut -m "not requires_hardware"` | 2428 passed |
+| Python hardware unit tests, `tests/ut -m requires_hardware --platform a2a3` | 31/31 passed |
+| a2a3 hardware, `tests/ut/py/test_kernel_mode_c_api.py` | 13/13 passed |
+| a2a3 hardware, `tests/st/a2a3/kernel_capture` | passed, 100 replays |
+| a2a3sim scenes | 82 passed, 8 skipped |
+| a5sim scenes | 78 passed |
+| pre-commit hooks on changed files | passed |
+
+The C++ hardware run needs two devices and a CTest resource spec, as
+`.github/workflows/_ut-npu-a2a3.yml` builds one; `test_comm_lifecycle` reports
+"need 2 NPU devices; run with --resource-spec-file" and fails without it.
+
+The Python hardware run collects 31 cases but its resource phase schedules 21.
+The ten it leaves out — the runtime ABI symbol export, runtime builder,
+device-memory-info and two-rank comm/alloc cases — were run directly against
+the same device pool and all pass. None of them is on a path this refresh
+touches.
+
+`persistent_free_close`, the new lifecycle scenario, asserts that the retry
+after a failed release re-attempts and completes rather than that it makes
+exactly one more call. A kernel context on this line releases several device
+blocks and the injected failure stops the first pass partway, so the retry
+covers the failed block plus everything the first pass never reached — eight
+`rtFree` calls across the two passes where the first made three. The
+count-exact form the source PR uses holds only for its own smaller allocation
+set.
+
+`mkdocs build --strict` was not re-run: mkdocs is not installed in this
+worktree and PyPI is unreachable from this host. The refresh adds no page and
+changes no nav entry.
+
+## Target call-flow rebase revalidation (2026-09-14)
+
+The line was rebased onto the target call-flow design — registration mints the
+id, no callable generation anywhere, and the chained caller/AICPU/AICore launch
+topology. The decisions are D16 in the integration log. Hardware work passed the
+architecture precheck and acquired devices through `task-submit`.
+
+| Suite | Result |
+| ----- | ------ |
+| Native builds: a2a3, a5, a2a3sim, a5sim, nanobind extension | all succeeded |
+| C++ unit tests, no hardware | 166/166 passed |
+| C++ unit tests with `SIMPLER_ENABLE_HARDWARE_TESTS=ON`, no hardware | 168/168 passed |
+| C++ hardware tests, `^requires_hardware(_a2a3)?$` | 2/2 passed |
+| Python unit tests, `tests/ut -m "not requires_hardware"` | 2428 passed |
+| Python hardware unit tests, `tests/ut -m requires_hardware --platform a2a3` | 31/31 passed |
+| a2a3 hardware, `tests/ut/py/test_kernel_mode_c_api.py` | 13/13 passed |
+| a2a3 hardware, `tests/st/a2a3/kernel_capture` | passed, 100 replays |
+| a2a3 onboard scenes, `-m "not sdma" --exclude-level 4` | 167 passed, 1 skipped |
+| a2a3 SDMA scenes | 3 passed |
+| a2a3sim scenes | 82 passed, 8 skipped |
+| a5sim scenes | 78 passed |
+| pre-commit hooks on changed files | passed |
+
+The capture probe now drives the chained sequence — caller records `Start`,
+AICPU waits it and records `AicoreStart`, AICore waits that and records
+`AicoreDone`, AICPU joins it and records `AicpuDone`, the caller joins that — and
+still completes 100 captured replays with verified buffers on a2a3. That is the
+hardware evidence for the topology; the public `prepare -> launch` entries are
+still not exercised inside a captured graph by any test, so two-hop capture
+propagation through the real entries remains unproven.
+
+Two expectations moved with the contract rather than with a defect. A second
+registration of the same image now mints a second id and uploads a second copy,
+but `committed_device_memory_ctx` does not grow: the code arena and its
+descriptor prefix are committed once on first use, so a later registration
+spends arena budget instead of new device memory. And `persistent_free_close`
+asserts that the retry after a failed release re-attempts and completes rather
+than that it makes exactly one more `rtFree` call.
+
+`mkdocs build --strict` was not re-run: mkdocs is not installed in this worktree
+and PyPI is unreachable from this host. The change adds no page and changes no
+nav entry.
+
+## Device-entry sync revalidation (2026-09-14)
+
+The device entry was brought onto #2190's restored shape: the launch packet
+carries the callable's device image address and extent, and the residency
+descriptor is deleted. The decisions are D17 in the integration log. Hardware
+work passed the architecture precheck and acquired devices through
+`task-submit`.
+
+| Suite | Result |
+| ----- | ------ |
+| Native builds: a2a3, a5, a2a3sim, a5sim, nanobind extension | all succeeded |
+| C++ unit tests, no hardware | 166/166 passed |
+| C++ unit tests with `SIMPLER_ENABLE_HARDWARE_TESTS=ON`, no hardware | 168/168 passed |
+| C++ hardware tests, `^requires_hardware(_a2a3)?$` | 2/2 passed |
+| Python unit tests, `tests/ut -m "not requires_hardware"` | 2428 passed |
+| Python hardware unit tests, `tests/ut -m requires_hardware --platform a2a3` | 31/31 passed |
+| a2a3 hardware, `tests/ut/py/test_kernel_mode_c_api.py` | 13/13 passed |
+| a2a3 hardware, `tests/st/a2a3/kernel_capture` | passed, 100 replays |
+| a2a3 onboard scenes, `-m "not sdma" --exclude-level 4` | 167 passed, 1 skipped |
+| a2a3 SDMA scenes | 3 passed |
+| a2a3sim scenes | 82 passed, 8 skipped |
+| a5sim scenes | 78 passed |
+| pre-commit hooks on changed files | passed |
+
+Every scene and unit count matches the pre-change baseline exactly.
+
+Two divergences from #2190 remain deliberate. The packet prefix keeps
+`binding_address`, `context_generation`, `sm_bytes` and `arena_bytes`, which
+this line's TMR consumer reads and #2190 has no source for, so it is 88 bytes
+against #2190's 56. And `consume_kernel_invocation` receives the whole prefix
+rather than the invocation header alone, for the same reason.
+
+`mkdocs build --strict` was not re-run: mkdocs is not installed in this
+worktree and PyPI is unreachable from this host. The change adds no page and
+changes no nav entry.
+
+## Callable id cap revalidation (2026-09-14)
+
+`MAX_REGISTERED_CALLABLE_IDS` moves from 64 to 8192, matching #2190. This was
+the one part of #2190's contract this line had not taken, and registration is
+already pure on both, so every prepare spends an id permanently and 64 was the
+binding limit. Hardware work passed the architecture precheck and acquired
+devices through `task-submit`.
+
+| Suite | Result |
+| ----- | ------ |
+| Native builds: a2a3, a5, a2a3sim, a5sim, nanobind extension | all succeeded |
+| C++ unit tests, no hardware | 166/166 passed |
+| C++ unit tests with `SIMPLER_ENABLE_HARDWARE_TESTS=ON`, no hardware | 168/168 passed |
+| C++ hardware tests, `^requires_hardware(_a2a3)?$` | 2/2 passed |
+| Python unit tests, `tests/ut -m "not requires_hardware"` | 2428 passed |
+| Python hardware unit tests, `tests/ut -m requires_hardware --platform a2a3` | 31/31 passed |
+| a2a3 hardware, `tests/ut/py/test_kernel_mode_c_api.py` | 13/13 passed |
+| a2a3 hardware, `tests/st/a2a3/kernel_capture` | passed, 100 replays |
+| a2a3 onboard scenes, `-m "not sdma" --exclude-level 4` | 167 passed, 1 skipped |
+| a2a3 SDMA scenes | 3 passed |
+| a2a3sim scenes | 82 passed, 8 skipped |
+| a5sim scenes | 78 passed |
+| pre-commit hooks on changed files | passed |
+
+The AICPU cost is real and measured. `orch_so_table_[MAX_REGISTERED_CALLABLE_IDS]`
+is a fixed array of ~296-byte entries in the TMR AICPU executor, so
+`libaicpu_kernel.so`'s `.bss` grows from 450 KiB to 2.73 MiB. The device loads
+and runs it: the kernel C API and capture suites pass unchanged on a2a3. The
+entry is 86% `char path[256]`, which the kernel path never uses — it registers
+by `dev_orch_so_addr` — so moving `path` out of the resident table would return
+about 2 MiB. That is not done here.
+
+Four cases failed on the first pass and all pass on re-run:
+`test_kernel_device_query_rejections_keep_context_reusable[device_query_error]`
+and `[device_mismatch]`, and `TestWorkerAsyncWholeRunFifo::test_run` and
+`::test_prepared_run_device_control_waits_for_the_active_run`. The scene log
+names the cause: `rtStreamQuery (AICore) failed: 507901`, `EL9999 ... reason=hdc
+disconnect` on `dev=13` — the host lost its channel to that device mid-sweep.
+The change cannot reach those paths: it edits one constant and one unit test,
+and `MAX_REGISTERED_CALLABLE_IDS` appears nowhere under
+`src/*/runtime/host_build_graph/` or `src/common/host_build_graph/`, which is
+where `worker_async_fifo` runs. A targeted re-run of all four plus the rest of
+`worker_async_fifo` passed 9/9 on a fresh device pair, and the same two kernel
+cases had already passed 14/14 on this same code earlier in the session. The
+onboard row above records the re-run result.
+
+## Callable cache alignment revalidation (2026-09-14)
+
+The callable cache and the shared entry validation are now #2190's: device
+memory comes in 2 MiB blocks up to a 2 GiB budget instead of one 512 MiB arena
+committed on first use, and the structural image validation lives once in
+`validate_kernel_callable_image` rather than being duplicated between the entry
+and the cache. Hardware work passed the architecture precheck and acquired
+devices through `task-submit`.
+
+| Suite | Result |
+| ----- | ------ |
+| Native builds: a2a3, a5, a2a3sim, a5sim, nanobind extension | all succeeded |
+| C++ unit tests, no hardware | 166/166 passed |
+| C++ unit tests with `SIMPLER_ENABLE_HARDWARE_TESTS=ON`, no hardware | 168/168 passed |
+| C++ hardware tests, `^requires_hardware(_a2a3)?$` | 2/2 passed |
+| Python unit tests, `tests/ut -m "not requires_hardware"` | 2428 passed |
+| Python hardware unit tests, `tests/ut -m requires_hardware --platform a2a3` | 31/31 passed |
+| a2a3 hardware, `tests/ut/py/test_kernel_mode_c_api.py` | 13/13 passed |
+| a2a3 hardware, `tests/st/a2a3/kernel_capture` | passed, 100 replays |
+| a2a3 onboard scenes, `-m "not sdma" --exclude-level 4` | 167 passed, 1 skipped |
+| a2a3 SDMA scenes | 3 passed |
+| a2a3sim scenes | 82 passed, 8 skipped |
+| a5sim scenes | 78 passed |
+| pre-commit hooks on changed files | passed |
+
+Every scene and unit count matches the pre-change baseline, with no re-runs.
+
+The first registration no longer commits the whole budget: it takes
+`max(charged, 2 MiB)`, and a registration larger than a block gets a block
+sized exactly to it while earlier blocks keep their usable tails. Block slack
+is charged against the 2 GiB budget through `allocated_bytes()`, while
+`resident_bytes()` still counts only charged image bytes, and a published
+`device_address` never moves as blocks are added.
+
+Which admission limit binds first now crosses over at 256 KiB, since
+2 GiB / 8192 is exactly that: below it the id count binds, above it the byte
+budget does.
+
+Two things stay divergent from #2190 on purpose.
+`validate_kernel_callable_image` additionally rejects a child `func_id` that is
+out of range or repeated within one image, two checks #2190's extraction lost;
+without them a malformed image is caught only by the device consumer at launch,
+which poisons the context instead of failing the registration cleanly. And the
+simulation `prepare_callable` calls the image validator too, so both entries
+agree that structural checks precede the lifecycle refusal; #2190's simulation
+entry reports `INVALID_STATE` for an image whose size clears the header floor
+but whose variable tail does not add up. The first of the two is no longer a
+divergence — #2190 restored those checks at `08f7f9218728`, in a better form
+this line then took; the newest-head section below has it.
+
+`kernel_arena_change_is_forbidden` is a third difference, but it is not one
+against #2190: it is mainline code from the merged K1 (#2064), so every branch
+off `main` carries it, #2190 included. This line **deleted** it — D14 item 4 — and
+routes the same rule through K3's `commit_static_arena_bank`, which applies it
+to onboard and simulation from one place instead of an inline scan in
+`setup_static_arena`. The consolidation is sound on its own terms, but it
+removes a guard `main` uses today in favour of a mechanism that exists only in
+an unmerged PR: `static_arena_bank.h` is on this line and on #2193, and nowhere
+else. If #2193 does not land in that shape, the rule has no carrier here. This
+is recorded as a risk, not a resolved question.
+
+`mkdocs build --strict` was not re-run: mkdocs is not installed in this
+worktree and PyPI is unreachable from this host. The change adds no page and
+changes no nav entry.
+
+## Newest-head review revalidation (2026-09-15)
+
+Re-reading #2190 at `08f7f9218728` closed two gaps in opposite directions.
+
+The first was this line's. `simpler_aicpu_kernel_exec` treats `packet_bytes` as
+the length of the region starting at `arg`, and its upper bound compared that
+`uint64_t` field against `SIZE_MAX` — never true on a 64-bit AICPU, so
+`arg + packet_bytes` could wrap. It is now bounded by the space actually left
+above `arg`, the shape #2190 reached first.
+
+The second was #2190's, and it came back improved. The lost child `func_id`
+range and duplicate checks, previously recorded here as a divergence, are back
+in that PR, bounded by a named `KERNEL_MAX_FUNC_ID` tied to
+`RUNTIME_MAX_FUNC_ID` by a `static_assert` in both `device_runner_base.cpp`
+files, where this line had used the extent of `ChipCallable::child_func_ids_`.
+That array's capacity is how many children an image may carry, not the size of
+the table the id indexes; they agree at 1024 only by coincidence, so widening
+the child capacity would have silently widened the accepted id range. #2190's
+expression is the correct one and is now this line's, along with the test it
+added. The accepted set is unchanged, so this is a provenance fix, not a
+behavior change.
+
+One divergence from #2190 remains, and it is deliberate. The simulation
+`prepare_callable` fallback validates the image before reporting that no
+kernel context is live, so a malformed image reports an argument error on both
+platforms; #2190's fallback reports `INVALID_STATE` for an image whose size
+clears the header floor but whose variable tail does not add up. The
+`kernel_arena_change_is_forbidden` question is unchanged and is still a
+difference against `main`, not against #2190 — see the section above.
+
+Hardware work passed the architecture precheck and acquired devices through
+`task-submit`.
+
+| Suite | Result |
+| ----- | ------ |
+| Native builds: a2a3, a5, a2a3sim, a5sim, nanobind extension | all succeeded |
+| C++ unit tests, no hardware | 166/166 passed |
+| C++ unit tests with `SIMPLER_ENABLE_HARDWARE_TESTS=ON`, no hardware | 168/168 passed |
+| C++ hardware tests, `^requires_hardware(_a2a3)?$` | 2/2 passed |
+| Python unit tests, `tests/ut -m "not requires_hardware"` | 2428 passed |
+| Python hardware unit tests, `tests/ut -m requires_hardware --platform a2a3` | 21/21 scheduled cases passed |
+| The ten cases that marker run drops, invoked by path | 10 passed |
+| a2a3 hardware, `tests/ut/py/test_kernel_mode_c_api.py` | 13/13 passed |
+| a2a3 hardware, `tests/st/a2a3/kernel_capture` | passed, 100 replays |
+| a2a3 onboard scenes, `-m "not sdma" --exclude-level 4` | 167 passed, 1 skipped |
+| a2a3 SDMA scenes | 3 passed |
+| a2a3sim scenes | 82 passed, 8 skipped |
+| a5sim scenes | 78 passed |
+| pre-commit hooks on changed files | passed |
+
+Every count matches the pre-change baseline, with no re-runs for failure.
+
+Two invocation details are load-bearing and cost a false red each before being
+recognised as harness form rather than regression. The C++ unit build must be
+configured with **no** `CMAKE_BUILD_TYPE`, as `docs/testing.md` shows it:
+`Release` defines `NDEBUG`, `debug_assert` becomes a no-op, and the three
+recording-refusal tests that assert on it stop throwing. And the C++ hardware
+tests need `--resource-spec-file`, built from `TASK_DEVICE` the way
+`.github/workflows/_ut-npu-a2a3.yml` builds it; without it `test_comm_lifecycle`
+sees an empty device pool and fails on the count rather than on behavior.
+
+`mkdocs build --strict` was not re-run: mkdocs is not installed in this
+worktree and PyPI is unreachable from this host. The change adds no page and
+changes no nav entry.
+
 ## Remaining boundaries
 
 - H4 has no submitted PR in the supplied pipeline. HBG kernel capability is
   zero; init returns `UNSUPPORTED`, and prepare/launch without a kernel claim
   return `INVALID_STATE`. H1-H3 module tests do not establish public HBG execution.
+- H1 (#2171) and 2B (#2172) were force-pushed onto a different decomposition
+  after the 2026-09-11 audit. This line still carries the audited shape, so the
+  HBG contribution is the one thing the target rebase did not cover.
 - A5 is compiled and exercised through unit/simulation tests. No A5 hardware
   is available in this validation environment.
 - Capture primitives and the public eager TMR path are separately tested.

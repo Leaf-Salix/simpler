@@ -24,7 +24,7 @@
 namespace {
 using namespace simpler::tmr;
 
-const PreparedInvocationView kCallable{3, 1, 1, 4};
+const PreparedInvocationView kCallable{3, 1, 1};
 const TmrExecutionBindingView kBinding{0x10000, 8};
 
 ChipStorageTaskArgs make_args(uint64_t address = 0x20000, uint64_t scalar = 19) {
@@ -101,7 +101,7 @@ TEST(TmrKernelInvocation, ConsumptionRejectsBeforeChangingCallerStorage) {
     storage.scalar_count_ = 1;
     storage.scalars_[0] = 1234;
     auto stale = kCallable;
-    ++stale.slot_generation;
+    ++stale.callable_id;
     EXPECT_EQ(consume_tmr_invocation(packet.packet(), stale, kBinding, &storage), InvocationStatus::StaleCallable);
     EXPECT_EQ(storage.scalar_count(), 1);
     EXPECT_EQ(storage.scalar(0), 1234u);
@@ -217,7 +217,7 @@ TEST(TmrKernelInvocation, GeometryBackingAndGenerationsInvalidateTemplate) {
         if (change == 1) current.tensor(0).strides[0] = 8;
         if (change == 2) current.tensor(0).start_offset = 1;
         if (change == 3) current.tensor(0).buffer.size = 132;
-        if (change == 4) ++callable.slot_generation;
+        if (change == 4) ++callable.callable_id;
         if (change == 5) ++binding.context_generation;
         if (change == 6) current.tensor(0).dtype = DataType::FLOAT16;
         TmrEncodingCandidate candidate;
@@ -247,7 +247,7 @@ TEST(TmrKernelInvocation, DecoderRejectsCorruptionTruncationAndPreservesView) {
         EXPECT_TRUE(good.valid());
     }
     auto stale = kCallable;
-    ++stale.slot_generation;
+    ++stale.callable_id;
     EXPECT_EQ(validate_tmr_submission(candidate, stale, kBinding), InvocationStatus::StaleCallable);
     auto other_binding = kBinding;
     ++other_binding.context_generation;
@@ -349,7 +349,7 @@ TEST(TmrKernelInvocation, EmptyTensorMatchesBoundaryConversionWithoutBacking) {
 
 TEST(TmrKernelInvocation, MinimumMaximumAndScalarOnlyPackets) {
     TmrEncodingCache cache;
-    const PreparedInvocationView cases[] = {{0, 0, 0, 1}, {0, 256, 0, 1}, {0, 0, 128, 1}, {0, 128, 128, 1}};
+    const PreparedInvocationView cases[] = {{0, 0, 0}, {0, 256, 0}, {0, 0, 128}, {0, 128, 128}};
     for (const auto &callable : cases) {
         ChipStorageTaskArgs args{};
         auto sample = make_args();

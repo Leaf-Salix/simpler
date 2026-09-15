@@ -17,13 +17,15 @@
 #include "kernel_invocation_header.h"
 
 // CANN deep-copies this prefix and the following payload into each launch.
-// residency_address is the issuing context's stable device slot descriptor,
-// supplied by the binder, never an address supplied by a tensor/callable image.
-// Its allocation stays alive until every referencing graph is destroyed and
-// all executions have completed. Slot updates require external quiescence.
+// This is a kernel invocation envelope, not the program entry's KernelArgs
+// layout. The binder supplies every address here from the issuing context's
+// own committed state; none of them comes from a caller-supplied image.
 struct SimplerKernelDispatchArgs {
     uint64_t packet_bytes;
-    uint64_t residency_address;
+    // Filled from the issuing context's committed residency, not a Host image.
+    // The immutable device image outlives every referencing launch and graph.
+    uint64_t chip_callable_address;
+    uint64_t chip_callable_bytes;
     /* The issuing context's device KernelArgs. It is the one pointer a
        kernel-mode entry gets, and everything the program-mode entry receives in
        its own launch argument hangs off it: the resident runtime, the per-core
@@ -38,18 +40,24 @@ struct SimplerKernelDispatchArgs {
     SimplerKernelInvocationHeader invocation;
 };
 
-// Direct AICPU entry return values, not host C API or latched runtime codes.
-// CANN propagates nonzero entry failure through the caller's synchronization.
+// Nonzero device-entry status is surfaced by caller synchronization. 2 and 3
+// are retired: they reported a residency descriptor the entry no longer reads.
 enum class KernelDispatchStatus : int32_t {
     Success = 0,
     InvalidArgs = 1,
-    NotResident = 2,
-    Stale = 3,
     UnsupportedPayload = 4,
 };
 
 static_assert(
     std::is_trivially_copyable_v<SimplerKernelDispatchArgs> && std::is_standard_layout_v<SimplerKernelDispatchArgs>
 );
+static_assert(sizeof(SimplerKernelDispatchArgs) == 88);
+static_assert(offsetof(SimplerKernelDispatchArgs, chip_callable_address) == 8);
+static_assert(offsetof(SimplerKernelDispatchArgs, chip_callable_bytes) == 16);
+static_assert(offsetof(SimplerKernelDispatchArgs, binding_address) == 24);
+static_assert(offsetof(SimplerKernelDispatchArgs, context_generation) == 32);
+static_assert(offsetof(SimplerKernelDispatchArgs, sm_bytes) == 40);
+static_assert(offsetof(SimplerKernelDispatchArgs, arena_bytes) == 48);
+static_assert(offsetof(SimplerKernelDispatchArgs, invocation) == 56);
 
 extern "C" int simpler_aicpu_kernel_exec(void *args);

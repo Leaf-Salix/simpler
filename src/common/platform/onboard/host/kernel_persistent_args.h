@@ -43,8 +43,8 @@
  * an arch entry that takes its own allocator and a different signature on
  * a2a3 than on a5, and reaches the driver; `ffts_base_addr` exists only on
  * a2a3. Absorbing both at the table's construction point keeps the platform
- * knowledge with the platform, exactly as `KernelContextOps::event_flag` does
- * for ACL_EVENT_SYNC.
+ * knowledge with the platform; the context operation implementation likewise
+ * owns the platform-specific ACL_EVENT_SYNC choice.
  */
 struct PersistentArgsOps {
     void *context{nullptr};

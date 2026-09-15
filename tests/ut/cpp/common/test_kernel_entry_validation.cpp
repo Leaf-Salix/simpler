@@ -11,7 +11,8 @@
 
 #include <gtest/gtest.h>
 
-#include <cstring>
+#include <cstdlib>
+#include <vector>
 
 #include "host/kernel_entry_validation.h"
 
@@ -61,19 +62,15 @@ TEST(KernelEntryValidation, InitRejectsEachStructuralViolation) {
     );
     // One inconsistent span per position, in both directions.
     EXPECT_EQ(
+        validate_kernel_init_args(kCtx, 0, nullptr, 4, kBinary, sizeof(kBinary), nullptr, 0, kConfig, 1),
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    EXPECT_EQ(
         validate_kernel_init_args(kCtx, 0, kBinary, 0, kBinary, sizeof(kBinary), nullptr, 0, kConfig, 1),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
     EXPECT_EQ(
         validate_kernel_init_args(kCtx, 0, kBinary, sizeof(kBinary), nullptr, 4, nullptr, 0, kConfig, 1),
-        PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    );
-    EXPECT_EQ(
-        validate_kernel_init_args(kCtx, 0, kBinary, sizeof(kBinary), kBinary, sizeof(kBinary), nullptr, 4, kConfig, 1),
-        PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    );
-    EXPECT_EQ(
-        validate_kernel_init_args(kCtx, 0, nullptr, 4, kBinary, sizeof(kBinary), nullptr, 0, kConfig, 1),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
     EXPECT_EQ(
@@ -84,55 +81,65 @@ TEST(KernelEntryValidation, InitRejectsEachStructuralViolation) {
         validate_kernel_init_args(kCtx, 0, kBinary, sizeof(kBinary), kBinary, sizeof(kBinary), kBinary, 0, kConfig, 1),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
+    EXPECT_EQ(
+        validate_kernel_init_args(kCtx, 0, kBinary, sizeof(kBinary), kBinary, sizeof(kBinary), nullptr, 4, kConfig, 1),
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
 }
 
-TEST(KernelEntryValidation, PrepareCallableChecksPointersIdRangeAndImageSize) {
-    EXPECT_EQ(validate_kernel_prepare_callable_args(kCtx, 0, kCallableImage, sizeof(ChipCallable), kStream), 0);
+TEST(KernelEntryValidation, PrepareCallableChecksOutputPointerAndImageSize) {
+    int32_t id = -1;
+    EXPECT_EQ(validate_kernel_prepare_callable_args(kCtx, kCallableImage, sizeof(ChipCallable), &id), 0);
     EXPECT_EQ(
-        validate_kernel_prepare_callable_args(
-            kCtx, MAX_REGISTERED_CALLABLE_IDS - 1, kCallableImage, sizeof(ChipCallable), kStream
-        ),
-        0
-    );
-    EXPECT_EQ(
-        validate_kernel_prepare_callable_args(nullptr, 0, kCallableImage, sizeof(ChipCallable), kStream),
+        validate_kernel_prepare_callable_args(nullptr, kCallableImage, sizeof(ChipCallable), &id),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
     EXPECT_EQ(
-        validate_kernel_prepare_callable_args(kCtx, 0, nullptr, sizeof(ChipCallable), kStream),
-        PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    );
-    // Preparation stages on the caller's stream, so a null stream is an
-    // argument error rather than something the implementation substitutes for.
-    EXPECT_EQ(
-        validate_kernel_prepare_callable_args(kCtx, 0, kCallableImage, sizeof(ChipCallable), nullptr),
+        validate_kernel_prepare_callable_args(kCtx, nullptr, sizeof(ChipCallable), &id),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
     EXPECT_EQ(
-        validate_kernel_prepare_callable_args(kCtx, -1, kCallableImage, sizeof(ChipCallable), kStream),
+        validate_kernel_prepare_callable_args(kCtx, kCallableImage, sizeof(ChipCallable), nullptr),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
     EXPECT_EQ(
-        validate_kernel_prepare_callable_args(
-            kCtx, MAX_REGISTERED_CALLABLE_IDS, kCallableImage, sizeof(ChipCallable), kStream
-        ),
+        validate_kernel_prepare_callable_args(kCtx, kCallableImage, sizeof(ChipCallable) - 1, &id),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
     EXPECT_EQ(
-        validate_kernel_prepare_callable_args(kCtx, 0, kCallableImage, sizeof(ChipCallable) - 1, kStream),
+        validate_kernel_prepare_callable_args(kCtx, kCallableImage + 1, sizeof(ChipCallable), &id),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
-    // storage_ sits at a CALLABLE_CHILD_ALIGN offset from the header, so an
-    // image the caller placed off-alignment puts every child off-alignment.
-    static_assert(alignof(ChipCallable) > 1, "a misaligned image must be expressible");
-    EXPECT_EQ(
-        validate_kernel_prepare_callable_args(kCtx, 0, kCallableImage + 1, sizeof(ChipCallable), kStream),
-        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+}
+
+TEST(KernelEntryValidation, CallableImageRejectsTruncatedVariableTail) {
+    const auto child = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, kBinary, sizeof(kBinary));
+    const int32_t child_id = 7;
+    const std::vector<uint8_t> children[] = {child};
+    const auto image = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
+        nullptr, 0, "orch", kBinary, sizeof(kBinary), &child_id, children, 1, ""
     );
+    ASSERT_GT(image.size(), sizeof(ChipCallable));
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), 0);
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size() - 1), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+}
+
+TEST(KernelEntryValidation, CallableImageRejectsOutOfRangeChildMetadata) {
+    const auto child = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, kBinary, sizeof(kBinary));
+    const int32_t child_id = 7;
+    const std::vector<uint8_t> children[] = {child};
+    auto image = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
+        nullptr, 0, "orch", nullptr, 0, &child_id, children, 1, ""
+    );
+    auto *callable = reinterpret_cast<ChipCallable *>(image.data());
+    callable->child_offsets_[0] = static_cast<uint32_t>(image.size());
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
 }
 
 TEST(KernelEntryValidation, LaunchChecksPointersAndIdRange) {
     EXPECT_EQ(validate_kernel_launch_args(kCtx, 0, kCallableImage, kStream), 0);
+    EXPECT_EQ(validate_kernel_launch_args(kCtx, 8191, kCallableImage, kStream), 0);
+    EXPECT_EQ(validate_kernel_launch_args(kCtx, 8192, kCallableImage, kStream), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     EXPECT_EQ(validate_kernel_launch_args(nullptr, 0, kCallableImage, kStream), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     EXPECT_EQ(validate_kernel_launch_args(kCtx, 0, nullptr, kStream), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     EXPECT_EQ(validate_kernel_launch_args(kCtx, 0, kCallableImage, nullptr), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
@@ -143,90 +150,22 @@ TEST(KernelEntryValidation, LaunchChecksPointersAndIdRange) {
     );
 }
 
-TEST(KernelEntryValidation, PrepareRejectsInvalidInvocationSignatureBeforeRegistration) {
-    alignas(ChipCallable) unsigned char image[sizeof(ChipCallable)] = {};
-    auto set_count = [&](size_t offset, int32_t count) {
-        std::memcpy(image + offset, &count, sizeof(count));
-    };
-    auto set_direction = [&](int32_t index, ArgDirection direction) {
-        std::memcpy(
-            image + offsetof(ChipCallable, signature_) + index * sizeof(direction), &direction, sizeof(direction)
-        );
-    };
-    set_count(offsetof(ChipCallable, sig_count_), -1);
-    EXPECT_EQ(
-        validate_kernel_prepare_callable_args(kCtx, 0, image, sizeof(image), kStream), PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    );
-    set_count(offsetof(ChipCallable, sig_count_), CHIP_MAX_TENSOR_ARGS + 1);
-    EXPECT_EQ(
-        validate_kernel_prepare_callable_args(kCtx, 0, image, sizeof(image), kStream), PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    );
-    set_count(offsetof(ChipCallable, sig_count_), 2);
-    set_direction(0, ArgDirection::IN);
-    set_direction(1, ArgDirection::SCALAR);
-    EXPECT_EQ(validate_kernel_prepare_callable_args(kCtx, 0, image, sizeof(image), kStream), 0);
-    constexpr size_t padding_begin = offsetof(ChipCallable, config_name_len_) + sizeof(uint32_t);
-    std::memset(image + padding_begin, 0xff, offsetof(ChipCallable, storage_) - padding_begin);
-    EXPECT_EQ(validate_kernel_prepare_callable_args(kCtx, 0, image, sizeof(image), kStream), 0);
-    set_direction(0, ArgDirection::SCALAR);
-    set_direction(1, ArgDirection::OUT);
-    EXPECT_EQ(
-        validate_kernel_prepare_callable_args(kCtx, 0, image, sizeof(image), kStream), PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    );
-    set_direction(0, static_cast<ArgDirection>(99));
-    EXPECT_EQ(
-        validate_kernel_prepare_callable_args(kCtx, 0, image, sizeof(image), kStream), PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    );
-}
-
-TEST(KernelEntryValidation, PrepareBoundsCanonicalImageBeforeHashOrUpload) {
-    const uint8_t binary[] = {1, 2, 3};
-    const auto child = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, binary, sizeof(binary));
-    const int32_t func_id = 0;
-    const auto valid = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
-        nullptr, 0, "entry", binary, sizeof(binary), &func_id, &child, 1, "config"
-    );
-    ASSERT_EQ(validate_kernel_prepare_callable_args(kCtx, 0, valid.data(), valid.size(), kStream), 0);
-    const auto *header = reinterpret_cast<const ChipCallable *>(valid.data());
-    const size_t child_start = offsetof(ChipCallable, storage_) + header->child_offset(0);
-    auto reject_word = [&](size_t offset, uint32_t value) {
-        auto image = valid;
-        std::memcpy(image.data() + offset, &value, sizeof(value));
-        EXPECT_EQ(
-            validate_kernel_prepare_callable_args(kCtx, 0, image.data(), image.size(), kStream),
-            PTO_RUNTIME_ERR_INVALID_ARGUMENT
-        );
-    };
-    reject_word(offsetof(ChipCallable, binary_size_), UINT32_MAX);
-    reject_word(offsetof(ChipCallable, child_count_), UINT32_MAX);
-    reject_word(offsetof(ChipCallable, child_count_), 1025);
-    reject_word(offsetof(ChipCallable, child_offsets_), UINT32_MAX);
-    reject_word(offsetof(ChipCallable, child_offsets_), 1);
-    reject_word(offsetof(ChipCallable, child_offsets_), 0);
-    reject_word(child_start + offsetof(CoreCallable, binary_size_), UINT32_MAX);
-    reject_word(child_start + offsetof(CoreCallable, sig_count_), CORE_MAX_TENSOR_ARGS + 1);
-    reject_word(offsetof(ChipCallable, func_name_len_), CALLABLE_FUNC_NAME_MAX);
-    reject_word(offsetof(ChipCallable, config_name_len_), CALLABLE_FUNC_NAME_MAX);
-    auto unterminated = valid;
-    std::memset(unterminated.data() + offsetof(ChipCallable, func_name_), 'x', CALLABLE_FUNC_NAME_MAX);
-    EXPECT_EQ(
-        validate_kernel_prepare_callable_args(kCtx, 0, unterminated.data(), unterminated.size(), kStream),
-        PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    );
-    EXPECT_EQ(
-        validate_kernel_prepare_callable_args(kCtx, 0, valid.data(), child_start + sizeof(CoreCallable) - 1, kStream),
-        PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    );
-    EXPECT_EQ(
-        validate_kernel_prepare_callable_args(kCtx, 0, valid.data(), valid.size() - 1, kStream),
-        PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    );
-    auto trailing = valid;
-    trailing.push_back(0);
-    EXPECT_EQ(
-        validate_kernel_prepare_callable_args(kCtx, 0, trailing.data(), trailing.size(), kStream),
-        PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    );
+TEST(KernelEntryValidation, CallableImageRejectsInvalidAndDuplicateChildFunctionIds) {
+    const auto child = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, kBinary, sizeof(kBinary));
+    const int32_t ids[] = {0, KERNEL_MAX_FUNC_ID - 1};
+    const std::vector<uint8_t> children[] = {child, child};
+    auto image =
+        make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(nullptr, 0, "orch", nullptr, 0, ids, children, 2, "");
+    auto *callable = reinterpret_cast<ChipCallable *>(image.data());
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), 0);
+    for (int32_t id : {-1, KERNEL_MAX_FUNC_ID, MAX_REGISTERED_CALLABLE_IDS - 1}) {
+        callable->child_func_ids_[1] = id;
+        EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    }
+    callable->child_func_ids_[1] = 0;
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    callable->child_func_ids_[0] = KERNEL_MAX_FUNC_ID - 1;
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), 0);
 }
 
 }  // namespace

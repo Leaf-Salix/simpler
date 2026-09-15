@@ -12,16 +12,18 @@
 
 #include <cstddef>
 
-#include "kernel_callable_residency.h"
 #include "kernel_dispatch_args.h"
+#include "callable.h"
 
 // Per-thread kernel-entry setup supplied by platforms with a scheduling policy.
 void prepare_kernel_aicpu_thread();
 
-// Called only after envelope and current device residency validation. Runtime
-// consumers validate their payload layout/capacity before accessing its data.
-// This function does not own the launch packet or the resident allocation.
+// The binder pairs the ID with a committed device image. Before rebuilding the
+// function table, the runtime consumer must establish cache visibility,
+// validate child offsets against callable_bytes, and check signature counts.
+// Child func_ids and resolved_addr fields provide the per-invocation mapping.
+// This function owns neither the launch packet nor the committed image.
 int consume_kernel_invocation(
-    const SimplerKernelDispatchArgs &args, const KernelCallableDeviceResidency &resident, const void *payload,
+    const SimplerKernelDispatchArgs &args, const ChipCallable &callable, size_t callable_bytes, const void *payload,
     size_t payload_bytes
 );

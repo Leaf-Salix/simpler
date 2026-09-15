@@ -49,11 +49,10 @@ TEST(KernelInvocationValidation, DerivesSignatureCountsAndPreservesOutputsOnFail
 }
 
 TEST(KernelInvocationValidation, FramingRejectsBeforePayloadReadsAndPreservesOutput) {
-    const PreparedInvocationView prepared{2, 1, 1, 7};
+    const PreparedInvocationView prepared{2, 1, 1};
     SimplerKernelInvocationHeader header{};
     header.mode = SIMPLER_MODE_KERNEL;
     header.callable_id = prepared.callable_id;
-    header.generation = prepared.slot_generation;
     header.tensor_count = 1;
     header.scalar_count = 1;
     std::vector<uint8_t> bytes(sizeof(header) + 1);
@@ -94,22 +93,18 @@ TEST(KernelInvocationValidation, FramingRejectsBeforePayloadReadsAndPreservesOut
     header.host_copy_tensor_count = -1;
     check(InvocationStatus::InvalidCounts);
     header.host_copy_tensor_count = 0;
-    header.generation = 8;
-    check(InvocationStatus::StaleCallable);
-    header.generation = 0;
+    header.callable_id = MAX_REGISTERED_CALLABLE_IDS;
     check(InvocationStatus::InvalidHeader);
-    header.generation = 7;
-    header.callable_id = 64;
+    header.callable_id = -1;
     check(InvocationStatus::InvalidHeader);
     header.callable_id = 3;
     check(InvocationStatus::StaleCallable);
 }
 TEST(KernelInvocationValidation, RuntimePayloadIsOpaqueAndTrustedCountsAreRequired) {
-    const PreparedInvocationView prepared{5, 2, 1, 9};
+    const PreparedInvocationView prepared{5, 2, 1};
     SimplerKernelInvocationHeader header{};
     header.mode = SIMPLER_MODE_KERNEL;
     header.callable_id = prepared.callable_id;
-    header.generation = prepared.slot_generation;
     header.tensor_count = prepared.tensor_count;
     header.scalar_count = prepared.scalar_count;
     header.payload_bytes = 13;
@@ -126,10 +121,10 @@ TEST(KernelInvocationValidation, RuntimePayloadIsOpaqueAndTrustedCountsAreRequir
     );
     EXPECT_EQ(out.tensor_count, prepared.tensor_count);
     different = prepared;
-    different.slot_generation = 0;
+    different.callable_id = -1;
     EXPECT_EQ(
         validate_invocation_header({packet.data(), packet.size()}, different, &out), InvocationStatus::InvalidArgument
     );
-    EXPECT_EQ(out.generation, prepared.slot_generation);
+    EXPECT_EQ(out.callable_id, prepared.callable_id);
 }
 }  // namespace

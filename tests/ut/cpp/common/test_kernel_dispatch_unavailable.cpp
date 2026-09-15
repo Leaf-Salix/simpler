@@ -10,17 +10,18 @@
  */
 #include <gtest/gtest.h>
 #include "kernel_dispatch_args.h"
-#include "kernel_callable_residency.h"
+#include "callable.h"
+#include "callable_protocol.h"
 
 TEST(KernelDispatchUnavailable, ProductionConsumerDoesNotReportExecutionSuccess) {
-    KernelCallableDeviceResidency resident{17, 0x100000, 128, 3, 0};
+    ChipCallable callable{};
     SimplerKernelDispatchArgs packet{};
+    packet.chip_callable_address = reinterpret_cast<uint64_t>(&callable);
+    packet.chip_callable_bytes = sizeof(callable);
     packet.packet_bytes = sizeof(packet);
-    packet.residency_address = reinterpret_cast<uint64_t>(&resident);
     packet.invocation.mode = SIMPLER_MODE_KERNEL;
-    packet.invocation.callable_id = 3;
-    packet.invocation.generation = 17;
+    packet.invocation.callable_id = MAX_REGISTERED_CALLABLE_IDS - 1;
     EXPECT_EQ(simpler_aicpu_kernel_exec(&packet), static_cast<int>(KernelDispatchStatus::UnsupportedPayload));
-    packet.invocation.generation = 16;
-    EXPECT_EQ(simpler_aicpu_kernel_exec(&packet), static_cast<int>(KernelDispatchStatus::Stale));
+    packet.invocation.callable_id = MAX_REGISTERED_CALLABLE_IDS;
+    EXPECT_EQ(simpler_aicpu_kernel_exec(&packet), static_cast<int>(KernelDispatchStatus::InvalidArgs));
 }

@@ -173,8 +173,7 @@ struct FakeLifecycleOps {
             [](void *context, void *stream) noexcept {
                 return destroy(context, stream, "stream");
             },
-            0,
-            [](void *context, uint32_t, void **event) noexcept {
+            [](void *context, void **event) noexcept {
                 return create(context, event, "event");
             },
             [](void *context, void *event) noexcept {
@@ -375,6 +374,31 @@ INSTANTIATE_TEST_SUITE_P(
         return name;
     }
 );
+
+TEST(PersistentKernelArgs, FailedRollbackRetainsOwnershipUntilFinalizeRetry) {
+    FakeArgsOps ops;
+    ops.fail_copy_on = 2;
+    ops.fail_free_on = 1;
+    Runtime runtime;
+    PersistentKernelArgs args;
+
+    EXPECT_EQ(args.prepare_once(runtime, ops.table(), kDeviceId), kInjectedRc);
+    EXPECT_FALSE(args.is_prepared());
+    EXPECT_EQ(args.device_k_args(), nullptr);
+    EXPECT_EQ(args.args().runtime_args, nullptr);
+    EXPECT_EQ(args.args().regs, 0u);
+    // The block whose release failed is still the owner's to free.
+    EXPECT_TRUE(args.has_live_resources());
+    EXPECT_EQ(ops.live_blocks(), 1u);
+
+    const int allocs = ops.alloc_calls;
+    EXPECT_EQ(args.prepare_once(runtime, ops.table(), kDeviceId), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(ops.alloc_calls, allocs);
+
+    EXPECT_EQ(args.finalize_once(), 0);
+    EXPECT_FALSE(args.has_live_resources());
+    EXPECT_EQ(ops.live_blocks(), 0u);
+}
 
 // ---------------------------------------------------------------------------
 // UT-P4 / UT-P5 / UT-F4 / UT-F5: release, abandon, retry.

@@ -74,13 +74,6 @@ struct CallConfig;
 extern "C" {
 #endif
 
-/* Context-local callable identity. Preserve both fields unchanged for launch.
- * generation zero is invalid; slot reuse must issue a different generation. */
-typedef struct SimplerCallableHandle {
-    int32_t callable_id;
-    uint64_t generation;
-} SimplerCallableHandle;
-
 typedef void *RuntimeHandle;
 typedef void *DeviceContextHandle;
 
@@ -122,8 +115,7 @@ enum {
     PTO_RUNTIME_ERR_CALLABLE_COUNT_EXCEEDED = PTO_RUNTIME_ERR_BASE - 5,
     PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED = PTO_RUNTIME_ERR_BASE - 6,
     PTO_RUNTIME_ERR_CALLABLE_NOT_RESIDENT = PTO_RUNTIME_ERR_BASE - 7,
-    PTO_RUNTIME_ERR_CALLABLE_STALE = PTO_RUNTIME_ERR_BASE - 8,
-    PTO_RUNTIME_ERR_CAPACITY_EXCEEDED = PTO_RUNTIME_ERR_BASE - 9,
+    PTO_RUNTIME_ERR_CAPACITY_EXCEEDED = PTO_RUNTIME_ERR_BASE - 8,
 };
 
 /** Return values from simpler_poll_run(). */
@@ -649,43 +641,51 @@ int simpler_kernel_mode_init(
 );
 
 /**
- * Stage one callable for kernel-mode launches, outside ACLGraph capture.
+ * Register one callable for kernel-mode launches, outside ACLGraph capture.
  *
- * The caller serializes init/prepare/launch/finalize on each context, and
- * chooses `callable_id` from [0, MAX_REGISTERED_CALLABLE_IDS). An id already
- * staged on this context is a duplicate registration and is refused; ids are
- * never evicted, unregistered, or reused before close. Two ids carrying
- * byte-identical canonical content share one device upload, so the second is
- * charged no arena bytes. The code arena holds 512 MiB of unique images,
- * charged with 64-byte alignment, plus a fixed descriptor prefix indexed by
- * id. COUNT_EXCEEDED / BYTES_EXCEEDED reject admission before upload. No
- * error exits the process. A registration that fails on the device poisons
- * the context and retains its storage until an explicit close after
+ * Registration mints the id: on success `out_callable_id` receives a
+ * context-local id in [0, MAX_REGISTERED_CALLABLE_IDS), and on any failure it
+ * receives -1. The same image registered twice takes two distinct, equally
+ * valid ids and two uploads - there is no deduplication and no lookup, so
+ * arena capacity is spent per registration. An id is minted once and never
+ * evicted, unregistered, or reused for the life of the context, which is what
+ * lets launch resolve one without a version comparand; close invalidates every
+ * id the context minted. Device memory for the images is taken in 2 MiB
+ * blocks as registrations need it, up to 2 GiB of block capacity, and each
+ * registration is charged with 64-byte alignment; a published address never
+ * moves as the block set grows.
+ * COUNT_EXCEEDED / BYTES_EXCEEDED reject admission before upload. No error
+ * exits the process. A registration that fails on the device poisons the
+ * context and retains its storage until an explicit close after
  * caller-established quiescence.
  *
  * `callable` points to a canonical ChipCallable image of exactly
  * `callable_size` bytes. Validating every flexible-array offset before the
- * image is hashed or uploaded is the implementation's obligation. Shared
- * entry validation checks the canonical image bounds, signature counts,
- * symbol names, alignment, and the callable id range. Preparation may
- * allocate persistent state and enqueue asynchronous device work on
- * `caller_stream`, but never synchronizes a stream or device - preparation
- * errors surface through the caller's own warmup plus synchronize. The
- * stream is borrowed for this call only.
+ * image is uploaded is the implementation's obligation. Shared entry
+ * validation checks the canonical image bounds, signature counts, symbol
+ * names and alignment. Registration enqueues its asynchronous device work on
+ * the context's own AICPU stream, which every later launch also enqueues on,
+ * so stream FIFO orders registration ahead of each launch and no caller
+ * stream is involved. It never synchronizes a stream or device - registration
+ * errors surface through the caller's own warmup plus synchronize.
  */
 int simpler_kernel_mode_prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream
+    DeviceContextHandle ctx, const void *callable, size_t callable_size, int32_t *out_callable_id
 );
 
 /**
  * Enqueue one bounded asynchronous kernel-mode operator invocation.
  *
- * `callable_id` names a callable staged on this context by prepare. The
- * residency it resolves to carries the context generation it was staged
- * under, so an id left over from a previous generation returns
- * CALLABLE_STALE before dispatch rather than replaying recycled addresses;
- * an id that was never staged returns CALLABLE_NOT_RESIDENT. The invocation
- * carries the resolved generation to the device for the same check on replay.
+ * `callable_id` is a value this context's prepare minted. An id outside
+ * [0, MAX_REGISTERED_CALLABLE_IDS) is an argument error and one inside it
+ * that names no registration returns CALLABLE_NOT_RESIDENT. Nothing versions
+ * the id: ids are unique for the life of the context and a closed context
+ * accepts no launch, so an id can only ever reach the registration that
+ * minted it.
+ *
+ * `caller_stream` is this call's execution stream and is required. It is
+ * taken per call rather than remembered from init, because a framework
+ * caller's current stream is a property of the call.
  *
  * `args` points to a ChipStorageTaskArgs POD whose tensor addresses are
  * caller-owned device addresses; they are passed through without ever being

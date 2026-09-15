@@ -668,8 +668,7 @@ struct ResourceContextPlatform {
             [](void *, void *) noexcept {
                 return 0;
             },
-            0,
-            [](void *ctx, uint32_t, void **event) noexcept {
+            [](void *ctx, void **event) noexcept {
                 *event = reinterpret_cast<void *>(static_cast<ResourceContextPlatform *>(ctx)->next_handle++);
                 return 0;
             },
@@ -955,7 +954,7 @@ protected:
     ResourceContextPlatform provider;
     KernelExecutionState context;
     hbg::GraphLaunchTemplate snapshot;
-    hbg::GraphInvocationIdentity identity{7, 1, 2, 31, 101, 103, 107};
+    hbg::GraphInvocationIdentity identity{7, 1, 2, 101, 103, 107};
     hbg::GraphResourceRequirements required;
     hbg::KernelWorkingBinding binding;
 
@@ -1221,9 +1220,6 @@ TEST_F(HbgGraphPacketTest, RejectsMalformedEnvelopeHeaderRegionsAndContents) {
             e.callable_id = -1;
         },
         [](auto &e, auto &, auto &) {
-            e.generation = 0;
-        },
-        [](auto &e, auto &, auto &) {
             e.tensor_count = -1;
         },
         [](auto &e, auto &, auto &) {
@@ -1323,10 +1319,6 @@ TEST_F(HbgGraphPacketTest, FailedCandidateKeepsPreviousSnapshotAndRejectsFullWin
     prepare();
     ASSERT_EQ(snapshot_graph(), 0);
     const auto original = bytes();
-    identity.callable_generation = 0;
-    EXPECT_EQ(snapshot_graph(), PTO_RUNTIME_ERR_INTERNAL);
-    EXPECT_EQ(bytes(), original);
-    identity.callable_generation = 31;
     result.total_tasks = capacity;
     result.usage.submitted_tasks = capacity;
     EXPECT_EQ(snapshot_graph(), PTO_RUNTIME_ERR_CAPACITY_EXCEEDED);
@@ -1804,7 +1796,6 @@ TEST_F(HbgGraphSlotTest, InvocationIdentityMayVaryWithoutChangingTheRegisteredSl
     ASSERT_NO_FATAL_FAILURE(prepare_slot());
     auto *envelope = reinterpret_cast<SimplerKernelInvocationHeader *>(packet.storage.data());
     ++envelope->callable_id;
-    ++envelope->generation;
     ++packet_header().callable_hash;
     ++packet_header().argument_hash;
     ++packet_header().function_hash;

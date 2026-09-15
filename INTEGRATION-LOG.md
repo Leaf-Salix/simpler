@@ -509,3 +509,259 @@ any producer.
 
 **Affects.** #2064 (final contract adopted), #2189 and #2190 (error-code
 numbers), #2193 (bank kept over the merged guard), #2185 (symbol resolution).
+
+---
+
+## D15 - Re-survey the PR heads; take only what does not re-open a decision
+
+**Problem.** The heads this integration was audited against were frozen on
+2026-09-11. Since then #2064 merged to `main`, `main` advanced four commits
+past the integration base `748c39fb`, and six of the remaining thirteen PRs
+moved. A head that moved is not automatically a change to adopt: some of the
+movement is a rebase over the merged K1, and some of it reverses a decision
+this log already made.
+
+**Finding.** Seven PRs are byte-identical to their audited heads: #2173,
+\#2174, #2175, #2180, #2187, #2189 and #2193. The six that moved divide
+cleanly:
+
+| PR | What moved | Re-opens a decision? |
+| -- | ---------- | -------------------- |
+| #2177 | Invalid `CallConfig` now returns `INVALID_ARGUMENT`, not `INTERNAL` | no |
+| #2176 | `KernelContextOps` drops `event_flag`; `create_event` takes `(context, event)` | no |
+| #2176 | Failed-rollback retention test; `rtFree` fault hook and `arm_destroy_failure_after` | no |
+| #2176 | Header states a capture-boundary rule that forbids a prepare-published tail | **yes** — D9 |
+| #2185 | Test reaps a hung child; asserts the borrowed stream survives a refused init | no |
+| #2185 | `prepare_callable` drops `caller_stream` (five parameters to four) | **yes** — D3 |
+| #2190 | `SimplerCallableHandle` and the per-callable generation removed; block allocator; resolve by index | **yes** — D7, D8 |
+| #2171, #2172 | H1 and 2B restructured around new `graph_definition_pack.{h,cpp}`, `kernel_pipeline_contract.h`, `kernel_resource_plan.h` | **yes** — D2, D11 |
+
+**Choice.** Adopt the four rows marked "no". Leave the rest for a decision
+pass that can weigh each on its merits, and record here what that pass has to
+answer.
+
+Adopted:
+
+1. **#2177's error codes.** `build_kernel_pipeline_contract_impl` returns
+   `INVALID_ARGUMENT` for a null or unresolvable `CallConfig` and keeps
+   `INTERNAL` for a null output or a contract it generated but cannot
+   validate. Both arch TMR runtime makers, the header's contract comment,
+   `test_trb_runtime_temp_buffer.cpp` and `test_pipeline_contract_loader.cpp`
+   move together. This continues D14 rather than re-opening it: D14 adopted
+   the merged K1 numbering for the entry points, and this extends the same
+   numbering to the hook behind them.
+2. **#2176's `event_flag` removal.** The flag existed so a host-only test
+   could observe which constant the platform asked for. The platform's own
+   `create_event` is a better place for that knowledge, and the test that
+   read the field goes with it.
+3. **#2176's fault coverage.** `PersistentKernelArgs` already rolls back
+   through `finalize_once` on this line, but nothing exercised a rollback
+   whose own release fails. The new test and the `rtFree` hook behind
+   `persistent_free_close` cover the owner to `finalize_common` to allocator
+   retry chain.
+4. **#2185's test hardening.** A hung non-daemon child is terminated instead
+   of left for the CI job timeout, and destroying the borrowed stream after a
+   refused `kernel_init` is now an assertion rather than a swallowed
+   exception. Only the hardening is taken; the signature change it accompanies
+   is deferred below.
+
+**Not applicable here.** #2176, #2177 and #2185 all drop
+`kernel_execution_state.cpp` from a platform source list, because on their
+lines nothing outside K2 consumes it. On this line
+`kernel_resource_requirements.h` calls `bind_resources_for_launch` from the
+H chain, so both the onboard and the simulation host runtimes need the
+translation unit; removing it from the simulation lists leaves
+`libhost_runtime.so` with an undefined symbol that `test_pipeline_contract_loader`
+catches at `dlopen`.
+
+**Deferred here, and decided in D16.** The four rows marked "yes" are not open
+questions: `.docs/vllm/kernel-mode-design.md`'s companion call-flow document
+settles all but the last of them, and D16 adopts that settlement. They are
+listed here as what this pass did not take, not as what still needs arguing.
+
+- **D3, `prepare_callable`'s stream parameter.** D3's first reason was that the
+  entry layer, #2185, called the five-parameter form and K2 was the outlier.
+  \#2185 has since moved to four, so that evidence no longer holds.
+- **D7 and D8, the callable generation.** D7 kept `int32_t callable_id` on both
+  entries because the generation guard was "the valuable half of #2190" and
+  survived the collapse. That half no longer exists in #2190.
+- **D9 and the capture boundary.** #2176's header records that a wait issued
+  during capture on an event recorded before capture is rejected by CANN as
+  107024, and concludes that preparation must not publish a tail for a later
+  captured launch to consume. This line does exactly that, so the note and the
+  five-event sibling topology cannot both stand.
+- **D2 and D11, the H chain.** #2171 and #2172 were force-pushed onto a
+  different decomposition: a `GraphDefinitionPack` with its own translation
+  unit, and `kernel_resource_plan.h` where this line has
+  `kernel_resource_requirements.h`. Re-integrating them is a rewrite of the H
+  contribution, not a patch to it, and no target document covers it.
+
+**Affects.** #2176, #2177, #2185 (partially adopted); #2171, #2172, #2190
+(deferred here); D2, D3, D7, D8, D9, D11 (superseded or restated in D16).
+
+---
+
+## D16 - Adopt the target call-flow design: minted ids, no generation, chained streams
+
+**Problem.** D15 left four adjudications open. Three of them are settled by the
+target design the kernel-mode work is being built against — the vLLM call-flow
+document dated 2026-09-13, with the callable-id shape frozen 2026-09-14 — which
+names this integration line explicitly and says it "still has the old shape" and
+needs rebasing onto #2185's signature and #2190's callable-id out parameter.
+That design is not one more PR's opinion: it is what the three-party contract
+between vLLM, PyPTO and simpler is written to.
+
+**Finding.** The three are one package, not three independent choices.
+
+The four-parameter prepare (D3) and the deleted `PrepareTail` (D9) stand or fall
+together with the stream topology. `PrepareTail` exists on this line only because
+D9 chose #2187's sibling topology, in which both device branches fork from the
+caller's `Start`: AICore's stream is then unrelated to the AICPU stream, so
+nothing orders it behind registration and an event has to. In the target's
+chained topology AICore forks from AICPU, so the AICPU stream's own FIFO carries
+registration ahead of every launch and no event is needed. Taking the
+four-parameter prepare without the chained topology would be the worst of both:
+prepare would lose the stream it currently orders, leaving the launch-side
+`PrepareTail` wait as the only mechanism — and that wait is precisely what
+crosses the ACLGraph capture boundary.
+
+**Choice.** Adopt the target design.
+
+1. **Registration mints the id.** `simpler_kernel_mode_prepare_callable(ctx,
+   callable, size, int32_t *out)` writes a context-local id on success and -1 on
+   every failure. It takes no `caller_stream`; only launch does, per call.
+2. **Registration is pure.** No deduplication and no lookup: the same image
+   registered twice takes two ids, two uploads and two charges. Capacity is
+   spent per registration.
+3. **No callable generation, anywhere.** `SimplerCallableHandle`,
+   `PTO_RUNTIME_ERR_CALLABLE_STALE`, `KernelCallableDeviceResidency::generation`
+   and `SimplerKernelInvocationHeader::generation` are gone; the wire header is
+   32 bytes. What replaces the guard is three properties together: an id is
+   minted once and never reused within a context, close invalidates every id the
+   context minted, and a closed worker accepts no launch.
+4. **The launch sequence is chained.** Events are `Start`, `AicoreStart`,
+   `AicoreDone`, `AicpuDone`, `SerialTail`. Caller records `Start`; AICPU waits
+   it, clears the handshake, records `AicoreStart`; AICore waits that, launches,
+   records `AicoreDone`; AICPU launches with HostArgs, waits `AicoreDone`,
+   records `AicpuDone`; the caller waits that and records `SerialTail`. Caller
+   and AICore share no event, so capture propagates in two hops.
+5. **`PTO_RUNTIME_ERR_CAPACITY_EXCEEDED` moves to `BASE - 8`,** the slot
+   `CALLABLE_STALE` vacated. Nothing outside this line pins either value: the
+   merged K1 on `main` declares no `CALLABLE_*` code at all.
+
+**Reason.** Items 1 to 3 are the frozen contract of the document PyPTO and vLLM
+are being written against; keeping this line's shape would mean every consumer
+adapts to an integration branch rather than to the design. Item 4 is what makes
+items 1 and 2 safe, and independently removes the 107024 exposure D15 recorded.
+Item 5 keeps the error band dense rather than leaving a hole behind a code no
+producer emits any more.
+
+**Kept against the source PRs.** #2190's block allocator is not taken. Its cache
+is host-only — that branch carries no device dispatch — whereas this line's
+AICPU entry resolves a descriptor at `arena_ + callable_id * sizeof(descriptor)`.
+The single arena with its descriptor prefix stays; only the generation, the
+deduplication and the caller-chosen id leave it. The descriptor shrinks to 24
+bytes accordingly.
+
+**Boundary.** The chained topology is what #2176's capture probe validates on
+a2a3, and `tests/st/a2a3/kernel_capture` now drives that sequence. The public
+`prepare -> launch` path is still not exercised inside a captured graph by any
+test, so two-hop capture propagation through the real entries remains unproven.
+
+**Affects.** #2176, #2180, #2185, #2189, #2190 (their shapes adopted); #2187
+(its binder rewritten to the chained topology); D3, D7, D8, D9 (superseded).
+
+---
+
+## D17 - Follow #2190's device entry: the image span travels in the packet
+
+**Problem.** D16 kept this line's residency descriptor: a 24-byte device struct
+per callable, uploaded at registration into a fixed prefix of the code arena,
+whose address the packet carried so the AICPU could read the image address and
+extent from it. #2190 has since restored its device entry without a descriptor
+at all — `SimplerKernelDispatchArgs` carries `chip_callable_address` and
+`chip_callable_bytes` directly, and the consumer receives the `ChipCallable`
+reference.
+
+**Finding.** The descriptor bought two things and only one of them was real.
+
+The stated one was revocation: the entry re-read the slot on every invocation
+"including graph replay", so the host had one small location it could
+invalidate. Nothing ever wrote a descriptor after commit — ids are never
+evicted, kernel-mode `unregister_callable` returns `INVALID_STATE`, and
+`clear()` only drops host metadata — so the capability was never exercised. And
+it would not have helped the case that matters: after close the arena is freed,
+which leaves the descriptor address dangling exactly as the image address does.
+
+The real one was keeping the extent out of the per-call packet, so a packet
+could name *which* descriptor but could not widen the window the device parses.
+That argument assumes an untrusted packet, and the packet is built by the host
+binder from `cache.resolve()`. It is not part of this contract's threat model.
+
+**Choice.** Adopt #2190's shape.
+
+1. `SimplerKernelDispatchArgs` replaces `residency_address` with
+   `chip_callable_address` and `chip_callable_bytes`. This line keeps the four
+   binding fields #2190 has no source for — `binding_address`,
+   `context_generation`, `sm_bytes`, `arena_bytes` — because its TMR consumer
+   reads them; the prefix is 88 bytes against #2190's 56.
+2. `KernelCallableDeviceResidency` and its header are deleted. The code arena
+   loses its descriptor prefix, so `device_address` is `arena_ + used_`.
+3. `consume_kernel_invocation` takes
+   `(args, const ChipCallable &, callable_bytes, payload, payload_bytes)`. This
+   line passes the whole prefix where #2190 passes only the invocation header,
+   for the same reason as item 1; it is otherwise #2190's signature.
+4. The entry validates the span — non-null, `alignof(ChipCallable)`, at least
+   `sizeof(ChipCallable)`, no wraparound — and performs no device read. Cache
+   visibility for the image moves to the consumer, which is where the image is
+   actually parsed.
+5. `KernelDispatchStatus` drops `NotResident` and `Stale`; the entry no longer
+   produces them. 2 and 3 stay retired rather than being reused.
+
+**Reason.** One indirection and one device read per launch disappear, the
+descriptor prefix and its upload disappear, and the two lines stop diverging on
+a wire struct. Nothing that was load-bearing is lost: the image address and
+extent still come from the context's own committed residency, and the host is
+the only producer either way.
+
+**Affects.** #2190 (shape adopted); #2180, #2189 (their consumer signature and
+TMR dispatch follow); D16 item 3 is superseded on the descriptor point only —
+the callable generation stays gone.
+
+## D18 - Take the func_id bound from the runtime table, not the child array
+
+**Problem.** D17's line of work restored two checks #2190's extraction of
+`validate_kernel_callable_image` had lost: a child `func_id` outside the device
+function table, or repeated within one image, has the device consumer overwrite
+a mapping it built earlier in the same invocation. This line expressed the range
+bound as `std::extent_v<decltype(ChipCallable::child_func_ids_)>`. #2190 has
+since restored the same two checks against `KERNEL_MAX_FUNC_ID`, a named
+constant in `callable_protocol.h` tied to `RUNTIME_MAX_FUNC_ID` by a
+`static_assert` in both `device_runner_base.cpp` files.
+
+**Finding.** The two bounds are both 1024 and that is a coincidence.
+`ChipCallable` is `Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>`, so the
+array extent says how many children one image may carry. A `func_id` indexes
+the runtime's function table, whose size is `RUNTIME_MAX_FUNC_ID`. Nothing ties
+them: raising the child capacity would widen the accepted id range past the
+table the ids address, and the widening would be silent because the validator
+would still compile and still look right.
+
+**Choice.** Adopt #2190's expression, and its test with it.
+
+1. `KERNEL_MAX_FUNC_ID` joins `MAX_REGISTERED_CALLABLE_IDS` in
+   `callable_protocol.h`, with the comment saying the two id spaces are
+   independent.
+2. `validate_kernel_callable_image` bounds `func_id` by it.
+3. `static_assert(KERNEL_MAX_FUNC_ID == RUNTIME_MAX_FUNC_ID)` in the onboard and
+   simulation `device_runner_base.cpp`, the two translation units that see both
+   headers, so a change to either bound fails the build rather than the images.
+
+**Reason.** The accepted set does not move today, so this buys no behavior. It
+buys the constraint: the bound now names what it bounds, and drift between the
+two is a compile error instead of a class of image the device will accept and
+then mis-dispatch.
+
+**Affects.** #2190 (its shape adopted, closing the divergence this line had
+recorded against it); the simulation `prepare_callable` ordering remains the one
+deliberate difference.

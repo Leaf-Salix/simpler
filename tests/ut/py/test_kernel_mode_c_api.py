@@ -83,7 +83,16 @@ def kernel_close_faults(tmp_path_factory):
 @pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_TMR_CASES)
 @pytest.mark.parametrize(
     "scenario",
-    ["repeat_init", "init_failure", "stream_close", "event_close", "destroy_unclosed", "prepare", "fatal_device"],
+    [
+        "repeat_init",
+        "init_failure",
+        "stream_close",
+        "event_close",
+        "persistent_free_close",
+        "destroy_unclosed",
+        "prepare",
+        "fatal_device",
+    ],
 )
 def test_kernel_lifecycle_retry(arch, runtime, scenario, kernel_close_faults, request):
     _binaries(arch, runtime)
@@ -161,10 +170,9 @@ def _load(arch: str, variant: str, runtime: str) -> ctypes.CDLL:
     lib.simpler_kernel_mode_init.restype = ctypes.c_int
     lib.simpler_kernel_mode_prepare_callable.argtypes = [
         ctypes.c_void_p,
-        ctypes.c_int32,
         ctypes.c_void_p,
         ctypes.c_size_t,
-        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int32),
     ]
     lib.simpler_kernel_mode_prepare_callable.restype = ctypes.c_int
     lib.simpler_kernel_mode_launch.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p]
@@ -344,6 +352,7 @@ def _check_lifecycle_retry(lib, faults, arch, runtime, device, scenario):
         1,
     )
     faults.arm_destroy_failure.argtypes = [ctypes.c_int]
+    faults.arm_destroy_failure_after.argtypes = [ctypes.c_int, ctypes.c_int]
     faults.destroy_attempts.restype = ctypes.c_int
     lib.ensure_acl_ready_ctx.argtypes = [ctypes.c_void_p, ctypes.c_int]
     lib.ensure_acl_ready_ctx.restype = ctypes.c_int
@@ -369,6 +378,7 @@ def _check_lifecycle_retry(lib, faults, arch, runtime, device, scenario):
     faults.arm_acl_guard()
     if scenario == "init_failure":
         faults.arm_destroy_failure(3)
+    finalized = False
     try:
         assert lib.simpler_kernel_mode_init(*init_args) == (-4321 if scenario == "init_failure" else 0)
         # These exported C++ methods use the Linux Itanium ABI. Resolve the
@@ -395,19 +405,43 @@ def _check_lifecycle_retry(lib, faults, arch, runtime, device, scenario):
             assert not accepts(ctx)
             assert force_reset(ctx) == PTO_RUNTIME_ERR_INVALID_STATE
             assert lib.finalize_device(ctx) == 0
+            finalized = True
         elif scenario == "destroy_unclosed":
             lib.destroy_device_context(ctx)
             assert lib.ensure_acl_ready_ctx(ctx, device) == PTO_RUNTIME_ERR_INVALID_STATE
             assert lib.finalize_device(ctx) == 0
+            finalized = True
         elif scenario == "prepare":
             # The caller's packed buffer stops being configuration authority
             # when init returns; prepare uses its owned, validated snapshot.
             config.aicpu_thread_num = -1
             config.enable_dump_args = 1
             _check_prepare_reuse(lib, ctx, arch, runtime)
+            finalized = True
+        elif scenario == "persistent_free_close":
+            _check_prepare_reuse(lib, ctx, arch, runtime, close=False)
+            # The first rtFree releases the callable upload. Fail the next
+            # call, which is owned by PersistentKernelArgs, to cover the
+            # owner -> finalize_common -> allocator retry chain.
+            faults.arm_destroy_failure_after(4, 1)
+            # The allocator path may translate an injected RTS status, but it
+            # must never report success or forget the allocation before retry.
+            assert lib.finalize_device(ctx) != 0
+            first_attempts = faults.destroy_attempts()
+            assert first_attempts > 0
+            assert lib.finalize_device(ctx) == 0
+            # A kernel context releases several device blocks, and the failure
+            # stops the first pass partway, so the retry attempts the block
+            # that failed plus everything the first pass never reached. The
+            # invariant is that it re-attempts and completes, not a count.
+            assert faults.destroy_attempts() > first_attempts
+            assert lib.committed_device_memory_ctx(ctx) == 0
+            finalized = True
         elif scenario in ("repeat_init", "init_failure"):
             assert lib.simpler_kernel_mode_init(*init_args) == PTO_RUNTIME_ERR_INVALID_STATE
             assert lib.ensure_acl_ready_ctx(ctx, device) == PTO_RUNTIME_ERR_INVALID_STATE
+            assert lib.finalize_device(ctx) == 0
+            finalized = True
         else:
             faults.arm_destroy_failure(1 if scenario == "stream_close" else 2)
             assert lib.finalize_device(ctx) == -4321
@@ -415,8 +449,10 @@ def _check_lifecycle_retry(lib, faults, arch, runtime, device, scenario):
             assert first_attempts > 0
             assert lib.finalize_device(ctx) == 0
             assert faults.destroy_attempts() == first_attempts + 1
+            finalized = True
     finally:
-        lib.finalize_device(ctx)
+        if not finalized:
+            assert lib.finalize_device(ctx) == 0
         lib.destroy_device_context(ctx)
         names = (
             "aclInit",
@@ -430,7 +466,7 @@ def _check_lifecycle_retry(lib, faults, arch, runtime, device, scenario):
         assert {name: faults.acl_call_count(i) for i, name in enumerate(names)} == dict.fromkeys(names, 0)
 
 
-def _check_prepare_reuse(lib, ctx, arch, runtime):
+def _check_prepare_reuse(lib, ctx, arch, runtime, *, close=True):
     import tempfile  # noqa: PLC0415
 
     from simpler.task_interface import ChipCallable  # noqa: PLC0415
@@ -452,27 +488,31 @@ def _check_prepare_reuse(lib, ctx, arch, runtime):
     caller_stream = ctypes.c_void_p()
     assert lib.aclrtCreateStream(ctypes.byref(caller_stream)) == 0
     before = lib.committed_device_memory_ctx(ctx)
-    assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image), caller_stream) == 0
+    minted = ctypes.c_int32(99)
+    assert lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), ctypes.byref(minted)) == 0
+    assert minted.value == 0
     assert lib.aclrtSynchronizeStreamWithTimeout(caller_stream, 60000) == 0
     prepared = lib.committed_device_memory_ctx(ctx)
     assert prepared > before
-    # Duplicate registration is rejected; it must not disturb the first ID.
-    assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image), caller_stream) != 0
-    assert lib.committed_device_memory_ctx(ctx) == prepared
-    # Identical bytes deduplicate the callable upload. The second ID also
-    # reuses the context's persistent argument blocks, so neither adds GM.
-    assert lib.simpler_kernel_mode_prepare_callable(ctx, 1, image, len(image), caller_stream) == 0
+    # Registration is pure: the same image again mints a second, distinct id
+    # with its own upload. Committed device memory does not move, because the
+    # code arena and its descriptor prefix are committed once on first use and
+    # a second registration spends arena budget rather than new device memory.
+    assert lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), ctypes.byref(minted)) == 0
+    assert minted.value == 1
     assert lib.aclrtSynchronizeStreamWithTimeout(caller_stream, 60000) == 0
     assert lib.committed_device_memory_ctx(ctx) == prepared
     lib.simpler_unregister_callable.argtypes = [ctypes.c_void_p, ctypes.c_int32]
     lib.simpler_unregister_callable.restype = ctypes.c_int
     assert lib.simpler_unregister_callable(ctx, 0) == PTO_RUNTIME_ERR_INVALID_STATE
-    assert lib.finalize_device(ctx) == 0
-    assert lib.committed_device_memory_ctx(ctx) == 0
-    assert (
-        lib.simpler_kernel_mode_prepare_callable(ctx, 2, image, len(image), caller_stream)
-        == PTO_RUNTIME_ERR_INVALID_STATE
-    )
+    if close:
+        assert lib.finalize_device(ctx) == 0
+        assert lib.committed_device_memory_ctx(ctx) == 0
+        assert (
+            lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), ctypes.byref(minted))
+            == PTO_RUNTIME_ERR_INVALID_STATE
+        )
+        assert minted.value == -1
     assert lib.aclrtDestroyStream(caller_stream) == 0
 
 
@@ -487,21 +527,27 @@ def test_kernel_entries_reject_a_context_with_no_kernel_claim(arch: str, runtime
     assert ctx
     try:
         assert lib.simpler_kernel_mode_supported(ctx) == 0
+        minted = ctypes.c_int32(99)
         assert (
-            lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image), stream) == PTO_RUNTIME_ERR_INVALID_STATE
+            lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), ctypes.byref(minted))
+            == PTO_RUNTIME_ERR_INVALID_STATE
         )
+        assert minted.value == -1
         assert lib.simpler_kernel_mode_launch(ctx, 0, image, stream) == PTO_RUNTIME_ERR_INVALID_STATE
-        # An out-of-range callable id and a truncated image are argument
-        # errors, so the structural checks run before the ordering one.
+        # A truncated image and a missing out parameter are argument errors, so
+        # the structural checks run before the ordering one.
         assert (
-            lib.simpler_kernel_mode_prepare_callable(ctx, -1, image, len(image), stream)
+            lib.simpler_kernel_mode_prepare_callable(ctx, image, 1, ctypes.byref(minted))
             == PTO_RUNTIME_ERR_INVALID_ARGUMENT
         )
-        assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, 1, stream) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
         assert (
-            lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image) - 1, stream)
+            lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image) - 1, ctypes.byref(minted))
             == PTO_RUNTIME_ERR_INVALID_ARGUMENT
         )
+        assert (
+            lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), None) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        )
+        assert lib.simpler_kernel_mode_launch(ctx, -1, image, stream) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
         assert lib.simpler_kernel_mode_launch(ctx, 0, image, None) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
     finally:
         lib.destroy_device_context(ctx)
@@ -525,9 +571,10 @@ def test_simulated_components_report_kernel_mode_unsupported(arch: str, runtime:
         )
         # The refused init took no claim, so the context is still free.
         image = _minimal_callable_image()
-        stream = ctypes.byref((ctypes.c_uint8 * 8)())
+        minted = ctypes.c_int32(99)
         assert (
-            lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image), stream) == PTO_RUNTIME_ERR_INVALID_STATE
+            lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), ctypes.byref(minted))
+            == PTO_RUNTIME_ERR_INVALID_STATE
         )
     finally:
         lib.destroy_device_context(ctx)
@@ -565,8 +612,9 @@ def test_kernel_context_init_respects_runtime_support_on_a_borrowed_device(arch:
             assert lib.committed_device_memory_ctx(ctx) == 0
             image = _minimal_callable_image()
             stream = ctypes.byref((ctypes.c_uint8 * 8)())
+            minted = ctypes.c_int32(99)
             assert (
-                lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image), stream)
+                lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), ctypes.byref(minted))
                 == PTO_RUNTIME_ERR_INVALID_STATE
             )
             assert lib.simpler_kernel_mode_launch(ctx, 0, image, stream) == PTO_RUNTIME_ERR_INVALID_STATE
@@ -751,6 +799,7 @@ def _run_eager_values(arch, runtime, device, scenario="eager_values"):
         )
         initialized = True
         assert lib.simpler_kernel_mode_supported(ctx) == 1
+        minted = ctypes.c_int32(99)
         if check_device_query:
             _check_device_query_rejection(
                 lib,
@@ -759,14 +808,15 @@ def _run_eager_values(arch, runtime, device, scenario="eager_values"):
                 scenario,
                 lib.simpler_kernel_mode_prepare_callable,
                 ctx,
-                0,
                 chip.buffer_ptr(),
                 chip.buffer_size(),
-                caller_stream,
+                ctypes.byref(minted),
             )
         assert (
-            lib.simpler_kernel_mode_prepare_callable(ctx, 0, chip.buffer_ptr(), chip.buffer_size(), caller_stream) == 0
+            lib.simpler_kernel_mode_prepare_callable(ctx, chip.buffer_ptr(), chip.buffer_size(), ctypes.byref(minted))
+            == 0
         )
+        assert minted.value == 0
         assert lib.aclrtSynchronizeStreamWithTimeout(caller_stream, 60000) == 0
         committed = lib.committed_device_memory_ctx(ctx)
         assert committed > 0

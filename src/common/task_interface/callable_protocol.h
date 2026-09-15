@@ -28,4 +28,8 @@
 // via Worker.register / DeviceRunner::register_callable. The AICPU
 // executor reserves a fixed-size `orch_so_table_[MAX_REGISTERED_CALLABLE_IDS]`
 // keyed by callable_id, so this bound is part of the host↔AICPU protocol.
-constexpr int32_t MAX_REGISTERED_CALLABLE_IDS = 64;
+constexpr int32_t MAX_REGISTERED_CALLABLE_IDS = 8192;
+
+// Child function IDs index the runtime kernel function table, independently
+// of the ChipCallable registration ID space.
+constexpr int32_t KERNEL_MAX_FUNC_ID = 1024;

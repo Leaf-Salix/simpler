@@ -554,25 +554,22 @@ bool ChipWorker::kernel_mode_supported() const {
     return kernel_supported_fn_(device_ctx_) != 0;
 }
 
-void ChipWorker::kernel_prepare_callable(
-    int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream
-) {
+int32_t ChipWorker::kernel_prepare_callable(const void *callable, size_t callable_size) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call kernel_init() first");
     }
     if (callable == nullptr) {
         throw std::runtime_error("kernel_prepare_callable: callable must not be null");
     }
-    if (caller_stream == nullptr) {
-        throw std::runtime_error("kernel_prepare_callable: caller_stream must not be null");
-    }
     if (kernel_prepare_callable_fn_ == nullptr) {
         throw UnsupportedRuntimeOperation("this host runtime does not support kernel mode");
     }
-    int rc = kernel_prepare_callable_fn_(device_ctx_, callable_id, callable, callable_size, caller_stream);
+    int32_t callable_id = -1;
+    int rc = kernel_prepare_callable_fn_(device_ctx_, callable, callable_size, &callable_id);
     if (rc != 0) {
         throw std::runtime_error("simpler_kernel_mode_prepare_callable failed with code " + std::to_string(rc));
     }
+    return callable_id;
 }
 
 void ChipWorker::kernel_launch(int32_t callable_id, const ChipStorageTaskArgs *args, void *caller_stream) {
