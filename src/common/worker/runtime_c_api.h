@@ -128,8 +128,8 @@ enum {
 
 /**
  * How a resource behaves across the KernelLaunch boundary, which is what
- * decides its copy count: HOST_PER_RUN and EXEC_HANDLE need one instance per
- * in-flight run (`pipeline_depth`), DEVICE_SCRATCH needs exactly one.
+ * decides its copy count: HOST_PER_RUN needs one instance per in-flight run
+ * (`pipeline_depth`); DEVICE_SCRATCH and EXEC_HANDLE need exactly one.
  */
 typedef enum PipelineResourceClass {
     /* Carries this run's own content, so the device is still reading the
@@ -138,7 +138,9 @@ typedef enum PipelineResourceClass {
     /* Not rewritten per run: whoever populates it does so once, and device ops
        run one at a time, so a single instance is reused across runs. */
     PTO_PIPELINE_DEVICE_SCRATCH = 1,
-    /* Execution context (stream) a run owns while its op runs and is reaped. */
+    /* Execution context (stream) a run owns while its op runs and is reaped.
+       One instance serves every run: a role is declared once and the platform
+       holds that stream for the runner's lifetime. */
     PTO_PIPELINE_EXEC_HANDLE = 2,
 } PipelineResourceClass;
 
@@ -158,14 +160,11 @@ typedef enum PipelineResourceKind {
 typedef struct PipelineResource {
     uint32_t kind;
     uint32_t resource_class;
-    /* Program: reserved, must be 0 — a transitional rule, because program
-       declarations predate sized resources, not because program resources
-       occupy nothing. Kernel: every resource that occupies storage declares
-       nonzero required usable bytes per copy, and an EXEC_HANDLE declares 0.
+    /* Program: must be 0. Kernel: every resource that occupies storage states
+       nonzero required usable bytes per copy, and an EXEC_HANDLE states 0.
        The number is a per-copy requirement for the resource named by `kind`:
-       it is neither committed HBM nor a capacity budget, and the set of
-       declared resources is not a complete manifest of what a context
-       ultimately commits. */
+       it is neither committed HBM nor a capacity budget, and the declared
+       resources are not a complete manifest of what a context commits. */
     uint64_t bytes_per_copy;
 } PipelineResource;
 

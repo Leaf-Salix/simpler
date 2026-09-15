@@ -51,13 +51,10 @@ inline bool is_valid_pipeline_contract(const PipelineContract *contract, uint32_
             resource.resource_class > PTO_PIPELINE_EXEC_HANDLE) {
             return false;
         }
-        // Transitional rule, not the destination: program declarations predate
-        // sized resources and still carry zero, so the byte requirement is
-        // gated on mode. The resource model both modes will share decides
-        // "does this resource occupy storage" from the resource itself; until
-        // program declarations carry sizes, mode stands in for that. Within
-        // kernel mode the partition is already the resource class, so adding a
-        // kind cannot change which rule applies.
+        // A program declaration carries no sizes. A kernel declaration sizes
+        // every resource that occupies storage, and only an execution handle
+        // is exempt, so within kernel mode the rule keys on the resource class
+        // and adding a kind cannot change which side a resource falls on.
         const bool sized = mode == SIMPLER_MODE_KERNEL && resource.resource_class != PTO_PIPELINE_EXEC_HANDLE;
         if (sized ? resource.bytes_per_copy == 0 : resource.bytes_per_copy != 0) return false;
     }
@@ -71,7 +68,7 @@ inline bool is_valid_pipeline_contract(const PipelineContract *contract) {
 
 /** Return the number of concrete copies required for one resource. */
 inline uint32_t pipeline_resource_copy_count(const PipelineContract &contract, const PipelineResource &resource) {
-    return resource.resource_class == PTO_PIPELINE_DEVICE_SCRATCH ? 1u : contract.pipeline_depth;
+    return resource.resource_class == PTO_PIPELINE_HOST_PER_RUN ? contract.pipeline_depth : 1u;
 }
 
 /** Select the concrete copy of `resource` owned by `lease`. */
@@ -123,8 +120,7 @@ inline bool has_serviceable_arena_topology(const PipelineContract &contract) {
     return true;
 }
 
-// Each execution role is supplied exactly once. Copy counts do not prescribe
-// the number of physical streams created by the platform.
+// Each execution role is supplied exactly once.
 inline bool has_serviceable_stream_topology(const PipelineContract &contract) {
     if (contract.resource_count > PTO_PIPELINE_MAX_RESOURCES) return false;
     constexpr uint32_t STREAM_KINDS[] = {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_AICORE_STREAM};

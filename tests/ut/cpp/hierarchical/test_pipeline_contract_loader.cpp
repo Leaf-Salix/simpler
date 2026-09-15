@@ -79,6 +79,26 @@ void expect_factory_admission(const PipelineContract &contract, int expected_cre
     EXPECT_EQ(create_count(), expected_creates);
 }
 
+// One matrix of the sim runtimes this test drives, so the artifact check and
+// the execution loop cannot disagree about which variants exist.
+struct SimRuntime {
+    std::string path;
+    bool is_tmr;
+};
+
+std::vector<SimRuntime> sim_runtimes() {
+    std::vector<SimRuntime> runtimes;
+    for (const char *arch : {"a2a3", "a5"}) {
+        for (const char *runtime : {"tensormap_and_ringbuffer", "host_build_graph"}) {
+            runtimes.push_back(
+                {std::string(RUNTIME_LIBRARY_ROOT) + "/" + arch + "/sim/" + runtime + "/libhost_runtime.so",
+                 std::string(runtime) == "tensormap_and_ringbuffer"}
+            );
+        }
+    }
+    return runtimes;
+}
+
 }  // namespace
 
 TEST(PipelineContractLoader, MissingOrMisclassifiedStreamsRejectBeforeCreatingContext) {
@@ -98,80 +118,65 @@ TEST(PipelineContractLoader, LegalProgramDeclarationReachesRealFactoryCall) {
 }
 
 TEST(KernelPipelineEntry, RealSimVariantsValidateWithoutClaimingOrCommitting) {
-    std::vector<std::string> runtime_paths;
-    for (const char *arch : {"a2a3", "a5"}) {
-        for (const char *runtime : {"tensormap_and_ringbuffer", "host_build_graph"}) {
-            runtime_paths.push_back(
-                std::string(RUNTIME_LIBRARY_ROOT) + "/" + arch + "/sim/" + runtime + "/libhost_runtime.so"
-            );
-        }
-    }
+    const std::vector<SimRuntime> runtimes = sim_runtimes();
     size_t present = std::filesystem::exists(SIM_CONTEXT_PATH) ? 1 : 0;
     std::string missing;
     if (present == 0) missing = SIM_CONTEXT_PATH;
-    for (const auto &path : runtime_paths) {
-        if (std::filesystem::exists(path)) {
+    for (const auto &runtime : runtimes) {
+        if (std::filesystem::exists(runtime.path)) {
             ++present;
         } else {
-            missing += "\n" + path;
+            missing += "\n" + runtime.path;
         }
     }
     if (present == 0) {
         GTEST_SKIP() << "Sim runtimes not built; build build_package_sim before running real entry tests.\n" << missing;
     }
-    ASSERT_EQ(present, runtime_paths.size() + 1) << "Incomplete sim runtime artifacts; missing:\n" << missing;
+    ASSERT_EQ(present, runtimes.size() + 1) << "Incomplete sim runtime artifacts; missing:\n" << missing;
     // No writer or file sink: diagnostics are synchronous on stderr. The state
     // outlives any runtime DSO whose unload is deferred by the platform loader.
     static SimplerHostLogState log_state{static_cast<int32_t>(simpler::log::LogLevel::ERROR)};
     // Sim hooks must remain global for every host runtime loaded beneath them.
     LoadedRuntime sim_context(SIM_CONTEXT_PATH, RTLD_NOW | RTLD_GLOBAL);
-    for (const char *arch : {"a2a3", "a5"}) {
-        for (const char *runtime : {"tensormap_and_ringbuffer", "host_build_graph"}) {
-            const std::string path =
-                std::string(RUNTIME_LIBRARY_ROOT) + "/" + arch + "/sim/" + runtime + "/libhost_runtime.so";
-            SCOPED_TRACE(path);
-            LoadedRuntime library(path.c_str());
-            auto bind_log = symbol<SimplerHostLogBindStateFn>(library.handle, "simpler_host_log_bind_state");
-            ASSERT_EQ(bind_log(&log_state), 0);
-            auto create = symbol<decltype(&create_device_context)>(library.handle, "create_device_context");
-            auto destroy = symbol<decltype(&destroy_device_context)>(library.handle, "destroy_device_context");
-            auto init = symbol<decltype(&simpler_kernel_mode_init)>(library.handle, "simpler_kernel_mode_init");
-            auto supported =
-                symbol<decltype(&simpler_kernel_mode_supported)>(library.handle, "simpler_kernel_mode_supported");
-            auto launch = symbol<decltype(&simpler_kernel_mode_launch)>(library.handle, "simpler_kernel_mode_launch");
-            auto committed =
-                symbol<decltype(&committed_device_memory_ctx)>(library.handle, "committed_device_memory_ctx");
-            DeviceContextHandle ctx = create();
-            ASSERT_NE(ctx, nullptr);
-            CallConfig config;
-            auto invoke = [&](const CallConfig *input, uint64_t generation = 1) {
-                return init(ctx, 0, nullptr, 0, nullptr, 0, nullptr, 0, input, generation);
-            };
-            EXPECT_EQ(invoke(nullptr), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
-            EXPECT_EQ(invoke(&config, 0), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
-            const uint8_t binary = 0;
-            EXPECT_EQ(init(ctx, 0, &binary, 0, nullptr, 0, nullptr, 0, &config, 1), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
-            EXPECT_EQ(init(ctx, 0, nullptr, 0, &binary, 0, nullptr, 0, &config, 1), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
-            EXPECT_EQ(init(ctx, 0, nullptr, 0, nullptr, 0, &binary, 0, &config, 1), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
-            config.runtime_env.ring_task_window[0] = 3;
-            EXPECT_EQ(
-                invoke(&config), std::string(runtime) == "tensormap_and_ringbuffer" ? PTO_RUNTIME_ERR_INVALID_ARGUMENT :
-                                                                                      PTO_RUNTIME_ERR_UNSUPPORTED
-            );
-            config.runtime_env.ring_task_window[0] = 0;
-            testing::internal::CaptureStderr();
-            const int init_result = invoke(&config);
-            const std::string diagnostic = testing::internal::GetCapturedStderr();
-            EXPECT_EQ(init_result, PTO_RUNTIME_ERR_UNSUPPORTED);
-            EXPECT_NE(diagnostic.find("kernel mode is not supported"), std::string::npos) << diagnostic;
-            EXPECT_EQ(supported(ctx), 0);
-            EXPECT_EQ(committed(ctx), 0u);
-            // A structurally valid launch still cannot run after unsupported init.
-            int caller_stream_token = 0;
-            EXPECT_EQ(launch(ctx, 0, &config, &caller_stream_token), PTO_RUNTIME_ERR_INVALID_STATE);
-            EXPECT_EQ(invoke(&config), PTO_RUNTIME_ERR_UNSUPPORTED);
-            EXPECT_EQ(committed(ctx), 0u);
-            destroy(ctx);
-        }
+    for (const auto &runtime : runtimes) {
+        SCOPED_TRACE(runtime.path);
+        LoadedRuntime library(runtime.path.c_str());
+        auto bind_log = symbol<SimplerHostLogBindStateFn>(library.handle, "simpler_host_log_bind_state");
+        ASSERT_EQ(bind_log(&log_state), 0);
+        auto create = symbol<decltype(&create_device_context)>(library.handle, "create_device_context");
+        auto destroy = symbol<decltype(&destroy_device_context)>(library.handle, "destroy_device_context");
+        auto init = symbol<decltype(&simpler_kernel_mode_init)>(library.handle, "simpler_kernel_mode_init");
+        auto supported =
+            symbol<decltype(&simpler_kernel_mode_supported)>(library.handle, "simpler_kernel_mode_supported");
+        auto launch = symbol<decltype(&simpler_kernel_mode_launch)>(library.handle, "simpler_kernel_mode_launch");
+        auto committed = symbol<decltype(&committed_device_memory_ctx)>(library.handle, "committed_device_memory_ctx");
+        DeviceContextHandle ctx = create();
+        ASSERT_NE(ctx, nullptr);
+        CallConfig config;
+        auto invoke = [&](const CallConfig *input, uint64_t generation = 1) {
+            return init(ctx, 0, nullptr, 0, nullptr, 0, nullptr, 0, input, generation);
+        };
+        EXPECT_EQ(invoke(nullptr), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+        EXPECT_EQ(invoke(&config, 0), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+        const uint8_t binary = 0;
+        EXPECT_EQ(init(ctx, 0, &binary, 0, nullptr, 0, nullptr, 0, &config, 1), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+        EXPECT_EQ(init(ctx, 0, nullptr, 0, &binary, 0, nullptr, 0, &config, 1), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+        EXPECT_EQ(init(ctx, 0, nullptr, 0, nullptr, 0, &binary, 0, &config, 1), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+        config.runtime_env.ring_task_window[0] = 3;
+        EXPECT_EQ(invoke(&config), runtime.is_tmr ? PTO_RUNTIME_ERR_INVALID_ARGUMENT : PTO_RUNTIME_ERR_UNSUPPORTED);
+        config.runtime_env.ring_task_window[0] = 0;
+        testing::internal::CaptureStderr();
+        const int init_result = invoke(&config);
+        const std::string diagnostic = testing::internal::GetCapturedStderr();
+        EXPECT_EQ(init_result, PTO_RUNTIME_ERR_UNSUPPORTED);
+        EXPECT_NE(diagnostic.find("kernel mode is not supported"), std::string::npos) << diagnostic;
+        EXPECT_EQ(supported(ctx), 0);
+        EXPECT_EQ(committed(ctx), 0u);
+        // A structurally valid launch still cannot run after unsupported init.
+        int caller_stream_token = 0;
+        EXPECT_EQ(launch(ctx, 0, &config, &caller_stream_token), PTO_RUNTIME_ERR_INVALID_STATE);
+        EXPECT_EQ(invoke(&config), PTO_RUNTIME_ERR_UNSUPPORTED);
+        EXPECT_EQ(committed(ctx), 0u);
+        destroy(ctx);
     }
 }

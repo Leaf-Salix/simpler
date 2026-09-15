@@ -87,14 +87,17 @@ TEST(PipelineContract, AcceptsDepthTwoAndDerivesResourceCopies) {
     PipelineContract c = accepted_contract();
     c.pipeline_depth = 2;
     ASSERT_TRUE(is_valid_pipeline_contract(&c));
-    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[0]), 2u);
-    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[1]), 1u);
-    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[2]), 2u);
+    // Only a host-filled region is replicated per in-flight run. A device
+    // scratch region is reused across runs, and an execution handle is held
+    // for the runner's lifetime, so both stay at one.
+    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[0]), 2u);  // TASK_ARGS, HOST_PER_RUN
+    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[1]), 1u);  // RUNTIME_IMAGE, DEVICE_SCRATCH
+    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[2]), 1u);  // AICPU_STREAM, EXEC_HANDLE
 
     const PipelineSlotLease second_slot{1, 0, 7};
     EXPECT_EQ(pipeline_resource_slot(c, c.resources[0], second_slot), 1u);
     EXPECT_EQ(pipeline_resource_slot(c, c.resources[1], second_slot), 0u);
-    EXPECT_EQ(pipeline_resource_slot(c, c.resources[2], second_slot), 1u);
+    EXPECT_EQ(pipeline_resource_slot(c, c.resources[2], second_slot), 0u);
 }
 
 TEST(PipelineContract, RejectsDepthOutsideSupportedRange) {

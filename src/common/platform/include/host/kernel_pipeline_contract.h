@@ -19,9 +19,9 @@
 //
 // The result is a pure function of the config, and the implementations keep no
 // static or thread-local state, so calls carry no ordering constraints against
-// each other. Today the only caller is kernel-mode init, which computes the
-// contract, admits it and drops it — nothing yet retains a resolved contract,
-// because nothing yet establishes the resources it describes.
+// each other. The only caller is kernel-mode init, which computes the contract,
+// admits it and drops it: no resolved contract is retained, and no resource it
+// describes is established.
 //
 // TMR rejects invalid config with INVALID_ARGUMENT and a null output or invalid
 // generated contract with INTERNAL. Unsupported implementations return UNSUPPORTED.
