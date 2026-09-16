@@ -157,23 +157,38 @@ simpler 仍引用主机侧参数，本次执行会读到被清空的数据，结
 
 ## 8. 图模式验证到哪一步
 
-上面的数值用例是 eager 调用，不包含任何 `aclmdlRICapture` 调用。
+第 2 节的数值用例是 eager 调用，不包含任何 `aclmdlRICapture` 调用。图模式由两套
+测试覆盖，一套验证原语，一套验证公开入口。
 
-图模式只在独立探针 `tests/st/a2a3/kernel_capture/` 中验证过：
+**独立探针 `tests/st/a2a3/kernel_capture/`** 验证三流五事件原语本身：
 
 1. 在一条 warmup stream 上 eager 执行一遍。
 2. 在 caller stream 上 `aclmdlRICaptureBegin`，执行同一串操作，`aclmdlRICaptureEnd` 得到图。
 3. `aclmdlRIExecuteAsync` 回放 100 次，每次更换输入数据并校验结果，证明回放时内部 kernel 确实重新执行。
 4. 用链接器 `--wrap` 拦截 `rtStreamAddToModel`、`rtStreamGetCaptureInfo`、`aclmdlRICaptureGetInfo`，断言调用次数为零。
 
-该探针不经过公开的四个入口。它直接构造执行状态对象，自行加载 AICPU 执行体，
-手写 record / wait 序列，使用测试专用的小 kernel，不经过 TMR runtime，也不经过
-launch owner 与 binder。
+它直接构造执行状态对象，自行加载 AICPU 执行体，手写 record / wait 序列，使用
+测试专用的小 kernel，不经过 TMR runtime，也不经过 launch owner 与 binder。
 
-因此两件事是分开验证的：三流五事件原语能被 ACLGraph 正确 capture 与回放；公开
-launch 路径能在 eager 下算对。在 capture 窗口内调用 `simpler_kernel_mode_launch`
-并回放，目前还没有验证。补充方式是在现有 eager 用例上增加一段：在 capture 窗口内
-调用一次 launch，得到图后改写同一块输入显存，回放若干次并比对输出。
+**场景测试 `tests/st/a2a3/tensormap_and_ringbuffer/kernel_mode_capture/`** 走的是
+公开入口：24 个场景在 `aclmdlRICaptureBegin` / `End` 之间调用
+`simpler_kernel_mode_launch`，取到图后改写输入显存再 `aclmdlRIExecuteAsync` 回放并
+比对输出，覆盖冷图、热图、多 callable、跨 stream、重建图、长链、DAG 以及 eager 侧
+的批量与拒绝路径。
+
+这套测试用 `LD_PRELOAD` 挂一个观察层（`kernel_capture_observer.cpp` +
+`prepare_gate.cpp`，编译成 `observer.so`），按名字截获 CANN 与 runtime 符号，做三件事：
+
+| 职责 | 手段 |
+| ---- | ---- |
+| 断言 simpler 不做什么 | 截获四个同步入口与 `aclrtQueryEventStatus`，按作用域判定：launch 作用域内**任何**同步都被拒绝并计数（入队路径不得含等待，否则图里装不下）；注册作用域内只拒绝**调用方自己的 stream**，上下文私有 AICPU stream 的那次同步照常放行 |
+| 观察它做了什么 | 截获 `rtKernelLaunchWithHandleV2`（AICore）与 `rtsLaunchCpuKernel`（AICPU），解包校验 binding 地址与常驻 `KernelArgs` 在多次调用间不变、两侧 launch 成对；另计 event wait / record 与 `aclrtMemsetAsync` 次数，给出事件拓扑 |
+| 注入故障 | `capture_observer_fail_prepare` 让 AICPU 注册 launch 返回 -4333；`prepare_gate.cpp` 用 `aclrtLaunchCallback(ACL_CALLBACK_BLOCK)` 在 AICPU stream 上插一个阻塞回调，供 `blocked_same` / `stream_busy` 制造"前一次 launch 的 serial tail 未完成"的状态 |
+
+注册作用域与 launch 作用域必须分开：注册**会**同步上下文自己的 AICPU stream（见
+第 4 节），那次等待正是设备侧注册失败能成为 `prepare_callable` 自身返回值的原因。
+阻塞门也随之挂在 launch 上而不是注册上——注册返回时它已经完成，没有"注册尚未完成"
+的窗口可言。
 
 ## 9. 并入主线时的接口裁决
 

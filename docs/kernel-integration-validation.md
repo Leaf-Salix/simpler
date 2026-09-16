@@ -583,6 +583,32 @@ platform entries those suites exercise.
 worktree and PyPI is unreachable from this host. The change adds no page and
 changes no nav entry.
 
+## Capture scene-test revalidation (2026-09-15)
+
+`tests/st/a2a3/tensormap_and_ringbuffer/kernel_mode_capture` was failing 23 of
+its 24 scenarios on a2a3 before this change, every one on
+`prepare/launch performed an internal sync` — the observer forbade the AICPU
+stream wait that #2245 deliberately added to registration. The decisions are D21
+in the integration log: the wait stays, the guard splits into a launch scope
+that refuses every synchronize and a registration scope that refuses only the
+caller's streams, and the blocking gate moves from registration to launch.
+
+| Suite | Result |
+| ----- | ------ |
+| a2a3 hardware, `tests/st/.../kernel_mode_capture` | 24/24 scenarios passed |
+| a2a3 hardware, `tests/st/a2a3/kernel_capture` | passed, unchanged |
+| Python unit tests, `tests/ut -m "not requires_hardware"` | 2458 passed |
+| Python hardware unit tests, `tests/ut -m requires_hardware --platform a2a3` | 23/23 scheduled cases passed |
+| pre-commit hooks on changed files | passed |
+
+Before the change the same invocation reported 1 of 24. Splitting the two scopes
+alone took it to 22; the remaining two, `blocked_same` and `stream_busy`, are the
+scenarios whose gate assumed registration returns while it is still outstanding,
+and they pass once the gate is installed ahead of a launch instead.
+
+This is a test-side change only: no native source differs, so the entry
+behaviour every earlier row in this document recorded is unchanged.
+
 ## Remaining boundaries
 
 - H4 has no submitted PR in the supplied pipeline. HBG kernel capability is

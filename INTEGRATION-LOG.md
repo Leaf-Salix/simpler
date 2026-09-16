@@ -899,3 +899,59 @@ artifact of its own stub platform:
 
 **Affects.** #2185 (the remainder of its refreshed head adopted); D15 (its
 deferral of this PR closed).
+
+---
+
+## D21 - Registration may synchronize; only the launch scope forbids every wait
+
+**Problem.** `tests/st/a2a3/tensormap_and_ringbuffer/kernel_mode_capture` failed
+23 of its 24 scenarios on a2a3, every one on the same assertion:
+`prepare/launch performed an internal sync`. D19 routed kernel
+`prepare_callable` through `register_callable_on_device`, which synchronizes the
+context's AICPU stream so a device-side registration failure is
+`prepare_callable`'s own status. The scene test's `_guarded` armed the
+observer's `forbid_sync` around registration as well as launch, and the observer
+does not merely count a forbidden sync — it refuses it, returning -4331. The two
+cannot both stand. #2245 merged at 12:09 and #2242 at 12:16 the same day, so the
+latter's checks ran against a base without the wait, and this base branch runs
+only the `build` check.
+
+**Choice.** D19's wait stays. The test's expectation is the half that was
+written against a contract that had already changed.
+
+1. **Two scopes, not one.** `capture_observer_guard_sync` keeps its meaning for
+   launch: every synchronize is refused, because launch is pure enqueue and a
+   wait there is what a captured graph cannot contain. A new
+   `capture_observer_prepare_scope` covers registration and refuses only the
+   *caller's* streams, which the test registers up front; the context's own
+   AICPU stream reaches CANN. A null stream counts as the caller's, since a
+   device-wide drain takes those streams with it.
+2. **`forbid_sync` stops doubling as a scope marker.** The registration fault
+   injection and the capture gate both keyed off `forbid_sync &&
+   !invocation_scope`, so simply not arming it around registration would have
+   disarmed them too — `prepare_fail_register` returned 0 where it expects
+   -4333. Both now key off `prepare_scope` directly.
+3. **The blocking gate moves from registration to launch.** It installed a
+   blocking callback ahead of the AICPU register launch, which a synchronous
+   registration now waits on: `prepare` returned only after the gate's own 10 s
+   timeout, and the scenarios that assert it is still blocked could not hold.
+   `capture_gate_install_if_armed` is called from the invocation scope instead,
+   ahead of that launch's AICPU work, so the first launch's serial tail stays
+   incomplete. `blocked_same` then asserts what remains true — a second launch
+   on the same caller stream neither queries the tail nor waits for it, since
+   the stream's own FIFO orders it and the query belongs to the
+   different-stream path — and `stream_busy` keeps its
+   `PREPARED_INCOMPATIBLE` coverage for the different-stream case.
+
+**Reason.** The property the scene test exists for is that a launch contains no
+wait, and that is untouched. Registration is not in a captured graph: it is the
+eager, out-of-capture step whose whole purpose is to have already happened
+before any launch a graph records. Asserting it performs no wait asserted
+something the design never promised, and the narrower assertion — that it never
+touches a stream the caller owns — is the one that protects a framework caller.
+
+**Boundary.** 24 of 24 scenarios pass on a2a3. `tests/st/a2a3/kernel_capture`
+is unchanged and still passes. No native source changed.
+
+**Affects.** #2242 (its observer and two of its scenarios); #2245 and D19 (their
+wait confirmed as the contract).
