@@ -13,14 +13,18 @@
 #include <runtime/rt.h>
 #include <runtime/rts/rts_kernel.h>
 
+#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
 #include <initializer_list>
+#include <unordered_set>
 
 #include "common/kernel_args.h"
 #include "task_interface/kernel_dispatch_args.h"
+#include "task_interface/tmr_kernel_context.h"
+#include "task_interface/tmr_kernel_control.h"
 #include "tensormap_and_ringbuffer/kernel_invocation.h"
 
 extern "C" aclError capture_gate_install_if_armed(aclrtStream stream);
@@ -44,6 +48,7 @@ struct Observer {
     uint64_t core_launches{0};
     uint64_t cpu_launches{0};
     uint64_t binding{0};
+    uint64_t core_envelope{0};
     uint64_t context_generation{0};
     KernelArgs resident{};
 };
@@ -60,6 +65,10 @@ uint64_t total_queries{0};
 uint64_t event_waits{0}, event_records{0}, async_clears{0};
 int prepare_failure{0};
 uint64_t prepare_failure_calls{0};
+std::unordered_set<void *> large_prepare_allocations;
+bool fail_large_free{false};
+uint64_t failed_frees{0};
+bool corrupt_next_invocation{false};
 
 bool fail_prepare_step(int kind) {
     if (!prepare_scope || prepare_failure != kind) return false;
@@ -124,9 +133,12 @@ void observe_core(const rtArgsEx_t *args) {
         note_error(ObserverError::InvalidCoreArgs);
         return;
     }
-    KernelArgs *device_args = nullptr;
+    void *device_args = nullptr;
     std::memcpy(&device_args, args->args, sizeof(device_args));
-    note_binding(reinterpret_cast<uintptr_t>(device_args));
+    const auto address = reinterpret_cast<uintptr_t>(device_args);
+    if (address == 0 || (observer.core_envelope != 0 && observer.core_envelope != address))
+        note_error(ObserverError::BindingChanged);
+    observer.core_envelope = address;
 }
 
 void observe_cpu(const rtCpuKernelArgs_t *args) {
@@ -184,6 +196,27 @@ extern "C" void capture_observer_fail_prepare(int kind) {
     prepare_failure_calls = 0;
 }
 extern "C" uint64_t capture_observer_prepare_failures() { return prepare_failure_calls; }
+extern "C" void capture_observer_fail_large_free(int enabled) { fail_large_free = enabled != 0; }
+extern "C" uint64_t capture_observer_failed_frees() { return failed_frees; }
+extern "C" void capture_observer_corrupt_next_invocation() { corrupt_next_invocation = true; }
+
+extern "C" rtError_t rtMalloc(void **address, uint64_t bytes, uint32_t kind, uint16_t module) {
+    static const auto real = reinterpret_cast<decltype(&rtMalloc)>(resolve_cann_symbol("rtMalloc"));
+    const auto rc = real == nullptr ? -4330 : real(address, bytes, kind, module);
+    if (rc == 0 && prepare_scope && bytes >= 1024 * 1024) large_prepare_allocations.insert(*address);
+    return rc;
+}
+
+extern "C" rtError_t rtFree(void *address) {
+    if (fail_large_free && large_prepare_allocations.count(address) != 0) {
+        ++failed_frees;
+        return -4334;
+    }
+    static const auto real = reinterpret_cast<decltype(&rtFree)>(resolve_cann_symbol("rtFree"));
+    const auto rc = real == nullptr ? -4330 : real(address);
+    if (rc == 0) large_prepare_allocations.erase(address);
+    return rc;
+}
 
 extern "C" aclError aclrtQueryEventStatus(aclrtEvent event, aclrtEventRecordedStatus *status) {
     if (invocation_scope) ++total_queries;
@@ -269,8 +302,18 @@ extern "C" int capture_observer_check_resident() {
     if (status != 0) return status;
     const auto copy = reinterpret_cast<decltype(&aclrtMemcpy)>(resolve_cann_symbol("aclrtMemcpy"));
     if (copy == nullptr) return -4330;
+    simpler::tmr::TmrKernelAicoreArgs envelope{};
+    int rc = copy(
+        &envelope, sizeof(envelope), reinterpret_cast<const void *>(observer.core_envelope), sizeof(envelope),
+        ACL_MEMCPY_DEVICE_TO_HOST
+    );
+    if (rc != 0) return rc;
+    if (envelope.resident_kernel_args != observer.binding) {
+        note_error(ObserverError::BindingChanged);
+        return static_cast<int>(observer.error);
+    }
     KernelArgs resident{};
-    const int rc = copy(
+    rc = copy(
         &resident, sizeof(resident), reinterpret_cast<const void *>(observer.binding), sizeof(resident),
         ACL_MEMCPY_DEVICE_TO_HOST
     );
@@ -286,6 +329,51 @@ extern "C" int capture_observer_check_resident() {
         observer.resident_sampled = true;
     }
     return static_cast<int>(observer.error);
+}
+
+extern "C" int capture_observer_failure_retired(int expect_opened) {
+    using namespace simpler::tmr;
+    const auto copy = reinterpret_cast<decltype(&aclrtMemcpy)>(resolve_cann_symbol("aclrtMemcpy"));
+    if (copy == nullptr || observer.core_envelope == 0) return -1;
+    const auto read = [&](void *out, uint64_t address, size_t bytes) {
+        return copy(out, bytes, reinterpret_cast<const void *>(address), bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+    };
+    TmrKernelAicoreArgs envelope{};
+    TmrKernelContextDescriptor descriptor{};
+    TmrLaunchControl control{};
+    if (read(&envelope, observer.core_envelope, sizeof(envelope)) != 0 ||
+        read(&descriptor, envelope.context_descriptor, sizeof(descriptor)) != 0 ||
+        read(&control, descriptor.control_address, sizeof(control)) != 0)
+        return -2;
+    if (control.completion != static_cast<uint32_t>(TmrCompletion::Complete) || control.runtime_status == 0 ||
+        control.cleanup_status != 0 || control.round_epoch == 0 || descriptor.worker_count <= 0) {
+        std::fprintf(
+            stderr, "retirement control: completion=%u runtime=%d cleanup=%d epoch=%" PRIu64 " workers=%d\n",
+            control.completion, control.runtime_status, control.cleanup_status, control.round_epoch,
+            descriptor.worker_count
+        );
+        return -3;
+    }
+    const uint64_t expected_epoch = expect_opened ? control.round_epoch : 0;
+    const auto expected_release = static_cast<uint32_t>(expect_opened ? TmrCoreRelease::Release : TmrCoreRelease::Wait);
+    for (int32_t i = 0; i < descriptor.worker_count; ++i) {
+        TmrCoreReport report{};
+        const int rc = read(&report, descriptor.reports_address + i * sizeof(report), sizeof(report));
+        // Unopened cores exit on CANCEL without waiting for a window release.
+        if (rc != 0 || report.ready != static_cast<uint32_t>(i + 1) || report.exited != static_cast<uint32_t>(i + 1) ||
+            report.command != static_cast<uint32_t>(TmrCoreCommand::Cancel) || report.round_epoch != expected_epoch ||
+            report.release != expected_release) {
+            std::fprintf(
+                stderr,
+                "retirement core=%d read=%d ready=%u exited=%u command=%u release=%u epoch=%" PRIu64
+                " expected_release=%u expected_epoch=%" PRIu64 "\n",
+                i, rc, report.ready, report.exited, report.command, report.release, report.round_epoch,
+                expected_release, expected_epoch
+            );
+            return -4;
+        }
+    }
+    return 0;
 }
 
 extern "C" rtError_t rtKernelLaunchWithHandleV2(
@@ -308,7 +396,25 @@ extern "C" rtError_t rtsLaunchCpuKernel(
     if (invocation_scope) {
         if (const auto rc = capture_gate_install_if_armed(stream); rc != 0) return rc;
     }
-    if (observer.armed && invocation_scope) observe_cpu(args);
+    // The separate caller-result node carries only trusted context identity;
+    // it is not an invocation and must not be counted as a second dispatch.
+    if (observer.armed && invocation_scope && args != nullptr &&
+        args->baseArgs.argsSize != sizeof(simpler::tmr::TmrContextRegistrationArgs))
+        observe_cpu(args);
     static const auto real = reinterpret_cast<decltype(&rtsLaunchCpuKernel)>(resolve_cann_symbol("rtsLaunchCpuKernel"));
+    if (real != nullptr && invocation_scope && corrupt_next_invocation && args != nullptr &&
+        args->baseArgs.argsSize >= sizeof(SimplerKernelDispatchArgs)) {
+        corrupt_next_invocation = false;
+        auto *bytes = static_cast<unsigned char *>(args->baseArgs.args);
+        SimplerKernelDispatchArgs original{};
+        std::memcpy(&original, bytes, sizeof(original));
+        auto invalid = original;
+        ++invalid.context_generation;
+        std::memcpy(bytes, &invalid, sizeof(invalid));
+        const auto rc = real(function, blocks, stream, config, args);
+        // CANN owns the copied packet after the native API returns.
+        std::memcpy(bytes, &original, sizeof(original));
+        return rc;
+    }
     return real == nullptr ? -4330 : real(function, blocks, stream, config, args);
 }

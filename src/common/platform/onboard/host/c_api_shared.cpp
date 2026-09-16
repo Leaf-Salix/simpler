@@ -1406,7 +1406,7 @@ int simpler_kernel_mode_prepare_callable(
         rollback.dismiss();
         try {
             const HostApi kernel_api(runner, 0, 0, &g_host_api_ops);
-            rc = runner->prepare_kernel_callable(minted, &kernel_api);
+            rc = runner->prepare_kernel_callable(minted, &kernel_api, callable_size);
         } catch (...) {
             runner->kernel_execution_state().poison(PTO_RUNTIME_ERR_INTERNAL);
             throw;

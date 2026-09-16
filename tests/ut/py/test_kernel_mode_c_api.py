@@ -203,7 +203,8 @@ def _minimal_callable_image() -> bytes:
 def _binaries(arch: str, runtime: str) -> tuple[bytes, bytes, bytes]:
     base = _PROJECT_ROOT / "build" / "lib" / arch / "onboard" / runtime
     dispatcher = _PROJECT_ROOT / "build" / "lib" / arch / "dispatcher" / "libsimpler_aicpu_dispatcher.so"
-    files = (base / "libaicpu_kernel.so", base / "aicore_kernel.o", dispatcher)
+    core_name = "aicore_kernel_mode.o" if runtime == "tensormap_and_ringbuffer" else "aicore_kernel.o"
+    files = (base / "libaicpu_kernel.so", base / core_name, dispatcher)
     for path in files:
         if not path.exists():
             pytest.skip(f"{path} not built")
@@ -336,6 +337,11 @@ def _run_lifecycle_retry(arch, runtime, device, scenario):
             faults.disarm_acl_guard()
 
 
+def _finalize_after_quiescence(lib, ctx):
+    """Close after external quiescence; preserve actual teardown errors."""
+    return lib.finalize_device(ctx)
+
+
 def _check_lifecycle_retry(lib, faults, arch, runtime, device, scenario):
     aicpu, aicore, dispatcher = _binaries(arch, runtime)
     config = CallConfig()
@@ -424,16 +430,16 @@ def _check_lifecycle_retry(lib, faults, arch, runtime, device, scenario):
             finalized = True
         elif scenario == "persistent_free_close":
             _check_prepare_reuse(lib, ctx, arch, runtime, close=False)
-            # The first rtFree releases the callable upload. Fail the next
-            # call, which is owned by PersistentKernelArgs, to cover the
+            # The first rtFree releases K7 coordination storage after revoke.
+            # Fail the next, owned by PersistentKernelArgs, to exercise the
             # owner -> finalize_common -> allocator retry chain.
             faults.arm_destroy_failure_after(4, 1)
             # The allocator path may translate an injected RTS status, but it
             # must never report success or forget the allocation before retry.
-            assert lib.finalize_device(ctx) != 0
+            assert _finalize_after_quiescence(lib, ctx) != 0
             first_attempts = faults.destroy_attempts()
             assert first_attempts > 0
-            assert lib.finalize_device(ctx) == 0
+            assert _finalize_after_quiescence(lib, ctx) == 0
             # A kernel context releases several device blocks, and the failure
             # stops the first pass partway, so the retry attempts the block
             # that failed plus everything the first pass never reached. The
@@ -456,7 +462,7 @@ def _check_lifecycle_retry(lib, faults, arch, runtime, device, scenario):
             finalized = True
     finally:
         if not finalized:
-            assert lib.finalize_device(ctx) == 0
+            assert _finalize_after_quiescence(lib, ctx) == 0
         lib.destroy_device_context(ctx)
         names = (
             "aclInit",
@@ -491,7 +497,7 @@ def _check_register_failure(lib, ctx):
         == PTO_RUNTIME_ERR_INVALID_STATE
     )
     assert minted.value == -1
-    assert lib.finalize_device(ctx) == 0
+    assert _finalize_after_quiescence(lib, ctx) == 0
     assert lib.committed_device_memory_ctx(ctx) == 0
 
 
@@ -535,7 +541,7 @@ def _check_prepare_reuse(lib, ctx, arch, runtime, *, close=True):
     lib.simpler_unregister_callable.restype = ctypes.c_int
     assert lib.simpler_unregister_callable(ctx, 0) == PTO_RUNTIME_ERR_INVALID_STATE
     if close:
-        assert lib.finalize_device(ctx) == 0
+        assert _finalize_after_quiescence(lib, ctx) == 0
         assert lib.committed_device_memory_ctx(ctx) == 0
         assert (
             lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), ctypes.byref(minted))
@@ -897,7 +903,7 @@ def _run_eager_values(arch, runtime, device, scenario="eager_values"):
         first_output = host_array()
         assert lib.aclrtMemcpy(first_output, bytes_per_tensor, results[0][0], bytes_per_tensor, 2) == 0
         assert list(first_output) == results[0][1]
-        assert lib.finalize_device(ctx) == 0
+        assert _finalize_after_quiescence(lib, ctx) == 0
         initialized = False
         assert lib.committed_device_memory_ctx(ctx) == 0
     finally:
@@ -905,7 +911,7 @@ def _run_eager_values(arch, runtime, device, scenario="eager_values"):
             lib.aclrtSynchronizeStreamWithTimeout(caller_stream, 60000)
         if ctx:
             if initialized:
-                lib.finalize_device(ctx)
+                _finalize_after_quiescence(lib, ctx)
             lib.destroy_device_context(ctx)
         for address in reversed(allocations):
             assert lib.aclrtFree(address) == 0

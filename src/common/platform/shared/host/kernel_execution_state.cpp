@@ -73,6 +73,14 @@ void KernelExecutionState::poison(int runtime_error) {
     if (last_runtime_error_ == 0) last_runtime_error_ = runtime_error;
 }
 
+int KernelExecutionState::begin_closing() {
+    std::scoped_lock lock(mutex_);
+    if (phase_ == KernelContextPhase::Initializing) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (phase_ == KernelContextPhase::Closed) return 0;
+    phase_ = KernelContextPhase::Closing;
+    return 0;
+}
+
 int KernelExecutionState::close() {
     std::scoped_lock lock(mutex_);
     switch (phase_) {

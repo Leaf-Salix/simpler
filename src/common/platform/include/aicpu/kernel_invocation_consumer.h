@@ -18,6 +18,11 @@
 // Per-thread kernel-entry setup supplied by platforms with a scheduling policy.
 void prepare_kernel_aicpu_thread();
 
+// Runtime admission must see even rejected framing: TMR uses its prepared
+// context, not an untrusted packet pointer, to retire an already launched group.
+// The shared entry remains the sole native status-domain adapter.
+int consume_kernel_task(void *arg);
+
 // The binder pairs the ID with a committed device image. Before rebuilding the
 // function table, the runtime consumer must establish cache visibility,
 // validate child offsets against callable_bytes, and check signature counts.

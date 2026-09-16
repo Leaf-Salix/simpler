@@ -86,7 +86,9 @@ simpler 没有调用过它们。
 | `finalize_device` | 释放上下文拥有的资源；测试断言 committed memory 归零 |
 
 init 期间的执行体加载和 prepare 期间的 callable 注册，会同步上下文自己的 AICPU
-stream。launch 路径不同步任何 stream。
+stream。launch 路径不同步任何 stream。TMR close 在调用方已完成执行且销毁相关 graph
+之后，等待上下文自有 AICPU stream 完成设备注销及回执复制，再释放资源；不替调用方
+同步 caller stream。等待有超时，注销、等待或释放失败均保留相应资源供 close 重试。
 
 prepare 之后，测试自己同步一次 caller stream 再读 committed memory。prepare 的设备侧
 注册错误由它自己的返回值报告，不依赖这次同步。

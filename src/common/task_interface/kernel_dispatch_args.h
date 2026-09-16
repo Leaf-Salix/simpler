@@ -40,12 +40,15 @@ struct SimplerKernelDispatchArgs {
     SimplerKernelInvocationHeader invocation;
 };
 
-// Nonzero device-entry status is surfaced by caller synchronization. 2 and 3
-// are retired: they reported a residency descriptor the entry no longer reads.
+// Logical runtime classifications, distinct from the native CANN 0/2 domain.
+// Values 2 and 3 are retired residency-descriptor classifications.
 enum class KernelDispatchStatus : int32_t {
     Success = 0,
     InvalidArgs = 1,
     UnsupportedPayload = 4,
+    InvalidBinding = 5,
+    ExecutionFailed = 6,
+    CleanupFailed = 7,
 };
 
 static_assert(

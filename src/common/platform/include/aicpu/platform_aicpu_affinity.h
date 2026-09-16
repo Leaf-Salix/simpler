@@ -20,6 +20,10 @@
 // the gate in lockstep by referencing this constant instead of a literal.
 constexpr int32_t MAX_GATE_THREADS = 16;
 
+// Observation for kernel's all-launched-thread admission; not a role index.
+// Sim has no device CPU identity and returns -1.
+int32_t platform_aicpu_current_cpu();
+
 // Returns true if this thread should call aicpu_execute().
 // Returns false if this thread should exit (dropped).
 // logical_count: desired active threads (from runtime.aicpu_thread_num)

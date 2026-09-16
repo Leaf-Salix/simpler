@@ -14,6 +14,7 @@ import platform
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -28,6 +29,11 @@ MODULE = "tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture"
 RUNTIME = "tensormap_and_ringbuffer"
 SCENARIOS = (
     "cold_synced",
+    "close_fail_free",
+    "device_error_eager",
+    "device_error_replay",
+    "runtime_error_eager",
+    "runtime_error_replay",
     "cold_unsynced",
     "warm",
     "multi_callable",
@@ -122,7 +128,11 @@ def test_tmr_kernel_mode(st_platform, st_device_ids, scenario, capture_observer)
             pytest.fail(f"capture scenario timed out; artifacts: {tmp_path}")
     output = (tmp_path / "run.log").read_text()
     assert result.returncode == 0, f"{output}\nArtifacts: {tmp_path}"
-    if scenario.startswith("prepare_fail_"):
+    if "_error_" in scenario:
+        assert f"PASS {scenario} caller_error=1 cores_retired=1" in output
+    elif scenario == "close_fail_free":
+        assert "PASS close_fail_free retained_then_retried=1" in output
+    elif scenario.startswith("prepare_fail_"):
         assert f"PASS {scenario} rejected_after_failure=1 forbidden_sync=0" in output
     elif scenario.startswith("eager_") and scenario != "eager_replay":
         assert f"PASS {scenario} eager=100 forbidden_sync=0" in output
@@ -130,7 +140,7 @@ def test_tmr_kernel_mode(st_platform, st_device_ids, scenario, capture_observer)
         assert f"PASS {scenario} replays=100 forbidden_sync=0" in output
 
 
-def _build_callable(build_dir, alternate=False, dag=False):
+def _build_callable(build_dir, alternate=False, dag=False, execution_error=False):
     from simpler.task_interface import ArgDirection, ChipCallable, CoreCallable  # noqa: PLC0415
 
     from simpler_setup.elf_parser import extract_text_section  # noqa: PLC0415
@@ -146,6 +156,8 @@ def _build_callable(build_dir, alternate=False, dag=False):
     )
     if dag:
         source = Path(__file__).with_name("kernel_tmr_chain.cpp")
+    if execution_error:
+        source = Path(__file__).with_name("kernel_execution_error.cpp")
     orchestration = compiler.compile_orchestration(RUNTIME, str(source), build_dir=str(build_dir))
     incore = compiler.compile_incore(
         str(ROOT / "examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels/aiv/kernel_add_scalar.cpp"),
@@ -158,7 +170,9 @@ def _build_callable(build_dir, alternate=False, dag=False):
     child = CoreCallable.build(signature=signature, binary=extract_text_section(incore))
     return ChipCallable.build(
         signature=signature,
-        func_name="kernel_tmr_chain"
+        func_name="kernel_execution_error"
+        if execution_error
+        else "kernel_tmr_chain"
         if dag
         else ("kernel_capture_alternate" if alternate else "kernel_eager_orchestration"),
         binary=orchestration,
@@ -215,6 +229,8 @@ def _bind_observer_guards(observer):
     observer.capture_observer_fail_prepare.restype = None
     observer.capture_observer_caller_syncs.argtypes = []
     observer.capture_observer_caller_syncs.restype = ctypes.c_uint64
+    observer.capture_observer_failure_retired.argtypes = [ctypes.c_int]
+    observer.capture_observer_failure_retired.restype = ctypes.c_int
     for name in ("query_calls", "total_queries", "waits", "records", "clears", "prepare_failures"):
         function = getattr(observer, "capture_observer_" + name)
         function.argtypes = []
@@ -245,7 +261,9 @@ def _close(lib, ctx, allocations, streams, device, graphs=()):
 
     for graph in graphs:
         _check(lib.aclmdlRIDestroy(graph), "destroy graph")
-    _check(lib.finalize_device(ctx), "finalize context")
+    # All caller work is drained and graphs are destroyed before entering this
+    # helper. Close waits only for its own metadata revocation.
+    _check(lib.finalize_device(ctx), "finalize context (including revocation)")
     assert lib.committed_device_memory_ctx(ctx) == 0
     lib.destroy_device_context(ctx)
     for address in reversed(allocations):
@@ -254,6 +272,21 @@ def _close(lib, ctx, allocations, streams, device, graphs=()):
         _check(lib.aclrtDestroyStream(stream), "destroy stream")
     _check(lib.aclrtResetDevice(device), "reset")
     _check(lib.aclFinalize(), "finalize ACL")
+
+
+def _check_close_failure(context):
+    lib, observer, ctx = context.lib, context.observer, context.handle
+    observer.capture_observer_fail_large_free.argtypes = [ctypes.c_int]
+    observer.capture_observer_failed_frees.restype = ctypes.c_uint64
+    observer.capture_observer_fail_large_free(1)
+    status = lib.finalize_device(ctx)
+    assert observer.capture_observer_failed_frees() > 0
+    assert status == -4334, f"failed free was lost: close={status}"
+    retained = lib.committed_device_memory_ctx(ctx)
+    assert retained > 0, "failed device free disappeared from the allocator ledger"
+    assert lib.finalize_device(ctx) == -4334
+    assert lib.committed_device_memory_ctx(ctx) == retained
+    observer.capture_observer_fail_large_free(0)
 
 
 def _fail():
@@ -304,7 +337,13 @@ def _initialize(device, scenario, build_dir):
         _check,
     )
 
-    chips = [_build_callable(build_dir / "callable-a", dag=scenario in ("tmr_dag", "eager_dag"))]
+    chips = [
+        _build_callable(
+            build_dir / "callable-a",
+            dag=scenario in ("tmr_dag", "eager_dag"),
+            execution_error=scenario.startswith("runtime_error_"),
+        )
+    ]
     if scenario in ("multi_callable", "prepare_again", "prepare_after_capture", "eager_multi_callable"):
         chips.append(_build_callable(build_dir / "callable-b", alternate=True))
     lib = _load("a2a3", "onboard", RUNTIME)
@@ -495,6 +534,36 @@ def _replay(context, graph, stream=None):
     assert observer.capture_observer_total_queries() == before
 
 
+def _check_device_failure(context, scenario, launch, record_nodes, replay):
+    observer = context.observer
+    if scenario.startswith("device_error_"):
+        observer.capture_observer_corrupt_next_invocation()
+    if scenario.endswith("replay"):
+        graph = record_nodes([(0, None, 1.25)])
+        replay(graph)
+    else:
+        launch(0)
+    started = time.monotonic()
+    status = context.lib.aclrtSynchronizeStreamWithTimeout(context.caller, 10000)
+    assert status != 0, "hidden AICPU error was not propagated to caller"
+    assert time.monotonic() - started < 9, "failure only surfaced through timeout"
+    # Generation rejection precedes window-open; the config failure follows it.
+    expect_opened = scenario.startswith("runtime_error_")
+    retired = observer.capture_observer_failure_retired(int(expect_opened))
+    assert retired == 0, f"failed round retirement rc={retired}, expect_opened={expect_opened}"
+    print(f"PASS {scenario} caller_error=1 cores_retired=1", flush=True)
+    # Error streams/graphs are terminal; this test proves retirement,
+    # not a D2 recovery policy. Let the isolated process release them.
+    os._exit(0)
+
+
+def _run_close_failure(context, prepare, launch, sync):
+    prepare(0)
+    launch(0)
+    sync(context.caller)
+    _check_close_failure(context)
+
+
 def _run(device, scenario, build_dir):
     from simpler.task_interface import ChipStorageTaskArgs, ChipTensor, DataType  # noqa: PLC0415
 
@@ -576,10 +645,17 @@ def _run(device, scenario, build_dir):
     def record(cids, increment=1.25):
         return record_nodes([(cid, None, 1.25) for cid in cids] + [(0, (counter, counter), increment)])
 
-    def replay(graph, stream=None):
-        return _replay(context, graph, stream)
+    replay = partial(_replay, context)
 
     try:
+        if scenario.startswith(("device_error_", "runtime_error_")):
+            prepare(0)
+            _check_device_failure(context, scenario, launch, record_nodes, replay)
+        if scenario == "close_fail_free":
+            _run_close_failure(context, prepare, launch, sync)
+            _close(lib, ctx, allocations, streams, device)
+            print("PASS close_fail_free retained_then_retried=1", flush=True)
+            return
         if scenario.startswith("prepare_fail_"):
             _check_prepare_failure(scenario, observer, lib, ctx, prepare, launch)
             _close(lib, ctx, allocations, streams, device)

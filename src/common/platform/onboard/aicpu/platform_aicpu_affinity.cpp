@@ -29,6 +29,8 @@
 // slot and the sched/orch role id.
 static thread_local int32_t tl_exec_idx = -1;
 
+int32_t platform_aicpu_current_cpu() { return sched_getcpu(); }
+
 // =============================================================================
 // Filter-style gate (onboard).
 // =============================================================================
