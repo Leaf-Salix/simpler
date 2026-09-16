@@ -714,7 +714,7 @@ KernelCallableCache::Ops DeviceRunnerBase::kernel_callable_cache_ops() {
     };
 }
 
-int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id, const HostApi *api) {
+int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id, const HostApi *api, size_t callable_bytes) {
     rtStream_t control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
     if (control_stream == nullptr) {
         LOG_ERROR("prepare_kernel_callable: no live kernel context");
@@ -753,7 +753,19 @@ int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id, const HostApi
         return PTO_RUNTIME_ERR_INTERNAL;
     if (state.kernel_packet.prepare(callable) != simpler::kernel::InvocationStatus::Ok) return PTO_RUNTIME_ERR_INTERNAL;
 
-    const int rc = register_callable_on_device(callable_id, control_stream);
+    int rc = prepare_kernel_coordination();
+    if (rc != 0) return rc;
+    simpler::tmr::TmrCallableRegistrationArgs registration{
+        kernel_static_config_.generation(), kernel_callable_cache_.pending_uploaded_address(), callable_bytes,
+        callable_id, 0
+    };
+    rc = launch_aicpu_payload(
+        control_stream, &registration, sizeof(registration), "simpler_aicpu_register_tmr_kernel_callable", 1
+    );
+    if (rc != 0) return rc;
+    rc = aclrtSynchronizeStreamWithTimeout(control_stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (rc != 0) return rc;
+    rc = commit_device_register(callable_id);
     if (rc != 0) return rc;
     return kernel_exec_state_.mark_ready_enqueued();
 }
@@ -1655,6 +1667,9 @@ int DeviceRunnerBase::abandon_common_after_device_failure() { return finalize_co
 
 int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     if (!abandon_device_resources && execution_mode_latch_.is_kernel()) {
+        kernel_exec_state_.begin_closing();
+        const int coordination_rc = finalize_kernel_coordination();
+        if (coordination_rc != 0) return coordination_rc;
         const int args_rc = persistent_args_.finalize_once();
         if (args_rc != 0) {
             kernel_exec_state_.poison(args_rc);
@@ -1829,12 +1844,23 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     // teardown sees arguments released while their owning context still
     // exists. Both are no-ops on a program-mode context.
     if (abandon_device_resources) {
+        abandon_kernel_coordination();
         persistent_args_.abandon();
     } else {
         const int args_rc = persistent_args_.finalize_once();
         if (args_rc != 0 && rc == 0) rc = args_rc;
+        if (execution_mode_latch_.is_kernel()) {
+            if (args_rc != 0) return args_rc;
+            release_child_memory_host_views();
+            // Revoke already confirmed that no device metadata borrows these
+            // allocations. Retain failed frees and the stream/event owner so
+            // destroy cannot treat a failed close as a completed teardown.
+            const int alloc_rc = mem_alloc_.finalize_preserving_failures();
+            if (alloc_rc != 0) return alloc_rc;
+        }
         const int close_rc = kernel_exec_state_.close();
         if (close_rc != 0 && rc == 0) rc = close_rc;
+        if (execution_mode_latch_.is_kernel() && close_rc != 0) return close_rc;
     }
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
@@ -1843,7 +1869,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         // they cannot be released after it. A force reset already invalidated
         // both, and the unregister would be a further device call.
         release_child_memory_host_views();
-        mem_alloc_.finalize();
+        if (!execution_mode_latch_.is_kernel()) mem_alloc_.finalize();
     }
 
     block_dim_ = 0;

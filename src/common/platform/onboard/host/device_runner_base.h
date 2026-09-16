@@ -77,6 +77,10 @@
 #include "worker/kernel_dispatch_packet.h"
 #include "kernel_persistent_args.h"
 #include "host/kernel_static_config.h"
+#include "host/kernel_context_revoke.h"
+#include "task_interface/tmr_kernel_context.h"
+#include "task_interface/tmr_kernel_control.h"
+#include "task_interface/tmr_kernel_revoke.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
 #include "host/runtime_timeout_config.h"
@@ -175,7 +179,7 @@ public:
      * context's persistent argument blocks exist. Idempotent in the part that
      * matters: only the first callable pays for the argument blocks.
      */
-    int prepare_kernel_callable(int32_t callable_id, const HostApi *api);
+    int prepare_kernel_callable(int32_t callable_id, const HostApi *api, size_t callable_bytes);
     int launch_kernel_callable(int32_t callable_id, const ChipStorageTaskArgs &args, void *caller_stream);
     std::mutex &kernel_submission_mutex() { return kernel_submission_mutex_; }
     KernelCallableCache &kernel_callable_cache() { return kernel_callable_cache_; }
@@ -1358,6 +1362,18 @@ protected:
     // and per-invocation fields stay at the sentinels Runtime() sets; binding
     // a callable into it is a later step's work.
     Runtime kernel_runtime_;
+    int prepare_kernel_coordination();
+    int finalize_kernel_coordination();
+    void abandon_kernel_coordination();
+    simpler::tmr::TmrKernelContextDescriptor kernel_descriptor_{};
+    void *kernel_coordination_block_{nullptr};
+    void *kernel_core_envelope_{nullptr};
+    void *kernel_revoke_device_receipt_{nullptr};
+    simpler::tmr::TmrContextRevokeReceipt *kernel_revoke_host_receipt_{nullptr};
+    rtEvent_t kernel_revoke_event_{nullptr};
+    KernelContextRevoke kernel_revoke_;
+    bool kernel_coordination_ready_{false};
+    rtFuncHandle kernel_result_handle_{nullptr};
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results

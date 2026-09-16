@@ -43,6 +43,20 @@
 // OUT_OF_ORDER_FULL_BARRIER - no-op on real hardware (dcci handles full cache coherency)
 #define OUT_OF_ORDER_FULL_BARRIER() ((void)0)
 
+// The wire is plain POD; silicon needs explicit visibility for shared words.
+template <typename T>
+__aicore__ inline T load_kernel_gm_word(__gm__ T *address) {
+    dcci(address, SINGLE_CACHE_LINE);
+    dsb(static_cast<mem_dsb_t>(0));
+    return *reinterpret_cast<volatile __gm__ T *>(address);
+}
+template <typename T>
+__aicore__ inline void store_kernel_gm_word(__gm__ T *address, T value) {
+    *reinterpret_cast<volatile __gm__ T *>(address) = value;
+    dcci(address, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb(static_cast<mem_dsb_t>(0));
+}
+
 __aicore__ inline uint32_t read_aicore_teardown_control(__gm__ uint32_t *control) {
     return static_cast<uint32_t>(ld_dev(control, 0));
 }

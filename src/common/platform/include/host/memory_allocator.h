@@ -91,6 +91,10 @@ public:
      */
     int finalize();
 
+    // Kernel close is retriable: erase only successfully released allocations.
+    // Keep the legacy program/destructor finalize behavior unchanged.
+    int finalize_preserving_failures();
+
     /**
      * Forget tracked device pointers without calling the platform free API.
      *

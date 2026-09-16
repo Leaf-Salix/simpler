@@ -305,6 +305,39 @@ TEST(KernelExecutionState, CloseOnNewContextIsANoOpSuccess) {
     EXPECT_EQ(state.phase(), KernelContextPhase::Closed);
 }
 
+TEST(KernelExecutionState, BeginClosingRevokesAdmissionWithoutReleasingAnyHandle) {
+    FakeContextOps fake;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    ASSERT_EQ(state.mark_ready_enqueued(), 0);
+    const void *stream = state.hidden_stream(KernelStreamKind::Aicpu);
+    ASSERT_EQ(state.begin_closing(), 0);
+    EXPECT_EQ(state.phase(), KernelContextPhase::Closing);
+    EXPECT_FALSE(state.accepts_dispatch());
+    EXPECT_EQ(state.mark_ready_enqueued(), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(state.hidden_stream(KernelStreamKind::Aicpu), stream);
+    EXPECT_TRUE(state.has_live_resources());
+    EXPECT_EQ(fake.streams_destroyed, 0);
+    EXPECT_EQ(fake.events_destroyed, 0);
+    EXPECT_EQ(state.unexpected_teardown_error(), 0);
+    ASSERT_EQ(state.begin_closing(), 0);
+    EXPECT_EQ(fake.streams_destroyed, 0);
+    EXPECT_EQ(fake.events_destroyed, 0);
+    ASSERT_EQ(state.close(), 0);
+    EXPECT_EQ(state.phase(), KernelContextPhase::Closed);
+    EXPECT_EQ(state.begin_closing(), 0);
+    EXPECT_EQ(state.phase(), KernelContextPhase::Closed);
+}
+
+TEST(KernelExecutionState, BeginClosingOnNewContextCreatesNothingAndCanClose) {
+    KernelExecutionState state;
+    EXPECT_EQ(state.begin_closing(), 0);
+    EXPECT_FALSE(state.accepts_dispatch());
+    EXPECT_FALSE(state.has_live_resources());
+    EXPECT_EQ(state.close(), 0);
+    EXPECT_EQ(state.phase(), KernelContextPhase::Closed);
+}
+
 TEST(KernelExecutionState, RepeatedInitializeRejected) {
     FakeContextOps fake;
     KernelExecutionState state;

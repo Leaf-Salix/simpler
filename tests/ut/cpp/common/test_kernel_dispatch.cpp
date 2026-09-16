@@ -19,6 +19,7 @@
 
 namespace {
 int consumed;
+int consumer_status;
 const void *seen_payload;
 int32_t seen_id;
 const ChipCallable *seen_callable;
@@ -39,6 +40,7 @@ protected:
     std::vector<uint8_t> image;
     void SetUp() override {
         consumed = 0;
+        consumer_status = -83;
         seen_payload = nullptr;
         seen_binding = seen_context_generation = seen_sm_bytes = seen_arena_bytes = 0;
         const uint8_t code[] = {1, 2, 3};
@@ -61,7 +63,7 @@ protected:
     }
     int run() { return simpler_aicpu_kernel_exec(&packet); }
     void invalid() {
-        EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
+        EXPECT_EQ(run(), 2);
         EXPECT_EQ(consumed, 0);
     }
 };
@@ -86,14 +88,14 @@ int consume_kernel_invocation(
     seen_id = invocation.callable_id;
     EXPECT_EQ(bytes, sizeof(uint64_t));
     EXPECT_EQ(*static_cast<const uint64_t *>(payload), 42);
-    return -83;
+    return consumer_status;
 }
 
-TEST_F(KernelDispatch, ValidSnapshotReachesConsumerAndPropagatesResult) {
+TEST_F(KernelDispatch, ValidSnapshotReachesConsumerAndNormalizesNativeResult) {
     const Packet before = packet;
     const auto original_image = image;
-    EXPECT_EQ(run(), -83);
-    EXPECT_EQ(run(), -83);
+    EXPECT_EQ(run(), 2);
+    EXPECT_EQ(run(), 2);
     EXPECT_EQ(consumed, 2);
     EXPECT_EQ(seen_payload, &packet.payload);
     EXPECT_EQ(seen_id, 63);
@@ -107,6 +109,13 @@ TEST_F(KernelDispatch, ValidSnapshotReachesConsumerAndPropagatesResult) {
     EXPECT_EQ(image, original_image);
     EXPECT_EQ(std::memcmp(&packet, &before, sizeof(packet)), 0);
 }
+TEST_F(KernelDispatch, NativeBoundaryAcceptsOnlySuccessOrInnerError) {
+    for (int result : {0, 1, 2, 4, 6, 7, -83, std::numeric_limits<int>::max()}) {
+        consumer_status = result;
+        EXPECT_EQ(run(), result == 0 ? 0 : 2);
+    }
+    EXPECT_EQ(consumed, 8);
+}
 TEST_F(KernelDispatch, RejectsInvalidIdentityBeforeConsumingPayload) {
     for (int id : {-1, MAX_REGISTERED_CALLABLE_IDS, std::numeric_limits<int32_t>::max()}) {
         packet.args.invocation.callable_id = id;
@@ -117,11 +126,8 @@ TEST_F(KernelDispatch, RejectsInvalidIdentityBeforeConsumingPayload) {
     invalid();
 }
 TEST_F(KernelDispatch, RejectsMalformedEnvelope) {
-    EXPECT_EQ(simpler_aicpu_kernel_exec(nullptr), static_cast<int>(KernelDispatchStatus::InvalidArgs));
-    EXPECT_EQ(
-        simpler_aicpu_kernel_exec(reinterpret_cast<char *>(&packet) + 1),
-        static_cast<int>(KernelDispatchStatus::InvalidArgs)
-    );
+    EXPECT_EQ(simpler_aicpu_kernel_exec(nullptr), 2);
+    EXPECT_EQ(simpler_aicpu_kernel_exec(reinterpret_cast<char *>(&packet) + 1), 2);
     for (uint64_t bytes :
          {uint64_t(0), uint64_t(sizeof(SimplerKernelDispatchArgs) - 1), std::numeric_limits<uint64_t>::max()}) {
         packet.args.packet_bytes = bytes;
@@ -167,7 +173,7 @@ TEST_F(KernelDispatch, RejectsInvalidCallableSpanBeforeConsumer) {
 }
 
 TEST_F(KernelDispatch, EachInvocationReceivesItsOwnCallableFunctionMapping) {
-    EXPECT_EQ(run(), -83);
+    EXPECT_EQ(run(), 2);
     const auto first_function = seen_function;
     auto other = image;
     auto *callable = reinterpret_cast<ChipCallable *>(other.data());
@@ -177,14 +183,14 @@ TEST_F(KernelDispatch, EachInvocationReceivesItsOwnCallableFunctionMapping) {
     );
     packet.args.chip_callable_address = reinterpret_cast<uint64_t>(other.data());
     packet.args.invocation.callable_id = 3;
-    EXPECT_EQ(run(), -83);
+    EXPECT_EQ(run(), 2);
     EXPECT_EQ(seen_id, 3);
     EXPECT_EQ(seen_function_id, 19);
     EXPECT_NE(seen_function, first_function);
     EXPECT_EQ(seen_callable, callable);
     packet.args.chip_callable_address = reinterpret_cast<uint64_t>(image.data());
     packet.args.invocation.callable_id = 63;
-    EXPECT_EQ(run(), -83);
+    EXPECT_EQ(run(), 2);
     EXPECT_EQ(seen_function_id, 7);
     EXPECT_EQ(seen_function, first_function);
 }
@@ -194,7 +200,7 @@ TEST_F(KernelDispatch, ForwardsContextBindingAndRegionExtentsToRuntimeConsumer) 
     packet.args.context_generation = 83;
     packet.args.sm_bytes = 4096;
     packet.args.arena_bytes = 8192;
-    EXPECT_EQ(run(), -83);
+    EXPECT_EQ(run(), 2);
     EXPECT_EQ(seen_binding, 0x200000u);
     EXPECT_EQ(seen_context_generation, 83u);
     EXPECT_EQ(seen_sm_bytes, 4096u);

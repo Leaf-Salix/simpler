@@ -62,6 +62,22 @@ int MemoryAllocator::free(void *ptr) {
     return 0;
 }
 
+int MemoryAllocator::finalize_preserving_failures() {
+    std::scoped_lock<std::mutex> lk(mu_);
+    int first_error = 0;
+    for (auto it = ptr_size_map_.begin(); it != ptr_size_map_.end();) {
+        const int rc = rtFree(it->first);
+        if (rc != 0) {
+            if (first_error == 0) first_error = rc;
+            ++it;
+        } else {
+            committed_bytes_ -= it->second;
+            it = ptr_size_map_.erase(it);
+        }
+    }
+    return first_error;
+}
+
 int MemoryAllocator::finalize() {
     std::scoped_lock<std::mutex> lk(mu_);
     int last_error = 0;

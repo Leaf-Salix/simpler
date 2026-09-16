@@ -180,6 +180,10 @@ public:
     bool resources_frozen() const;
     int mark_ready_enqueued();
     void poison(int runtime_error);
+    // Revoke Host admission without releasing handles. A kernel owner uses
+    // this before asynchronous Device unregister, then calls close only after
+    // its completion receipt is observed. The submission lease is still held.
+    int begin_closing();
     int close();
 
     KernelContextPhase phase() const;
