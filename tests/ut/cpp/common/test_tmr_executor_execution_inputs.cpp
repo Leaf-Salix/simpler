@@ -30,6 +30,7 @@
 #include "host_log.h"
 #include "worker/kernel_dispatch_packet.h"
 #include "task_interface/tmr_kernel_context.h"
+#include "task_interface/tmr_kernel_revoke.h"
 #include "tensormap_and_ringbuffer/kernel_execution_inputs.h"
 #include "tensormap_and_ringbuffer/kernel_execution.h"
 #include "tensormap_and_ringbuffer/kernel_native_status.h"
@@ -80,7 +81,7 @@ void platform_close_aicore_window(uint64_t) { ++closed_windows; }
 extern "C" int simpler_aicpu_register_callable(void *);
 extern "C" int simpler_aicpu_prepare_tmr_context(void *);
 extern "C" int simpler_aicpu_register_tmr_kernel_callable(void *);
-extern "C" int simpler_aicpu_release_tmr_context(void *);
+extern "C" int simpler_aicpu_revoke_tmr_context(void *);
 void corrupt_kernel_arch_argument(KernelArgs &args, int fault);
 
 namespace {
@@ -135,7 +136,23 @@ protected:
 
     void TearDown() override {
         EXPECT_EQ(kernel_execution_status(), -1);
-        if (registered_context) EXPECT_EQ(simpler_aicpu_release_tmr_context(&registration), 0);
+        if (registered_context) EXPECT_EQ(revoke_context(registration.context_generation), 0);
+    }
+
+    int revoke_context(uint64_t generation) {
+        TmrContextRevokeReceipt receipt{registration.descriptor_address, registration.context_generation, 0, 0, {}};
+        const auto pending = receipt;
+        TmrContextRevokeArgs args{
+            registration.descriptor_address, generation, reinterpret_cast<uint64_t>(&receipt), sizeof(receipt)
+        };
+        const int rc = simpler_aicpu_revoke_tmr_context(&args);
+        if (rc == 0) {
+            EXPECT_TRUE(valid_tmr_context_revoke_receipt(receipt, args, TmrRevokeCompletion::Complete));
+            registered_context = false;
+        } else {
+            EXPECT_EQ(std::memcmp(&receipt, &pending, sizeof(receipt)), 0);
+        }
+        return rc;
     }
 
     void register_orchestration(int id, const char *entry, const char *config) {
@@ -404,9 +421,7 @@ TEST_F(TmrExecutorExecutionInputsTest, NativeEntryCancelsMalformedContextAndUnre
         EXPECT_EQ(std::memcmp(&descriptor, &stable_descriptor, sizeof(descriptor)), 0);
         EXPECT_EQ(std::memcmp(&arena_runtime->prebuilt_layout, stable_layout.data(), stable_layout.size()), 0);
     }
-    auto wrong_context = registration;
-    ++wrong_context.context_generation;
-    EXPECT_EQ(simpler_aicpu_release_tmr_context(&wrong_context), kAicpuKernelInnerError);
+    EXPECT_EQ(revoke_context(registration.context_generation + 1), kAicpuKernelInnerError);
     auto wrong_slot =
         TmrCallableRegistrationArgs{99, reinterpret_cast<uint64_t>(kernel_image.data()), kernel_image.size(), 7, 0};
     EXPECT_EQ(simpler_aicpu_register_tmr_kernel_callable(&wrong_slot), kAicpuKernelInnerError);

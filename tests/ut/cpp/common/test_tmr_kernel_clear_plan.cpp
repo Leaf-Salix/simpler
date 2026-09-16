@@ -36,7 +36,6 @@ void expect_equal(const TmrKernelClearPlan &actual, const TmrKernelClearPlan &ex
 TEST(TmrKernelClearPlan, BuildsOnlyDynamicRegionsAndSingleWordCancel) {
     TmrKernelClearPlan plan;
     ASSERT_TRUE(build_tmr_kernel_clear_plan(kBinding, &plan));
-    EXPECT_TRUE(validate_tmr_kernel_clear_plan(plan, kBinding));
     EXPECT_EQ(plan.context_generation, 11u);
     EXPECT_EQ(plan.regions[0].address, kBinding.control.address);
     EXPECT_EQ(plan.regions[0].bytes, sizeof(TmrLaunchControl));
@@ -59,7 +58,6 @@ TEST(TmrKernelClearPlan, InvalidBindingPreservesOutput) {
     const auto original = output;
     auto reject = [&](const TmrKernelClearBinding &binding) {
         EXPECT_FALSE(build_tmr_kernel_clear_plan(binding, &output));
-        EXPECT_FALSE(validate_tmr_kernel_clear_plan(original, binding));
         expect_equal(output, original);
     };
     auto invalid = kBinding;
@@ -93,38 +91,6 @@ TEST(TmrKernelClearPlan, InvalidBindingPreservesOutput) {
     invalid = kBinding;
     invalid.worker_count = 2;
     reject(invalid);
-}
-
-TEST(TmrKernelClearPlan, RejectsSkippedExpandedStaticAndStaleRegions) {
-    TmrKernelClearPlan plan;
-    ASSERT_TRUE(build_tmr_kernel_clear_plan(kBinding, &plan));
-    const auto original = plan;
-    for (size_t i = 0; i < plan.regions.size(); ++i) {
-        plan = original;
-        plan.regions[i] = {};
-        EXPECT_FALSE(validate_tmr_kernel_clear_plan(plan, kBinding));
-        plan = original;
-        plan.regions[i].bytes += 64;
-        EXPECT_FALSE(validate_tmr_kernel_clear_plan(plan, kBinding));
-        plan = original;
-        plan.regions[i].address = 0x30000;
-        EXPECT_FALSE(validate_tmr_kernel_clear_plan(plan, kBinding));
-    }
-    plan = original;
-    plan.regions[0] = {0x10000, 0x20000};
-    EXPECT_FALSE(validate_tmr_kernel_clear_plan(plan, kBinding));
-    plan = original;
-    std::swap(plan.regions[0], plan.regions[1]);
-    EXPECT_FALSE(validate_tmr_kernel_clear_plan(plan, kBinding));
-    plan = original;
-    ++plan.context_generation;
-    EXPECT_FALSE(validate_tmr_kernel_clear_plan(plan, kBinding));
-    plan = original;
-    plan.cancel = plan.regions[0];
-    EXPECT_FALSE(validate_tmr_kernel_clear_plan(plan, kBinding));
-    plan = original;
-    plan.cancel.address += sizeof(uint32_t);
-    EXPECT_FALSE(validate_tmr_kernel_clear_plan(plan, kBinding));
 }
 
 struct alignas(64) ClearFixture {
@@ -163,7 +129,6 @@ TEST(TmrKernelClearPlan, ClearingPreservesSurroundingStaticBytesAndCancelPreserv
     const auto binding = fixture_binding(fixture);
     TmrKernelClearPlan plan;
     ASSERT_TRUE(build_tmr_kernel_clear_plan(binding, &plan));
-    ASSERT_TRUE(validate_tmr_kernel_clear_plan(plan, binding));
     for (const auto &region : plan.regions)
         clear_region(region);
     for (const auto &region : plan.regions)
@@ -216,9 +181,6 @@ TEST(TmrKernelClearPlan, SkippingEitherClearLeavesObservablePriorRoundState) {
             EXPECT_EQ(fixture.reports[1].command, static_cast<uint32_t>(TmrCoreCommand::Open));
             EXPECT_EQ(fixture.reports[2].release, static_cast<uint32_t>(TmrCoreRelease::Release));
         }
-        auto skipped_plan = plan;
-        skipped_plan.regions[skipped] = {};
-        EXPECT_FALSE(validate_tmr_kernel_clear_plan(skipped_plan, binding));
     }
 }
 

@@ -66,18 +66,4 @@ inline bool build_tmr_kernel_clear_plan(const TmrKernelClearBinding &binding, Tm
     return true;
 }
 
-inline bool
-validate_tmr_kernel_clear_plan(const TmrKernelClearPlan &plan, const TmrKernelClearBinding &trusted_binding) noexcept {
-    TmrKernelClearPlan expected;
-    if (!build_tmr_kernel_clear_plan(trusted_binding, &expected) ||
-        plan.context_generation != expected.context_generation)
-        return false;
-    for (size_t i = 0; i < expected.regions.size(); ++i) {
-        if (plan.regions[i].address != expected.regions[i].address ||
-            plan.regions[i].bytes != expected.regions[i].bytes)
-            return false;
-    }
-    return plan.cancel.address == expected.cancel.address && plan.cancel.bytes == expected.cancel.bytes;
-}
-
 }  // namespace simpler::tmr
