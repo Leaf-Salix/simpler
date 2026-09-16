@@ -156,6 +156,15 @@ inline uint64_t get_sys_cnt_aicore() { return sys_cnt_now_ticks(); }
 volatile uint8_t *sim_get_reg_base();
 uint32_t sim_get_physical_core_id();
 
+template <typename T>
+inline T load_kernel_gm_word(T *address) {
+    return __atomic_load_n(address, __ATOMIC_ACQUIRE);
+}
+template <typename T>
+inline void store_kernel_gm_word(T *address, T value) {
+    __atomic_store_n(address, value, __ATOMIC_RELEASE);
+}
+
 /**
  * Read an AICore register from simulated register memory
  *

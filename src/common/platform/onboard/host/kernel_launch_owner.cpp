@@ -14,13 +14,14 @@
 #include <runtime/rt.h>
 
 #include "host/kernel_launch_binder.h"
+#include "tensormap_and_ringbuffer/kernel_clear_plan.h"
 
 int DeviceRunnerBase::launch_kernel_callable(
     int32_t callable_id, const ChipStorageTaskArgs &args, void *caller_stream
 ) {
     std::unique_lock<std::mutex> lease(kernel_submission_mutex_, std::try_to_lock);
     if (!lease.owns_lock() || !kernel_context_claim_.held() || !kernel_exec_state_.accepts_dispatch() ||
-        !persistent_args_.is_prepared())
+        !persistent_args_.is_prepared() || !kernel_coordination_ready_ || !kernel_result_handle_)
         return PTO_RUNTIME_ERR_INVALID_STATE;
     int rc = adopt_borrowed_device(device_id_);
     if (rc != 0) return rc;
@@ -46,25 +47,19 @@ int DeviceRunnerBase::launch_kernel_callable(
         void *caller;
         const uint8_t *packet;
         size_t bytes;
-        void *workers;
-        size_t workers_bytes;
-        void *gates;
-        size_t gates_bytes;
+        simpler::tmr::TmrKernelClearPlan clear;
     };
-    const auto device_base = reinterpret_cast<uintptr_t>(persistent_args_.args().runtime_args);
-    const auto host_base = reinterpret_cast<uintptr_t>(&kernel_runtime_);
-    Submission submission{
-        this,
-        caller_stream,
-        packet.packet().data,
-        packet.packet().size,
-        reinterpret_cast<void *>(device_base + reinterpret_cast<uintptr_t>(kernel_runtime_.get_workers()) - host_base),
-        static_cast<size_t>(worker_count_) * sizeof(Handshake),
-        reinterpret_cast<void *>(
-            device_base + reinterpret_cast<uintptr_t>(kernel_runtime_.get_teardown_gates()) - host_base
-        ),
-        static_cast<size_t>(worker_count_) * sizeof(AicoreTeardownControl)
-    };
+    const auto &d = kernel_descriptor_;
+    simpler::tmr::TmrKernelClearPlan clear;
+    if (!simpler::tmr::build_tmr_kernel_clear_plan(
+            {d.context_generation,
+             {d.control_address, d.control_bytes},
+             {d.reports_address, d.reports_bytes},
+             d.worker_count},
+            &clear
+        ))
+        return PTO_RUNTIME_ERR_INTERNAL;
+    Submission submission{this, caller_stream, packet.packet().data, packet.packet().size, clear};
     kl::KernelLaunchGateOps gate;
     gate.context = &submission;
     gate.acquire = [](void *context, const kl::KernelInvocationBinding &, void *,
@@ -107,17 +102,21 @@ int DeviceRunnerBase::launch_kernel_callable(
     };
     ops.memset_handshake = [](void *context, void *stream) noexcept {
         const auto &s = *static_cast<Submission *>(context);
-        int result = aclrtMemsetAsync(s.workers, s.workers_bytes, 0, s.workers_bytes, stream);
-        if (result != 0) return result;
-        return aclrtMemsetAsync(s.gates, s.gates_bytes, 0, s.gates_bytes, stream);
+        for (const auto &region : s.clear.regions) {
+            const int result =
+                aclrtMemsetAsync(reinterpret_cast<void *>(region.address), region.bytes, 0, region.bytes, stream);
+            if (result != 0) return result;
+        }
+        return 0;
     };
     ops.cancel_waiting_aicore = [](void *context, void *stream) noexcept {
         const auto &s = *static_cast<Submission *>(context);
-        return aclrtMemsetAsync(s.gates, s.gates_bytes, 0xff, s.gates_bytes, stream);
+        const auto &cancel = s.clear.cancel;
+        return aclrtMemsetAsync(reinterpret_cast<void *>(cancel.address), cancel.bytes, 0xff, cancel.bytes, stream);
     };
     ops.launch_aicore = [](void *context, void *stream) noexcept {
         auto &r = *static_cast<Submission *>(context)->runner;
-        KernelArgs *device_args = r.persistent_args_.device_k_args();
+        void *device_args = r.kernel_core_envelope_;
         rtArgsEx_t native{};
         native.args = &device_args;
         native.argsSize = sizeof(device_args);
@@ -136,6 +135,18 @@ int DeviceRunnerBase::launch_kernel_callable(
         return rtsLaunchCpuKernel(
             s.runner->kernel_aicpu_handle_, s.runner->kernel_runtime_.get_aicpu_launch_count(), stream, &config, &native
         );
+    };
+    ops.check_result = [](void *context, void *stream) noexcept {
+        auto &r = *static_cast<Submission *>(context)->runner;
+        simpler::tmr::TmrContextRegistrationArgs args{
+            r.kernel_descriptor_.self_address, r.kernel_descriptor_.context_generation
+        };
+        rtCpuKernelArgs_t native{};
+        native.baseArgs.args = &args;
+        native.baseArgs.argsSize = sizeof(args);
+        rtLaunchKernelAttr_t attribute{};
+        rtKernelLaunchCfg_t config{&attribute, 0U};
+        return rtsLaunchCpuKernel(r.kernel_result_handle_, 1, stream, &config, &native);
     };
     return kl::launch_bound_kernel({submission.packet, submission.bytes, nullptr, 0}, caller_stream, gate, ops).status;
 }

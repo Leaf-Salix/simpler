@@ -16,6 +16,8 @@
 #include "common/unified_log.h"
 
 static std::atomic<int32_t> s_thread_counter{0};
+
+int32_t platform_aicpu_current_cpu() { return -1; }
 static std::atomic<int32_t> s_cleanup_counter{0};
 
 bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched) {

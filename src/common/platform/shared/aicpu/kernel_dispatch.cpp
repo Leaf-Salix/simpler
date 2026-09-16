@@ -15,7 +15,7 @@
 #include "arg_direction.h"
 #include "aicpu/kernel_invocation_consumer.h"
 
-extern "C" __attribute__((visibility("default"))) int simpler_aicpu_kernel_exec(void *arg) {
+__attribute__((weak)) int consume_kernel_task(void *arg) {
     if (arg == nullptr || reinterpret_cast<uintptr_t>(arg) % alignof(SimplerKernelDispatchArgs) != 0)
         return static_cast<int>(KernelDispatchStatus::InvalidArgs);
     // The packet prefix and declared packet_bytes must describe the actual
@@ -43,4 +43,10 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_kernel_exec(
         args, *reinterpret_cast<const ChipCallable *>(args.chip_callable_address),
         static_cast<size_t>(args.chip_callable_bytes), payload, static_cast<size_t>(invocation.payload_bytes)
     );
+}
+
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_kernel_exec(void *arg) {
+    // CANN CPU entries use OK=0 and INNER_ERROR=2. Runtime status values
+    // belong to the consumer's diagnostics, not the native return domain.
+    return consume_kernel_task(arg) == 0 ? 0 : 2;
 }

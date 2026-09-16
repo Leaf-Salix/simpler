@@ -1527,10 +1527,13 @@ class ChipWorker:
                 if context_generation is None
                 else int(context_generation)
             )
+            kernel_aicore_path = getattr(bins, "kernel_aicore_path", None)
+            if getattr(bins, "kernel_aicore_required", False) and kernel_aicore_path is None:
+                raise ValueError("kernel_init requires the runtime's kernel-mode AICore binary")
             self._impl.kernel_init(
                 str(bins.host_path),
                 str(bins.aicpu_path),
-                str(bins.aicore_path),
+                str(bins.aicore_path if kernel_aicore_path is None else kernel_aicore_path),
                 "" if dispatcher_path is None else str(dispatcher_path),
                 int(device_id),
                 config,

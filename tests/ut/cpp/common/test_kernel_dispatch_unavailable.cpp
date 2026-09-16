@@ -21,7 +21,7 @@ TEST(KernelDispatchUnavailable, ProductionConsumerDoesNotReportExecutionSuccess)
     packet.packet_bytes = sizeof(packet);
     packet.invocation.mode = SIMPLER_MODE_KERNEL;
     packet.invocation.callable_id = MAX_REGISTERED_CALLABLE_IDS - 1;
-    EXPECT_EQ(simpler_aicpu_kernel_exec(&packet), static_cast<int>(KernelDispatchStatus::UnsupportedPayload));
+    EXPECT_EQ(simpler_aicpu_kernel_exec(&packet), 2);
     packet.invocation.callable_id = MAX_REGISTERED_CALLABLE_IDS;
-    EXPECT_EQ(simpler_aicpu_kernel_exec(&packet), static_cast<int>(KernelDispatchStatus::InvalidArgs));
+    EXPECT_EQ(simpler_aicpu_kernel_exec(&packet), 2);
 }

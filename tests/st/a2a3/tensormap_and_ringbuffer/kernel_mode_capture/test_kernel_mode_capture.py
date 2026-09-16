@@ -14,6 +14,8 @@ import platform
 import subprocess
 import sys
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -28,6 +30,11 @@ MODULE = "tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture"
 RUNTIME = "tensormap_and_ringbuffer"
 SCENARIOS = (
     "cold_synced",
+    "close_fail_free",
+    "device_error_eager",
+    "device_error_replay",
+    "runtime_error_eager",
+    "runtime_error_replay",
     "cold_unsynced",
     "warm",
     "multi_callable",
@@ -122,7 +129,11 @@ def test_tmr_kernel_mode(st_platform, st_device_ids, scenario, capture_observer)
             pytest.fail(f"capture scenario timed out; artifacts: {tmp_path}")
     output = (tmp_path / "run.log").read_text()
     assert result.returncode == 0, f"{output}\nArtifacts: {tmp_path}"
-    if scenario.startswith("prepare_fail_"):
+    if "_error_" in scenario:
+        assert f"PASS {scenario} caller_error=1 cores_retired=1" in output
+    elif scenario == "close_fail_free":
+        assert "PASS close_fail_free retained_then_retried=1" in output
+    elif scenario.startswith("prepare_fail_"):
         assert f"PASS {scenario} rejected_after_failure=1 forbidden_sync=0" in output
     elif scenario.startswith("eager_") and scenario != "eager_replay":
         assert f"PASS {scenario} eager=100 forbidden_sync=0" in output
@@ -130,7 +141,7 @@ def test_tmr_kernel_mode(st_platform, st_device_ids, scenario, capture_observer)
         assert f"PASS {scenario} replays=100 forbidden_sync=0" in output
 
 
-def _build_callable(build_dir, alternate=False, dag=False):
+def _build_callable(build_dir, alternate=False, dag=False, execution_error=False):
     from simpler.task_interface import ArgDirection, ChipCallable, CoreCallable  # noqa: PLC0415
 
     from simpler_setup.elf_parser import extract_text_section  # noqa: PLC0415
@@ -146,6 +157,8 @@ def _build_callable(build_dir, alternate=False, dag=False):
     )
     if dag:
         source = Path(__file__).with_name("kernel_tmr_chain.cpp")
+    if execution_error:
+        source = Path(__file__).with_name("kernel_execution_error.cpp")
     orchestration = compiler.compile_orchestration(RUNTIME, str(source), build_dir=str(build_dir))
     incore = compiler.compile_incore(
         str(ROOT / "examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels/aiv/kernel_add_scalar.cpp"),
@@ -158,7 +171,9 @@ def _build_callable(build_dir, alternate=False, dag=False):
     child = CoreCallable.build(signature=signature, binary=extract_text_section(incore))
     return ChipCallable.build(
         signature=signature,
-        func_name="kernel_tmr_chain"
+        func_name="kernel_execution_error"
+        if execution_error
+        else "kernel_tmr_chain"
         if dag
         else ("kernel_capture_alternate" if alternate else "kernel_eager_orchestration"),
         binary=orchestration,
@@ -195,7 +210,7 @@ def _config():
 
 
 def _bind_observer_guards(observer):
-    for name in ("arm", "release", "blocked", "finish"):
+    for name in ("arm", "release", "blocked", "wait_blocked", "finish"):
         function = getattr(observer, "capture_gate_" + name)
         function.argtypes = []
         function.restype = None if name in ("arm", "release") else ctypes.c_int
@@ -203,6 +218,8 @@ def _bind_observer_guards(observer):
     observer.capture_observer_guard_sync.restype = None
     observer.capture_observer_invocation_scope.argtypes = [ctypes.c_int]
     observer.capture_observer_invocation_scope.restype = None
+    observer.capture_observer_prepare_scope.argtypes = [ctypes.c_int]
+    observer.capture_observer_prepare_scope.restype = None
     observer.capture_observer_sync_calls.argtypes = []
     observer.capture_observer_sync_calls.restype = ctypes.c_uint64
     observer.capture_observer_override_query.argtypes = [ctypes.c_int]
@@ -239,7 +256,14 @@ def _close(lib, ctx, allocations, streams, device, graphs=()):
 
     for graph in graphs:
         _check(lib.aclmdlRIDestroy(graph), "destroy graph")
-    _check(lib.finalize_device(ctx), "finalize context")
+    # All caller work is drained and graphs are destroyed before entering this
+    # helper. Close may now queue its own metadata revocation without a sync.
+    deadline = time.monotonic() + 10
+    status = lib.finalize_device(ctx)
+    while status == -1003 and time.monotonic() < deadline:
+        time.sleep(0.001)
+        status = lib.finalize_device(ctx)
+    _check(status, "finalize context (including async revocation)")
     assert lib.committed_device_memory_ctx(ctx) == 0
     lib.destroy_device_context(ctx)
     for address in reversed(allocations):
@@ -248,6 +272,25 @@ def _close(lib, ctx, allocations, streams, device, graphs=()):
         _check(lib.aclrtDestroyStream(stream), "destroy stream")
     _check(lib.aclrtResetDevice(device), "reset")
     _check(lib.aclFinalize(), "finalize ACL")
+
+
+def _check_close_failure(context):
+    lib, observer, ctx = context.lib, context.observer, context.handle
+    observer.capture_observer_fail_large_free.argtypes = [ctypes.c_int]
+    observer.capture_observer_failed_frees.restype = ctypes.c_uint64
+    observer.capture_observer_fail_large_free(1)
+    deadline = time.monotonic() + 10
+    status = lib.finalize_device(ctx)
+    while status == -1003 and time.monotonic() < deadline:
+        time.sleep(0.001)
+        status = lib.finalize_device(ctx)
+    assert observer.capture_observer_failed_frees() > 0
+    assert status == -4334, f"failed free was lost: close={status}"
+    retained = lib.committed_device_memory_ctx(ctx)
+    assert retained > 0, "failed device free disappeared from the allocator ledger"
+    assert lib.finalize_device(ctx) == -4334
+    assert lib.committed_device_memory_ctx(ctx) == retained
+    observer.capture_observer_fail_large_free(0)
 
 
 def _fail():
@@ -298,7 +341,13 @@ def _initialize(device, scenario, build_dir):
         _check,
     )
 
-    chips = [_build_callable(build_dir / "callable-a", dag=scenario in ("tmr_dag", "eager_dag"))]
+    chips = [
+        _build_callable(
+            build_dir / "callable-a",
+            dag=scenario in ("tmr_dag", "eager_dag"),
+            execution_error=scenario.startswith("runtime_error_"),
+        )
+    ]
     if scenario in ("multi_callable", "prepare_again", "prepare_after_capture", "eager_multi_callable"):
         chips.append(_build_callable(build_dir / "callable-b", alternate=True))
     lib = _load("a2a3", "onboard", RUNTIME)
@@ -324,21 +373,36 @@ def _initialize(device, scenario, build_dir):
     return chips, lib, streams, caller, ctx, observer
 
 
-def _prepare_initial(scenario, observer, prepare, launch):
+def _prepare_initial(scenario, observer, prepare, launch, lib):
     from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.kernel_capture_values import _check  # noqa: PLC0415
 
     blocked = scenario == "blocked_same"
-    if blocked:
-        observer.capture_gate_arm()
-    prepare(0)
-    if blocked:
-        assert observer.capture_gate_blocked() == 1
-        before = observer.capture_observer_total_queries()
-        launch(0)
-        assert observer.capture_observer_total_queries() == before
-        assert observer.capture_gate_blocked() == 1, "launch waited for blocked prepare"
-        observer.capture_gate_release()
-        _check(observer.capture_gate_finish(), "finish prepare gate")
+    if not blocked:
+        prepare(0)
+        return False
+    lib.aclrtGetCurrentContext.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+    lib.aclrtSetCurrentContext.argtypes = [ctypes.c_void_p]
+    current = ctypes.c_void_p()
+    _check(lib.aclrtGetCurrentContext(ctypes.byref(current)), "get context")
+
+    def prepare_on_thread():
+        _check(lib.aclrtSetCurrentContext(current), "adopt context")
+        prepare(0)
+
+    observer.capture_gate_arm()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(prepare_on_thread)
+        try:
+            assert observer.capture_gate_wait_blocked() == 1
+            assert not pending.done(), "prepare returned before registration completed"
+            before = _submission_counts(observer)
+            launch(0, expected=-1003)
+            assert _submission_counts(observer) == before
+        finally:
+            observer.capture_gate_release()
+        pending.result(timeout=15)
+    _check(observer.capture_gate_finish(), "finish prepare gate")
+    launch(0)
     return blocked
 
 
@@ -363,9 +427,7 @@ def _configure(context, scenario, prepare, launch, sync, io, pairs, initial):
     from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.kernel_capture_values import _check  # noqa: PLC0415
 
     lib, observer, streams, caller = context.lib, context.observer, context.streams, context.caller
-    if scenario == "stream_busy":
-        observer.capture_gate_arm()
-    if _prepare_initial(scenario, observer, prepare, launch):
+    if _prepare_initial(scenario, observer, prepare, launch, lib):
         sync(caller)
         io.verify(pairs[0][1], [value + 1.25 for value in initial])
     if scenario in ("multi_callable", "eager_multi_callable"):
@@ -377,6 +439,8 @@ def _configure(context, scenario, prepare, launch, sync, io, pairs, initial):
         sync(caller)
         caller = streams[1]
     if scenario in ("stream_query_error", "stream_busy"):
+        if scenario == "stream_busy":
+            observer.capture_gate_arm()
         launch(0, stream=caller)
         if scenario == "stream_query_error":
             sync(caller)
@@ -437,11 +501,13 @@ def _execute_eager(context, scenario, guarded, io, launch, sync, pairs, initial,
     )
 
 
-def _guarded(observer, operation, *arguments, expected=0):
+def _guarded(observer, operation, *arguments, expected=0, preparing=False):
     observer.capture_observer_guard_sync(1)
+    observer.capture_observer_prepare_scope(int(preparing))
     try:
         result = operation(*arguments)
     finally:
+        observer.capture_observer_prepare_scope(0)
         observer.capture_observer_guard_sync(0)
     assert observer.capture_observer_sync_calls() == 0, "prepare/launch performed an internal sync"
     assert result == expected, f"guarded native operation rc={result}, expected={expected}"
@@ -458,6 +524,33 @@ def _replay(context, graph, stream=None):
     finally:
         observer.capture_observer_invocation_scope(0)
     assert observer.capture_observer_total_queries() == before
+
+
+def _check_device_failure(context, scenario, launch, record_nodes, replay):
+    observer = context.observer
+    if scenario.startswith("device_error_"):
+        observer.capture_observer_corrupt_next_invocation()
+    if scenario.endswith("replay"):
+        graph = record_nodes([(0, None, 1.25)])
+        replay(graph)
+    else:
+        launch(0)
+    started = time.monotonic()
+    status = context.lib.aclrtSynchronizeStreamWithTimeout(context.caller, 10000)
+    assert status != 0, "hidden AICPU error was not propagated to caller"
+    assert time.monotonic() - started < 9, "failure only surfaced through timeout"
+    assert observer.capture_observer_failure_retired() == 0, "failed round did not retire every core"
+    print(f"PASS {scenario} caller_error=1 cores_retired=1", flush=True)
+    # Error streams/graphs are terminal; this test proves retirement,
+    # not a D2 recovery policy. Let the isolated process release them.
+    os._exit(0)
+
+
+def _run_close_failure(context, prepare, launch, sync):
+    prepare(0)
+    launch(0)
+    sync(context.caller)
+    _check_close_failure(context)
 
 
 def _run(device, scenario, build_dir):
@@ -492,6 +585,7 @@ def _run(device, scenario, build_dir):
             chip.buffer_size(),
             ctypes.byref(minted),
             expected=expected,
+            preparing=True,
         )
         if expected == 0:
             assert minted.value >= 0 and minted.value not in callable_ids.values()
@@ -540,10 +634,17 @@ def _run(device, scenario, build_dir):
     def record(cids, increment=1.25):
         return record_nodes([(cid, None, 1.25) for cid in cids] + [(0, (counter, counter), increment)])
 
-    def replay(graph, stream=None):
-        return _replay(context, graph, stream)
+    replay = partial(_replay, context)
 
     try:
+        if scenario.startswith(("device_error_", "runtime_error_")):
+            prepare(0)
+            _check_device_failure(context, scenario, launch, record_nodes, replay)
+        if scenario == "close_fail_free":
+            _run_close_failure(context, prepare, launch, sync)
+            _close(lib, ctx, allocations, streams, device)
+            print("PASS close_fail_free retained_then_retried=1", flush=True)
+            return
         if scenario.startswith("prepare_fail_"):
             _check_prepare_failure(scenario, observer, lib, ctx, prepare, launch)
             _close(lib, ctx, allocations, streams, device)
