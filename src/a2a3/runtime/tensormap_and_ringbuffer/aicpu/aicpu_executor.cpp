@@ -1064,9 +1064,6 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_prepare_tmr_
 extern "C" __attribute__((visibility("default"))) int simpler_aicpu_register_tmr_kernel_callable(void *arg) {
     return simpler::tmr::to_aicpu_native_status(simpler::tmr::register_kernel_callable(g_aicpu_executor, arg));
 }
-extern "C" __attribute__((visibility("default"))) int simpler_aicpu_release_tmr_context(void *arg) {
-    return simpler::tmr::to_aicpu_native_status(simpler::tmr::release_kernel_context(g_aicpu_executor, arg));
-}
 extern "C" __attribute__((visibility("default"))) int simpler_aicpu_revoke_tmr_context(void *arg) {
     return simpler::tmr::to_aicpu_native_status(simpler::tmr::revoke_kernel_context(g_aicpu_executor, arg));
 }
