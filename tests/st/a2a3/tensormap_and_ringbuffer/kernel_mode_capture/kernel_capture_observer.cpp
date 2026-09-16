@@ -13,6 +13,7 @@
 #include <runtime/rt.h>
 #include <runtime/rts/rts_kernel.h>
 
+#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -316,7 +317,7 @@ extern "C" int capture_observer_check_resident() {
     return static_cast<int>(observer.error);
 }
 
-extern "C" int capture_observer_failure_retired() {
+extern "C" int capture_observer_failure_retired(int expect_opened) {
     using namespace simpler::tmr;
     const auto copy = reinterpret_cast<decltype(&aclrtMemcpy)>(resolve_cann_symbol("aclrtMemcpy"));
     if (copy == nullptr || observer.core_envelope == 0) return -1;
@@ -331,13 +332,32 @@ extern "C" int capture_observer_failure_retired() {
         read(&control, descriptor.control_address, sizeof(control)) != 0)
         return -2;
     if (control.completion != static_cast<uint32_t>(TmrCompletion::Complete) || control.runtime_status == 0 ||
-        control.cleanup_status != 0 || descriptor.worker_count <= 0)
+        control.cleanup_status != 0 || control.round_epoch == 0 || descriptor.worker_count <= 0) {
+        std::fprintf(
+            stderr, "retirement control: completion=%u runtime=%d cleanup=%d epoch=%" PRIu64 " workers=%d\n",
+            control.completion, control.runtime_status, control.cleanup_status, control.round_epoch,
+            descriptor.worker_count
+        );
         return -3;
+    }
+    const uint64_t expected_epoch = expect_opened ? control.round_epoch : 0;
+    const auto expected_release = static_cast<uint32_t>(expect_opened ? TmrCoreRelease::Release : TmrCoreRelease::Wait);
     for (int32_t i = 0; i < descriptor.worker_count; ++i) {
         TmrCoreReport report{};
-        if (read(&report, descriptor.reports_address + i * sizeof(report), sizeof(report)) != 0 || report.exited == 0 ||
-            report.release != static_cast<uint32_t>(TmrCoreRelease::Release))
+        const int rc = read(&report, descriptor.reports_address + i * sizeof(report), sizeof(report));
+        // Unopened cores exit on CANCEL without waiting for a window release.
+        if (rc != 0 || report.ready != static_cast<uint32_t>(i + 1) || report.exited != static_cast<uint32_t>(i + 1) ||
+            report.command != static_cast<uint32_t>(TmrCoreCommand::Cancel) || report.round_epoch != expected_epoch ||
+            report.release != expected_release) {
+            std::fprintf(
+                stderr,
+                "retirement core=%d read=%d ready=%u exited=%u command=%u release=%u epoch=%" PRIu64
+                " expected_release=%u expected_epoch=%" PRIu64 "\n",
+                i, rc, report.ready, report.exited, report.command, report.release, report.round_epoch,
+                expected_release, expected_epoch
+            );
             return -4;
+        }
     }
     return 0;
 }
