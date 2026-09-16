@@ -21,7 +21,6 @@ import ctypes
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -339,18 +338,8 @@ def _run_lifecycle_retry(arch, runtime, device, scenario):
 
 
 def _finalize_after_quiescence(lib, ctx):
-    """Poll only in tests with exclusive ownership and no outstanding graphs.
-
-    INVALID_STATE may mean that the close-owned revoke is still pending. Other
-    errors are returned unchanged, so injected free/destroy failures remain
-    visible to the retry assertions. A stuck INVALID_STATE fails the caller.
-    """
-    deadline = time.monotonic() + 10
-    status = lib.finalize_device(ctx)
-    while status == PTO_RUNTIME_ERR_INVALID_STATE and time.monotonic() < deadline:
-        time.sleep(0.001)
-        status = lib.finalize_device(ctx)
-    return status
+    """Close after external quiescence; preserve actual teardown errors."""
+    return lib.finalize_device(ctx)
 
 
 def _check_lifecycle_retry(lib, faults, arch, runtime, device, scenario):

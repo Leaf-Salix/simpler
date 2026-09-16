@@ -13,19 +13,19 @@
 #include "worker/runtime_c_api.h"
 
 // Close-only operations over prepare-owned receipt/event storage. Submission
-// success and completion are separate; no synchronization or allocation exists
-// in this vocabulary. The owner's submission mutex serializes every operation.
+// success and completion are separate; completion waits are bounded and cover
+// only the owner's control stream. The submission mutex serializes every operation.
 struct KernelRevokeOps {
     void *context{nullptr};
     int (*enqueue_revoke)(void *) noexcept {nullptr};
     int (*enqueue_receipt_copy)(void *) noexcept {nullptr};
     int (*record_completion)(void *) noexcept {nullptr};
-    int (*query_completion)(void *, bool *) noexcept {nullptr};
+    int (*wait_completion)(void *) noexcept {nullptr};
     int (*validate_receipt)(void *) noexcept {nullptr};
 
     bool valid() const {
         return enqueue_revoke != nullptr && enqueue_receipt_copy != nullptr && record_completion != nullptr &&
-               query_completion != nullptr && validate_receipt != nullptr;
+               wait_completion != nullptr && validate_receipt != nullptr;
     }
 };
 
@@ -59,10 +59,8 @@ public:
         }
         // An event that was never recorded may query COMPLETE. The stage
         // check above is therefore essential, not just a retry optimization.
-        bool complete = false;
-        const int rc = ops.query_completion(ops.context, &complete);
+        const int rc = ops.wait_completion(ops.context);
         if (rc != 0) return rc;
-        if (!complete) return PTO_RUNTIME_ERR_INVALID_STATE;
         const int receipt_rc = ops.validate_receipt(ops.context);
         if (receipt_rc != 0) return receipt_rc;
         stage_ = Stage::Confirmed;

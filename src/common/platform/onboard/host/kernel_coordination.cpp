@@ -129,12 +129,14 @@ int DeviceRunnerBase::finalize_kernel_coordination() {
         auto &r = *static_cast<DeviceRunnerBase *>(context);
         return aclrtRecordEvent(r.kernel_revoke_event_, r.kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
     };
-    ops.query_completion = [](void *context, bool *complete) noexcept -> int {
+    ops.wait_completion = [](void *context) noexcept -> int {
         auto &r = *static_cast<DeviceRunnerBase *>(context);
         aclrtEventRecordedStatus status{};
         const int rc = aclrtQueryEventStatus(r.kernel_revoke_event_, &status);
-        *complete = rc == 0 && status == ACL_EVENT_RECORDED_STATUS_COMPLETE;
-        return rc;
+        if (rc != 0 || status == ACL_EVENT_RECORDED_STATUS_COMPLETE) return rc;
+        return aclrtSynchronizeStreamWithTimeout(
+            r.kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu), PLATFORM_STREAM_SYNC_TIMEOUT_MS
+        );
     };
     ops.validate_receipt = [](void *context) noexcept -> int {
         auto &r = *static_cast<DeviceRunnerBase *>(context);

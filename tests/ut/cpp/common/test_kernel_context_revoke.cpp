@@ -17,7 +17,6 @@ namespace {
 struct RevokeFixture {
     std::array<int, 5> calls{};
     int fail{-1};
-    bool complete{false};
     int call(int index) {
         ++calls[index];
         return index == fail ? -71 : 0;
@@ -34,10 +33,8 @@ struct RevokeFixture {
             [](void *p) noexcept {
                 return static_cast<RevokeFixture *>(p)->call(2);
             },
-            [](void *p, bool *done) noexcept {
-                auto &self = *static_cast<RevokeFixture *>(p);
-                *done = self.complete;
-                return self.call(3);
+            [](void *p) noexcept {
+                return static_cast<RevokeFixture *>(p)->call(3);
             },
             [](void *p) noexcept {
                 return static_cast<RevokeFixture *>(p)->call(4);
@@ -46,17 +43,29 @@ struct RevokeFixture {
     }
 };
 
-TEST(KernelContextRevokeTest, PendingKeepsAllOwnershipAndDoesNotResubmit) {
+TEST(KernelContextRevokeTest, SuccessfulCloseWaitsAndConfirmsInOneCall) {
+    KernelContextRevoke revoke;
+    RevokeFixture f;
+    revoke.registration_may_exist();
+    EXPECT_EQ(revoke.advance(f.ops()), 0);
+    EXPECT_TRUE(revoke.confirmed());
+    EXPECT_EQ(f.calls, (std::array<int, 5>{1, 1, 1, 1, 1}));
+    EXPECT_EQ(revoke.advance({}), 0);
+    EXPECT_EQ(f.calls, (std::array<int, 5>{1, 1, 1, 1, 1}));
+}
+
+TEST(KernelContextRevokeTest, WaitFailureKeepsAllOwnershipAndDoesNotResubmit) {
     KernelContextRevoke revoke;
     RevokeFixture f;
     EXPECT_EQ(revoke.advance({}), 0);
     revoke.registration_may_exist();
     EXPECT_FALSE(revoke.confirmed());
-    EXPECT_EQ(revoke.advance(f.ops()), PTO_RUNTIME_ERR_INVALID_STATE);
-    EXPECT_EQ(revoke.advance(f.ops()), PTO_RUNTIME_ERR_INVALID_STATE);
+    f.fail = 3;
+    EXPECT_EQ(revoke.advance(f.ops()), -71);
+    EXPECT_EQ(revoke.advance(f.ops()), -71);
     EXPECT_EQ(f.calls, (std::array<int, 5>{1, 1, 1, 2, 0}));
     EXPECT_FALSE(revoke.confirmed());
-    f.complete = true;
+    f.fail = -1;
     EXPECT_EQ(revoke.advance(f.ops()), 0);
     EXPECT_TRUE(revoke.confirmed());
     EXPECT_EQ(revoke.advance({}), 0);
@@ -69,7 +78,6 @@ TEST(KernelContextRevokeTest, RetryResumesAtFirstUncommittedStep) {
         KernelContextRevoke revoke;
         RevokeFixture f;
         revoke.registration_may_exist();
-        f.complete = true;
         f.fail = failure;
         EXPECT_EQ(revoke.advance(f.ops()), -71);
         EXPECT_FALSE(revoke.confirmed());
@@ -88,7 +96,6 @@ TEST(KernelContextRevokeTest, NeverQueriesUnrecordedEventOrAcceptsInvalidReceipt
     RevokeFixture f;
     revoke.registration_may_exist();
     EXPECT_EQ(revoke.advance({}), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
-    f.complete = true;
     f.fail = 2;
     EXPECT_EQ(revoke.advance(f.ops()), -71);
     EXPECT_EQ(f.calls[3], 0);

@@ -262,13 +262,8 @@ def _close(lib, ctx, allocations, streams, device, graphs=()):
     for graph in graphs:
         _check(lib.aclmdlRIDestroy(graph), "destroy graph")
     # All caller work is drained and graphs are destroyed before entering this
-    # helper. Close may now queue its own metadata revocation without a sync.
-    deadline = time.monotonic() + 10
-    status = lib.finalize_device(ctx)
-    while status == -1003 and time.monotonic() < deadline:
-        time.sleep(0.001)
-        status = lib.finalize_device(ctx)
-    _check(status, "finalize context (including async revocation)")
+    # helper. Close waits only for its own metadata revocation.
+    _check(lib.finalize_device(ctx), "finalize context (including revocation)")
     assert lib.committed_device_memory_ctx(ctx) == 0
     lib.destroy_device_context(ctx)
     for address in reversed(allocations):
@@ -284,11 +279,7 @@ def _check_close_failure(context):
     observer.capture_observer_fail_large_free.argtypes = [ctypes.c_int]
     observer.capture_observer_failed_frees.restype = ctypes.c_uint64
     observer.capture_observer_fail_large_free(1)
-    deadline = time.monotonic() + 10
     status = lib.finalize_device(ctx)
-    while status == -1003 and time.monotonic() < deadline:
-        time.sleep(0.001)
-        status = lib.finalize_device(ctx)
     assert observer.capture_observer_failed_frees() > 0
     assert status == -4334, f"failed free was lost: close={status}"
     retained = lib.committed_device_memory_ctx(ctx)
