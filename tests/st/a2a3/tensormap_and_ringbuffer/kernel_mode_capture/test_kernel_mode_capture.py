@@ -209,7 +209,7 @@ def _config():
 
 
 def _bind_observer_guards(observer):
-    for name in ("arm", "release", "blocked", "wait_blocked", "finish"):
+    for name in ("arm", "release", "blocked", "finish"):
         function = getattr(observer, "capture_gate_" + name)
         function.argtypes = []
         function.restype = None if name in ("arm", "release") else ctypes.c_int
@@ -229,6 +229,8 @@ def _bind_observer_guards(observer):
     observer.capture_observer_fail_prepare.restype = None
     observer.capture_observer_caller_syncs.argtypes = []
     observer.capture_observer_caller_syncs.restype = ctypes.c_uint64
+    observer.capture_observer_failure_retired.argtypes = [ctypes.c_int]
+    observer.capture_observer_failure_retired.restype = ctypes.c_int
     for name in ("query_calls", "total_queries", "waits", "records", "clears", "prepare_failures"):
         function = getattr(observer, "capture_observer_" + name)
         function.argtypes = []
@@ -554,7 +556,10 @@ def _check_device_failure(context, scenario, launch, record_nodes, replay):
     status = context.lib.aclrtSynchronizeStreamWithTimeout(context.caller, 10000)
     assert status != 0, "hidden AICPU error was not propagated to caller"
     assert time.monotonic() - started < 9, "failure only surfaced through timeout"
-    assert observer.capture_observer_failure_retired() == 0, "failed round did not retire every core"
+    # Generation rejection precedes window-open; the config failure follows it.
+    expect_opened = scenario.startswith("runtime_error_")
+    retired = observer.capture_observer_failure_retired(int(expect_opened))
+    assert retired == 0, f"failed round retirement rc={retired}, expect_opened={expect_opened}"
     print(f"PASS {scenario} caller_error=1 cores_retired=1", flush=True)
     # Error streams/graphs are terminal; this test proves retirement,
     # not a D2 recovery policy. Let the isolated process release them.

@@ -92,12 +92,6 @@ aclError install_gate(aclrtStream stream) {
 }  // namespace
 
 extern "C" void capture_gate_arm() { armed = true; }
-extern "C" int capture_gate_wait_blocked() {
-    std::unique_lock<std::mutex> lock(gate.mutex);
-    return gate.changed.wait_for(lock, std::chrono::seconds(5), [] {
-        return gate.entered && !gate.released;
-    });
-}
 extern "C" int capture_gate_blocked() {
     std::lock_guard<std::mutex> lock(gate.mutex);
     return gate.entered && !gate.released && !gate.timed_out;
