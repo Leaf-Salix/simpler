@@ -91,6 +91,8 @@ def kernel_close_faults(tmp_path_factory):
         "persistent_free_close",
         "destroy_unclosed",
         "prepare",
+        "prepare_capture_global",
+        "prepare_capture_thread_local",
         "register_failure",
         "fatal_device",
     ],
@@ -418,18 +420,19 @@ def _check_lifecycle_retry(lib, faults, arch, runtime, device, scenario):
             assert lib.ensure_acl_ready_ctx(ctx, device) == PTO_RUNTIME_ERR_INVALID_STATE
             assert lib.finalize_device(ctx) == 0
             finalized = True
-        elif scenario == "prepare":
+        elif scenario.startswith("prepare"):
             # The caller's packed buffer stops being configuration authority
             # when init returns; prepare uses its owned, validated snapshot.
             config.aicpu_thread_num = -1
             config.enable_dump_args = 1
-            _check_prepare_reuse(lib, ctx, arch, runtime)
+            mode = {"prepare_capture_global": 0, "prepare_capture_thread_local": 1}.get(scenario)
+            _check_prepare_reuse(lib, ctx, arch, runtime, faults=faults, capture_mode=mode)
             finalized = True
         elif scenario == "register_failure":
-            _check_register_failure(lib, ctx)
+            _check_register_failure(lib, ctx, faults)
             finalized = True
         elif scenario == "persistent_free_close":
-            _check_prepare_reuse(lib, ctx, arch, runtime, close=False)
+            _check_prepare_reuse(lib, ctx, arch, runtime, faults=faults, close=False)
             # The first rtFree releases K7 coordination storage after revoke.
             # Fail the next, owned by PersistentKernelArgs, to exercise the
             # owner -> finalize_common -> allocator retry chain.
@@ -461,6 +464,7 @@ def _check_lifecycle_retry(lib, faults, arch, runtime, device, scenario):
             assert faults.destroy_attempts() == first_attempts + 1
             finalized = True
     finally:
+        faults.finish_prepare_guard()
         if not finalized:
             assert _finalize_after_quiescence(lib, ctx) == 0
         lib.destroy_device_context(ctx)
@@ -476,32 +480,50 @@ def _check_lifecycle_retry(lib, faults, arch, runtime, device, scenario):
         assert {name: faults.acl_call_count(i) for i, name in enumerate(names)} == dict.fromkeys(names, 0)
 
 
-def _check_register_failure(lib, ctx):
+def _check_register_failure(lib, ctx, faults):
     from simpler.task_interface import ChipCallable  # noqa: PLC0415
 
     # Host validation reads the image's sizes, offsets and names and never the
     # orchestration binary, so bytes that are not a loadable SO are admitted and
-    # uploaded. The AICPU's own dlopen is the first refusal, and registration
-    # waits on the context's AICPU stream for it, so it is this call's status.
+    # uploaded. Nothing dlopens them until a launch round asks for the
+    # orchestration, so neither preparation nor a drain can refuse this image.
     chip = ChipCallable.build(
         signature=[], func_name="kernel_prepare_orchestration", binary=b"\x00" * 4096, children=[]
     )
     image = ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size()))
     minted = ctypes.c_int32(99)
-    assert lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), ctypes.byref(minted)) != 0
-    assert minted.value == -1
-    # The failure poisons the context, which keeps its storage until an explicit
-    # close: no further registration is accepted, and finalize still reclaims.
-    assert (
-        lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), ctypes.byref(minted))
-        == PTO_RUNTIME_ERR_INVALID_STATE
-    )
-    assert minted.value == -1
+    assert _prepare_under_no_sync_guard(lib, ctx, faults, image, minted) == 0
+    assert minted.value == 0
+    committed = lib.committed_device_memory_ctx(ctx)
+    assert committed > 0
+    # Registration enqueues no device load, so a drain has nothing to refuse:
+    # the refusal belongs to the first launch round, which this case never
+    # reaches. A clean drain here is what proves the load is deferred.
+    lib.aclrtSynchronizeDeviceWithTimeout.argtypes = [ctypes.c_int32]
+    lib.aclrtSynchronizeDeviceWithTimeout.restype = ctypes.c_int
+    assert lib.aclrtSynchronizeDeviceWithTimeout(60000) == 0
+    # The registration's storage belongs to the context until an explicit close,
+    # which still reclaims all of it.
+    assert lib.committed_device_memory_ctx(ctx) == committed
     assert _finalize_after_quiescence(lib, ctx) == 0
     assert lib.committed_device_memory_ctx(ctx) == 0
 
 
-def _check_prepare_reuse(lib, ctx, arch, runtime, *, close=True):
+def _prepare_under_no_sync_guard(lib, ctx, faults, image, minted):
+    """Prepare with every synchronize entry refused.
+
+    Preparation runs inside an ACLGraph capture, which no wait can sit in, so a
+    refusal surfaces as prepare's own status instead of a capture that silently
+    records one.
+    """
+    faults.arm_prepare_guard()
+    try:
+        return lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), ctypes.byref(minted))
+    finally:
+        assert faults.finish_prepare_guard() == 0, "prepare synchronized a stream or the device"
+
+
+def _check_prepare_reuse(lib, ctx, arch, runtime, *, faults, close=True, capture_mode=None):
     import tempfile  # noqa: PLC0415
 
     from simpler.task_interface import ChipCallable  # noqa: PLC0415
@@ -522,21 +544,46 @@ def _check_prepare_reuse(lib, ctx, arch, runtime, *, close=True):
     lib.aclrtSynchronizeStreamWithTimeout.restype = ctypes.c_int
     caller_stream = ctypes.c_void_p()
     assert lib.aclrtCreateStream(ctypes.byref(caller_stream)) == 0
+    # Prove the guard refuses and counts before trusting the zeros it reports.
+    faults.arm_prepare_guard()
+    assert faults.aclrtSynchronizeStream(None) == -4323
+    assert faults.finish_prepare_guard() == 1
+    model = ctypes.c_void_p()
+    thread_mode = ctypes.c_int(capture_mode or 0)
+    if capture_mode is not None:
+        _bind_capture_entries(lib)
+        # The thread override is independent of the mode Begin is given.
+        assert lib.aclmdlRICaptureThreadExchangeMode(ctypes.byref(thread_mode)) == 0
+        assert lib.aclmdlRICaptureBegin(caller_stream, capture_mode) == 0
     before = lib.committed_device_memory_ctx(ctx)
     minted = ctypes.c_int32(99)
-    assert lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), ctypes.byref(minted)) == 0
+    assert _prepare_under_no_sync_guard(lib, ctx, faults, image, minted) == 0
     assert minted.value == 0
-    assert lib.aclrtSynchronizeStreamWithTimeout(caller_stream, 60000) == 0
     prepared = lib.committed_device_memory_ctx(ctx)
     assert prepared > before
     # Registration is pure: the same image again mints a second, distinct id
     # with its own upload. Committed device memory does not move, because the
     # code arena and its descriptor prefix are committed once on first use and
     # a second registration spends arena budget rather than new device memory.
-    assert lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), ctypes.byref(minted)) == 0
+    assert _prepare_under_no_sync_guard(lib, ctx, faults, image, minted) == 0
     assert minted.value == 1
-    assert lib.aclrtSynchronizeStreamWithTimeout(caller_stream, 60000) == 0
     assert lib.committed_device_memory_ctx(ctx) == prepared
+    if capture_mode is not None:
+        # Each upload restored the mode it borrowed, so the capture the caller
+        # opened is still the thread's own.
+        restored = ctypes.c_int(2)
+        assert lib.aclmdlRICaptureThreadExchangeMode(ctypes.byref(restored)) == 0
+        assert restored.value == capture_mode
+        assert lib.aclmdlRICaptureThreadExchangeMode(ctypes.byref(restored)) == 0
+        assert lib.aclmdlRICaptureEnd(caller_stream, ctypes.byref(model)) == 0
+        assert lib.aclmdlRIExecuteAsync(model, caller_stream) == 0
+    assert lib.aclrtSynchronizeStreamWithTimeout(caller_stream, 60000) == 0
+    # The uploads are context-owned state, not graph nodes: replaying the graph
+    # they were issued under changes nothing they published.
+    assert lib.committed_device_memory_ctx(ctx) == prepared
+    if capture_mode is not None:
+        assert lib.aclmdlRIDestroy(model) == 0
+        assert lib.aclmdlRICaptureThreadExchangeMode(ctypes.byref(thread_mode)) == 0
     lib.simpler_unregister_callable.argtypes = [ctypes.c_void_p, ctypes.c_int32]
     lib.simpler_unregister_callable.restype = ctypes.c_int
     assert lib.simpler_unregister_callable(ctx, 0) == PTO_RUNTIME_ERR_INVALID_STATE
@@ -549,6 +596,22 @@ def _check_prepare_reuse(lib, ctx, arch, runtime, *, close=True):
         )
         assert minted.value == -1
     assert lib.aclrtDestroyStream(caller_stream) == 0
+
+
+def _bind_capture_entries(lib):
+    lib.aclmdlRICaptureBegin.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.aclmdlRICaptureEnd.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    lib.aclmdlRICaptureThreadExchangeMode.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    lib.aclmdlRIExecuteAsync.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    lib.aclmdlRIDestroy.argtypes = [ctypes.c_void_p]
+    for name in (
+        "aclmdlRICaptureBegin",
+        "aclmdlRICaptureEnd",
+        "aclmdlRICaptureThreadExchangeMode",
+        "aclmdlRIExecuteAsync",
+        "aclmdlRIDestroy",
+    ):
+        getattr(lib, name).restype = ctypes.c_int
 
 
 @pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)

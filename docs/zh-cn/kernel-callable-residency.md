@@ -15,8 +15,9 @@ HBG 和 sim 的不支持判定发生在取得 kernel 身份之前。在这种未
 结构合法的 prepare / launch 返回 `INVALID_STATE`。能力查询不替代 context 初始化或生命周期检查。
 
 调用者先完成 ACL 初始化，并让当前线程持有所需设备。Kernel init 借用这个设备，
-不调用选卡、设备重置或 ACL 初始化/终止接口。init 和 prepare 可在 capture 之外
-同步 context 自己的 AICPU stream；launch 不做 stream/device 同步。
+不调用选卡、设备重置或 ACL 初始化/终止接口。init 必须在 capture 之外完成，
+它会同步 context 自己的 AICPU stream；prepare 和 launch 都不做 stream/device 同步，
+因此 prepare 可以在 capture 内调用。
 调用者负责串行执行同一 context 的 init、prepare、launch 和 finalize。
 
 ```cpp
@@ -95,8 +96,13 @@ blocks_（每块的底层分配由 MemoryAllocator 持有）
 各自的错误码（`CALLABLE_COUNT_EXCEEDED` / `CALLABLE_BYTES_EXCEEDED`）。
 
 上传只修补临时 `scratch` 中的子 `CoreCallable::resolved_addr_`，调用者镜像保持不变。
-缓存上传通过 `Ops.copy → rtMemcpy(..., RT_MEMCPY_HOST_TO_DEVICE)` 同步复制；随后的
-设备注册是异步下发，由 prepare 在返回前同步 AICPU stream 等它完成。
+缓存上传通过 `Ops.copy → capture_memcpy_h2d` 同步复制：先用
+`aclmdlRICaptureThreadExchangeMode` 把本线程的 capture 模式临时切到
+`ACL_MODEL_RI_CAPTURE_MODE_RELAXED`，再调用同步 `aclrtMemcpy`，随后恢复原模式；
+拷贝失败也照样恢复，切换或恢复失败按错误返回。这条拷贝立即执行、不进 graph，
+它的设备分配一直活到 close，所以临时 `scratch` 可以在返回后释放。
+Runtime、`KernelArgs` 和 AICore 寄存器地址表的上传走同一个函数。
+随后的设备注册是异步下发，prepare 不等它完成。
 
 Host 条目保存驻留信息、镜像副本、计费字节数和 `ready`。
 `resident_count()` 只统计 ready 项，`resident_bytes()` 包括未 commit 的计费占用。
@@ -111,15 +117,19 @@ program 模式继续使用原有上传与引用计数路径。
 TMR 的 `prepare_kernel_callable` 首次配置固定 runtime 区域、准备 `PersistentKernelArgs`，
 随后冻结配置。每个 callable 在此分配 Host dispatch packet 缓冲区，launch 只重写内容。
 
-设备注册在 context 专用的 AICPU stream 上发射 `RegisterCallableName`。
-每次 launch 也把 AICPU 任务发在同一条流上，FIFO 因此保证注册排在每次 launch 之前，
-不需要事件，prepare 也不接触 caller stream。prepare 在提交该 callable 之前同步这条
-AICPU stream，设备侧注册失败因此由 prepare 自己的返回值报告；它不同步 caller stream，
-也不做 device synchronize。
+设备注册在 context 专用的 AICPU stream 上发射 `simpler_aicpu_register_tmr_kernel_callable`
+记录驻留（设备地址与长度），**不再 dlopen 编排 SO**——该装载移到该 callable 第一次 launch 的
+轮次 leader 阶段（`prepare_kernel_round`），因此 launch 不依赖注册任务是否已执行；
+其前的 `prepare_kernel_coordination` 在同一条流上发射 `simpler_aicpu_prepare_tmr_context`
+交接 context 描述符。每次 launch 也把 AICPU 任务发在同一条流上，FIFO 因此保证两者都
+排在每次 launch 之前，不需要事件，prepare 也不接触 caller stream。prepare 不同步任何
+stream，也不做 device synchronize：返回 0 表示镜像已上传、注册任务已被接受下发，
+不表示设备已经 dlopen 成功。编排 SO 无法装载这类失败，在该 callable 第一次 launch 时才暴露。
+program 模式仍走带同步的 `register_callable_on_device`，它的注册失败仍是注册调用自己的状态。
 
 context 随后转为 `ReadyEnqueued`，缓存通过 `commit(callable_id)` 发布 ready 条目。
-ready 表示注册已在设备上完成并建立依赖。
-调用者仍须在 capture 之前完成自己的 warmup 和同步检查。
+ready 表示注册已下发并由同一条 AICPU stream 承接顺序。
+调用者仍须在自己 warmup 并同步时检查异步准备结果。
 
 HBG 内部准备包含资源计划、freeze 和 execution-slot 注册；公开 HBG init 已提前拒绝，
 不能通过公开 prepare 绕过 H4 缺失的限制。详见

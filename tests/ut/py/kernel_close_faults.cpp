@@ -27,6 +27,8 @@ bool guard_acl = false;
 std::array<int, 7> forbidden_calls{};
 bool fake_device_drain = false;
 int device_drain_calls = 0;
+bool guard_prepare = false;
+int prepare_sync_calls = 0;
 bool override_device_query = false;
 int device_query_result = 0;
 int reported_device = -1;
@@ -148,7 +150,41 @@ extern "C" int rtDeviceReset(int device) {
     if (guard_acl) return forbidden(5);
     return forward_cann("rtDeviceReset", device);
 }
+extern "C" void arm_prepare_guard() {
+    guard_prepare = true;
+    prepare_sync_calls = 0;
+}
+extern "C" int finish_prepare_guard() {
+    guard_prepare = false;
+    return prepare_sync_calls;
+}
+
+extern "C" int aclrtSynchronizeStream(void *stream) {
+    if (guard_prepare) {
+        ++prepare_sync_calls;
+        return -4323;
+    }
+    return forward_cann("aclrtSynchronizeStream", stream);
+}
+extern "C" int aclrtSynchronizeStreamWithTimeout(void *stream, int32_t timeout) {
+    if (guard_prepare) {
+        ++prepare_sync_calls;
+        return -4323;
+    }
+    return forward_cann("aclrtSynchronizeStreamWithTimeout", stream, timeout);
+}
+extern "C" int rtStreamSynchronize(void *stream) {
+    if (guard_prepare) {
+        ++prepare_sync_calls;
+        return -4323;
+    }
+    return forward_cann("rtStreamSynchronize", stream);
+}
 extern "C" int aclrtSynchronizeDeviceWithTimeout(int32_t timeout) {
+    if (guard_prepare) {
+        ++prepare_sync_calls;
+        return -4323;
+    }
     if (fake_device_drain) {
         ++device_drain_calls;
         return 0;

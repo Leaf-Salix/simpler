@@ -81,17 +81,46 @@ simpler 没有调用过它们。
 | 入口 | 做什么 |
 | ---- | ------ |
 | `simpler_kernel_mode_init` | 用 `aclrtGetDevice` 确认当前卡与传入卡号一致，只核对不设置；用 `rtStreamCreate` 创建两条私有 stream（AICPU、AICore）和 5 个 event；加载 AICPU 执行体。容量配置此时固定 |
-| `simpler_kernel_mode_prepare_callable` | 上传 callable 镜像并铸造 callable_id（出参返回），把编排 .so 注册到设备；首次调用时提交 pooled arena，上传常驻 Runtime 与 KernelArgs |
+| `simpler_kernel_mode_prepare_callable` | 上传 callable 镜像并铸造 callable_id（出参返回），把编排 .so 的注册任务下发到设备；首次调用时提交 pooled arena，上传常驻 Runtime 与 KernelArgs。全部 H2D 走 `capture_memcpy_h2d`，可在 capture 内执行 |
 | `simpler_kernel_mode_launch` | 校验上下文与 callable 驻留，把本次参数连同该 callable 的设备镜像地址与长度编码进参数包，在三条 stream 上排布一串异步操作后返回 |
 | `finalize_device` | 释放上下文拥有的资源；测试断言 committed memory 归零 |
 
-init 期间的执行体加载和 prepare 期间的 callable 注册，会同步上下文自己的 AICPU
-stream。launch 路径不同步任何 stream。TMR close 在调用方已完成执行且销毁相关 graph
-之后，等待上下文自有 AICPU stream 完成设备注销及回执复制，再释放资源；不替调用方
-同步 caller stream。等待有超时，注销、等待或释放失败均保留相应资源供 close 重试。
+init 期间的执行体加载会同步上下文自己的 AICPU stream，因此 init 必须在 capture 之外
+完成。prepare 与 launch 都不同步任何 stream，prepare 因此可以在 capture 内调用；
+它的 H2D 上传走 `capture_memcpy_h2d`，临时切到 RELAXED 模式后同步拷贝再恢复。
+TMR close 在调用方已完成执行且销毁相关 graph 之后，等待上下文自有 AICPU stream 完成
+设备注销及回执复制，再释放资源；不替调用方同步 caller stream。等待有超时，注销、
+等待或释放失败均保留相应资源供 close 重试。
 
-prepare 之后，测试自己同步一次 caller stream 再读 committed memory。prepare 的设备侧
-注册错误由它自己的返回值报告，不依赖这次同步。
+## 4.1 Python 侧的 Worker 入口
+
+上面四个是 C 入口。Python 侧对应的公开对象是 L2 `Worker`，构造时用
+`execution_mode` 选定分派面，之后只读：
+
+```python
+worker = Worker(level=2, execution_mode="kernel", device_id=d,
+                platform="a2a3", runtime="tensormap_and_ringbuffer")
+worker.init(config=cfg)                       # -> simpler_kernel_mode_init
+cid = worker.kernel_prepare_callable(chip)    # -> ..._prepare_callable，返回铸好的 id
+worker.kernel_launch(cid, args, stream)       # -> ..._launch，stream 每次显式传
+worker.close()                                # -> finalize_device
+```
+
+`config` 是 context 固定配置，kernel 模式必填、program 模式拒收；program 模式的
+`prewarm_config` 反之。init 与 prepare 都不收 stream，只有 launch 收，且不保存。
+两个分派面互斥：kernel 模式下 `register` / `submit` / `run` 被拒，program 模式下两个
+`kernel_*` 入口被拒，报错里点名构造时固定的模式。
+
+`kernel_prepare_callable` 是纯注册：同一个 callable 注册两次得到两个不同且都有效的
+id，没有去重也没有 lookup，容量按注册次数计。id 只在本 context 内有效、成功过的不
+复用，`close()` 之后整体失效——这三条合起来取代了 id 上的 generation 字段。
+
+Worker 层的端到端用例是 `tests/ut/py/test_worker/test_kernel_mode_entry.py` 的
+`test_worker_kernel_mode_eager_end_to_end`：与第 2 节的 C API 用例同一个向量加标量
+算子，同样由测试自己持有设备、stream 和显存，区别只是经过 Worker 而不是 ctypes。
+
+prepare 之后，测试自己同步一次 caller stream 再读 committed memory。prepare 只保证镜像
+已上传、注册任务已被接受下发，设备侧注册错误要等这次 warmup 同步才暴露。
 
 ## 5. 一次 launch 的时序
 
@@ -183,14 +212,14 @@ simpler 仍引用主机侧参数，本次执行会读到被清空的数据，结
 
 | 职责 | 手段 |
 | ---- | ---- |
-| 断言 simpler 不做什么 | 截获四个同步入口与 `aclrtQueryEventStatus`，按作用域判定：launch 作用域内**任何**同步都被拒绝并计数（入队路径不得含等待，否则图里装不下）；注册作用域内只拒绝**调用方自己的 stream**，上下文私有 AICPU stream 的那次同步照常放行 |
+| 断言 simpler 不做什么 | 截获四个同步入口与 `aclrtQueryEventStatus`：注册与 launch 两个作用域内**任何**同步都被拒绝并计数（两者都可能在调用方的 capture 内执行，图里装不下等待） |
 | 观察它做了什么 | 截获 `rtKernelLaunchWithHandleV2`（AICore）与 `rtsLaunchCpuKernel`（AICPU），解包校验 binding 地址与常驻 `KernelArgs` 在多次调用间不变、两侧 launch 成对；另计 event wait / record 与 `aclrtMemsetAsync` 次数，给出事件拓扑 |
 | 注入故障 | `capture_observer_fail_prepare` 让 AICPU 注册 launch 返回 -4333；`prepare_gate.cpp` 用 `aclrtLaunchCallback(ACL_CALLBACK_BLOCK)` 在 AICPU stream 上插一个阻塞回调，供 `blocked_same` / `stream_busy` 制造"前一次 launch 的 serial tail 未完成"的状态 |
 
-注册作用域与 launch 作用域必须分开：注册**会**同步上下文自己的 AICPU stream（见
-第 4 节），那次等待正是设备侧注册失败能成为 `prepare_callable` 自身返回值的原因。
-阻塞门也随之挂在 launch 上而不是注册上——注册返回时它已经完成，没有"注册尚未完成"
-的窗口可言。
+两个作用域仍然分开，但分的不再是同步策略：注册作用域另外武装注册故障注入，
+`prepare_fail_register` 只对这一次调用生效。阻塞门挂在 launch 上而不是注册上——
+注册只入队，本来就没有可阻塞的等待。`prepare_in_capture` 场景在 capture 打开的状态下
+注册第二个 callable，再把它的 launch 一起录进同一张图。
 
 ## 9. 并入主线时的接口裁决
 
@@ -203,7 +232,7 @@ simpler 仍引用主机侧参数，本次执行会读到被清空的数据，结
 | launch 的 callable id 越界 | 返回 `INVALID_ARGUMENT`，与 prepare 一致 |
 | kernel 入口符号解析 | 每个 runtime 仍导出全部四个入口；ChipWorker 只在 `supported` 非零时解析 init、prepare、launch |
 | kernel 模式容量规则 | 使用 K3 的共享 static arena bank，同时覆盖 onboard 与仿真 |
-| 同步语义说明 | init 与 prepare 会同步上下文自己的 AICPU stream，launch 路径不同步 |
+| 同步语义说明 | init 会同步上下文自己的 AICPU stream，必须在 capture 外完成；prepare 与 launch 都不同步，prepare 因此可在 capture 内调用 |
 | callable id 与版本 | prepare 铸 id 经出参返回，失败写 `-1`；纯注册不去重，id 在 context 内不复用、close 后整体失效，不带 generation |
 | 设备侧如何找到 callable | 参数包直接携带该 callable 的设备镜像地址与长度，由 binder 从本 context 已提交的驻留信息填入；不再有独立的驻留描述符 |
 

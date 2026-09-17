@@ -578,8 +578,8 @@ public:
 
     /**
      * Number of distinct callable_ids the AICPU has been asked to
-     * dlopen for. Monotonically increases when an AICPU load succeeds
-     * during prepare prewarm or first-run fallback; `unregister_callable`
+     * dlopen for. Kernel mode counts accepted enqueues; program mode counts
+     * loads the registration stream has completed. `unregister_callable`
      * does NOT decrement it. So a `prepare → unregister → re-prepare`
      * sequence reports 2 (each AICPU dlopen counted once), even though one cid is
      * currently registered.
@@ -958,9 +958,12 @@ protected:
     virtual int prepare_aicpu_affinity(Runtime &runtime, int requested, rtStream_t control_stream) = 0;
 
     /**
-     * Launch the AICPU callable registration on `control_stream` and wait for
-     * it. The device must already be up; launch_device_register() is the
-     * program-mode entry that brings it up first.
+     * Launch the AICPU callable registration on `control_stream`, wait for it,
+     * and commit it, so a device-side load failure is this call's status. The
+     * device must already be up; launch_device_register() is the program-mode
+     * entry that brings it up first. Kernel preparation registers through its
+     * own payload and does not use this: it may run inside an ACLGraph
+     * capture, which no wait can sit in.
      */
     int register_callable_on_device(int32_t callable_id, rtStream_t control_stream);
 
@@ -1370,7 +1373,6 @@ protected:
     void *kernel_core_envelope_{nullptr};
     void *kernel_revoke_device_receipt_{nullptr};
     simpler::tmr::TmrContextRevokeReceipt *kernel_revoke_host_receipt_{nullptr};
-    rtEvent_t kernel_revoke_event_{nullptr};
     KernelContextRevoke kernel_revoke_;
     bool kernel_coordination_ready_{false};
     rtFuncHandle kernel_result_handle_{nullptr};

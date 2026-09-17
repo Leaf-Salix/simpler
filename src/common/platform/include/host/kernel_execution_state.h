@@ -115,6 +115,7 @@ enum class KernelEventKind : uint8_t {
     AicoreDone,  /* aicore → aicpu join */
     AicpuDone,   /* aicpu → caller join */
     SerialTail,  /* caller-visible call tail; the stream-switch gate reads it */
+    Revoke,      /* close-time context revocation completion, recorded on the aicpu stream */
     Count,
 };
 

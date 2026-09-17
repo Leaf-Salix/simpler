@@ -57,8 +57,6 @@ bool invocation_scope{false};
 bool forbid_sync{false};
 bool prepare_scope{false};
 uint64_t forbidden_sync_calls{0};
-uint64_t caller_stream_syncs{0};
-const void *caller_streams[2]{nullptr, nullptr};
 int query_override{0};
 uint64_t query_override_calls{0};
 uint64_t total_queries{0};
@@ -77,28 +75,14 @@ bool fail_prepare_step(int kind) {
     return true;
 }
 
-bool is_caller_stream(const void *stream) {
-    for (const void *candidate : caller_streams) {
-        if (candidate != nullptr && candidate == stream) return true;
-    }
-    return false;
-}
-
-// A sync the scope in force forbids, counted in that scope's own tally. Launch
-// forbids every sync: it is pure enqueue, and a wait there is what a captured
-// graph cannot contain. Registration forbids only the caller's streams — it
-// synchronizes the context's own AICPU stream by contract, so that one reaches
-// CANN. A null stream means device-wide, which drains the caller's streams too.
-bool sync_is_forbidden(const void *stream) {
-    if (forbid_sync) {
-        ++forbidden_sync_calls;
-        return true;
-    }
-    if (prepare_scope && (stream == nullptr || is_caller_stream(stream))) {
-        ++caller_stream_syncs;
-        return true;
-    }
-    return false;
+// Registration and launch both run inside a capture the caller owns, and a
+// captured graph can contain no wait, so each scope refuses every synchronize
+// rather than only counting it — a refusal surfaces as the call's own status
+// instead of a wait the graph silently records.
+bool sync_is_forbidden() {
+    if (!forbid_sync) return false;
+    ++forbidden_sync_calls;
+    return true;
 }
 
 void note_error(ObserverError error) {
@@ -177,11 +161,6 @@ extern "C" void capture_observer_guard_sync(int enabled) { forbid_sync = enabled
 extern "C" void capture_observer_prepare_scope(int enabled) { prepare_scope = enabled != 0; }
 extern "C" void capture_observer_invocation_scope(int enabled) { invocation_scope = enabled != 0; }
 extern "C" uint64_t capture_observer_sync_calls() { return forbidden_sync_calls; }
-extern "C" uint64_t capture_observer_caller_syncs() { return caller_stream_syncs; }
-extern "C" void capture_observer_caller_streams(uint64_t first, uint64_t second) {
-    caller_streams[0] = reinterpret_cast<const void *>(first);
-    caller_streams[1] = reinterpret_cast<const void *>(second);
-}
 extern "C" void capture_observer_override_query(int kind) {
     query_override = kind;
     query_override_calls = 0;
@@ -253,7 +232,7 @@ extern "C" aclError aclrtMemsetAsync(void *device, size_t maximum, int32_t value
 }
 
 extern "C" aclError aclrtSynchronizeStreamWithTimeout(aclrtStream stream, int32_t timeout) {
-    if (sync_is_forbidden(stream)) return -4331;
+    if (sync_is_forbidden()) return -4331;
     static const auto real = reinterpret_cast<decltype(&aclrtSynchronizeStreamWithTimeout)>(
         resolve_cann_symbol("aclrtSynchronizeStreamWithTimeout")
     );
@@ -261,21 +240,21 @@ extern "C" aclError aclrtSynchronizeStreamWithTimeout(aclrtStream stream, int32_
 }
 
 extern "C" aclError aclrtSynchronizeStream(aclrtStream stream) {
-    if (sync_is_forbidden(stream)) return -4331;
+    if (sync_is_forbidden()) return -4331;
     static const auto real =
         reinterpret_cast<decltype(&aclrtSynchronizeStream)>(resolve_cann_symbol("aclrtSynchronizeStream"));
     return real == nullptr ? -4330 : real(stream);
 }
 
 extern "C" aclError aclrtSynchronizeDevice() {
-    if (sync_is_forbidden(nullptr)) return -4331;
+    if (sync_is_forbidden()) return -4331;
     static const auto real =
         reinterpret_cast<decltype(&aclrtSynchronizeDevice)>(resolve_cann_symbol("aclrtSynchronizeDevice"));
     return real == nullptr ? -4330 : real();
 }
 
 extern "C" rtError_t rtStreamSynchronize(rtStream_t stream) {
-    if (sync_is_forbidden(stream)) return -4331;
+    if (sync_is_forbidden()) return -4331;
     static const auto real =
         reinterpret_cast<decltype(&rtStreamSynchronize)>(resolve_cann_symbol("rtStreamSynchronize"));
     return real == nullptr ? -4330 : real(stream);

@@ -40,6 +40,7 @@ SCENARIOS = (
     "cross_stream",
     "prepare_again",
     "prepare_after_capture",
+    "prepare_in_capture",
     "stream_query_error",
     "stream_busy",
     "blocked_same",
@@ -217,8 +218,6 @@ def _bind_observer_guards(observer):
     observer.capture_observer_guard_sync.restype = None
     observer.capture_observer_prepare_scope.argtypes = [ctypes.c_int]
     observer.capture_observer_prepare_scope.restype = None
-    observer.capture_observer_caller_streams.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
-    observer.capture_observer_caller_streams.restype = None
     observer.capture_observer_invocation_scope.argtypes = [ctypes.c_int]
     observer.capture_observer_invocation_scope.restype = None
     observer.capture_observer_sync_calls.argtypes = []
@@ -227,8 +226,6 @@ def _bind_observer_guards(observer):
     observer.capture_observer_override_query.restype = None
     observer.capture_observer_fail_prepare.argtypes = [ctypes.c_int]
     observer.capture_observer_fail_prepare.restype = None
-    observer.capture_observer_caller_syncs.argtypes = []
-    observer.capture_observer_caller_syncs.restype = ctypes.c_uint64
     observer.capture_observer_failure_retired.argtypes = [ctypes.c_int]
     observer.capture_observer_failure_retired.restype = ctypes.c_int
     for name in ("query_calls", "total_queries", "waits", "records", "clears", "prepare_failures"):
@@ -344,7 +341,13 @@ def _initialize(device, scenario, build_dir):
             execution_error=scenario.startswith("runtime_error_"),
         )
     ]
-    if scenario in ("multi_callable", "prepare_again", "prepare_after_capture", "eager_multi_callable"):
+    if scenario in (
+        "multi_callable",
+        "prepare_again",
+        "prepare_after_capture",
+        "prepare_in_capture",
+        "eager_multi_callable",
+    ):
         chips.append(_build_callable(build_dir / "callable-b", alternate=True))
     lib = _load("a2a3", "onboard", RUNTIME)
     _bind_acl(lib)
@@ -366,7 +369,6 @@ def _initialize(device, scenario, build_dir):
     )
     observer = _bind_capture_functions(lib)
     _bind_observer_guards(observer)
-    observer.capture_observer_caller_streams(streams[0].value or 0, streams[1].value or 0)
     return chips, lib, streams, caller, ctx, observer
 
 
@@ -504,20 +506,22 @@ def _guarded(observer, operation, *arguments, expected=0):
 
 
 def _prepared(observer, operation, *arguments, expected=0):
-    """Run one registration with the caller's streams off limits.
+    """Run one registration with every synchronize refused.
 
-    Registration synchronizes the context's own AICPU stream, and that wait is
-    what makes a device-side registration failure this call's own status. What
-    it must never touch is a stream the caller owns, so only those are refused;
-    the context's own sync reaches CANN. The scope also arms the registration
-    fault injection and the capture gate, which apply to this call alone.
+    Registration is callable inside a caller's capture, so it may wait for
+    nothing: it enqueues its AICPU work on the context's own stream, whose FIFO
+    orders it ahead of every launch, and a device-side load failure is left for
+    the caller's own warmup to surface. The scope also arms the registration
+    fault injection, which applies to this call alone.
     """
     observer.capture_observer_prepare_scope(1)
+    observer.capture_observer_guard_sync(1)
     try:
         result = operation(*arguments)
     finally:
+        observer.capture_observer_guard_sync(0)
         observer.capture_observer_prepare_scope(0)
-    assert observer.capture_observer_caller_syncs() == 0, "prepare synchronized a caller stream"
+    assert observer.capture_observer_sync_calls() == 0, "prepare performed an internal sync"
     assert result == expected, f"prepared native operation rc={result}, expected={expected}"
 
 
@@ -629,9 +633,11 @@ def _run(device, scenario, build_dir):
         args.clear()
         host_launches += int(expected == 0)
 
-    def record_nodes(nodes):
+    def record_nodes(nodes, prepare_cid=None):
         graph = ctypes.c_void_p()
         _check(lib.aclmdlRICaptureBegin(caller, 0), "capture begin")
+        if prepare_cid is not None:
+            prepare(prepare_cid)
         for index, (cid, tensors, scalar) in enumerate(nodes):
             if index == 0:
                 launch(cid, tensors, scalar=scalar)
@@ -642,8 +648,10 @@ def _run(device, scenario, build_dir):
         graphs.append(graph)
         return graph
 
-    def record(cids, increment=1.25):
-        return record_nodes([(cid, None, 1.25) for cid in cids] + [(0, (counter, counter), increment)])
+    def record(cids, increment=1.25, prepare_cid=None):
+        return record_nodes(
+            [(cid, None, 1.25) for cid in cids] + [(0, (counter, counter), increment)], prepare_cid=prepare_cid
+        )
 
     replay = partial(_replay, context)
 
@@ -693,7 +701,13 @@ def _run(device, scenario, build_dir):
             _close(lib, ctx, allocations, streams, device, graphs)
             print(f"PASS {scenario} replays=100 forbidden_sync=0 host_launches={host_launches}", flush=True)
             return
-        record([0, 1, 0] if len(callable_ids) == 2 else [0])
+        if scenario == "prepare_in_capture":
+            # Registration inside the capture publishes context state rather
+            # than a graph node, so the replays below leave it where it is.
+            record([0, 1, 0], prepare_cid=1)
+            committed = lib.committed_device_memory_ctx(ctx)
+        else:
+            record([0, 1, 0] if len(callable_ids) == 2 else [0])
         if scenario == "prepare_after_capture":
             prepare(1)
             record([1])

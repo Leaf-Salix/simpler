@@ -110,6 +110,10 @@ static RuntimeContext *rt{nullptr};
 struct OrchSoEntry {
     simpler::tmr::PreparedKernelCallable kernel;
     bool kernel_owned{false};
+    // Set when a residency is recorded, cleared once the round leader has
+    // loaded that image. A handle left over from a previous residency at this
+    // id is stale, so a non-null handle alone does not mean loaded.
+    bool needs_load{false};
     bool in_use{false};
     void *handle{nullptr};
     char path[256]{};
@@ -385,12 +389,9 @@ int32_t AicpuExecutor::load_orch_so(
 
     OrchSoEntry &entry = orch_so_table_[callable_id];
 
-    // Registration always (re)loads: the slot may have been reused after an
+    // Loading always (re)loads: the slot may have been reused after an
     // unregister, so dlclose any stale handle before dlopen'ing the new SO.
-    // No AicpuPhase::SoLoad stamp here: that phase times the dlopen within a
-    // simpler_run launch, but loading now happens in the separate
-    // register_callable launch which has no phase buffer (the run-path SoLoad
-    // slot is simply 0 now that run never loads).
+    // No AicpuPhase::SoLoad stamp here: this has no phase buffer.
     LOG_INFO("Thread %d: New orch SO detected (callable_id=%d), (re)loading", thread_idx, callable_id);
     if (entry.handle != nullptr) {
         dlclose(entry.handle);
@@ -398,7 +399,16 @@ int32_t AicpuExecutor::load_orch_so(
     if (entry.path[0] != '\0') {
         unlink(entry.path);
     }
+    // Only the dlopen state resets. A kernel-mode residency records the image
+    // span and the child function table, and a dispatch admitted before this
+    // load holds a view into that table — resetting it would dangle the view.
+    auto resident = std::move(entry.kernel);
+    const bool kernel_owned = entry.kernel_owned;
+    const bool needs_load = entry.needs_load;
     entry = OrchSoEntry{};
+    entry.kernel = std::move(resident);
+    entry.kernel_owned = kernel_owned;
+    entry.needs_load = needs_load;
 
     const void *so_data = reinterpret_cast<const void *>(dev_orch_so_addr);
     size_t so_size = dev_orch_so_size;
@@ -974,8 +984,25 @@ int32_t AicpuExecutor::prepare_kernel_round(const simpler::tmr::KernelExecutionR
     if (admitted != InvocationStatus::Ok) return invocation_dispatch_status(admitted);
     const auto &inputs = kernel_invocation_.inputs();
     const int32_t cid = inputs.callable_id;
-    if (cid < 0 || cid >= MAX_REGISTERED_CALLABLE_IDS || !orch_so_table_[cid].in_use ||
-        orch_so_table_[cid].handle == nullptr || orch_so_table_[cid].func == nullptr)
+    if (cid < 0 || cid >= MAX_REGISTERED_CALLABLE_IDS) return -1;
+    // The orchestration SO is loaded here, on the round leader, because dlopen
+    // can only run in this process and a host-side load would be unordered
+    // against a launch replayed from a graph. The gate admits one leader per
+    // round, so the load happens once and every other thread observes its
+    // verdict through the admission this function's status publishes.
+    if (orch_so_table_[cid].needs_load || orch_so_table_[cid].handle == nullptr ||
+        orch_so_table_[cid].func == nullptr) {
+        const auto &resident = orch_so_table_[cid].kernel;
+        if (resident.device_address == 0) return -1;
+        const auto *image = reinterpret_cast<const ChipCallable *>(resident.device_address);
+        if (load_orch_so(
+                cid, reinterpret_cast<uint64_t>(image->binary_data()), image->binary_size(), image->func_name(),
+                image->config_name(), 0
+            ) != 0)
+            return -1;
+        orch_so_table_[cid].needs_load = false;
+    }
+    if (!orch_so_table_[cid].in_use || orch_so_table_[cid].handle == nullptr || orch_so_table_[cid].func == nullptr)
         return -1;
     if (!configure_orchestration_args(inputs, orch_args_cached_, orch_so_table_[cid].config_func))
         return static_cast<int32_t>(KernelDispatchStatus::InvalidArgs);

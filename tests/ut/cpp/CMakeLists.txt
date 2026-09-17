@@ -516,6 +516,18 @@ set_tests_properties(test_native_run_acceptance PROPERTIES LABELS "no_hardware")
 # callers invoke it from different host threads.
 add_common_utils_test(test_host_api common/test_host_api.cpp)
 
+# Capture-safe H2D: the thread capture-mode exchange around each context-owned
+# upload, provable against a stub ACL without a device.
+add_executable(test_capture_memcpy common/test_capture_memcpy.cpp)
+target_include_directories(test_capture_memcpy PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/capture_stubs
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+)
+target_link_libraries(test_capture_memcpy PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_capture_memcpy COMMAND test_capture_memcpy)
+set_tests_properties(test_capture_memcpy PROPERTIES LABELS "no_hardware")
+
 # Kernel-mode entry argument validation: shared by every host-runtime
 # component (real implementation and stub alike), so its rejection rules are
 # provable here without any device or built .so.

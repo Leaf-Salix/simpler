@@ -14,6 +14,7 @@
 #include <cstring>
 #include <vector>
 
+#include "host/capture_memcpy.h"
 #include "tensormap_and_ringbuffer/kernel_clear_plan.h"
 
 namespace {
@@ -30,8 +31,7 @@ static_assert(sizeof(CoordinationImage) % alignof(TmrCoreReport) == 0);
 
 int DeviceRunnerBase::prepare_kernel_coordination() {
     if (kernel_coordination_ready_) return 0;
-    if (kernel_coordination_block_ || kernel_revoke_host_receipt_ || kernel_revoke_event_)
-        return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (kernel_coordination_block_ || kernel_revoke_host_receipt_) return PTO_RUNTIME_ERR_INVALID_STATE;
     if (!persistent_args_.is_prepared() || worker_count_ <= 0) return PTO_RUNTIME_ERR_INVALID_STATE;
     const size_t report_bytes = static_cast<size_t>(worker_count_) * sizeof(TmrCoreReport);
     if (report_bytes / sizeof(TmrCoreReport) != static_cast<size_t>(worker_count_) ||
@@ -80,15 +80,13 @@ int DeviceRunnerBase::prepare_kernel_coordination() {
     initial.receipt.descriptor_address = d.self_address;
     initial.receipt.context_generation = d.context_generation;
     std::memcpy(image.data(), &initial, sizeof(initial));
-    int rc = rtMemcpy(kernel_coordination_block_, bytes, image.data(), bytes, RT_MEMCPY_HOST_TO_DEVICE);
+    int rc = capture_memcpy_h2d(kernel_coordination_block_, bytes, image.data(), bytes);
     if (rc != 0) return rc;
     void *host_receipt = nullptr;
     rc = aclrtMallocHost(&host_receipt, sizeof(TmrContextRevokeReceipt));
     if (rc != 0) return rc;
     kernel_revoke_host_receipt_ = static_cast<TmrContextRevokeReceipt *>(host_receipt);
     std::memcpy(kernel_revoke_host_receipt_, &initial.receipt, sizeof(initial.receipt));
-    rc = aclrtCreateEventWithFlag(&kernel_revoke_event_, ACL_EVENT_SYNC);
-    if (rc != 0) return rc;
     kernel_result_handle_ = load_aicpu_op_.BuiltInHandle("simpler_aicpu_check_tmr_result");
     if (!kernel_result_handle_) return PTO_RUNTIME_ERR_INTERNAL;
     TmrContextRegistrationArgs registration{d.self_address, d.context_generation};
@@ -96,8 +94,9 @@ int DeviceRunnerBase::prepare_kernel_coordination() {
     kernel_revoke_.registration_may_exist();
     rc = launch_aicpu_payload(stream, &registration, sizeof(registration), "simpler_aicpu_prepare_tmr_context", 1);
     if (rc != 0) return rc;
-    rc = aclrtSynchronizeStreamWithTimeout(stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
-    if (rc != 0) return rc;
+    // The same AICPU stream carries every later registration and launch, so
+    // FIFO alone orders this context handshake ahead of them; a device-side
+    // failure surfaces when the caller drains.
     kernel_coordination_ready_ = true;
     return 0;
 }
@@ -127,12 +126,15 @@ int DeviceRunnerBase::finalize_kernel_coordination() {
     };
     ops.record_completion = [](void *context) noexcept -> int {
         auto &r = *static_cast<DeviceRunnerBase *>(context);
-        return aclrtRecordEvent(r.kernel_revoke_event_, r.kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
+        return aclrtRecordEvent(
+            r.kernel_exec_state_.event(KernelEventKind::Revoke),
+            r.kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu)
+        );
     };
     ops.wait_completion = [](void *context) noexcept -> int {
         auto &r = *static_cast<DeviceRunnerBase *>(context);
         aclrtEventRecordedStatus status{};
-        const int rc = aclrtQueryEventStatus(r.kernel_revoke_event_, &status);
+        const int rc = aclrtQueryEventStatus(r.kernel_exec_state_.event(KernelEventKind::Revoke), &status);
         if (rc != 0 || status == ACL_EVENT_RECORDED_STATUS_COMPLETE) return rc;
         return aclrtSynchronizeStreamWithTimeout(
             r.kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu), PLATFORM_STREAM_SYNC_TIMEOUT_MS
@@ -150,11 +152,6 @@ int DeviceRunnerBase::finalize_kernel_coordination() {
     };
     int rc = kernel_revoke_.advance(ops);
     if (rc != 0) return rc;
-    if (kernel_revoke_event_) {
-        rc = aclrtDestroyEvent(kernel_revoke_event_);
-        if (rc != 0) return rc;
-        kernel_revoke_event_ = nullptr;
-    }
     if (kernel_revoke_host_receipt_) {
         rc = aclrtFreeHost(kernel_revoke_host_receipt_);
         if (rc != 0) return rc;
@@ -175,6 +172,5 @@ void DeviceRunnerBase::abandon_kernel_coordination() {
     kernel_coordination_block_ = nullptr;
     kernel_core_envelope_ = nullptr;
     kernel_revoke_device_receipt_ = nullptr;
-    kernel_revoke_event_ = nullptr;
     // Pinned receipt is retained: an interrupted D2H may still reference it.
 }

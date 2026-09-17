@@ -955,3 +955,95 @@ is unchanged and still passes. No native source changed.
 
 **Affects.** #2242 (its observer and two of its scenarios); #2245 and D19 (their
 wait confirmed as the contract).
+
+---
+
+## D22 - Preparation uploads; the launch round loads the orchestration SO
+
+**Problem.** #2190's head moved again, from `08f7f9218` — the head D16/D17 and
+the validation record took — to `a8b19e8a0`. The move makes `prepare_callable`
+callable *inside* an ACLGraph capture: every context-owned H2D goes through a
+new `capture_memcpy_h2d`, which exchanges the thread's capture mode to
+`ACL_MODEL_RI_CAPTURE_MODE_RELAXED`, issues the synchronous `aclrtMemcpy` and
+restores the mode even when the copy fails, and the registration stream
+synchronize is gone.
+
+That second half is D19 reversed, and D21 then split the scene test's sync
+scopes so D19's wait could stand. Both rest on "prepare is outside capture by
+contract", which the new head retires. CANN's own capture guide is categorical:
+synchronizing or querying a stream, event, device or context during capture is
+illegal **in every capture mode** — `RELAXED` releases only the
+memory-synchronous calls. So the wait cannot be kept in any form.
+
+Removing it exposed what the wait had been paying for. K7 (#2250) registers a
+kernel callable with `simpler_aicpu_register_tmr_kernel_callable`, whose real
+work is `load_orch_so`: it writes the orchestration SO out and `dlopen`s it into
+the AICPU process. Dispatch then refuses any callable whose table slot is empty.
+The two are ordered only by the hidden AICPU stream's FIFO — which an eager
+launch is submitted to, and **a replayed graph is not**. With the wait gone,
+`cold_unsynced` — the one scenario that drains nothing between prepare and the
+first replay — lost the race by 192 µs and reported `InvalidBinding` six times,
+once per AICPU thread. Moving preparation *inside* the capture does not help: a
+registration enqueued before the first launch's `Start` event still executes
+eagerly, and `cold_in_capture`, built to check exactly that, failed the same way.
+
+**Choice.** Stop ordering the load against the launch, and put it *in* the
+launch.
+
+1. **Capture-safe uploads.** `host/capture_memcpy.h` is adopted as #2190 wrote
+   it and reaches the same three uploads: `PersistentArgsOps::copy_h2d`, the
+   `KernelCallableCache::Ops` copy, and `init_aicore_register_addresses` on both
+   arches. This line's prepare does more, so two more take it: the prebuilt
+   runtime arena, through `HostApi::copy_to_device` in kernel mode only —
+   program mode keeps `rtMemcpy`, where that same function carries per-run
+   tensor copy-in — and K7's coordination image, which nothing but kernel
+   preparation writes.
+2. **The SO loads on the round leader.** `prepare_kernel_round` is the
+   leader-only phase of `execute_kernel_round_impl`, and the gate publishes its
+   status to every other thread through `publish_admission`. Loading there is
+   exactly-once by construction, and it happens inside the task that needs the
+   orchestration, so no cross-stream edge is required at all. Both preparation
+   waits are then free, and both are gone.
+3. **A packet can establish residency.** `register_kernel_callable` records the
+   image span and child function table and no longer loads. Dispatch, which
+   already receives `chip_callable_address` and `chip_callable_bytes` in the
+   packet (D17), builds that residency itself when the slot is empty. A launch
+   therefore never depends on the registration payload having executed, which
+   is what removes the race rather than hiding it.
+4. **`needs_load` marks a stale handle.** A revoke clears residency but not the
+   `dlopen` handle, so "handle is non-null" does not mean "the current image is
+   loaded". Recording residency sets the flag; the leader clears it after
+   loading. This preserves the old "every registration (re)loads" semantics
+   across the move.
+5. **`load_orch_so` no longer resets residency.** It reset the whole
+   `OrchSoEntry`, which was harmless while registration loaded *before* storing
+   residency. With the order reversed, dispatch already holds a
+   `KernelCallableView` into `slot.functions`, and the reset dangled it —
+   observed as a device-side `Scheduler fatal error (code=5)`. Only the dlopen
+   state resets now.
+6. **One sync scope again.** With nothing left in prepare to permit, D21's
+   `caller_streams` / `caller_stream_syncs` half goes: both scopes refuse every
+   synchronize, and `_prepared` arms `guard_sync` alongside `prepare_scope`.
+   D21's other two items stand — the fault injection still keys off
+   `prepare_scope`, and the blocking gate still installs from the invocation
+   scope.
+
+**Reason.** The dependency was always device-side: an image must be `dlopen`ed
+into the AICPU process before an orchestration call can use it. Expressing it as
+host-side stream order worked only while every launch was eager. A wait made it
+look ordered; it did not make it ordered, and a captured launch showed the
+difference. Loading inside the round is not a new mechanism but the removal of
+one — the cost lands on the first launch of each callable and on nothing else.
+
+**Boundary.** On a2a3: 30/30 `kernel_mode_capture` scenarios, including
+`cold_unsynced` with both waits gone and a new `prepare_in_capture`; 30/30
+hardware Python unit cases; 177/177 C++ unit tests; 2529 non-hardware Python
+tests. A device-side `dlopen` refusal is now reported by neither preparation nor
+a drain — only by the first launch round, and `register_failure` asserts that.
+Program-mode registration is untouched: it still loads at `register_callable`
+and still waits. A5 kernel mode is compiled and unit-tested but has no scene
+test.
+
+**Affects.** #2190 (its new head adopted); D19 and D21 (superseded on the wait;
+D21's fault injection and gate placement retained); #2250 (its registration
+entry no longer loads, and dispatch may establish residency from the packet).

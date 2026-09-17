@@ -45,6 +45,7 @@
 #include "common/sdma_warmup_layout.h"
 #include "common/unified_log.h"
 #include "host/acl_error_log.h"
+#include "host/capture_memcpy.h"
 #include "kernel_platform_ops.h"
 #include "host/kernel_pipeline_contract.h"
 #include "host/host_phase_records_artifact.h"
@@ -204,6 +205,10 @@ void DeviceRunnerBase::release_child_memory_host_views() {
 }
 
 int DeviceRunnerBase::copy_to_device(void *dev_ptr, const void *host_ptr, std::size_t bytes) {
+    // A kernel context reaches this only from preparation, which the caller may
+    // issue inside an ACLGraph capture; what it uploads is context-owned state
+    // rather than a graph node. Program mode runs outside capture entirely.
+    if (execution_mode_latch_.is_kernel()) return capture_memcpy_h2d(dev_ptr, bytes, host_ptr, bytes);
     return rtMemcpy(dev_ptr, bytes, host_ptr, bytes, RT_MEMCPY_HOST_TO_DEVICE);
 }
 
@@ -694,7 +699,7 @@ PersistentArgsOps DeviceRunnerBase::persistent_args_ops() {
         return static_cast<DeviceRunnerBase *>(context)->mem_alloc_.free(ptr);
     };
     ops.copy_h2d = [](void *, void *dst, size_t dst_bytes, const void *src, size_t src_bytes) -> int {
-        return static_cast<int>(rtMemcpy(dst, dst_bytes, src, src_bytes, RT_MEMCPY_HOST_TO_DEVICE));
+        return capture_memcpy_h2d(dst, dst_bytes, src, src_bytes);
     };
     ops.fill_arch_fields = [](void *context, KernelArgs *args, uint64_t device_id) -> int {
         return static_cast<DeviceRunnerBase *>(context)->fill_persistent_arch_fields(args, device_id);
@@ -709,7 +714,7 @@ KernelCallableCache::Ops DeviceRunnerBase::kernel_callable_cache_ops() {
             return static_cast<DeviceRunnerBase *>(context)->mem_alloc_.alloc(bytes);
         },
         [](void *, void *dst, const void *src, size_t bytes) -> int {
-            return static_cast<int>(rtMemcpy(dst, bytes, src, bytes, RT_MEMCPY_HOST_TO_DEVICE));
+            return capture_memcpy_h2d(dst, bytes, src, bytes);
         }
     };
 }
@@ -763,8 +768,9 @@ int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id, const HostApi
         control_stream, &registration, sizeof(registration), "simpler_aicpu_register_tmr_kernel_callable", 1
     );
     if (rc != 0) return rc;
-    rc = aclrtSynchronizeStreamWithTimeout(control_stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
-    if (rc != 0) return rc;
+    // Host publication records an accepted enqueue. The AICPU stream's FIFO
+    // orders registration ahead of every launch, and a device-side load that
+    // fails surfaces when the caller drains a launch or the context.
     rc = commit_device_register(callable_id);
     if (rc != 0) return rc;
     return kernel_exec_state_.mark_ready_enqueued();

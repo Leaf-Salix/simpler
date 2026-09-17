@@ -6,7 +6,7 @@ This records local integration of every submitted PR in the supplied kernel
 pipeline. It does not merge or change the GitHub PRs. The first audit froze
 these heads on 2026-09-11; the heads were re-surveyed on 2026-09-14, and the
 "Now" column is what each PR carried then, except #2190, which was re-read on
-2026-09-15 and is shown at that head. A head that moved is not by itself
+2026-09-16 and is shown at that head. A head that moved is not by itself
 a change this line took — D15 in the integration log says which of the moves
 were adopted and which were deferred.
 
@@ -24,7 +24,7 @@ were adopted and which were deferred.
 | #2185 | C++, nanobind and Python kernel entry points | `32dd9442f79bb936541cf41a6a08d7838d450134` | `7058de9f9f4d` — adopted |
 | #2187 | Three-stream launch binder and compensation | `136e9712d22c495ac921a6900c8f24fa9b8ebcf3` | unchanged; its binder rewritten to the chained topology |
 | #2189 | K5 resident and per-invocation execution state | `b6435e4858b1e0443966d664cca478276baefa55` | unchanged |
-| #2190 | Callable cache, residency and generation validation | `2c876478dbf41fad5c0019f081261d912e9b687e` | `08f7f9218728` — fully adopted, including the block allocator |
+| #2190 | Callable cache, residency and generation validation | `2c876478dbf41fad5c0019f081261d912e9b687e` | `a8b19e8a0a70` — fully adopted, including the block allocator and capture-callable preparation |
 | #2193 | K3 capacity refusal without releasing existing resources | `b8e739d9d8143ca6f35bf2177241976f900e2ab7` | unchanged |
 
 The two audited HBG heads were force-pushed away and are no longer fetchable;
@@ -44,7 +44,11 @@ source import as runtime evidence.
   forgotten close, fatal-device abandonment, invalid current device and
   device-query errors. Rejected work preserves the context and can recover.
 - Registration failure: an orchestration image the AICPU cannot load is
-  `prepare_callable`'s own status, poisons the context, and still closes clean.
+  admitted by `prepare_callable`, which waits for nothing; the caller's own
+  drain reports the refusal, and the context still closes clean.
+- In-capture preparation: two registrations under an open GLOBAL and an open
+  THREAD_LOCAL capture, the borrowed thread mode restored each time, and the
+  recorded graph replayed with committed memory unmoved.
 - Invocation transport: 24 gated asynchronous minimum/maximum packets with
   host buffers overwritten before device consumption; common header, residency,
   malformed input, stale generation and reserved-field rejection.
@@ -608,6 +612,57 @@ and they pass once the gate is installed ahead of a launch instead.
 
 This is a test-side change only: no native source differs, so the entry
 behaviour every earlier row in this document recorded is unchanged.
+
+## Capture-callable preparation revalidation (2026-09-17)
+
+The #2190 head moved from `08f7f9218728` to `a8b19e8a0a70`, making
+`prepare_callable` callable inside an ACLGraph capture. Taking it required
+removing preparation's two AICPU stream waits, which exposed a dependency they
+had been masking: K7's registration `dlopen`s the orchestration SO, dispatch
+refuses a callable whose slot is empty, and the two are ordered only by the
+hidden AICPU stream's FIFO — which a replayed graph does not join. D22 in the
+integration log moves the load into the launch round's leader-only phase, where
+no cross-stream edge is needed.
+
+| Suite | Result |
+| ----- | ------ |
+| a2a3 hardware, `tests/st/.../kernel_mode_capture` | 30/30 scenarios passed |
+| a2a3 hardware, `tests/ut -m requires_hardware` | 30/30 passed |
+| C++ unit tests, `ctest -LE requires_hardware` | 177 passed |
+| Python unit tests, `tests/ut -m "not requires_hardware"` | 2529 passed |
+| pre-commit hooks on changed files | passed |
+
+Three scenarios are new or changed. `prepare_capture_global` and
+`prepare_capture_thread_local` hold a capture of each mode open across two
+registrations, check that each upload restored the thread mode it borrowed, then
+end the capture, replay and confirm committed device memory did not move.
+`prepare_in_capture` registers a second callable inside the capture that records
+its launches. `register_failure` now asserts that an image the AICPU cannot load
+is refused by neither preparation nor a drain, because nothing loads it until a
+launch round asks for the orchestration.
+
+`cold_unsynced` is the case that pinned the defect: with both waits removed and
+the load still in registration it reported `InvalidBinding` six times, 192 µs
+after the registration executed. Restoring only the callable-registration wait
+fixed it and restoring only the context-handshake wait did not, which is what
+identified `load_orch_so` as the dependency. A five-second host sleep before the
+first replay also fixed it, confirming a race rather than a lost task. Moving
+preparation inside the capture did not, which ruled out "prepare and launch in
+the same capture window" as a sufficient rule.
+
+Two defects were found by these suites while making the move, both now fixed:
+`load_orch_so` reset the whole table entry, dangling the `KernelCallableView` a
+dispatch already held (device-side `Scheduler fatal error (code=5)`); and a
+revoke clears residency without clearing the `dlopen` handle, so a non-null
+handle did not imply the current image was loaded.
+
+`test_worker_kernel_mode_hw.py::[prepare_twice]` failed twice early in this work
+with `507901`, the hdc-disconnect cascade
+[already documented](troubleshooting/a2a3-507899-aicpu-shared-so-fault.md) as an
+intermittent AICPU shared-SO device fault. It did not reproduce in ten
+controlled runs — five on this branch and five on the unmodified integration
+head, interleaved on one device — so it is neither attributed to nor cleared by
+this change.
 
 ## Remaining boundaries
 

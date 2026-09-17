@@ -141,14 +141,9 @@ int register_kernel_callable(Executor &executor, const void *arg) noexcept {
         );
         PreparedKernelCallable candidate;
         if (!make_prepared_kernel_callable(registration, &candidate)) return -1;
-        const auto *image = reinterpret_cast<const ChipCallable *>(registration.device_address);
-        if (executor.load_orch_so(
-                registration.callable_id, reinterpret_cast<uint64_t>(image->binary_data()), image->binary_size(),
-                image->func_name(), image->config_name(), 0
-            ) != 0)
-            return -1;
         slot.kernel = std::move(candidate);
         slot.kernel_owned = true;
+        slot.needs_load = true;
         return 0;
     } catch (...) {
         return -1;
@@ -263,7 +258,33 @@ int dispatch_prepared_kernel_task(Executor &executor, void *arg, int32_t cpu) no
             simpler::kernel::valid_invocation_counts(header.tensor_count, header.scalar_count) &&
             header.host_copy_tensor_count == 0 && header.callable_id >= 0 &&
             header.callable_id < MAX_REGISTERED_CALLABLE_IDS) {
-            const auto &slot = executor.orch_so_table_[header.callable_id].kernel;
+            // A callable's residency is established by whichever comes first:
+            // the host's registration entry, or this packet. The packet carries
+            // the image span, so a launch never depends on registration having
+            // already executed — the two are unordered once a launch is
+            // recorded into a graph.
+            auto &entry = executor.orch_so_table_[header.callable_id];
+            if (entry.kernel.device_address == 0 && !(entry.in_use && !entry.kernel_owned)) {
+                const TmrCallableRegistrationArgs from_packet{
+                    dispatch.context_generation, dispatch.chip_callable_address, dispatch.chip_callable_bytes,
+                    header.callable_id, 0
+                };
+                try {
+                    cache_invalidate_range(
+                        reinterpret_cast<const void *>(dispatch.chip_callable_address),
+                        static_cast<size_t>(dispatch.chip_callable_bytes)
+                    );
+                    PreparedKernelCallable candidate;
+                    if (make_prepared_kernel_callable(from_packet, &candidate)) {
+                        entry.kernel = std::move(candidate);
+                        entry.kernel_owned = true;
+                        entry.needs_load = true;
+                    }
+                } catch (...) {
+                    // Leave the slot empty; the binding check below refuses.
+                }
+            }
+            const auto &slot = entry.kernel;
             request.admission_status = static_cast<int>(KernelDispatchStatus::InvalidBinding);
             if (slot.device_address != 0 && dispatch.chip_callable_address == slot.device_address &&
                 dispatch.chip_callable_bytes == slot.bytes &&

@@ -641,7 +641,8 @@ int simpler_kernel_mode_init(
 );
 
 /**
- * Register one callable for kernel-mode launches, outside ACLGraph capture.
+ * Register one callable for kernel-mode launches, inside or outside ACLGraph
+ * capture. Init must have completed outside capture.
  *
  * Registration mints the id: on success `out_callable_id` receives a
  * context-local id in [0, MAX_REGISTERED_CALLABLE_IDS), and on any failure it
@@ -655,9 +656,9 @@ int simpler_kernel_mode_init(
  * registration is charged with 64-byte alignment; a published address never
  * moves as the block set grows.
  * COUNT_EXCEEDED / BYTES_EXCEEDED reject admission before upload. No error
- * exits the process. A registration that fails on the device poisons the
- * context and retains its storage until an explicit close after
- * caller-established quiescence.
+ * exits the process. A registration this call refuses poisons the context and
+ * retains its storage until an explicit close after caller-established
+ * quiescence.
  *
  * `callable` points to a canonical ChipCallable image of exactly
  * `callable_size` bytes. Validating every flexible-array offset before the
@@ -666,9 +667,13 @@ int simpler_kernel_mode_init(
  * names and alignment. Registration enqueues its device work on the context's
  * own AICPU stream, which every later launch also enqueues on, so stream FIFO
  * orders registration ahead of each launch and no caller stream is involved.
- * It synchronizes that stream before committing the callable, so a device-side
- * registration failure is this call's own status; it synchronizes no caller
- * stream and no device.
+ * It synchronizes no stream and no device, so success means the image is
+ * uploaded and its residency recorded, not that the device has loaded the
+ * orchestration: that load belongs to the first launch of this callable, and a
+ * refusal surfaces when the caller drains that launch. Every context-owned upload on this path
+ * is a synchronous aclrtMemcpy issued with the thread's capture mode
+ * temporarily relaxed and then restored, so it executes immediately instead of
+ * being recorded, and its device allocation outlives every graph replay.
  */
 int simpler_kernel_mode_prepare_callable(
     DeviceContextHandle ctx, const void *callable, size_t callable_size, int32_t *out_callable_id
