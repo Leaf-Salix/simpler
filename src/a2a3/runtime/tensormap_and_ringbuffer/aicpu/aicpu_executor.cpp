@@ -985,7 +985,17 @@ int32_t AicpuExecutor::prepare_kernel_round(const simpler::tmr::KernelExecutionR
         request.binding.resident->dev.aicpu_thread_num != request.execution_threads ||
         request.binding.resident->dev.worker_count != request.handshake.worker_count)
         return static_cast<int32_t>(KernelDispatchStatus::InvalidBinding);
-    const auto admitted = kernel_invocation_.admit(request.packet, request.callable, request.binding);
+    // Residency and the SO load both happen here rather than in preparation:
+    // this runs on the round leader alone, so the shared table is written once
+    // per round, and the load lands in the task that needs the orchestration
+    // instead of depending on host-side stream order a replayed graph lacks.
+    if (!ensure_kernel_residency(
+            *this, request.callable_id, request.image_address, request.image_bytes,
+            kernel_context_.descriptor.context_generation
+        ))
+        return static_cast<int32_t>(KernelDispatchStatus::InvalidBinding);
+    const auto callable = orch_so_table_[request.callable_id].kernel.view();
+    const auto admitted = kernel_invocation_.admit(request.packet, callable, request.binding);
     if (admitted != InvocationStatus::Ok) return invocation_dispatch_status(admitted);
     const auto &inputs = kernel_invocation_.inputs();
     const int32_t cid = inputs.callable_id;

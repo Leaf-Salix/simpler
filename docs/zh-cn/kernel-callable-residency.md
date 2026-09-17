@@ -117,9 +117,9 @@ program 模式继续使用原有上传与引用计数路径。
 TMR 的 `prepare_kernel_callable` 首次配置固定 runtime 区域、准备 `PersistentKernelArgs`，
 随后冻结配置。每个 callable 在此分配 Host dispatch packet 缓冲区，launch 只重写内容。
 
-设备注册在 context 专用的 AICPU stream 上发射 `simpler_aicpu_register_tmr_kernel_callable`
-记录驻留（设备地址与长度），**不再 dlopen 编排 SO**——该装载移到该 callable 第一次 launch 的
-轮次 leader 阶段（`prepare_kernel_round`），因此 launch 不依赖注册任务是否已执行；
+prepare 不再为单个 callable 下发任何 AICPU 任务：设备从**第一个点名该 callable 的 launch 包**
+得知它的存在——包里带着同一段镜像地址与长度，dispatch 据此建立驻留，编排 SO 则由该 callable
+第一次 launch 的轮次 leader 装载（`prepare_kernel_round`）；
 其前的 `prepare_kernel_coordination` 在同一条流上发射 `simpler_aicpu_prepare_tmr_context`
 交接 context 描述符。每次 launch 也把 AICPU 任务发在同一条流上，FIFO 因此保证两者都
 排在每次 launch 之前，不需要事件，prepare 也不接触 caller stream。prepare 不同步任何

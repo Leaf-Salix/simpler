@@ -171,6 +171,34 @@ int release_kernel_context(Executor &executor, const void *arg) noexcept {
     return 0;
 }
 
+// Establish residency for a callable the device has not seen, from the image
+// span its launch packet names. The round leader is the only caller: it holds
+// the gate, so this writes the shared table exactly once per round, and the
+// packet's span was already checked against the resident one by every thread's
+// admission. Returns false when the image is malformed or the slot belongs to
+// a program-mode SO.
+template <typename Executor>
+bool ensure_kernel_residency(
+    Executor &executor, int32_t callable_id, uint64_t image_address, uint64_t image_bytes, uint64_t generation
+) noexcept {
+    if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) return false;
+    auto &entry = executor.orch_so_table_[callable_id];
+    if (entry.kernel.device_address != 0) return true;
+    if (entry.in_use && !entry.kernel_owned) return false;
+    const TmrCallableRegistrationArgs from_packet{generation, image_address, image_bytes, callable_id, 0};
+    try {
+        cache_invalidate_range(reinterpret_cast<const void *>(image_address), static_cast<size_t>(image_bytes));
+        PreparedKernelCallable candidate;
+        if (!make_prepared_kernel_callable(from_packet, &candidate)) return false;
+        entry.kernel = std::move(candidate);
+        entry.kernel_owned = true;
+        entry.needs_load = true;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 // The owner closes submission admission and proves graph quiescence before
 // this one-thread task. Busy/mismatched state leaves even the receipt untouched.
 // An absent registration is revocable only when no kernel metadata borrows it.
@@ -263,32 +291,14 @@ int dispatch_prepared_kernel_task(Executor &executor, void *arg, int32_t cpu) no
             // the image span, so a launch never depends on registration having
             // already executed — the two are unordered once a launch is
             // recorded into a graph.
-            auto &entry = executor.orch_so_table_[header.callable_id];
-            if (entry.kernel.device_address == 0 && !(entry.in_use && !entry.kernel_owned)) {
-                const TmrCallableRegistrationArgs from_packet{
-                    dispatch.context_generation, dispatch.chip_callable_address, dispatch.chip_callable_bytes,
-                    header.callable_id, 0
-                };
-                try {
-                    cache_invalidate_range(
-                        reinterpret_cast<const void *>(dispatch.chip_callable_address),
-                        static_cast<size_t>(dispatch.chip_callable_bytes)
-                    );
-                    PreparedKernelCallable candidate;
-                    if (make_prepared_kernel_callable(from_packet, &candidate)) {
-                        entry.kernel = std::move(candidate);
-                        entry.kernel_owned = true;
-                        entry.needs_load = true;
-                    }
-                } catch (...) {
-                    // Leave the slot empty; the binding check below refuses.
-                }
-            }
-            const auto &slot = entry.kernel;
+            // Read-only here: every launched thread runs this, and the shared
+            // table may be written only by the round leader.
+            const auto &slot = executor.orch_so_table_[header.callable_id].kernel;
             request.admission_status = static_cast<int>(KernelDispatchStatus::InvalidBinding);
-            if (slot.device_address != 0 && dispatch.chip_callable_address == slot.device_address &&
-                dispatch.chip_callable_bytes == slot.bytes &&
-                dispatch.binding_address == context.descriptor.resident_kernel_args &&
+            const bool resident_matches =
+                slot.device_address == 0 ||
+                (dispatch.chip_callable_address == slot.device_address && dispatch.chip_callable_bytes == slot.bytes);
+            if (resident_matches && dispatch.binding_address == context.descriptor.resident_kernel_args &&
                 dispatch.context_generation == context.descriptor.context_generation &&
                 dispatch.sm_bytes == context.descriptor.sm_capacity &&
                 dispatch.arena_bytes == context.descriptor.arena_capacity) {
@@ -296,7 +306,10 @@ int dispatch_prepared_kernel_task(Executor &executor, void *arg, int32_t cpu) no
                 request.packet = {
                     static_cast<const uint8_t *>(arg) + prefix, static_cast<size_t>(dispatch.packet_bytes) - prefix
                 };
-                request.callable = slot.view();
+                request.image_address = dispatch.chip_callable_address;
+                request.image_bytes = dispatch.chip_callable_bytes;
+                request.callable_id = header.callable_id;
+                if (slot.device_address != 0) request.callable = slot.view();
                 request.admission_status = 0;
             }
         }

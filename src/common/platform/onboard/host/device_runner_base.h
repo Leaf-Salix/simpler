@@ -179,7 +179,7 @@ public:
      * context's persistent argument blocks exist. Idempotent in the part that
      * matters: only the first callable pays for the argument blocks.
      */
-    int prepare_kernel_callable(int32_t callable_id, const HostApi *api, size_t callable_bytes);
+    int prepare_kernel_callable(int32_t callable_id, const HostApi *api);
     int launch_kernel_callable(int32_t callable_id, const ChipStorageTaskArgs &args, void *caller_stream);
     std::mutex &kernel_submission_mutex() { return kernel_submission_mutex_; }
     KernelCallableCache &kernel_callable_cache() { return kernel_callable_cache_; }
@@ -577,9 +577,10 @@ public:
     );
 
     /**
-     * Number of distinct callable_ids the AICPU has been asked to
-     * dlopen for. Kernel mode counts accepted enqueues; program mode counts
-     * loads the registration stream has completed. `unregister_callable`
+     * Number of distinct callable_ids this context has committed. Kernel mode
+     * counts prepared callables, whose device load happens on their first
+     * launch; program mode counts AICPU loads the registration stream has
+     * completed. `unregister_callable`
      * does NOT decrement it. So a `prepare → unregister → re-prepare`
      * sequence reports 2 (each AICPU dlopen counted once), even though one cid is
      * currently registered.

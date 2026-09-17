@@ -719,9 +719,10 @@ KernelCallableCache::Ops DeviceRunnerBase::kernel_callable_cache_ops() {
     };
 }
 
-int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id, const HostApi *api, size_t callable_bytes) {
-    rtStream_t control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
-    if (control_stream == nullptr) {
+int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id, const HostApi *api) {
+    // The context's AICPU stream must exist: the coordination handshake below
+    // enqueues on it, and every later launch does too.
+    if (kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu) == nullptr) {
         LOG_ERROR("prepare_kernel_callable: no live kernel context");
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
@@ -760,17 +761,9 @@ int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id, const HostApi
 
     int rc = prepare_kernel_coordination();
     if (rc != 0) return rc;
-    simpler::tmr::TmrCallableRegistrationArgs registration{
-        kernel_static_config_.generation(), kernel_callable_cache_.pending_uploaded_address(), callable_bytes,
-        callable_id, 0
-    };
-    rc = launch_aicpu_payload(
-        control_stream, &registration, sizeof(registration), "simpler_aicpu_register_tmr_kernel_callable", 1
-    );
-    if (rc != 0) return rc;
-    // Host publication records an accepted enqueue. The AICPU stream's FIFO
-    // orders registration ahead of every launch, and a device-side load that
-    // fails surfaces when the caller drains a launch or the context.
+    // Preparation publishes the image and its residency; the device learns of
+    // this callable from the first launch packet that names it, which carries
+    // the same image span. Nothing per-callable is enqueued here.
     rc = commit_device_register(callable_id);
     if (rc != 0) return rc;
     return kernel_exec_state_.mark_ready_enqueued();

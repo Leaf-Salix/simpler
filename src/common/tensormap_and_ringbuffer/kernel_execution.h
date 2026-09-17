@@ -32,6 +32,13 @@ struct KernelThreadView {
 struct KernelExecutionRequest {
     ByteSpan packet{};
     KernelCallableView callable{};
+    // The image span the packet names, carried so the round leader can
+    // establish residency for a callable the device has not seen. Every
+    // launched thread builds its own request, so only the leader may write
+    // the shared table.
+    uint64_t image_address{0};
+    uint64_t image_bytes{0};
+    int32_t callable_id{-1};
     KernelBindingView binding{};
     KernelHandshakeView handshake{};
     const int32_t *allowed_cpus{nullptr};
