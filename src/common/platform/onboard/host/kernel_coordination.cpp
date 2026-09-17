@@ -94,9 +94,11 @@ int DeviceRunnerBase::prepare_kernel_coordination() {
     kernel_revoke_.registration_may_exist();
     rc = launch_aicpu_payload(stream, &registration, sizeof(registration), "simpler_aicpu_prepare_tmr_context", 1);
     if (rc != 0) return rc;
-    // The same AICPU stream carries every later registration and launch, so
-    // FIFO alone orders this context handshake ahead of them; a device-side
-    // failure surfaces when the caller drains.
+    // Preparation runs this from init, which synchronizes by contract and is
+    // outside any capture, so the handshake waits for its own result and a
+    // device-side refusal is init's status rather than a later launch's.
+    rc = aclrtSynchronizeStreamWithTimeout(stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (rc != 0) return rc;
     kernel_coordination_ready_ = true;
     return 0;
 }

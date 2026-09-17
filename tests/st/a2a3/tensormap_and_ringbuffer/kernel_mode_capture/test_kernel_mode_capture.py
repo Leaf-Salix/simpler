@@ -50,7 +50,7 @@ SCENARIOS = (
     "chain",
     "feedback_batch",
     "eager_replay",
-    "prepare_fail_register",
+    "init_fail_handshake",
     "eager_batch",
     "eager_multi_callable",
     "eager_rejections",
@@ -133,7 +133,7 @@ def test_tmr_kernel_mode(st_platform, st_device_ids, scenario, capture_observer)
         assert f"PASS {scenario} caller_error=1 cores_retired=1" in output
     elif scenario == "close_fail_free":
         assert "PASS close_fail_free retained_then_retried=1" in output
-    elif scenario.startswith("prepare_fail_"):
+    elif scenario == "init_fail_handshake":
         assert f"PASS {scenario} rejected_after_failure=1 forbidden_sync=0" in output
     elif scenario.startswith("eager_") and scenario != "eager_replay":
         assert f"PASS {scenario} eager=100 forbidden_sync=0" in output
@@ -295,23 +295,20 @@ def _fail():
     os._exit(1)
 
 
-def _check_prepare_failure(scenario, observer, lib, ctx, prepare, launch):
+def _check_init_failure(observer, lib, ctx, prepare, launch):
     from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.kernel_capture_values import _check  # noqa: PLC0415
 
-    before = lib.committed_device_memory_ctx(ctx)
-    observer.capture_observer_fail_prepare(1)
-    prepare(0, expected=-4333)
-    assert observer.capture_observer_prepare_failures() == 1
+    # A context whose init failed keeps what it had committed and accepts no
+    # further work; only close reclaims it.
     retained = lib.committed_device_memory_ctx(ctx)
-    assert retained > before
     prepare(0, expected=-1003)
     submission = _submission_counts(observer)
     launch(0, expected=-1003)
     assert _submission_counts(observer) == submission
     assert observer.capture_observer_prepare_failures() == 1
     assert lib.committed_device_memory_ctx(ctx) == retained
-    # Previously enqueued initialization still belongs to the poisoned context.
-    _check(lib.aclrtSynchronizeDevice(), "external drain before poisoned-context close")
+    # Previously enqueued initialization still belongs to the refused context.
+    _check(lib.aclrtSynchronizeDevice(), "external drain before refused-context close")
     assert lib.committed_device_memory_ctx(ctx) == retained
 
 
@@ -361,14 +358,33 @@ def _initialize(device, scenario, build_dir):
     assert ctx
     config = _config()
     aicpu, aicore, dispatcher = _binaries("a2a3", RUNTIME)
-    _check(
-        lib.simpler_kernel_mode_init(
-            ctx, device, aicpu, len(aicpu), aicore, len(aicore), dispatcher, len(dispatcher), ctypes.byref(config), 71
-        ),
-        "kernel init",
-    )
     observer = _bind_capture_functions(lib)
     _bind_observer_guards(observer)
+    init_args = (
+        ctx,
+        device,
+        aicpu,
+        len(aicpu),
+        aicore,
+        len(aicore),
+        dispatcher,
+        len(dispatcher),
+        ctypes.byref(config),
+        71,
+    )
+    if scenario == "init_fail_handshake":
+        # The context handshake is init's device work now, so a refused AICPU
+        # launch is init's own status.
+        observer.capture_observer_fail_prepare(1)
+        observer.capture_observer_prepare_scope(1)
+        try:
+            rc = lib.simpler_kernel_mode_init(*init_args)
+        finally:
+            observer.capture_observer_prepare_scope(0)
+        assert rc == -4333, f"kernel init rc={rc}, expected the injected -4333"
+        assert observer.capture_observer_prepare_failures() == 1
+        return chips, lib, streams, caller, ctx, observer
+    _check(lib.simpler_kernel_mode_init(*init_args), "kernel init")
     return chips, lib, streams, caller, ctx, observer
 
 
@@ -568,6 +584,44 @@ def _run_close_failure(context, prepare, launch, sync):
     _check_close_failure(context)
 
 
+@dataclass
+class _GraphCase:
+    """Everything a graph-recording scenario needs beyond its `_Context`."""
+
+    io: object
+    graphs: list
+    record_nodes: object
+    replay: object
+    launch: object
+    sync_caller: object
+    # Read after the case runs: `launch` advances the caller's counter, so a
+    # snapshot taken before would under-count.
+    host_launches_now: object
+    committed: int
+    allocations: list
+    device: int
+
+
+def _run_graph_scenario(scenario, context, case):
+    from tests.st.a2a3.tensormap_and_ringbuffer.kernel_mode_capture.kernel_capture_values import (  # noqa: PLC0415
+        _check,
+        _check_resident,
+    )
+
+    lib, ctx = context.lib, context.handle
+
+    def destroy(graph):
+        _check(lib.aclmdlRIDestroy(graph), "destroy graph")
+        case.graphs.remove(graph)
+
+    run_graph_case(scenario, case.io, case.record_nodes, case.replay, case.launch, case.sync_caller, destroy)
+    host_launches = case.host_launches_now()
+    _check_resident(context.observer, host_launches)
+    assert lib.committed_device_memory_ctx(ctx) == case.committed
+    _close(lib, ctx, case.allocations, context.streams, case.device, case.graphs)
+    print(f"PASS {scenario} replays=100 forbidden_sync=0 host_launches={host_launches}", flush=True)
+
+
 def _run(device, scenario, build_dir):
     from simpler.task_interface import ChipStorageTaskArgs, ChipTensor, DataType  # noqa: PLC0415
 
@@ -664,8 +718,8 @@ def _run(device, scenario, build_dir):
             _close(lib, ctx, allocations, streams, device)
             print("PASS close_fail_free retained_then_retried=1", flush=True)
             return
-        if scenario.startswith("prepare_fail_"):
-            _check_prepare_failure(scenario, observer, lib, ctx, prepare, launch)
+        if scenario == "init_fail_handshake":
+            _check_init_failure(observer, lib, ctx, prepare, launch)
             _close(lib, ctx, allocations, streams, device)
             print(f"PASS {scenario} rejected_after_failure=1 forbidden_sync=0", flush=True)
             return
@@ -690,16 +744,22 @@ def _run(device, scenario, build_dir):
             print(f"PASS {scenario} eager=100 forbidden_sync=0", flush=True)
             return
         if scenario in ("fresh_inputs", "chain", "feedback_batch", "eager_replay", "graph_recreate", "long_chain"):
-
-            def destroy(graph):
-                _check(lib.aclmdlRIDestroy(graph), "destroy graph")
-                graphs.remove(graph)
-
-            run_graph_case(scenario, io, record_nodes, replay, launch, lambda: sync(caller), destroy)
-            _check_resident(observer, host_launches)
-            assert lib.committed_device_memory_ctx(ctx) == committed
-            _close(lib, ctx, allocations, streams, device, graphs)
-            print(f"PASS {scenario} replays=100 forbidden_sync=0 host_launches={host_launches}", flush=True)
+            _run_graph_scenario(
+                scenario,
+                context,
+                _GraphCase(
+                    io,
+                    graphs,
+                    record_nodes,
+                    replay,
+                    launch,
+                    lambda: sync(caller),
+                    lambda: host_launches,
+                    committed,
+                    allocations,
+                    device,
+                ),
+            )
             return
         if scenario == "prepare_in_capture":
             # Registration inside the capture publishes context state rather

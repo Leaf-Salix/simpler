@@ -1343,7 +1343,8 @@ int simpler_kernel_mode_init(
             std::vector<uint8_t> dispatcher_vec(dispatcher_binary, dispatcher_binary + dispatcher_size);
             runner->set_dispatcher_binary(std::move(dispatcher_vec));
         }
-        rc = runner->init_kernel_context(device_id, *config, context_generation);
+        const HostApi kernel_api(runner, 0, 0, &g_host_api_ops);
+        rc = runner->init_kernel_context(device_id, *config, context_generation, &kernel_api);
     } catch (...) {
         rc = PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -1405,8 +1406,7 @@ int simpler_kernel_mode_prepare_callable(
         // cannot be recycled until the caller establishes quiescence and closes.
         rollback.dismiss();
         try {
-            const HostApi kernel_api(runner, 0, 0, &g_host_api_ops);
-            rc = runner->prepare_kernel_callable(minted, &kernel_api);
+            rc = runner->prepare_kernel_callable(minted);
         } catch (...) {
             runner->kernel_execution_state().poison(PTO_RUNTIME_ERR_INTERNAL);
             throw;

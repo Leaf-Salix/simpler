@@ -629,7 +629,9 @@ int DeviceRunnerBase::ensure_device_initialized() {
     return ensure_dma_workspace_warmed();
 }
 
-int DeviceRunnerBase::init_kernel_context(int device_id, const CallConfig &config, uint64_t context_generation) {
+int DeviceRunnerBase::init_kernel_context(
+    int device_id, const CallConfig &config, uint64_t context_generation, const HostApi *api
+) {
     const char *serial_env = std::getenv("SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE");
     const bool serial = serial_env && (serial_env[0] == '1' || serial_env[0] == 't' || serial_env[0] == 'T');
     int rc = kernel_static_config_.initialize(&config, context_generation, serial);
@@ -685,6 +687,34 @@ int DeviceRunnerBase::init_kernel_context(int device_id, const CallConfig &confi
     if (rc != 0) return rc;
     rc = prepare_aicpu_affinity(kernel_runtime_, config.aicpu_thread_num, control_stream);
     if (rc != 0) return rc;
+
+    // Everything below is context-static: it depends on the CallConfig and the
+    // AICore binary this call already holds, never on a callable. Doing it here
+    // rather than on the first preparation keeps preparation free of device
+    // work a capture cannot contain, and lets the context handshake wait for
+    // its own result, which init may do and a capturing thread may not.
+    if (api == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    if (persistent_args_.has_live_resources()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    rc = configure_kernel_runtime_impl(kernel_runtime_, kernel_static_config_.serial_orch_sched());
+    if (rc != 0) return rc;
+    // The context-static device regions are committed here, before the runtime
+    // image that names them is uploaded.
+    rc = prepare_kernel_runtime_impl(kernel_runtime_, api, &kernel_static_config_.request());
+    if (rc != 0) return rc;
+    rc = persistent_args_.prepare_once(kernel_runtime_, persistent_args_ops(), static_cast<uint64_t>(device_id_));
+    if (rc != 0) return rc;
+    rc = kernel_static_config_.freeze();
+    if (rc != 0) return rc;
+    activate_launch_shape(kernel_runtime_);
+    rtDevBinary_t binary{};
+    binary.magic = RT_DEV_BINARY_MAGIC_ELF;
+    binary.data = aicore_kernel_binary_.data();
+    binary.length = aicore_kernel_binary_.size();
+    rc = rtRegisterAllKernel(&binary, &aicore_bin_handle_);
+    if (rc != 0) return rc;
+    rc = prepare_kernel_coordination();
+    if (rc != 0) return rc;
+
     claim_rollback.dismiss();
     return 0;
 }
@@ -719,35 +749,11 @@ KernelCallableCache::Ops DeviceRunnerBase::kernel_callable_cache_ops() {
     };
 }
 
-int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id, const HostApi *api) {
-    // The context's AICPU stream must exist: the coordination handshake below
-    // enqueues on it, and every later launch does too.
-    if (kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu) == nullptr) {
-        LOG_ERROR("prepare_kernel_callable: no live kernel context");
+int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id) {
+    // init committed every context-static resource, so preparation owns only
+    // this callable: it uploads, records residency, and enqueues nothing.
+    if (!kernel_static_config_.frozen() || !persistent_args_.is_prepared() || !kernel_coordination_ready_)
         return PTO_RUNTIME_ERR_INVALID_STATE;
-    }
-
-    if (!kernel_static_config_.initialized()) return PTO_RUNTIME_ERR_INVALID_STATE;
-    if (!persistent_args_.is_prepared()) {
-        if (persistent_args_.has_live_resources()) return PTO_RUNTIME_ERR_INVALID_STATE;
-        int rc = configure_kernel_runtime_impl(kernel_runtime_, kernel_static_config_.serial_orch_sched());
-        if (rc != 0) return rc;
-        // The context-static device regions are committed here, before the
-        // runtime image that names them is uploaded.
-        rc = prepare_kernel_runtime_impl(kernel_runtime_, api, &kernel_static_config_.request());
-        if (rc != 0) return rc;
-        rc = persistent_args_.prepare_once(kernel_runtime_, persistent_args_ops(), static_cast<uint64_t>(device_id_));
-        if (rc != 0) return rc;
-        rc = kernel_static_config_.freeze();
-        if (rc != 0) return rc;
-        activate_launch_shape(kernel_runtime_);
-        rtDevBinary_t binary{};
-        binary.magic = RT_DEV_BINARY_MAGIC_ELF;
-        binary.data = aicore_kernel_binary_.data();
-        binary.length = aicore_kernel_binary_.size();
-        rc = rtRegisterAllKernel(&binary, &aicore_bin_handle_);
-        if (rc != 0) return rc;
-    }
     auto it = callables_.find(callable_id);
     if (it == callables_.end()) return PTO_RUNTIME_ERR_CALLABLE_NOT_RESIDENT;
     auto &state = it->second;
@@ -759,12 +765,10 @@ int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id, const HostApi
         return PTO_RUNTIME_ERR_INTERNAL;
     if (state.kernel_packet.prepare(callable) != simpler::kernel::InvocationStatus::Ok) return PTO_RUNTIME_ERR_INTERNAL;
 
-    int rc = prepare_kernel_coordination();
-    if (rc != 0) return rc;
     // Preparation publishes the image and its residency; the device learns of
     // this callable from the first launch packet that names it, which carries
     // the same image span. Nothing per-callable is enqueued here.
-    rc = commit_device_register(callable_id);
+    int rc = commit_device_register(callable_id);
     if (rc != 0) return rc;
     return kernel_exec_state_.mark_ready_enqueued();
 }

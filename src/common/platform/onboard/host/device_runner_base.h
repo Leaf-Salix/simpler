@@ -172,14 +172,14 @@ public:
      * and launch simpler_aicpu_init on the context's AICPU stream. Creates no
      * async-DMA workspace — that channel belongs to program mode.
      */
-    int init_kernel_context(int device_id, const CallConfig &config, uint64_t context_generation);
+    int init_kernel_context(int device_id, const CallConfig &config, uint64_t context_generation, const HostApi *api);
 
     /**
      * Register one callable on a kernel-mode context and make sure the
      * context's persistent argument blocks exist. Idempotent in the part that
      * matters: only the first callable pays for the argument blocks.
      */
-    int prepare_kernel_callable(int32_t callable_id, const HostApi *api);
+    int prepare_kernel_callable(int32_t callable_id);
     int launch_kernel_callable(int32_t callable_id, const ChipStorageTaskArgs &args, void *caller_stream);
     std::mutex &kernel_submission_mutex() { return kernel_submission_mutex_; }
     KernelCallableCache &kernel_callable_cache() { return kernel_callable_cache_; }
