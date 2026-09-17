@@ -16,6 +16,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <initializer_list>
@@ -69,6 +70,20 @@ std::unordered_set<void *> large_prepare_allocations;
 bool fail_large_free{false};
 uint64_t failed_frees{0};
 bool corrupt_next_invocation{false};
+
+// Armed by CAPTURE_OBSERVER_REORDER_CANCEL_CLEAR. The handshake clear and the
+// compensating cancel write the same control word; when an invocation issues
+// them on *different* streams nothing orders the two, and the clear landing last
+// resets the word AICore polls back to zero. This reproduces that interleaving
+// deterministically: after a cross-stream cancel, put a zero fill back on top of
+// it, on the cancel's own stream so FIFO places it after. Same-stream code is
+// never touched, so the switch reproduces the hazard itself rather than the
+// outcome of one particular build.
+bool reorder_cancel_clear() {
+    static const bool armed = std::getenv("CAPTURE_OBSERVER_REORDER_CANCEL_CLEAR") != nullptr;
+    return armed;
+}
+const void *handshake_clear_stream{nullptr};
 
 bool fail_prepare_step(int kind) {
     if (!prepare_scope || prepare_failure != kind) return false;
@@ -175,7 +190,10 @@ extern "C" void capture_observer_begin() {
 
 extern "C" void capture_observer_guard_sync(int enabled) { forbid_sync = enabled != 0; }
 extern "C" void capture_observer_prepare_scope(int enabled) { prepare_scope = enabled != 0; }
-extern "C" void capture_observer_invocation_scope(int enabled) { invocation_scope = enabled != 0; }
+extern "C" void capture_observer_invocation_scope(int enabled) {
+    invocation_scope = enabled != 0;
+    if (invocation_scope) handshake_clear_stream = nullptr;
+}
 extern "C" uint64_t capture_observer_sync_calls() { return forbidden_sync_calls; }
 extern "C" uint64_t capture_observer_caller_syncs() { return caller_stream_syncs; }
 extern "C" void capture_observer_caller_streams(uint64_t first, uint64_t second) {
@@ -249,7 +267,16 @@ extern "C" aclError aclrtRecordEvent(aclrtEvent event, aclrtStream stream) {
 extern "C" aclError aclrtMemsetAsync(void *device, size_t maximum, int32_t value, size_t bytes, aclrtStream stream) {
     if (invocation_scope) ++async_clears;
     static const auto real = reinterpret_cast<decltype(&aclrtMemsetAsync)>(resolve_cann_symbol("aclrtMemsetAsync"));
-    return real == nullptr ? -4330 : real(device, maximum, value, bytes, stream);
+    if (real == nullptr) return -4330;
+    if (invocation_scope && value == 0) handshake_clear_stream = stream;
+    // The all-ones fill is the compensating cancel. Counting the emulated fill
+    // through `real` rather than through this interception keeps async_clears
+    // honest: the scenario asserts on how many memsets the sequence issued.
+    const bool late_clear = reorder_cancel_clear() && invocation_scope && value == 0xff &&
+                            handshake_clear_stream != nullptr && handshake_clear_stream != stream;
+    const auto rc = real(device, maximum, value, bytes, stream);
+    if (rc == 0 && late_clear) real(device, maximum, 0, bytes, stream);
+    return rc;
 }
 
 extern "C" aclError aclrtSynchronizeStreamWithTimeout(aclrtStream stream, int32_t timeout) {
