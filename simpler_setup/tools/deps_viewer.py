@@ -717,6 +717,8 @@ def _load_task_meta(deps_path, func_names=None):
         from .swimlane_converter import read_perf_data  # noqa: PLC0415
 
         perf = read_perf_data(perf_path)
+        if len(perf.get("run_boundaries", [])) > 1:
+            raise ValueError("capture contains multiple launches; capture one launch for dependency timing")
     except (OSError, ValueError) as e:
         print(f"Warning: couldn't read {perf_path}: {e}", file=sys.stderr)
         return {}

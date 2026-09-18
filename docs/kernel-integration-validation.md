@@ -741,6 +741,11 @@ rather than cleared, which is what identified the next one:
 | `aicore_executor.cpp` `KernelMode ? 0 : …` | init passes, launches run |
 | `kernel_mode_kernel.cpp` weak stubs | `aicore_tasks=0` with `scheduler_tasks=1`; AICPU counted the dispatch, AICore's record slot stayed all-zero |
 
+**Converter segmentation** is covered by CPU regression tests: repeated task
+and register IDs join within each `run_boundaries` epoch, and dependency flows,
+SPMD grouping and overhead counters are isolated per launch. See the
+[converter guide](../simpler_setup/tools/README.md#kernel-mode-launch-rounds).
+
 **Not covered.**
 
 - **a5.** Its collector mgmt thread calls `aclrtMemcpy` on every poll. CANN's
@@ -750,9 +755,6 @@ rather than cleared, which is what identified the next one:
   Whether such a call fails alone or invalidates the caller's capture is not
   stated in the CANN docs and was not measured. a2a3 is unaffected: its mgmt
   thread reads the `halHostRegister` SVM mapping and calls no ACL memory API.
-- **Converter segmentation.** `run_boundaries` reaches the artifact; nothing reads
-  it yet. Per-launch task identifiers repeat, so multi-launch conversion still
-  needs launch-aware join keys and dependency lookup.
 - **ACLGraph capture.** The bracket entries are documented as outside-capture and
   were exercised eagerly only.
 

@@ -808,6 +808,11 @@ def run_analysis(  # noqa: PLR0912, PLR0915
         from .swimlane_converter import read_perf_data  # noqa: PLC0415
 
         data = read_perf_data(chip_swimlane_records_path)
+    if len(data.get("run_boundaries", [])) > 1:
+        print(
+            "Error: capture contains multiple launches; capture one launch for sched_overhead_analysis", file=sys.stderr
+        )
+        return 1
     scheduler_producers = {
         stream.get("producer") for stream in data.get("scheduler_streams", []) if stream.get("producer")
     }

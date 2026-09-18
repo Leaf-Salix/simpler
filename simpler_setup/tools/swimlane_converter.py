@@ -242,6 +242,23 @@ def read_perf_data(filepath, *, timeline_origin_ns=None, placement=None):
     return _decode_perf_data(data, timeline_origin_ns=timeline_origin_ns, placement=placement)
 
 
+def _read_run_boundaries(metadata):
+    boundaries = metadata.get("run_boundaries", [])
+    if not isinstance(boundaries, list):
+        raise ValueError("metadata.run_boundaries must be an array")
+    if int(metadata.get("dropped_run_boundaries", 0)) != 0:
+        raise ValueError("dropped_run_boundaries is nonzero; capture fewer launches per profiling window")
+    previous_epoch, previous_start = -1, 0
+    for row in boundaries:
+        if not isinstance(row, list) or len(row) != 2 or any(type(value) is not int for value in row):
+            raise ValueError("metadata.run_boundaries must contain [epoch, start_cycles] integer pairs")
+        epoch, start = row
+        if epoch <= previous_epoch or start <= previous_start:
+            raise ValueError("metadata.run_boundaries epochs and positive start_cycles must strictly increase")
+        previous_epoch, previous_start = row
+    return boundaries
+
+
 def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa: PLR0912, PLR0915
     """Decode performance data from an already-loaded swimlane document.
 
@@ -254,7 +271,9 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
             "clock_freq_hz": <int>,
             "num_cores": <int>,
             "core_types": ["aic"|"aiv", ...],   # indexed by core_id
-            "core_to_thread": [<int>, ...]      # optional (level >= 3)
+            "core_to_thread": [<int>, ...],     # optional (level >= 3)
+            "run_boundaries": [[epoch, start_cycles], ...],  # optional kernel launches
+            "dropped_run_boundaries": 0
           },
           "aicore_tasks": [[core_id, task_token_raw, reg_task_id, start_cycles,
                             end_cycles, receive_to_start_cycles], ...],
@@ -303,12 +322,12 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
         phase, orch)
       - cycles → µs via `clock_freq_hz` from metadata (a2a3=50 MHz, a5=1 GHz —
         the freq MUST come from the host, never be hardcoded here)
-      - join `scheduler_tasks.records` by `(core_id, reg_task_id)`; unmatched rows are
-        dropped and counted
+      - join `scheduler_tasks.records` by `(core_id, reg_task_id)` within each launch
+        when `run_boundaries` is present; unmatched rows are dropped and counted
       - archived JSON with `aicpu_tasks` is accepted as an AICPU-produced stream
       - level 1 accepts AICore-only task records; higher levels require Scheduler
         dispatch/finish timing for every emitted task
-      - sort joined `tasks` by `task_id` (= task_token_raw)
+      - sort joined `tasks` by launch epoch, then `task_id` (= task_token_raw)
       - convert phase records from `*_cycles` → `*_time_us`
 
     Raises:
@@ -319,6 +338,21 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
         raise ValueError(f"Unsupported chip_swimlane_level: {level} (expected 1, 2, 3, or 4)")
 
     metadata = data.get("metadata") or {}
+    run_boundaries = _read_run_boundaries(metadata)
+    boundary_starts = [start for _, start in run_boundaries]
+
+    def _launch_epoch(cycles):
+        if not run_boundaries:
+            return None
+        index = bisect.bisect_right(boundary_starts, int(cycles)) - 1
+        if index < 0:
+            raise ValueError("device record precedes metadata.run_boundaries")
+        return run_boundaries[index][0]
+
+    def _join_key(core_id, reg_task_id, cycles):
+        key = (int(core_id), int(reg_task_id))
+        return (_launch_epoch(cycles), *key) if run_boundaries else key
+
     clock_freq_hz = int(metadata.get("clock_freq_hz") or 0)
     if clock_freq_hz <= 0:
         raise ValueError(f"metadata missing/zero clock_freq_hz: {clock_freq_hz}")
@@ -498,7 +532,8 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
     host_origin_ns = source_host_origin_ns
     host_composite_end_us = (max(host_timestamps) - host_origin_ns) / 1000.0 if host_timestamps else 0.0
 
-    # AICore lookup keyed by (core_id, reg_task_id). Two dispatches of the
+    # AICore lookup keyed by (launch_epoch, core_id, reg_task_id) when launch
+    # boundaries are present, otherwise (core_id, reg_task_id). Two dispatches of the
     # same task_token_raw to the same core (SPMD over-subscription, MIX
     # cluster spread) each get their own reg_task_id, so this key is unique
     # per dispatch even when task_token_raw collides.
@@ -506,7 +541,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
     # `*rest` makes v2 rows (5 cols, no receive_to_start_cycles) and v3 rows
     # (6 cols) both parse — archived JSON from before the receive_time split
     # still loads with r2s_cycles defaulting to 0.
-    aicore_lookup: dict[tuple[int, int], tuple[int, int, int, int]] = {}
+    aicore_lookup = {}
     for row_index, row in enumerate(aicore_rows):
         if not isinstance(row, list) or len(row) not in (5, 6):
             raise ValueError(f"aicore_tasks[{row_index}] must contain five or six columns")
@@ -521,7 +556,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
                 f"aicore_tasks[{row_index}] has invalid receive_to_start_cycles: "
                 "expected 0 <= receive_to_start_cycles < start_cycles"
             )
-        key = (int(core_id), int(reg_task_id))
+        key = _join_key(core_id, reg_task_id, start_cycles)
         if key in aicore_lookup:
             raise ValueError(f"duplicate aicore_tasks join key: {key}")
         aicore_lookup[key] = (
@@ -531,7 +566,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
             r2s_cycles,
         )
 
-    scheduler_task_keys = [(int(row[0]), int(row[1])) for row in scheduler_task_rows]
+    scheduler_task_keys = [_join_key(row[0], row[1], row[2]) for row in scheduler_task_rows]
     if len(scheduler_task_keys) != len(set(scheduler_task_keys)):
         raise ValueError("scheduler_tasks contains duplicate (core_id, reg_task_id) join keys")
     for row_index, row in enumerate(scheduler_task_rows):
@@ -559,6 +594,9 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
         nonlocal base_time_cycles
         if v > 0 and (base_time_cycles is None or v < base_time_cycles):
             base_time_cycles = v
+
+    for _, start in run_boundaries:
+        _track(start)
 
     for row in aicore_rows:
         # Column count varies (v2: 5, v3: 6); only the timing columns matter
@@ -646,7 +684,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
             core_id, reg_task_id, dispatch_cycles, finish_cycles = row
             core_id = int(core_id)
             reg_task_id = int(reg_task_id)
-            ac = aicore_lookup.get((core_id, reg_task_id))
+            ac = aicore_lookup.get(_join_key(core_id, reg_task_id, dispatch_cycles))
             if ac is None:
                 unmatched_per_core[core_id] += 1
                 continue
@@ -661,6 +699,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
             tasks.append(
                 {
                     "task_id": task_token_raw,
+                    **({"launch_epoch": _launch_epoch(start_cycles)} if run_boundaries else {}),
                     "func_id": -1,
                     "core_id": core_id,
                     "core_type": _core_type(core_id),
@@ -688,6 +727,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
             tasks.append(
                 {
                     "task_id": task_token_raw,
+                    **({"launch_epoch": _launch_epoch(start_cycles)} if run_boundaries else {}),
                     "func_id": -1,
                     "core_id": core_id,
                     "core_type": _core_type(core_id),
@@ -703,7 +743,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
     elif aicore_rows:
         raise ValueError(f"level {level} requires Scheduler task timing records")
 
-    tasks.sort(key=lambda t: int(t["task_id"]))
+    tasks.sort(key=lambda t: (t.get("launch_epoch", 0), int(t["task_id"])))
 
     total_unmatched = sum(unmatched_per_core.values())
     if total_unmatched > 0:
@@ -721,6 +761,8 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
         # Host already omits pop_hit / pop_miss for Complete records (terse
         # emit), so we don't need to re-strip zero deltas here.
         out = dict(pr)
+        if run_boundaries:
+            out["launch_epoch"] = _launch_epoch(pr.get("start_cycles", 0))
         out["start_time_us"] = _to_us(int(pr.get("start_cycles", 0)))
         out["end_time_us"] = _to_us(int(pr.get("end_cycles", 0)))
         out.pop("start_cycles", None)
@@ -752,6 +794,10 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
     aicpu_lifecycle_records = []
     for record_index, record in enumerate(lifecycle_raw):
         converted = dict(record)
+        if run_boundaries:
+            converted["launch_epoch"] = _launch_epoch(
+                min(int(record[field]) for field in lifecycle_cycle_fields if record.get(field, 0) > 0)
+            )
         for field in lifecycle_cycle_fields:
             if field not in converted:
                 continue
@@ -798,6 +844,10 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
         "chip_swimlane_level": level,
         "tasks": tasks,
     }
+    if run_boundaries:
+        out["run_boundaries"] = [
+            {"launch_epoch": epoch, "start_time_us": _to_us(start)} for epoch, start in run_boundaries
+        ]
     if scheduler_task_producer is not None:
         out["scheduler_task_producer"] = scheduler_task_producer
     if aicpu_scheduler_phases:
@@ -1562,6 +1612,64 @@ def build_overhead_counter_events(tasks, deps_edges, pid=2):  # noqa: PLR0912
     return events
 
 
+def _generate_launch_trace(tasks, run_boundaries, output_path, options):  # noqa: PLR0912
+    launches = {boundary["launch_epoch"]: {"tasks": []} for boundary in run_boundaries}
+    for task in tasks:
+        launches[task["launch_epoch"]]["tasks"].append(task)
+    for field in ("scheduler_phases", "orchestrator_phases"):
+        threads = options.pop(field) or []
+        for launch in launches.values():
+            launch[field] = [[] for _ in threads]
+        for thread_index, records in enumerate(threads):
+            for record in records:
+                launches[record["launch_epoch"]][field][thread_index].append(record)
+    for launch in launches.values():
+        launch["aicpu_lifecycle_records"] = []
+    for record in options.pop("aicpu_lifecycle_records") or []:
+        launches[record["launch_epoch"]]["aicpu_lifecycle_records"].append(record)
+
+    events = [{"ph": "M", "name": "process_name", "pid": 7, "args": {"name": "Kernel Launches"}}]
+    metadata_seen = set()
+    for boundary in run_boundaries:
+        epoch = boundary["launch_epoch"]
+        trace = generate_chrome_trace_json(output_path=None, **launches[epoch], **options)
+        end = boundary["start_time_us"]
+        for event in trace["traceEvents"]:
+            if event.get("ph") == "M":
+                key = json.dumps(event, sort_keys=True)
+                if key in metadata_seen:
+                    continue
+                metadata_seen.add(key)
+            else:
+                end = max(end, event.get("ts", end) + event.get("dur", 0))
+                if event.get("ph") != "C":
+                    event.setdefault("args", {})["launch_epoch"] = epoch
+                for field in ("id", "bind_id"):
+                    if field in event:
+                        event[field] = f"launch{epoch}:{event[field]}"
+            events.append(event)
+        events.append(
+            {
+                "ph": "X",
+                "cat": "kernel_launch",
+                "name": f"Launch {epoch}",
+                "pid": 7,
+                "tid": 0,
+                "ts": boundary["start_time_us"],
+                "dur": end - boundary["start_time_us"],
+                "args": {"launch_epoch": epoch, "end_basis": "last_observed_record"},
+            }
+        )
+    trace = {
+        "traceEvents": events,
+        "metadata": {**(options["timeline_metadata"] or {}), "run_boundaries": run_boundaries},
+    }
+    if output_path is not None:
+        with open(output_path, "w") as file:
+            json.dump(trace, file, indent=2)
+    return trace
+
+
 def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     tasks,
     output_path,
@@ -1580,6 +1688,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     emit_overhead=False,
     host_device_uploads=None,
     aicpu_lifecycle_records=None,
+    run_boundaries=None,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -1597,6 +1706,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         orchestrator_phases: Optional list of per-task orchestrator phase records (chip_swimlane_level >= 4)
         core_to_thread: Optional list mapping core_id (index) to scheduler thread index (-1 = unassigned)
         aicpu_lifecycle_records: Optional A5 HBG AICPU control-plane lifecycle records
+        run_boundaries: Optional decoded kernel launch epochs and start times
 
     Generates processes in the trace:
         - pid=5 "Graph Execution": one end-to-end envelope per Graph task
@@ -1605,6 +1715,29 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         - pid=3 "Scheduler View": dispatch_time_us to finish_time_us
         - pid=4 "Worker View": per-subtask kernel execution on physical cores
     """
+    if run_boundaries:
+        return _generate_launch_trace(
+            tasks,
+            run_boundaries,
+            output_path,
+            {
+                "func_id_to_name": func_id_to_name,
+                "verbose": verbose,
+                "scheduler_phases": scheduler_phases,
+                "scheduler_streams": scheduler_streams,
+                "orchestrator_phases": orchestrator_phases,
+                "core_to_thread": core_to_thread,
+                "orchestrator_name": orchestrator_name,
+                "orchestrator_source": orchestrator_source,
+                "timeline_metadata": timeline_metadata,
+                "deps_edges": deps_edges,
+                "deps_kernel_map": deps_kernel_map,
+                "deps_block_map": deps_block_map,
+                "emit_overhead": emit_overhead,
+                "host_device_uploads": host_device_uploads,
+                "aicpu_lifecycle_records": aicpu_lifecycle_records,
+            },
+        )
     if verbose:
         print("Generating Chrome Trace JSON...")
         print(f"  Tasks: {len(tasks)}")
@@ -4089,6 +4222,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             core_to_thread=data.get("core_to_thread"),
             host_device_uploads=data.get("host_device_uploads"),
             aicpu_lifecycle_records=data.get("aicpu_lifecycle_records"),
+            run_boundaries=data.get("run_boundaries"),
             deps_edges=artifacts["deps_edges"],
             deps_kernel_map=artifacts["deps_kernel_map"],
             deps_block_map=artifacts["deps_block_map"],
@@ -4226,6 +4360,7 @@ def main():
             core_to_thread=data.get("core_to_thread"),
             host_device_uploads=data.get("host_device_uploads"),
             aicpu_lifecycle_records=data.get("aicpu_lifecycle_records"),
+            run_boundaries=data.get("run_boundaries"),
             deps_edges=deps_edges,
             deps_kernel_map=deps_kernel_map,
             deps_block_map=deps_block_map,

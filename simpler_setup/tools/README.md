@@ -230,6 +230,24 @@ loads a unique `name_map*.json` next to the input file. If that directory
 contains multiple matching files, it prints a warning and uses default function
 labels until one is selected explicitly with `--func-names`.
 
+### Kernel-mode launch rounds
+
+For a kernel-context capture containing `metadata.run_boundaries` pairs
+`[epoch, start_cycles]`, the converter partitions tasks and device phases by
+launch. Repeated task/register IDs are joined only within that launch, and
+dependency arrows, SPMD grouping and `--overhead` calculations stay within it.
+All launches retain their spacing on one device timeline. The **Kernel Launches**
+track labels each epoch; its bar ends at the last observed record, not at a
+measured launch-completion timestamp. Event details include `launch_epoch`.
+The supplied `deps.json` topology and name mapping apply to every launch;
+capture different workloads in separate windows when their mappings differ.
+
+Missing boundary metadata preserves the single-run behavior. Invalid boundaries
+or nonzero `dropped_run_boundaries` are rejected because the remaining records
+cannot be assigned to launches reliably; recapture fewer launches per window.
+The standalone `sched_overhead_analysis` report and `deps_viewer` timing sidecar
+still require a single-launch capture; they reject combined multi-launch timing.
+
 ### SPMD dependency visualization
 
 For SPMD logical tasks (`block_num > 1` in `deps.json`), dependency

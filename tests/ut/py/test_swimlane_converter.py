@@ -13,9 +13,150 @@ from pathlib import Path
 
 import pytest
 
-from simpler_setup.tools import containment
+from simpler_setup.tools import containment, deps_viewer, sched_overhead_analysis
 from simpler_setup.tools import swimlane_converter as sc
 from simpler_setup.tools.strace_timing import parse_spans, to_host_swimlane
+
+
+def _kernel_launch_capture(level=4):
+    data = {
+        "chip_swimlane_level": level,
+        "metadata": {
+            "clock_freq_hz": 1_000_000,
+            "core_types": ["aiv"],
+            "core_to_thread": [0],
+            "run_boundaries": [[0, 100], [1, 200]],
+            "dropped_run_boundaries": 0,
+        },
+        "aicore_tasks": [],
+        "scheduler_tasks": {"schema_version": 1, "producer": "aicpu", "records": []},
+        "aicpu_scheduler_phases": [[]],
+        "aicpu_orchestrator_phases": [[]],
+    }
+    for base in (100, 200):
+        for task_id in (0, 1):
+            start = base + 10 + task_id * 20
+            data["aicore_tasks"].append([0, task_id, task_id + 1, start, start + 5, 1])
+            if level >= 2:
+                data["scheduler_tasks"]["records"].append([0, task_id + 1, start - 2, start + 6])
+            data["aicpu_orchestrator_phases"][0].append(
+                {"task_id": task_id, "submit_idx": task_id, "start_cycles": start - 5, "end_cycles": start - 3}
+            )
+        data["aicpu_scheduler_phases"][0].append({"kind": "dispatch", "start_cycles": base + 7, "end_cycles": base + 9})
+    return data
+
+
+@pytest.mark.parametrize("level", [1, 2, 3, 4])
+def test_kernel_launch_rounds_reuse_task_and_register_ids(level):
+    data = sc._decode_perf_data(_kernel_launch_capture(level))
+    assert [(task["launch_epoch"], task["task_id"]) for task in data["tasks"]] == [(0, 0), (0, 1), (1, 0), (1, 1)]
+    trace = sc.generate_chrome_trace_json(
+        data["tasks"],
+        None,
+        scheduler_phases=data["aicpu_scheduler_phases"],
+        orchestrator_phases=data["aicpu_orchestrator_phases"],
+        core_to_thread=data["core_to_thread"],
+        run_boundaries=data["run_boundaries"],
+        deps_edges={0: [1]},
+    )
+    events = trace["traceEvents"]
+    launches = [event for event in events if event.get("cat") == "kernel_launch"]
+    assert [event["args"]["launch_epoch"] for event in launches] == [0, 1]
+    assert [event["ts"] for event in launches] == [0, 100]
+    flows = {}
+    for event in events:
+        if event.get("cat") == "flow":
+            flows.setdefault(event["id"], []).append(event)
+    assert flows
+    for pair in flows.values():
+        assert len(pair) == 2
+        assert len({event["args"]["launch_epoch"] for event in pair}) == 1
+        assert max(event["ts"] for event in pair) - min(event["ts"] for event in pair) < 100
+    dependencies = [event for event in events if event.get("name") == "dependency" and event.get("ph") == "s"]
+    assert {event["args"]["launch_epoch"] for event in dependencies} == {0, 1}
+
+
+@pytest.mark.parametrize("boundaries", [[[0, 200], [1, 100]], [[0, 100], [0, 200]], [[0, 0]], [[0]]])
+def test_kernel_launch_rejects_invalid_boundaries(boundaries):
+    raw = _kernel_launch_capture()
+    raw["metadata"]["run_boundaries"] = boundaries
+    with pytest.raises(ValueError, match="run_boundaries"):
+        sc._decode_perf_data(raw)
+
+
+def test_kernel_launch_rejects_dropped_boundaries():
+    raw = _kernel_launch_capture()
+    raw["metadata"]["dropped_run_boundaries"] = 1
+    with pytest.raises(ValueError, match="dropped_run_boundaries"):
+        sc._decode_perf_data(raw)
+
+
+def test_kernel_launch_does_not_join_scheduler_from_another_round():
+    raw = _kernel_launch_capture()
+    raw["scheduler_tasks"]["records"].pop()
+    with pytest.raises(ValueError, match="missing 1 join key"):
+        sc._decode_perf_data(raw)
+
+
+def test_kernel_launch_still_rejects_duplicate_dispatch_within_round():
+    raw = _kernel_launch_capture()
+    raw["aicore_tasks"].append(raw["aicore_tasks"][0])
+    with pytest.raises(ValueError, match="duplicate aicore_tasks join key"):
+        sc._decode_perf_data(raw)
+
+
+def test_kernel_launch_preserves_empty_round_and_boundary_timestamp():
+    raw = _kernel_launch_capture(1)
+    raw["metadata"]["run_boundaries"].append([2, 300])
+    raw["aicore_tasks"].append([0, 2, 3, 200, 201, 0])
+    data = sc._decode_perf_data(raw)
+    assert next(task for task in data["tasks"] if task["task_id"] == 2)["launch_epoch"] == 1
+    trace = sc.generate_chrome_trace_json(data["tasks"], None, run_boundaries=data["run_boundaries"])
+    launches = [event for event in trace["traceEvents"] if event.get("cat") == "kernel_launch"]
+    assert len(launches) == 3
+    assert launches[2]["ts"] == 200
+    assert launches[2]["dur"] == 0
+
+
+def test_kernel_launch_cli_isolates_spmd_and_overhead(tmp_path, monkeypatch):
+    raw = _kernel_launch_capture()
+    for base in (100, 200):
+        raw["aicore_tasks"].append([0, 0, 3, base + 16, base + 18, 1])
+        raw["scheduler_tasks"]["records"].append([0, 3, base + 14, base + 19])
+    path = tmp_path / "chip_swimlane_records.json"
+    path.write_text(json.dumps(raw))
+    (tmp_path / "deps.json").write_text(json.dumps({"edges": [{"pred": 0, "succ": 1}]}))
+    monkeypatch.setattr("sys.argv", ["swimlane_converter", str(path), "--overhead"])
+    assert sc.main() == 0
+    trace = json.loads((tmp_path / "merged_swimlane.json").read_text())
+    events = trace["traceEvents"]
+    for epoch in (0, 1):
+        flows = [
+            event
+            for event in events
+            if event.get("name") == "dependency"
+            and event.get("ph") == "s"
+            and event.get("pid") == 4
+            and event["args"]["launch_epoch"] == epoch
+        ]
+        assert len(flows) == 1
+    counters = [event for event in events if event.get("ph") == "C"]
+    assert counters
+    first = [(event["name"], event["ts"], event["args"]) for event in counters if event["ts"] < 100]
+    second = [(event["name"], event["ts"] - 100, event["args"]) for event in counters if event["ts"] >= 100]
+    assert first == second
+    assert all("launch_epoch" not in event["args"] for event in counters)
+
+
+def test_kernel_launch_single_run_consumers_reject_combined_timing(tmp_path, capsys):
+    path = tmp_path / "chip_swimlane_records.json"
+    path.write_text(json.dumps(_kernel_launch_capture()))
+    deps = tmp_path / "deps.json"
+    deps.write_text('{"edges": []}')
+    assert sched_overhead_analysis.run_analysis(path, print_sources=False, deps_json_path=deps) == 1
+    assert "multiple launches" in capsys.readouterr().err
+    assert deps_viewer._load_task_meta(deps) == {}
+    assert "multiple launches" in capsys.readouterr().err
 
 
 def _containment_placement(document, *, runner_start_ns=1_000, runner_dur_ns=5_000, wall_ns=2_000, sched=(700, 100)):
