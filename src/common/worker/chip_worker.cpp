@@ -270,6 +270,8 @@ void ChipWorker::reset_runtime_bindings() {
     kernel_init_fn_ = nullptr;
     kernel_prepare_callable_fn_ = nullptr;
     kernel_launch_fn_ = nullptr;
+    kernel_begin_dfx_fn_ = nullptr;
+    kernel_end_dfx_fn_ = nullptr;
     runtime_bufs_.clear();
 }
 
@@ -560,6 +562,8 @@ void ChipWorker::kernel_init(
         const auto kernel_prepare_callable_fn =
             load_symbol<KernelPrepareCallableFn>(handle, "simpler_kernel_mode_prepare_callable");
         const auto kernel_launch_fn = load_symbol<KernelLaunchFn>(handle, "simpler_kernel_mode_launch");
+        const auto kernel_begin_dfx_fn = load_symbol<KernelBeginDfxFn>(handle, "simpler_kernel_mode_begin_dfx");
+        const auto kernel_end_dfx_fn = load_symbol<KernelEndDfxFn>(handle, "simpler_kernel_mode_end_dfx");
         std::vector<uint8_t> aicpu_bytes = read_binary_file(aicpu_path);
         std::vector<uint8_t> aicore_bytes = read_binary_file(aicore_path);
         std::vector<uint8_t> dispatcher_bytes;
@@ -577,6 +581,8 @@ void ChipWorker::kernel_init(
             kernel_init_fn_ = kernel_init_fn;
             kernel_prepare_callable_fn_ = kernel_prepare_callable_fn;
             kernel_launch_fn_ = kernel_launch_fn;
+            kernel_begin_dfx_fn_ = kernel_begin_dfx_fn;
+            kernel_end_dfx_fn_ = kernel_end_dfx_fn;
         }
     } catch (...) {
         destroy_device_context_fn_(device_ctx_);
@@ -648,6 +654,35 @@ int32_t ChipWorker::kernel_prepare_callable(const void *callable, size_t callabl
         );
     }
     return callable_id;
+}
+
+void ChipWorker::kernel_begin_dfx() {
+    if (!initialized_) {
+        throw ChipWorkerError(PTO_RUNTIME_ERR_INVALID_STATE, "ChipWorker not initialized; call kernel_init() first");
+    }
+    if (kernel_begin_dfx_fn_ == nullptr) {
+        throw UnsupportedRuntimeOperation("this host runtime does not support kernel mode");
+    }
+    const int rc = kernel_begin_dfx_fn_(device_ctx_);
+    if (rc != 0) {
+        throw ChipWorkerError(rc, "simpler_kernel_mode_begin_dfx failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::kernel_end_dfx(void *caller_stream) {
+    if (!initialized_) {
+        throw ChipWorkerError(PTO_RUNTIME_ERR_INVALID_STATE, "ChipWorker not initialized; call kernel_init() first");
+    }
+    if (caller_stream == nullptr) {
+        throw ChipWorkerError(PTO_RUNTIME_ERR_INVALID_ARGUMENT, "kernel_end_dfx: caller_stream must not be null");
+    }
+    if (kernel_end_dfx_fn_ == nullptr) {
+        throw UnsupportedRuntimeOperation("this host runtime does not support kernel mode");
+    }
+    const int rc = kernel_end_dfx_fn_(device_ctx_, caller_stream);
+    if (rc != 0) {
+        throw ChipWorkerError(rc, "simpler_kernel_mode_end_dfx failed with code " + std::to_string(rc));
+    }
 }
 
 void ChipWorker::kernel_launch(int32_t callable_id, const ChipStorageTaskArgs *args, void *caller_stream) {

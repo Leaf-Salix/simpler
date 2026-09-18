@@ -1423,6 +1423,36 @@ int simpler_kernel_mode_prepare_callable(
     }
 }
 
+static int kernel_dfx_bracket(DeviceContextHandle ctx, void *caller_stream, bool open, const char *entry) {
+    if (ctx == NULL) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    std::lock_guard<std::mutex> submission_lock(runner->kernel_submission_mutex());
+    if (!runner->execution_mode_latch().is_kernel()) {
+        LOG_ERROR("%s: no live kernel context on this device context", entry);
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    if (!runner->kernel_execution_state().accepts_dispatch()) {
+        LOG_ERROR("%s: the kernel context no longer accepts collection", entry);
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    try {
+        const int rc = runner->adopt_borrowed_device(runner->device_id());
+        if (rc != 0) return rc;
+        return open ? runner->begin_kernel_dfx() : runner->end_kernel_dfx(caller_stream);
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int simpler_kernel_mode_begin_dfx(DeviceContextHandle ctx) {
+    return kernel_dfx_bracket(ctx, NULL, true, "simpler_kernel_mode_begin_dfx");
+}
+
+int simpler_kernel_mode_end_dfx(DeviceContextHandle ctx, void *caller_stream) {
+    if (caller_stream == NULL) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    return kernel_dfx_bracket(ctx, caller_stream, false, "simpler_kernel_mode_end_dfx");
+}
+
 int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream) {
     const int rc = validate_kernel_launch_args(ctx, callable_id, args, caller_stream);
     if (rc != 0) return rc;

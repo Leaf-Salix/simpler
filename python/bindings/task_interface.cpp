@@ -3613,6 +3613,26 @@ NB_MODULE(_task_interface, m) {
             "caller's stream. Returning means the sequence was enqueued; device "
             "execution may still be in flight and may still fail asynchronously."
         )
+        .def(
+            "kernel_begin_dfx", &ChipWorker::kernel_begin_dfx, nb::call_guard<nb::gil_scoped_release>(),
+            "Open a chip-swimlane collection window over the launches that "
+            "follow. One artifact describes the bracket, not the worker, so an "
+            "operator measured on its own is bracketed on its own. Requires a "
+            "kernel context initialized with CallConfig.enable_chip_swimlane "
+            "nonzero; opening a second window before closing the first raises."
+        )
+        .def(
+            "kernel_end_dfx",
+            [](ChipWorker &self, uint64_t caller_stream) {
+                self.kernel_end_dfx(reinterpret_cast<void *>(caller_stream));
+            },
+            nb::arg("caller_stream"), nb::call_guard<nb::gil_scoped_release>(),
+            "Close the open window and write its artifact. Drains "
+            "`caller_stream` first — the window's launches end there — so the "
+            "caller owes no synchronization of its own. The first window's "
+            "artifact lands at CallConfig.output_prefix, each later one in "
+            "output_prefix/window_<n>."
+        )
         .def_prop_ro(
             "kernel_mode_supported", &ChipWorker::kernel_mode_supported,
             "Whether the bound runtime can execute kernel-mode launches. Requires "

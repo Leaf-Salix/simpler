@@ -1620,6 +1620,37 @@ class ChipWorker:
             raise ValueError("kernel_launch requires a non-null caller_stream")
         self._impl.kernel_launch(int(callable_id), args, stream)
 
+    def kernel_begin_dfx(self):
+        """Open a chip-swimlane collection window over the launches that follow.
+
+        One artifact describes the bracket, not the worker, so an operator
+        measured on its own is bracketed on its own. Requires a kernel context
+        initialized with ``CallConfig.enable_chip_swimlane`` nonzero; opening a
+        second window before closing the first raises ``ChipWorkerError``.
+
+        Synchronous and outside ACLGraph capture, beside preparation rather than
+        beside launch: it enqueues nothing and touches no caller stream.
+        """
+        self._impl.kernel_begin_dfx()
+
+    def kernel_end_dfx(self, caller_stream: int):
+        """Close the open window and write its artifact.
+
+        ``caller_stream`` is the stream the window's launches were enqueued on,
+        and this call drains it — the chained launch topology records each
+        invocation's serial tail there — so the caller owes no synchronization
+        of its own. It is therefore a synchronizing call and belongs outside
+        capture.
+
+        The first window's artifact lands at ``CallConfig.output_prefix``, each
+        later one in ``output_prefix/window_<n>``. Closing with no window open
+        raises ``ChipWorkerError``.
+        """
+        stream = int(caller_stream)
+        if not stream:
+            raise ValueError("kernel_end_dfx requires a non-null caller_stream")
+        self._impl.kernel_end_dfx(stream)
+
     def finalize(self):
         """Tear down everything: device resources and runtime library.
 

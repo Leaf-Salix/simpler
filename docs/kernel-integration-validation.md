@@ -664,6 +664,50 @@ controlled runs — five on this branch and five on the unmodified integration
 head, interleaved on one device — so it is neither attributed to nor cleared by
 this change.
 
+## Kernel-mode DFX validation (2026-09-17)
+
+Covers D23: the chip swimlane and dep_gen collecting inside a kernel context,
+bracketed by `begin_dfx` / `end_dfx`.
+
+**Environment.** a2a3 (`Ascend910_9392`), one device per case through
+`task-submit`; branch `feat/kernel-mode-chip-swimlane` on `4f162da09`.
+
+| What | Result |
+| ---- | ------ |
+| `test_worker_kernel_mode_hw` (7 cases, incl. new `dfx_bracket`) | 7/7 pass |
+| One launch inside a bracket, level 4 + dep_gen | `aicore_tasks=1`, `scheduler_tasks=1`, 3 scheduler-phase streams, 1 orchestrator phase |
+| Round boundaries | `run_boundaries=[[0, …]]`, `dropped_run_boundaries=0` |
+| Unbalanced brackets | close-without-open and double-open both refused |
+| `swimlane_converter` on the pair | labels resolve from `task(t0)` to `func_0_a(t0)`; `Func_ID` 0 rather than -1 |
+
+**How the four gates were found.** Each was opened in turn and the symptom moved
+rather than cleared, which is what identified the next one:
+
+| Gate | Symptom while closed |
+| ---- | -------------------- |
+| `KernelStaticConfig::validate` | `kernel init: rc=-1001` (UNSUPPORTED) |
+| `register_kernel_context` | `rc=507018`, device log `simpler_aicpu_prepare_tmr_context ... ret:2` |
+| `aicore_executor.cpp` `KernelMode ? 0 : …` | init passes, launches run |
+| `kernel_mode_kernel.cpp` weak stubs | `aicore_tasks=0` with `scheduler_tasks=1`; AICPU counted the dispatch, AICore's record slot stayed all-zero |
+
+**Not covered.**
+
+- **a5.** Its collector mgmt thread calls `aclrtMemcpy` on every poll. CANN's
+  capture-mode definition names `aclrtMemcpy` an unsafe function and
+  `ACL_MODEL_RI_CAPTURE_MODE_GLOBAL` (enum value 0) forbids it from every thread,
+  including one that never called `CaptureBegin` and cannot know to switch modes.
+  Whether such a call fails alone or invalidates the caller's capture is not
+  stated in the CANN docs and was not measured. a2a3 is unaffected: its mgmt
+  thread reads the `halHostRegister` SVM mapping and calls no ACL memory API.
+- **Multi-launch windows.** Only one launch per bracket was measured. A window
+  covering many back-to-back launches drains the per-core free queues faster than
+  the host refills them; the boundary ring and `dropped_record_count` report it,
+  but the behaviour was not characterized.
+- **Converter segmentation.** `run_boundaries` reaches the artifact; nothing reads
+  it yet, so a multi-launch window renders as one undivided trace.
+- **ACLGraph capture.** The bracket entries are documented as outside-capture and
+  were exercised eagerly only.
+
 ## Remaining boundaries
 
 - H4 has no submitted PR in the supplied pipeline. HBG kernel capability is

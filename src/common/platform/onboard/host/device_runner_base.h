@@ -758,9 +758,99 @@ public:
      * Populate the device-side KernelArgs fields only this architecture knows
      * how to produce: the per-core register table on both, plus a2a3's FFTS
      * base address. Anything allocated here must come from `mem_alloc_`, which
-     * is what PersistentKernelArgs releases through. DFX fields stay zero.
+     * is what PersistentKernelArgs releases through.
+     *
+     * DFX fields are not this hook's to fill: `persistent_args_ops()` publishes
+     * the chip-swimlane ones right after this returns, from the region the
+     * context already stood up.
      */
     virtual int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) = 0;
+
+    /**
+     * Stand up the chip-swimlane shared region on this architecture's own
+     * host-visibility path -- a2a3 maps the device allocation into host address
+     * space with `halHostRegister`. The collector and its level belong to the
+     * base; only that mapping mechanism is architecture-specific.
+     *
+     * The default collects nothing and reports success. An architecture whose
+     * collector has no kernel-mode path still admits a context that asked for
+     * the swimlane, and says once here that the artifact will be absent, rather
+     * than failing an initialization the caller cannot act on.
+     */
+    virtual int init_chip_swimlane_region(
+        int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level
+    );
+
+    /**
+     * Stand up the dep_gen capture ring, on the subclass that owns the
+     * collector. Both execution modes reach it: a program run from
+     * `init_dep_gen`, a kernel context from its own initialization.
+     *
+     * Default: this architecture has no dep_gen, so the run proceeds without
+     * one and its artifact is simply absent.
+     */
+    virtual int init_dep_gen_region(int /*num_threads*/, int /*device_id*/) { return 0; }
+
+    /**
+     * Publish the standing ring's device address and the flag the AICPU writer
+     * reads, into a KernelArgs image. A no-op while no ring stands, which keeps
+     * a null base out of the image: the device treats one as an error, not as
+     * "disabled".
+     */
+    virtual void publish_dep_gen_args(KernelArgs & /*args*/) const {}
+
+    /** Open the capture window: reset the previous one's records, then drain. */
+    virtual void begin_dep_gen_window() {}
+
+    /**
+     * Close the window and replay its records into `<prefix>/deps.json`.
+     *
+     * The completeness gate is the collector's own: an unflushed buffer or a
+     * dropped record yields no file rather than a partial graph a reader would
+     * take for the whole topology.
+     */
+    virtual void end_dep_gen_window(const std::string & /*output_prefix*/) {}
+
+    /**
+     * Publish the standing chip-swimlane region's device addresses into a
+     * KernelArgs image, and set the flag AICore's kernel entry reads to decide
+     * whether to write timing at all.
+     *
+     * A no-op while the collector holds no region, which keeps a null base out
+     * of the image: the device side treats one as an error, not as "disabled".
+     */
+    void publish_chip_swimlane_args(KernelArgs &args) const;
+
+    /**
+     * Open a chip-swimlane collection window over the launches that follow.
+     *
+     * The window, not the context, is what one artifact describes: a caller
+     * that wants its operator separated from its neighbours brackets just that
+     * operator. Reopening is what makes a second artifact; the records and
+     * counters of the window that closed do not carry into it.
+     *
+     * Rejects a second open on a context that already has one, so an unbalanced
+     * pair is a caller error rather than a silently merged window.
+     */
+    int begin_kernel_dfx();
+
+    /**
+     * Close the open window and write its artifact.
+     *
+     * Drains `caller_stream` first: the launches this window covers end there,
+     * so that wait is what establishes the quiescence the drain below needs.
+     * Rejects a close with no window open, and a null stream.
+     */
+    int end_kernel_dfx(void *caller_stream);
+
+    /** Drain the open window's records and write its artifact. */
+    void export_kernel_chip_swimlane();
+
+    /** Window sequence number, and therefore the artifact names already used. */
+    uint32_t kernel_dfx_windows_{0};
+    /// Directory the open window's artifacts land in; empty while none is open.
+    std::string kernel_dfx_prefix_;
+    bool kernel_dfx_open_{false};
 
     /**
      * Arm or disarm this thread's host-side dep_gen capture, from the run's own

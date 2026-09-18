@@ -7076,6 +7076,64 @@ class Worker:
         finally:
             self._kernel_gate.release()
 
+    def kernel_begin_dfx(self) -> None:
+        """Open a chip-swimlane collection window over the launches that follow.
+
+        What one artifact describes is the bracket, not the Worker, so an operator measured on its
+        own is bracketed on its own. Requires a kernel-mode Worker whose ``CallConfig`` carried a
+        nonzero ``enable_chip_swimlane``; opening a second window before closing the first raises.
+        Enqueues nothing and touches no caller stream, so it belongs beside ``kernel_prepare_callable``
+        rather than beside a launch, and must not be called inside an ACLGraph capture. Takes the
+        same gate as prepare/launch/close: the caller serializes them.
+        """
+        self._require_execution_mode("kernel_begin_dfx", "kernel")
+        self._require_kernel_process("kernel_begin_dfx")
+        if not self._kernel_gate.acquire(blocking=False):
+            raise RuntimeError(
+                "Worker.kernel_begin_dfx: a kernel prepare/launch/close is in progress; the caller serializes them"
+            )
+        try:
+            if self._lifecycle is not _Lifecycle.READY:
+                raise RuntimeError(
+                    "Worker.kernel_begin_dfx: requires an initialized (READY) worker"
+                ) from self._startup_error
+            chip = self._chip_worker
+            assert chip is not None
+            chip.kernel_begin_dfx()
+        finally:
+            self._kernel_gate.release()
+
+    def kernel_end_dfx(self, caller_stream: int) -> None:
+        """Close the open collection window and write its artifact.
+
+        ``caller_stream`` is the stream the window's launches were enqueued on, and this call drains
+        it — the chained launch topology records each invocation's serial tail there — so the caller
+        owes no synchronize of its own. It is therefore a synchronizing call and must not be made
+        inside an ACLGraph capture.
+
+        The first window's artifact lands at the Worker's ``output_prefix``, each later one in
+        ``output_prefix/window_<n>``. Closing with no window open raises.
+        """
+        self._require_execution_mode("kernel_end_dfx", "kernel")
+        stream = int(caller_stream)
+        if not stream:
+            raise ValueError("Worker.kernel_end_dfx requires a non-null caller_stream")
+        self._require_kernel_process("kernel_end_dfx")
+        if not self._kernel_gate.acquire(blocking=False):
+            raise RuntimeError(
+                "Worker.kernel_end_dfx: a kernel prepare/launch/close is in progress; the caller serializes them"
+            )
+        try:
+            if self._lifecycle is not _Lifecycle.READY:
+                raise RuntimeError(
+                    "Worker.kernel_end_dfx: requires an initialized (READY) worker"
+                ) from self._startup_error
+            chip = self._chip_worker
+            assert chip is not None
+            chip.kernel_end_dfx(stream)
+        finally:
+            self._kernel_gate.release()
+
     def _arm_kernel_chip_pin(self) -> None:
         """Arm the finalizer that leaks this Worker's kernel ChipWorker if the Worker is never closed.
 

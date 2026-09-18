@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <new>
 
@@ -701,6 +702,24 @@ int DeviceRunnerBase::init_kernel_context(
     // image that names them is uploaded.
     rc = prepare_kernel_runtime_impl(kernel_runtime_, api, &kernel_static_config_.request());
     if (rc != 0) return rc;
+    // A kernel context collects over its whole life: one window opens here and
+    // closes at teardown, because a launch is a bare enqueue with no point at
+    // which a per-run window could be opened or drained. The region precedes
+    // the KernelArgs image below, which is uploaded once and names it.
+    const auto swimlane_level = static_cast<ChipSwimlaneLevel>(kernel_static_config_.request().enable_chip_swimlane);
+    if (swimlane_level != ChipSwimlaneLevel::DISABLED) {
+        rc = init_chip_swimlane_region(
+            kernel_runtime_.get_worker_count(), kernel_runtime_.get_aicpu_thread_num(), device_id_, swimlane_level
+        );
+        if (rc != 0) return rc;
+    }
+    // dep_gen rides the same window: its graph is what resolves the swimlane's
+    // func_ids and draws its arrows, so the two are captured together or the
+    // trace reads as anonymous tasks.
+    if (kernel_static_config_.request().enable_dep_gen != 0) {
+        rc = init_dep_gen_region(kernel_runtime_.get_aicpu_thread_num(), device_id_);
+        if (rc != 0) return rc;
+    }
     rc = persistent_args_.prepare_once(kernel_runtime_, persistent_args_ops(), static_cast<uint64_t>(device_id_));
     if (rc != 0) return rc;
     rc = kernel_static_config_.freeze();
@@ -714,9 +733,108 @@ int DeviceRunnerBase::init_kernel_context(
     if (rc != 0) return rc;
     rc = prepare_kernel_coordination();
     if (rc != 0) return rc;
-
     claim_rollback.dismiss();
     return 0;
+}
+
+int DeviceRunnerBase::init_chip_swimlane_region(
+    int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level
+) {
+    (void)num_aicore;
+    (void)aicpu_thread_num;
+    (void)device_id;
+    (void)chip_swimlane_level;
+    LOG_WARN("chip swimlane has no kernel-mode path on this architecture; collecting nothing");
+    return 0;
+}
+
+void DeviceRunnerBase::publish_chip_swimlane_args(KernelArgs &args) const {
+    if (!chip_swimlane_collector_.is_initialized()) return;
+    args.chip_swimlane_data_base =
+        reinterpret_cast<uint64_t>(chip_swimlane_collector_.get_chip_swimlane_setup_device_ptr());
+    args.chip_swimlane_aicore_rotation_table =
+        reinterpret_cast<uint64_t>(chip_swimlane_collector_.get_aicore_ring_addr_table_device_ptr());
+    SIMPLER_SET_DFX_FLAG(args.enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
+}
+
+int DeviceRunnerBase::begin_kernel_dfx() {
+    const CallConfig &request = kernel_static_config_.request();
+    if (!request.diagnostics_any()) {
+        LOG_ERROR("begin_kernel_dfx: this context was initialized with no diagnostic enabled");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    if (kernel_dfx_open_) {
+        LOG_ERROR("begin_kernel_dfx: a collection window is already open on this context");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    // The first window keeps the artifact where a single-window capture expects
+    // it. Later ones take a directory of their own, because the artifact name
+    // is fixed and the directory is what separates two of them.
+    std::string prefix = request.output_prefix;
+    if (kernel_dfx_windows_ > 0) {
+        prefix += "/window_" + std::to_string(kernel_dfx_windows_);
+        std::error_code ec;
+        std::filesystem::create_directories(prefix, ec);
+        if (ec) {
+            LOG_ERROR("begin_kernel_dfx: could not create %s: %s", prefix.c_str(), ec.message().c_str());
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+    }
+    // Drops the closed window's records, counters and device level, so what the
+    // next artifact carries is this window's alone.
+    kernel_dfx_prefix_ = prefix;
+    if (chip_swimlane_collector_.is_initialized()) {
+        chip_swimlane_collector_.begin_run(prefix, static_cast<ChipSwimlaneLevel>(request.enable_chip_swimlane));
+        auto thread_factory = [this](std::function<void()> fn) {
+            return create_thread(std::move(fn));
+        };
+        chip_swimlane_collector_.start(thread_factory);
+    }
+    begin_dep_gen_window();
+    kernel_dfx_open_ = true;
+    return 0;
+}
+
+int DeviceRunnerBase::end_kernel_dfx(void *caller_stream) {
+    if (!kernel_dfx_open_) {
+        LOG_ERROR("end_kernel_dfx: no collection window is open on this context");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    if (caller_stream == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    // Every launch this window covers ends on the caller's stream -- the chained
+    // topology records its serial tail there -- so draining that stream is what
+    // makes the device-side producers quiet, which is quiesce()'s precondition.
+    const int sync_rc = aclrtSynchronizeStreamWithTimeout(caller_stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (sync_rc != 0) {
+        LOG_ERROR("end_kernel_dfx: caller stream sync failed: %d", sync_rc);
+        return sync_rc;
+    }
+    kernel_dfx_open_ = false;
+    end_dep_gen_window(kernel_dfx_prefix_);
+    export_kernel_chip_swimlane();
+    ++kernel_dfx_windows_;
+    return 0;
+}
+
+void DeviceRunnerBase::export_kernel_chip_swimlane() {
+    if (!chip_swimlane_collector_.is_initialized()) return;
+    // Each core's type reaches the host in that core's handshake report, which
+    // AICore writes when it runs, so a kernel context has real values only once
+    // its launches are behind it.
+    const Handshake *workers = kernel_runtime_.get_workers();
+    if (workers != nullptr && worker_count_ > 0) {
+        std::vector<CoreType> core_types(static_cast<size_t>(worker_count_));
+        for (int i = 0; i < worker_count_; ++i) {
+            core_types[i] = workers[i].core_type;
+        }
+        chip_swimlane_collector_.set_core_types(core_types.data(), worker_count_);
+    }
+    // quiesce() requires that no producer can still publish. The caller
+    // established that before closing the context; nothing here can check it.
+    chip_swimlane_collector_.quiesce();
+    chip_swimlane_collector_.read_phase_header_metadata();
+    chip_swimlane_collector_.reconcile_counters();
+    (void)chip_swimlane_collector_.export_swimlane_json();
 }
 
 PersistentArgsOps DeviceRunnerBase::persistent_args_ops() {
@@ -732,7 +850,15 @@ PersistentArgsOps DeviceRunnerBase::persistent_args_ops() {
         return capture_memcpy_h2d(dst, dst_bytes, src, src_bytes);
     };
     ops.fill_arch_fields = [](void *context, KernelArgs *args, uint64_t device_id) -> int {
-        return static_cast<DeviceRunnerBase *>(context)->fill_persistent_arch_fields(args, device_id);
+        auto *self = static_cast<DeviceRunnerBase *>(context);
+        const int rc = self->fill_persistent_arch_fields(args, device_id);
+        if (rc != 0) return rc;
+        // The context stood its swimlane region up before this image was built,
+        // and this image is uploaded once, so these addresses reach the device
+        // only if they are in it now.
+        self->publish_chip_swimlane_args(*args);
+        self->publish_dep_gen_args(*args);
+        return 0;
     };
     return ops;
 }

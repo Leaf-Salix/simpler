@@ -322,6 +322,10 @@ private:
      */
     int arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared);
 
+    int init_chip_swimlane_region(
+        int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level
+    ) override;
+
     int init_chip_swimlane(
         int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
         ChipSwimlaneLevel chip_swimlane_level
@@ -366,6 +370,11 @@ private:
      * @return 0 on success, error code on failure
      */
     int init_dep_gen(int num_threads, int device_id, KernelArgsHelper &kernel_args);
+
+    int init_dep_gen_region(int num_threads, int device_id) override;
+    void publish_dep_gen_args(KernelArgs &args) const override;
+    void begin_dep_gen_window() override;
+    void end_dep_gen_window(const std::string &output_prefix) override;
     int init_scope_stats(int num_threads, int device_id, KernelArgsHelper &kernel_args);
 
     /**

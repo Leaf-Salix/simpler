@@ -1030,6 +1030,7 @@ int32_t AicpuExecutor::prepare_kernel_round(const simpler::tmr::KernelExecutionR
             resident, aicpu_thread_num_, sched_thread_num_, get_platform_regs(), inputs.functions, inputs.sm
         ) != 0)
         return -1;
+    chip_swimlane_aicpu_record_run_boundary();
     return kernel_cores_.collect_reports(
         reinterpret_cast<const uint64_t *>(get_platform_regs()), platform_get_physical_cores_count()
     );

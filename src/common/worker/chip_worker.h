@@ -158,6 +158,17 @@ public:
     /// still be in flight and may still fail asynchronously.
     void kernel_launch(int32_t callable_id, const ChipStorageTaskArgs *args, void *caller_stream);
 
+    /// Open a chip-swimlane window over the launches that follow. What one
+    /// artifact describes is the bracket, not the worker, so an operator
+    /// measured on its own is bracketed on its own. Requires a kernel context
+    /// initialized with CallConfig.enable_chip_swimlane nonzero.
+    void kernel_begin_dfx();
+
+    /// Close the open window and write its artifact. Drains `caller_stream`
+    /// first -- the window's launches end there -- so the caller owes no
+    /// synchronization of its own.
+    void kernel_end_dfx(void *caller_stream);
+
     /// A nonzero context generation, unique and increasing within this host
     /// process. Generation zero is what the C ABI rejects as invalid, so the
     /// counter starts at one.
@@ -385,6 +396,8 @@ private:
     using KernelInitFn = decltype(&simpler_kernel_mode_init);
     using KernelPrepareCallableFn = decltype(&simpler_kernel_mode_prepare_callable);
     using KernelLaunchFn = decltype(&simpler_kernel_mode_launch);
+    using KernelBeginDfxFn = decltype(&simpler_kernel_mode_begin_dfx);
+    using KernelEndDfxFn = decltype(&simpler_kernel_mode_end_dfx);
 
     struct CommSession {
         void *handle = nullptr;
@@ -462,6 +475,8 @@ private:
     KernelInitFn kernel_init_fn_ = nullptr;
     KernelPrepareCallableFn kernel_prepare_callable_fn_ = nullptr;
     KernelLaunchFn kernel_launch_fn_ = nullptr;
+    KernelBeginDfxFn kernel_begin_dfx_fn_ = nullptr;
+    KernelEndDfxFn kernel_end_dfx_fn_ = nullptr;
     void *device_ctx_ = nullptr;
     std::vector<CommSession> comm_sessions_;
     std::unordered_map<uint64_t, size_t> comm_session_index_;

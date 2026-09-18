@@ -701,17 +701,7 @@ void DeviceRunner::emit_device_dep_gen_graph(const DfxRunConfig &dfx) {
     // The host-orch shape emits at the end of bind instead, where its capture
     // window closes — see `emit_host_dep_gen_graph` in c_api_shared.cpp.
     if (!dfx.dep_gen_enabled || dep_gen_host_graph_active()) return;
-    dep_gen_collector_.quiesce();
-    // reconcile_counters() is the completeness gate: an un-flushed device buffer
-    // or a dropped record makes it false and no deps.json is written, so a run
-    // that failed mid-flight yields a whole graph or none — never a partial one.
-    if (!dep_gen_collector_.reconcile_counters()) return;
-    const std::string deps = make_deps_json_path(dfx.output_prefix);
-    const auto &records = dep_gen_collector_.records();
-    int rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
-    if (rc != 0) {
-        LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", rc);
-    }
+    end_dep_gen_window(dfx.output_prefix);
 }
 
 // `print_handshake_results`, `prepare_orch_so`, `register_callable`,
@@ -1235,9 +1225,8 @@ int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &pr
     return 0;
 }
 
-int DeviceRunner::init_chip_swimlane(
-    int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
-    ChipSwimlaneLevel chip_swimlane_level
+int DeviceRunner::init_chip_swimlane_region(
+    int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level
 ) {
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
@@ -1260,17 +1249,18 @@ int DeviceRunner::init_chip_swimlane(
         return mem_alloc_.free(dev_ptr);
     };
 
-    int rc = chip_swimlane_collector_.initialize(
+    return chip_swimlane_collector_.initialize(
         num_aicore, aicpu_thread_num, device_id, chip_swimlane_level, alloc_cb, register_cb, free_cb
     );
-    if (rc != 0) {
-        return rc;
-    }
+}
 
-    kernel_args.args.chip_swimlane_data_base =
-        reinterpret_cast<uint64_t>(chip_swimlane_collector_.get_chip_swimlane_setup_device_ptr());
-    kernel_args.args.chip_swimlane_aicore_rotation_table =
-        reinterpret_cast<uint64_t>(chip_swimlane_collector_.get_aicore_ring_addr_table_device_ptr());
+int DeviceRunner::init_chip_swimlane(
+    int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
+    ChipSwimlaneLevel chip_swimlane_level
+) {
+    int rc = init_chip_swimlane_region(num_aicore, aicpu_thread_num, device_id, chip_swimlane_level);
+    if (rc != 0) return rc;
+    publish_chip_swimlane_args(kernel_args.args);
     return 0;
 }
 
@@ -1340,12 +1330,11 @@ int DeviceRunner::init_pmu(int num_cores, int num_threads, int device_id, Kernel
     return 0;
 }
 
-int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
+int DeviceRunner::init_dep_gen_region(int num_threads, int device_id) {
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
     };
-
-    auto register_cb = [](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
+    auto register_cb = [](void *dev_ptr, size_t size, int device_id_arg, void **host_ptr) -> int {
         if (load_hal_if_needed() != 0) {
             LOG_ERROR("Failed to load ascend_hal for dep_gen: %s", dlerror());
             return PTO_RUNTIME_ERR_INTERNAL;
@@ -1355,19 +1344,51 @@ int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper 
             LOG_ERROR("halHostRegister symbol not found: %s", dlerror());
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
+        return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id_arg, host_ptr);
     };
-
     auto free_cb = [this](void *dev_ptr) -> int {
         return mem_alloc_.free(dev_ptr);
     };
+    return dep_gen_collector_.init(num_threads, alloc_cb, register_cb, free_cb, device_id);
+}
 
-    int rc = dep_gen_collector_.init(num_threads, alloc_cb, register_cb, free_cb, device_id);
+void DeviceRunner::publish_dep_gen_args(KernelArgs &args) const {
+    if (!dep_gen_collector_.is_initialized()) return;
+    args.dep_gen_data_base = reinterpret_cast<uint64_t>(dep_gen_collector_.get_dep_gen_shm_device_ptr());
+    SIMPLER_SET_DFX_FLAG(args.enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
+}
+
+void DeviceRunner::begin_dep_gen_window() {
+    if (!dep_gen_collector_.is_initialized()) return;
+    dep_gen_collector_.begin_run();
+    auto thread_factory = [this](std::function<void()> fn) {
+        return create_thread(std::move(fn));
+    };
+    dep_gen_collector_.start(thread_factory);
+}
+
+void DeviceRunner::end_dep_gen_window(const std::string &output_prefix) {
+    if (!dep_gen_collector_.is_initialized()) return;
+    dep_gen_collector_.quiesce();
+    // The completeness gate: an unflushed device buffer or a dropped record
+    // makes this false, and the window then yields no graph rather than a
+    // partial one a reader would take for the whole topology.
+    if (!dep_gen_collector_.reconcile_counters()) return;
+    const std::string deps = make_deps_json_path(output_prefix);
+    const auto &records = dep_gen_collector_.records();
+    const int rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
+    if (rc != 0) {
+        LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", rc);
+    }
+}
+
+int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
+    const int rc = init_dep_gen_region(num_threads, device_id);
     if (rc != 0) {
         return rc;
     }
 
-    kernel_args.args.dep_gen_data_base = reinterpret_cast<uint64_t>(dep_gen_collector_.get_dep_gen_shm_device_ptr());
+    publish_dep_gen_args(kernel_args.args);
     return 0;
 }
 
@@ -1404,6 +1425,16 @@ int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHel
 }
 
 void DeviceRunner::finalize_collectors(bool abandon_device_resources) {
+    // Backstop for a context closed with a window still open: the artifact is
+    // written here rather than lost, because this is the last point before the
+    // release below at which the region still exists. A device whose resources
+    // are being abandoned produced records no reconcile can vouch for, so that
+    // path writes nothing.
+    if (!abandon_device_resources && execution_mode_latch_.is_kernel() && kernel_dfx_open_) {
+        kernel_dfx_open_ = false;
+        LOG_WARN("kernel context closed with a chip-swimlane window still open; writing its artifact now");
+        export_kernel_chip_swimlane();
+    }
     clear_collector_shape();
     auto healthy_unregister_cb = [](void *dev_ptr, int device_id) -> int {
         HalHostUnregisterFn fn = get_halHostUnregister();

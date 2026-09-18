@@ -61,6 +61,7 @@ _CASE_RUNTIMES = {
     "prepare_twice": (_TMR,),
     "launch_refusals": (_TMR,),
     "second_worker_same_device": (_TMR,),
+    "dfx_bracket": (_TMR,),
     "hbg_init_refused": (_HBG,),
 }
 
@@ -427,6 +428,58 @@ def _case_second_worker_same_device(platform: str, device: int) -> None:
             _assert_closed_cleanly(successor, successor_pin)
 
 
+def _case_dfx_bracket(platform: str, device: int) -> None:
+    """A begin/end bracket around one launch writes the swimlane and the graph that names it."""
+    import json
+    import tempfile
+
+    chip = _build_eager_callable(platform)
+    with tempfile.TemporaryDirectory() as output_prefix:
+        config = _kernel_config()
+        config.enable_chip_swimlane = 4
+        # dep_gen rides the same bracket: its graph is what resolves the
+        # swimlane's func_ids and draws its arrows.
+        config.enable_dep_gen = True
+        config.output_prefix = output_prefix
+        with _caller_device(device) as caller, _kernel_worker(caller, platform) as worker:
+            worker.init(config=config)
+            assert worker._lifecycle.name == "READY"
+            callable_id = worker.kernel_prepare_callable(chip)
+
+            # Closing a window that was never opened is a caller error, not a silent no-op.
+            with pytest.raises(RuntimeError):
+                worker.kernel_end_dfx(caller.stream)
+
+            worker.kernel_begin_dfx()
+            # A second open would silently merge two brackets into one artifact.
+            with pytest.raises(RuntimeError):
+                worker.kernel_begin_dfx()
+
+            _launch_and_check(caller, worker, callable_id, scalar=1.25, seed=0)
+            # end drains the caller's stream itself, so the case owes no synchronize here.
+            worker.kernel_end_dfx(caller.stream)
+            worker.close()
+
+        records = Path(output_prefix) / "chip_swimlane_records.json"
+        assert records.is_file(), f"no swimlane artifact under {output_prefix}"
+        captured = json.loads(records.read_text())
+        metadata = captured["metadata"]
+        assert captured["chip_swimlane_level"] == 4
+        # One launch inside the bracket, so one round boundary and no round past the ring.
+        assert len(metadata["run_boundaries"]) == 1
+        assert metadata["dropped_run_boundaries"] == 0
+        # The kernel submits a single AIV task, which both producers must have recorded.
+        assert len(captured["aicore_tasks"]) == 1
+        assert len(captured["scheduler_tasks"]["records"]) == 1
+
+        # The bracket closes dep_gen too, so the graph that names those tasks
+        # lands beside them rather than leaving the trace anonymous.
+        deps = Path(output_prefix) / "deps.json"
+        assert deps.is_file(), f"no deps.json under {output_prefix}"
+        graph = json.loads(deps.read_text())
+        assert len(graph["tasks"]) == 1
+
+
 def _case_hbg_init_refused(platform: str, device: int) -> None:
     """host_build_graph has no kernel mode: init fails to FAILED, close() is clean, the caller's stream survives."""
     with _caller_device(device) as caller, _kernel_worker(caller, platform, runtime=_HBG) as worker:
@@ -446,6 +499,7 @@ _CASES = {
     "prepare_twice": _case_prepare_twice,
     "launch_refusals": _case_launch_refusals,
     "second_worker_same_device": _case_second_worker_same_device,
+    "dfx_bracket": _case_dfx_bracket,
     "hbg_init_refused": _case_hbg_init_refused,
 }
 

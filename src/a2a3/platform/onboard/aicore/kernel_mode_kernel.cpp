@@ -18,14 +18,32 @@
 using simpler::tmr::TmrKernelAicoreArgs;
 using simpler::tmr::TmrKernelContextDescriptor;
 
-// Kernel mode currently rejects DFX at prepare. This separate ELF therefore
-// supplies stateless disabled getters; it must not import program kernel.cpp
-// (including its ID-0 entry) merely to obtain profiling storage. Weak linkage
-// coalesces the AIC/AIV definitions, as in the program profiling interface.
-__attribute__((weak)) __aicore__ void set_aicore_profiling_flag(uint32_t) {}
-__attribute__((weak)) __aicore__ uint32_t get_aicore_profiling_flag() { return 0; }
-__attribute__((weak)) __aicore__ void set_chip_swimlane_aicore_head_slot(__gm__ uint64_t *) {}
-__attribute__((weak)) __aicore__ __gm__ ChipSwimlaneActiveHead *get_chip_swimlane_aicore_head() { return nullptr; }
+// This separate ELF carries its own profiling storage rather than importing
+// program kernel.cpp, whose ID-0 entry would collide with the kernel-mode one.
+// The storage and accessors mirror that file's; only the entry differs. Weak
+// linkage coalesces the AIC/AIV definitions, as in the program interface.
+[[block_local]] static uint32_t s_aicore_profiling_flag;
+// Slot pointer (NOT the dereferenced head address) — see
+// aicore_profiling_state.h for the lazy-deref contract.
+[[block_local]] static __gm__ uint64_t *s_chip_swimlane_aicore_head_slot;
+[[block_local]] static __gm__ ChipSwimlaneActiveHead *s_chip_swimlane_aicore_head;
+
+__attribute__((weak)) __aicore__ void set_aicore_profiling_flag(uint32_t flag) { s_aicore_profiling_flag = flag; }
+__attribute__((weak)) __aicore__ uint32_t get_aicore_profiling_flag() { return s_aicore_profiling_flag; }
+
+__attribute__((weak)) __aicore__ void set_chip_swimlane_aicore_head_slot(__gm__ uint64_t *slot_ptr) {
+    s_chip_swimlane_aicore_head_slot = slot_ptr;
+    s_chip_swimlane_aicore_head = nullptr;  // force lazy resolution on next get
+}
+__attribute__((weak)) __aicore__ __gm__ ChipSwimlaneActiveHead *get_chip_swimlane_aicore_head() {
+    // Lazy first-call resolve. AICPU publishes the slot before opening any
+    // register window, so it is valid after AICore observes Phase 2 exit.
+    if (s_chip_swimlane_aicore_head == nullptr && s_chip_swimlane_aicore_head_slot != nullptr) {
+        s_chip_swimlane_aicore_head =
+            reinterpret_cast<__gm__ ChipSwimlaneActiveHead *>(*s_chip_swimlane_aicore_head_slot);
+    }
+    return s_chip_swimlane_aicore_head;
+}
 
 extern __aicore__ void aicore_execute_kernel(
     __gm__ Runtime *runtime, __gm__ const TmrKernelContextDescriptor *context, int block_idx, CoreType core_type
@@ -59,7 +77,21 @@ extern "C" __global__ __aicore__ void aicore_kernel_mode_0_mix_aic(__gm__ TmrKer
         return;
 
     set_ffts_base_addr(k_args->ffts_base_addr);
-    set_aicore_profiling_flag(0);
-    set_chip_swimlane_aicore_head_slot(nullptr);
+    // The chip swimlane is the one DFX channel a kernel context carries; the
+    // others have no kernel-mode path, so their bits never reach the executor.
+    const uint32_t swimlane_flag =
+        k_args->enable_profiling_flag & static_cast<uint32_t>(SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
+    set_aicore_profiling_flag(swimlane_flag);
+    // The slot CONTENTS are written by AICPU's `chip_swimlane_aicpu_init`,
+    // which races with this entry but publishes the slot before opening any
+    // register window; the executor dereferences only after Phase 2 exit.
+    // Publishing nullptr on a disabled launch keeps a prior launch's freed
+    // pointer out of `get_chip_swimlane_aicore_head()`.
+    if (swimlane_flag != 0 && k_args->chip_swimlane_aicore_rotation_table != 0) {
+        __gm__ uint64_t *head_table = reinterpret_cast<__gm__ uint64_t *>(k_args->chip_swimlane_aicore_rotation_table);
+        set_chip_swimlane_aicore_head_slot(&head_table[worker]);
+    } else {
+        set_chip_swimlane_aicore_head_slot(nullptr);
+    }
     aicore_execute_kernel(k_args->runtime_args, context, worker, type);
 }

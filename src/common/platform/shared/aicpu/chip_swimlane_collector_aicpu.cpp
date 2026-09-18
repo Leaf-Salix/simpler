@@ -274,6 +274,22 @@ try_pop_records_buffer(int core_id, ChipSwimlaneAicpuTaskPool *state, uint32_t n
     );
 }
 
+void chip_swimlane_aicpu_record_run_boundary() {
+    if (!is_chip_swimlane_enabled() || s_chip_swimlane_header == nullptr) return;
+    ChipSwimlaneDataHeader *header = s_chip_swimlane_header;
+    const uint32_t slot = header->num_run_boundaries;
+    if (slot >= static_cast<uint32_t>(PLATFORM_PROF_RUN_BOUNDARY_SLOTS)) {
+        header->dropped_run_boundaries++;
+        return;
+    }
+    header->run_boundaries[slot].start_cycles = get_sys_cnt_aicpu();
+    header->run_boundaries[slot].epoch = slot;
+    header->run_boundaries[slot].reserved_ = 0;
+    // The count publishes the slot, so it lands after the payload it describes.
+    wmb();
+    header->num_run_boundaries = slot + 1;
+}
+
 void chip_swimlane_aicpu_init(int worker_count) {
     // Reset cross-launch state up front. AICPU statics persist across launches
     // on the same loaded .so; without this reset, an enabled→disabled launch

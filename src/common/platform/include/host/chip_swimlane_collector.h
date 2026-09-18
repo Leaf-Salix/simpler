@@ -619,6 +619,10 @@ private:
 
     // Core-to-thread mapping (core_id → scheduler thread index, -1 = unassigned)
     std::vector<int8_t> core_to_thread_;
+    // One entry per launch round, in the order the device wrote them. Empty for
+    // a program-mode run, whose capture window already is a single run.
+    std::vector<ChipSwimlaneRunBoundary> run_boundaries_;
+    uint32_t dropped_run_boundaries_{0};
 
     RecordsByCollector<ChipSwimlaneAicpuTaskRecord> perf_records_by_collector_;
     RecordsByCollector<ChipSwimlaneAicoreTaskRecord> aicore_records_by_collector_;

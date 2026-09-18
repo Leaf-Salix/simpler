@@ -76,6 +76,18 @@ ChipSwimlaneLevel get_chip_swimlane_level();
 void chip_swimlane_aicpu_init(int worker_count);
 
 /**
+ * Open a launch round's segment by stamping its start on the shared header.
+ *
+ * Called once per round by the round leader, after chip_swimlane_aicpu_init has
+ * published the header for this round. A window whose boundary array is full
+ * counts the round and leaves the records to merge into the previous segment.
+ *
+ * Program mode never calls this: its window is a single run, which needs no
+ * boundary to be told apart from another.
+ */
+void chip_swimlane_aicpu_record_run_boundary();
+
+/**
  * Pre-dispatch hook for AICore buffer rotation and per-pool stats.
  *
  * Called from the dispatch path (scheduler_dispatch in tensormap_and_ringbuffer,

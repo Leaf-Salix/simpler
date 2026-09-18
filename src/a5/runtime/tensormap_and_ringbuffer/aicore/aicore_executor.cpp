@@ -75,7 +75,14 @@ __aicore__ static void execute_dispatch_loop(__gm__ Handshake *my_hank, __gm__ T
     // PMU MMIO base are all stable for the entire run (host-resolved at
     // AICore kernel entry from KernelArgs::regs[physical_core_id]), so
     // they are safe to cache here.
-    uint32_t profiling_flag = KernelMode ? 0 : get_aicore_profiling_flag();
+    // The chip swimlane is the one DFX channel a kernel context carries, and
+    // KERNEL_ENTRY publishes its bit from the same KernelArgs a program-mode
+    // launch does. The others have no kernel-mode path, so their bits are
+    // masked off rather than trusted from the image.
+    uint32_t profiling_flag = get_aicore_profiling_flag();
+    if (KernelMode) {
+        profiling_flag &= static_cast<uint32_t>(SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
+    }
     bool chip_swimlane_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
     bool dump_args_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
     bool pmu_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_PMU);

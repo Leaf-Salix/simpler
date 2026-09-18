@@ -960,6 +960,22 @@ void ChipSwimlaneCollector::read_phase_header_metadata() {
         LOG_INFO("  Core-to-thread mapping: %d cores", num_phase_cores);
     }
 
+    // Launch-round boundaries (header-resident; not buffered). Present only for
+    // a kernel context, whose one window spans every launch it made.
+    const uint32_t boundary_count = header->num_run_boundaries;
+    if (boundary_count > 0 && boundary_count <= static_cast<uint32_t>(PLATFORM_PROF_RUN_BOUNDARY_SLOTS)) {
+        run_boundaries_.assign(header->run_boundaries, header->run_boundaries + boundary_count);
+    }
+    dropped_run_boundaries_ = header->dropped_run_boundaries;
+    if (dropped_run_boundaries_ > 0) {
+        LOG_WARN(
+            "  Launch-round boundaries: %u recorded, %u rounds past capacity merged into the last segment",
+            boundary_count, dropped_run_boundaries_
+        );
+    } else if (boundary_count > 0) {
+        LOG_INFO("  Launch-round boundaries: %u", boundary_count);
+    }
+
     LOG_INFO("Phase metadata collection complete: has_phase_data=%s", has_phase_data_ ? "yes" : "no");
 }
 
@@ -1207,6 +1223,14 @@ int ChipSwimlaneCollector::export_swimlane_json() {
             outfile << static_cast<int>(core_to_thread_[i]);
         }
         outfile << "]";
+    }
+    if (!run_boundaries_.empty()) {
+        outfile << ",\n    \"run_boundaries\": [";
+        for (size_t i = 0; i < run_boundaries_.size(); i++) {
+            if (i > 0) outfile << ", ";
+            outfile << "[" << run_boundaries_[i].epoch << ", " << run_boundaries_[i].start_cycles << "]";
+        }
+        outfile << "],\n    \"dropped_run_boundaries\": " << dropped_run_boundaries_;
     }
     outfile << "\n  },\n";
 
@@ -1472,6 +1496,8 @@ int ChipSwimlaneCollector::finalize(
     orch_phase_records_by_collector_.clear();
     collector_counters_.clear();
     core_to_thread_.clear();
+    run_boundaries_.clear();
+    dropped_run_boundaries_ = 0;
     has_phase_data_ = false;
     total_perf_collected_ = 0;
     total_sched_phase_collected_ = 0;

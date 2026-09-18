@@ -58,10 +58,20 @@ int register_kernel_context(Executor &executor, const void *arg) noexcept {
     const auto *args_address = reinterpret_cast<const void *>(descriptor.resident_kernel_args);
     cache_invalidate_range(args_address, sizeof(args));
     std::memcpy(&args, args_address, sizeof(args));
+    // The chip swimlane is the one diagnostic a kernel context carries, so its
+    // two addresses and its flag bit are the only DFX state admitted here. The
+    // bit and the addresses must agree: a base without the bit is a region no
+    // producer writes, and the bit without a base is a producer writing to
+    // nothing.
+    const bool swimlane_requested = SIMPLER_GET_DFX_FLAG(args.enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
+    const bool swimlane_addressed = args.chip_swimlane_data_base != 0 && args.chip_swimlane_aicore_rotation_table != 0;
+    const bool dep_gen_requested = SIMPLER_GET_DFX_FLAG(args.enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
+    constexpr uint32_t kAdmittedDfxFlags =
+        static_cast<uint32_t>(SIMPLER_DFX_FLAG_CHIP_SWIMLANE) | static_cast<uint32_t>(SIMPLER_DFX_FLAG_DEP_GEN);
     if (args.runtime_args != resident || args.regs == 0 || args.regs % alignof(uint64_t) != 0 ||
-        args.enable_profiling_flag != 0 || args.dump_data_base != 0 || args.chip_swimlane_data_base != 0 ||
-        args.pmu_data_base != 0 || args.dep_gen_data_base != 0 || args.scope_stats_data_base != 0 ||
-        args.chip_swimlane_aicore_rotation_table != 0 || args.device_wall_data_base != 0)
+        (args.enable_profiling_flag & ~kAdmittedDfxFlags) != 0 || swimlane_requested != swimlane_addressed ||
+        dep_gen_requested != (args.dep_gen_data_base != 0) || args.dump_data_base != 0 || args.pmu_data_base != 0 ||
+        args.scope_stats_data_base != 0 || args.device_wall_data_base != 0)
         return -1;
     PreparedKernelContext candidate;
     if (!make_prepared_kernel_context(registration, descriptor, *resident, &candidate)) return -1;
@@ -81,11 +91,12 @@ int register_kernel_context(Executor &executor, const void *arg) noexcept {
     set_platform_regs(args.regs);
     set_dump_args_enabled(false);
     set_platform_dump_base(0);
-    set_chip_swimlane_enabled(false);
-    set_platform_chip_swimlane_base(0);
+    set_chip_swimlane_enabled(swimlane_requested);
+    set_platform_chip_swimlane_base(args.chip_swimlane_data_base);
+    set_platform_chip_swimlane_aicore_rotation_table(args.chip_swimlane_aicore_rotation_table);
     set_pmu_enabled(false);
-    set_dep_gen_enabled(false);
-    set_platform_dep_gen_base(0);
+    set_dep_gen_enabled(dep_gen_requested);
+    set_platform_dep_gen_base(args.dep_gen_data_base);
     set_scope_stats_enabled(false);
     set_platform_scope_stats_base(0);
     set_platform_phase_base(0);

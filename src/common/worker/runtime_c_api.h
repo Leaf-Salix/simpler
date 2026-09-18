@@ -542,7 +542,7 @@ size_t get_host_dlopen_count(DeviceContextHandle ctx);
 size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
 
 /* ===========================================================================
- * Kernel-mode lifecycle (four entries + finalize_device)
+ * Kernel-mode lifecycle (four entries + two swimlane brackets + finalize_device)
  *
  * A context has one of two execution modes for its whole lifetime, decided by
  * which init entry runs first. simpler_init latches program mode — the
@@ -629,6 +629,12 @@ int simpler_kernel_mode_supported(DeviceContextHandle ctx);
  * is context-static; launches never mutate it. `context_generation` is a
  * nonzero host-process-unique identity minted by the caller for sequential
  * contexts; generation zero is invalid.
+ *
+ * Of `config`'s five diagnostics only `enable_chip_swimlane` (0-4) is accepted,
+ * and it requires `output_prefix`; the other four and `capture_clock_anchors`
+ * return PTO_RUNTIME_ERR_UNSUPPORTED. This call commits the swimlane's device
+ * region, which the launch KernelArgs must name and which is therefore not
+ * deferrable; collection itself is bracketed by the begin/end pair below.
  * Repeated init is rejected without changing the existing context. An init
  * failure after device binding retains kernel mode and requires explicit
  * finalize_device() before destruction; initialization cannot be retried on
@@ -703,6 +709,42 @@ int simpler_kernel_mode_prepare_callable(
  * device execution may still be in flight and may still fail asynchronously.
  */
 int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream);
+
+/**
+ * Open a chip-swimlane collection window over the launches that follow.
+ *
+ * Bracketing is the caller's: the launches enqueued between this call and its
+ * matching end are what one artifact describes, so an operator measured on its
+ * own is bracketed on its own. Each launch round stamps a boundary the artifact
+ * carries, which is what separates several launches inside one window.
+ *
+ * Synchronous and called outside ACLGraph capture, like preparation: it
+ * synchronizes no caller stream and no device, and enqueues nothing. Requires a
+ * context initialized with `enable_chip_swimlane` nonzero; a second open before
+ * a close is PTO_RUNTIME_ERR_INVALID_STATE rather than a silently merged
+ * window.
+ */
+int simpler_kernel_mode_begin_dfx(DeviceContextHandle ctx);
+
+/**
+ * Close the open window and write its artifact.
+ *
+ * `caller_stream` is the stream the window's launches were enqueued on, and
+ * this call drains it: the chained launch topology records each invocation's
+ * serial tail there, so that wait is what establishes the quiescence the drain
+ * needs. It is therefore a synchronizing entry and belongs outside capture,
+ * beside preparation rather than beside launch.
+ *
+ * The first window's artifact lands at `output_prefix`, each
+ * later one in `output_prefix/window_<n>`, because the artifact name is fixed
+ * and the directory is what separates two captures.
+ *
+ * A close with no window open is PTO_RUNTIME_ERR_INVALID_STATE. A context
+ * closed with a window still open writes that window's artifact at
+ * finalize_device() instead; one whose device resources are abandoned after a
+ * failure writes none, because no reconcile can vouch for those records.
+ */
+int simpler_kernel_mode_end_dfx(DeviceContextHandle ctx, void *caller_stream);
 
 #ifdef __cplusplus
 }

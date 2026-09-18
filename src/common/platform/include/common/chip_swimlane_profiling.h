@@ -413,6 +413,23 @@ struct ReadyQueueEntry {
  * - Queue empty: head == tail
  * - Queue full: (tail + 1) % capacity == head
  */
+/**
+ * One launch round's opening timestamp.
+ *
+ * A kernel context's records carry nothing that separates one launch from the
+ * next, because the window spans every launch the context makes. A round owns
+ * the records from its own `start_cycles` up to the next boundary's, and the
+ * last round owns everything after its own. Program mode writes none: its
+ * window is one run already.
+ */
+struct ChipSwimlaneRunBoundary {
+    uint64_t start_cycles;  // get_sys_cnt on the round leader, before any dispatch
+    uint32_t epoch;         // 0-based round index within this window
+    uint32_t reserved_;
+};
+
+static_assert(sizeof(ChipSwimlaneRunBoundary) == 16, "ChipSwimlaneRunBoundary must be 16B");
+
 struct ChipSwimlaneDataHeader {
     // Per-thread ready queues (FIFO Circular Buffers)
     // Each AICPU thread has its own queue to avoid lock contention
@@ -438,6 +455,15 @@ struct ChipSwimlaneDataHeader {
     uint32_t num_orch_phase_threads;            // Number of orch-phase pools the AICPU initialized
     uint32_t num_phase_cores;                   // Number of valid entries in core_to_thread (0 = unset)
     int8_t core_to_thread[PLATFORM_MAX_CORES];  // core_id → scheduler thread index (-1 = unassigned)
+
+    // Launch-round boundaries (AICPU writes on the round leader, Host reads at
+    // drain). A round that finds the array full bumps `dropped_run_boundaries`
+    // and runs uninstrumented: overwriting a boundary would silently move
+    // records from one segment into another, which is worse than merging the
+    // tail rounds into the last segment and saying so.
+    uint32_t num_run_boundaries;
+    uint32_t dropped_run_boundaries;
+    ChipSwimlaneRunBoundary run_boundaries[PLATFORM_PROF_RUN_BOUNDARY_SLOTS];
 } __attribute__((aligned(64)));
 
 // ABI lock for the merged header. The phase metadata fields and the
@@ -458,6 +484,11 @@ static_assert(
     offsetof(ChipSwimlaneDataHeader, core_to_thread) ==
         offsetof(ChipSwimlaneDataHeader, num_phase_cores) + sizeof(uint32_t),
     "ChipSwimlaneDataHeader: core_to_thread[] must follow num_phase_cores"
+);
+static_assert(
+    offsetof(ChipSwimlaneDataHeader, num_run_boundaries) ==
+        offsetof(ChipSwimlaneDataHeader, core_to_thread) + sizeof(int8_t) * PLATFORM_MAX_CORES,
+    "ChipSwimlaneDataHeader: num_run_boundaries must follow core_to_thread[]"
 );
 static_assert(sizeof(ChipSwimlaneDataHeader) % 64 == 0, "ChipSwimlaneDataHeader must be 64-byte aligned");
 

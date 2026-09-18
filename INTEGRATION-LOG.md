@@ -1047,3 +1047,57 @@ test.
 **Affects.** #2190 (its new head adopted); D19 and D21 (superseded on the wait;
 D21's fault injection and gate placement retained); #2250 (its registration
 entry no longer loads, and dispatch may establish residency from the packet).
+
+## D23 - Kernel mode collects DFX, bracketed by the caller
+
+**Problem.** A kernel context could collect nothing. `KernelStaticConfig::validate`
+refused every `CallConfig` diagnostic outright, and three more layers enforced the
+same invariant independently: `register_kernel_context` rejected a `KernelArgs`
+whose DFX fields were non-zero and then published them as disabled, the TMR AICore
+executor hardcoded `enable_profiling_flag = 0` under `KernelMode`, and the
+kernel-mode AICore entry `kernel_mode_kernel.cpp` supplied weak no-op profiling
+accessors and published a null swimlane head slot. Each gate alone is sufficient,
+so opening one only moved the symptom: `-1001` became `507018` became a trace with
+no AICore records.
+
+**Choice.** Kernel mode collects the chip swimlane and dep_gen; the other three
+diagnostics and the clock anchors stay refused.
+
+1. **All four gates open, narrowly.** Each admits exactly
+   `SIMPLER_DFX_FLAG_CHIP_SWIMLANE | SIMPLER_DFX_FLAG_DEP_GEN` and nothing else,
+   and `register_kernel_context` additionally requires the flag bits and the
+   addresses to agree: a base without its bit is a region no producer writes, and
+   a bit without its base is a producer writing to nothing.
+2. **The region is committed at init, the window is bracketed by the caller.**
+   The launch `KernelArgs` names the swimlane region and is uploaded once, so the
+   region cannot be deferred past init. Collection is not the region: two new
+   entries, `simpler_kernel_mode_begin_dfx` and
+   `simpler_kernel_mode_end_dfx(ctx, caller_stream)`, open and close the window.
+   What one artifact describes is the bracket, so an operator measured on its own
+   is bracketed on its own. `end` drains `caller_stream` itself -- the chained
+   topology records each invocation's serial tail there -- so the caller owes no
+   synchronize, and both entries sit beside preparation, outside capture.
+3. **A device-side boundary per launch round.** A window can cover several
+   launches, and the records carry nothing that separates them. The round leader
+   stamps `{epoch, start_cycles}` into a header ring in `prepare_kernel_round`;
+   the host cuts its records by those timestamps. Host-side counting cannot do
+   this: under ACLGraph it would count one recording, not N replays.
+4. **The two diagnostics stay independently configurable.** Pairing them is what
+   makes a readable trace, but a swimlane alone still carries every timestamp and
+   a graph alone is the topology capture later timing runs join against.
+
+**Reason.** The refusal was a placeholder for work nobody had done, not a property
+kernel mode needs: nothing about a bare-enqueue launch makes per-task timing
+unsound. What it does make unsound is a *per-run* window, because a launch has no
+point at which one could be opened or drained -- hence the caller's bracket.
+
+**Boundary.** a2a3 only. a5 keeps the base no-op region hook: its collector mgmt
+thread calls `aclrtMemcpy` every poll, which `ACL_MODEL_RI_CAPTURE_MODE_GLOBAL`
+forbids from a non-capturing thread, and whether that invalidates the caller's
+capture is unverified. 7/7 `test_worker_kernel_mode_hw` cases pass on a2a3,
+including the new `dfx_bracket`. The converter does not yet cut by the round
+boundaries it now receives.
+
+**Affects.** #2296 (its init/prepare split is what made the region placement
+obvious), D21 and D22 (the bracket is a third synchronizing entry beside
+registration, and obeys the same outside-capture rule).

@@ -144,6 +144,16 @@ constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
 constexpr int PLATFORM_PROF_SLOT_COUNT = 4;
 
 /**
+ * Launch-round boundary slots in the chip-swimlane shared header.
+ *
+ * A kernel context collects every launch into one window, and one boundary per
+ * launch is what cuts the records back into per-launch segments. A window that
+ * outruns this count keeps collecting; the rounds past it are merged into the
+ * previous segment and counted in `dropped_run_boundaries`.
+ */
+constexpr int PLATFORM_PROF_RUN_BOUNDARY_SLOTS = 1024;
+
+/**
  * ChipSwimlaneAicpuTaskBuffer pre-allocation count per AICore.
  * Up to PLATFORM_PROF_SLOT_COUNT go into the free_queue at init, the rest into the recycled pool.
  */

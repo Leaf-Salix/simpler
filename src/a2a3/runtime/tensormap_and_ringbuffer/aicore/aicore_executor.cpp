@@ -70,7 +70,14 @@ __aicore__ static void execute_dispatch_loop(__gm__ Handshake *my_hank, __gm__ T
     dcci(my_hank, SINGLE_CACHE_LINE);
     __gm__ DispatchPayload *payload = reinterpret_cast<__gm__ DispatchPayload *>(my_hank->task);
 
-    uint32_t enable_profiling_flag = KernelMode ? 0 : get_aicore_profiling_flag();
+    // The chip swimlane is the one DFX channel a kernel context carries, and
+    // KERNEL_ENTRY publishes its bit from the same KernelArgs a program-mode
+    // launch does. The others have no kernel-mode path, so their bits are
+    // masked off rather than trusted from the image.
+    uint32_t enable_profiling_flag = get_aicore_profiling_flag();
+    if (KernelMode) {
+        enable_profiling_flag &= static_cast<uint32_t>(SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
+    }
     bool chip_swimlane_enabled = SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
     bool dump_args_enabled = SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
     bool pmu_enabled = SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
