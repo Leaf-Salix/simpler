@@ -774,6 +774,19 @@ target_include_directories(test_profiler_device_engine PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
 )
 
+foreach(arch a2a3 a5)
+    add_common_utils_test(test_${arch}_chip_swimlane_rounds common/test_chip_swimlane_rounds.cpp)
+    target_sources(test_${arch}_chip_swimlane_rounds PRIVATE
+        ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
+    )
+    target_include_directories(test_${arch}_chip_swimlane_rounds PRIVATE
+        ${CMAKE_SOURCE_DIR}/../../../src/${arch}/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    )
+endforeach()
+
 add_common_utils_test(test_worker_chip_orch_comm common/test_worker_chip_orch_comm.cpp)
 add_common_utils_test(test_file_marker_handshake common/test_file_marker_handshake.cpp)
 

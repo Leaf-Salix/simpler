@@ -702,10 +702,8 @@ int DeviceRunnerBase::init_kernel_context(
     // image that names them is uploaded.
     rc = prepare_kernel_runtime_impl(kernel_runtime_, api, &kernel_static_config_.request());
     if (rc != 0) return rc;
-    // A kernel context collects over its whole life: one window opens here and
-    // closes at teardown, because a launch is a bare enqueue with no point at
-    // which a per-run window could be opened or drained. The region precedes
-    // the KernelArgs image below, which is uploaded once and names it.
+    // Collector storage lives with the context. Its device enable bits are
+    // armed only inside an explicit begin/end DFX window.
     const auto swimlane_level = static_cast<ChipSwimlaneLevel>(kernel_static_config_.request().enable_chip_swimlane);
     if (swimlane_level != ChipSwimlaneLevel::DISABLED) {
         rc = init_chip_swimlane_region(
@@ -733,6 +731,8 @@ int DeviceRunnerBase::init_kernel_context(
     if (rc != 0) return rc;
     rc = prepare_kernel_coordination();
     if (rc != 0) return rc;
+    rc = persistent_args_.set_dfx_enabled(false);
+    if (rc != 0) return rc;
     claim_rollback.dismiss();
     return 0;
 }
@@ -757,7 +757,8 @@ void DeviceRunnerBase::publish_chip_swimlane_args(KernelArgs &args) const {
     SIMPLER_SET_DFX_FLAG(args.enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
 }
 
-int DeviceRunnerBase::begin_kernel_dfx() {
+int DeviceRunnerBase::begin_kernel_dfx(void *caller_stream) {
+    if (caller_stream == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     const CallConfig &request = kernel_static_config_.request();
     if (!request.diagnostics_any()) {
         LOG_ERROR("begin_kernel_dfx: this context was initialized with no diagnostic enabled");
@@ -766,6 +767,14 @@ int DeviceRunnerBase::begin_kernel_dfx() {
     if (kernel_dfx_open_) {
         LOG_ERROR("begin_kernel_dfx: a collection window is already open on this context");
         return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    // Prior work ends on the caller's stream, including each launch's serial
+    // tail. It must finish before the window flag and counters change.
+    const int sync_rc = aclrtSynchronizeStreamWithTimeout(caller_stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (sync_rc != 0) {
+        LOG_ERROR("begin_kernel_dfx: caller stream sync failed: %d", sync_rc);
+        kernel_exec_state_.poison(sync_rc);
+        return sync_rc;
     }
     // The first window keeps the artifact where a single-window capture expects
     // it. Later ones take a directory of their own, because the artifact name
@@ -792,7 +801,9 @@ int DeviceRunnerBase::begin_kernel_dfx() {
     }
     begin_dep_gen_window();
     kernel_dfx_open_ = true;
-    return 0;
+    const int rc = persistent_args_.set_dfx_enabled(true);
+    if (rc != 0) kernel_exec_state_.poison(rc);
+    return rc;
 }
 
 int DeviceRunnerBase::end_kernel_dfx(void *caller_stream) {
@@ -808,6 +819,11 @@ int DeviceRunnerBase::end_kernel_dfx(void *caller_stream) {
     if (sync_rc != 0) {
         LOG_ERROR("end_kernel_dfx: caller stream sync failed: %d", sync_rc);
         return sync_rc;
+    }
+    const int rc = persistent_args_.set_dfx_enabled(false);
+    if (rc != 0) {
+        kernel_exec_state_.poison(rc);
+        return rc;
     }
     kernel_dfx_open_ = false;
     end_dep_gen_window(kernel_dfx_prefix_);

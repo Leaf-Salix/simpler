@@ -1438,14 +1438,15 @@ static int kernel_dfx_bracket(DeviceContextHandle ctx, void *caller_stream, bool
     try {
         const int rc = runner->adopt_borrowed_device(runner->device_id());
         if (rc != 0) return rc;
-        return open ? runner->begin_kernel_dfx() : runner->end_kernel_dfx(caller_stream);
+        return open ? runner->begin_kernel_dfx(caller_stream) : runner->end_kernel_dfx(caller_stream);
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 }
 
-int simpler_kernel_mode_begin_dfx(DeviceContextHandle ctx) {
-    return kernel_dfx_bracket(ctx, NULL, true, "simpler_kernel_mode_begin_dfx");
+int simpler_kernel_mode_begin_dfx(DeviceContextHandle ctx, void *caller_stream) {
+    if (caller_stream == NULL) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    return kernel_dfx_bracket(ctx, caller_stream, true, "simpler_kernel_mode_begin_dfx");
 }
 
 int simpler_kernel_mode_end_dfx(DeviceContextHandle ctx, void *caller_stream) {

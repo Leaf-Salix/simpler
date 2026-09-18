@@ -858,6 +858,15 @@ void ChipSwimlaneCollector::publish_run_config() {
     if (shm_host_ == nullptr) return;
 
     ChipSwimlaneDataHeader *header = get_chip_swimlane_header(shm_host_);
+    header->num_run_boundaries = 0;
+    header->dropped_run_boundaries = 0;
+    static_assert(
+        offsetof(ChipSwimlaneDataHeader, dropped_run_boundaries) ==
+        offsetof(ChipSwimlaneDataHeader, num_run_boundaries) + sizeof(uint32_t)
+    );
+    wmb();
+    (void)manager_.write_range_to_device(&header->num_run_boundaries, 2 * sizeof(uint32_t));
+
     header->chip_swimlane_level = static_cast<uint32_t>(chip_swimlane_level_);
     wmb();
     // One field, not the region: a bulk write-back would race the AICPU's own
@@ -914,6 +923,22 @@ void ChipSwimlaneCollector::read_phase_header_metadata() {
 
     ChipSwimlaneDataHeader *header = get_chip_swimlane_header(shm_host_);
 
+    // Launch-round boundaries (header-resident; not buffered). Present only for
+    // a kernel context, whose window contains only its bracketed launches.
+    const uint32_t boundary_count = header->num_run_boundaries;
+    if (boundary_count > 0 && boundary_count <= static_cast<uint32_t>(PLATFORM_PROF_RUN_BOUNDARY_SLOTS)) {
+        run_boundaries_.assign(header->run_boundaries, header->run_boundaries + boundary_count);
+    }
+    dropped_run_boundaries_ = header->dropped_run_boundaries;
+    if (dropped_run_boundaries_ > 0) {
+        LOG_WARN(
+            "  Launch-round boundaries: %u recorded, %u rounds past capacity merged into the last segment",
+            boundary_count, dropped_run_boundaries_
+        );
+    } else if (boundary_count > 0) {
+        LOG_INFO("  Launch-round boundaries: %u", boundary_count);
+    }
+
     int num_sched = static_cast<int>(header->num_sched_phase_threads);
     int num_orch = static_cast<int>(header->num_orch_phase_threads);
     if (num_sched == 0 && num_orch == 0) {
@@ -959,23 +984,6 @@ void ChipSwimlaneCollector::read_phase_header_metadata() {
         core_to_thread_.assign(header->core_to_thread, header->core_to_thread + num_phase_cores);
         LOG_INFO("  Core-to-thread mapping: %d cores", num_phase_cores);
     }
-
-    // Launch-round boundaries (header-resident; not buffered). Present only for
-    // a kernel context, whose one window spans every launch it made.
-    const uint32_t boundary_count = header->num_run_boundaries;
-    if (boundary_count > 0 && boundary_count <= static_cast<uint32_t>(PLATFORM_PROF_RUN_BOUNDARY_SLOTS)) {
-        run_boundaries_.assign(header->run_boundaries, header->run_boundaries + boundary_count);
-    }
-    dropped_run_boundaries_ = header->dropped_run_boundaries;
-    if (dropped_run_boundaries_ > 0) {
-        LOG_WARN(
-            "  Launch-round boundaries: %u recorded, %u rounds past capacity merged into the last segment",
-            boundary_count, dropped_run_boundaries_
-        );
-    } else if (boundary_count > 0) {
-        LOG_INFO("  Launch-round boundaries: %u", boundary_count);
-    }
-
     LOG_INFO("Phase metadata collection complete: has_phase_data=%s", has_phase_data_ ? "yes" : "no");
 }
 

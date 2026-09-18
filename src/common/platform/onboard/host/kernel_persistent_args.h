@@ -54,8 +54,8 @@ struct PersistentArgsOps {
     /**
      * Populate the arch-specific device fields of `args`: `regs` on both
      * arches (a2a3 additionally selecting AicoreRegKind::Ctrl) and
-     * `ffts_base_addr` on a2a3. DFX fields stay zero. Anything this
-     * allocates must come from `alloc` above, so release through `free_`
+     * `ffts_base_addr` on a2a3, plus configured DFX addresses and capability bits.
+     * Anything this allocates must come from `alloc` above, so release through `free_`
      * matches and a host-only test's counts balance. Every successful
      * allocation is recorded in args even on failure; the owner rolls it back.
      */
@@ -71,8 +71,9 @@ struct PersistentArgsOps {
  * blocks an AICore launch reads: the device `Runtime` image, the per-core
  * register table, and the device copy of `KernelArgs` itself.
  *
- * Every operation this object performs happens in `prepare_once` and
- * `finalize_once`. The destructor performs none, so an owner that is dropped
+ * Window boundaries update only the device DFX flag via `set_dfx_enabled`;
+ * resource operations belong to `prepare_once` and `finalize_once`.
+ * The destructor performs none, so an owner that is dropped
  * without `finalize_once` leaks its device blocks rather than freeing memory
  * an in-flight device program may still read.
  *
@@ -97,6 +98,9 @@ public:
      * called. Preparation is rejected while such resources remain.
      */
     int prepare_once(const Runtime &host_runtime, const PersistentArgsOps &ops, uint64_t device_id);
+
+    /** Publish the window's DFX enablement while all context launches are quiescent. */
+    int set_dfx_enabled(bool enabled);
 
     bool is_prepared() const { return prepared_; }
     bool has_live_resources() const {

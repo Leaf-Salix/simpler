@@ -29,6 +29,17 @@
 
 namespace simpler::tmr {
 
+// The round leader refreshes the window bits before publishing initialization
+// to the other AICPU threads. Host updates occur only between completed rounds.
+inline void refresh_kernel_dfx(const PreparedKernelContext &context) noexcept {
+    if (get_platform_chip_swimlane_base() == 0 && get_platform_dep_gen_base() == 0) return;
+    const auto *args = reinterpret_cast<const KernelArgs *>(context.descriptor.resident_kernel_args);
+    cache_invalidate_range(&args->enable_profiling_flag, sizeof(args->enable_profiling_flag));
+    const uint32_t flags = args->enable_profiling_flag;
+    set_chip_swimlane_enabled(SIMPLER_GET_DFX_FLAG(flags, SIMPLER_DFX_FLAG_CHIP_SWIMLANE));
+    set_dep_gen_enabled(SIMPLER_GET_DFX_FLAG(flags, SIMPLER_DFX_FLAG_DEP_GEN));
+}
+
 // Prepare/close-only consumer hooks. One native thread, externally serialized
 // with the entire DSO's program/kernel lifetime. The resource provider owns
 // every referenced Device allocation, publishes it before registration, and
@@ -58,11 +69,9 @@ int register_kernel_context(Executor &executor, const void *arg) noexcept {
     const auto *args_address = reinterpret_cast<const void *>(descriptor.resident_kernel_args);
     cache_invalidate_range(args_address, sizeof(args));
     std::memcpy(&args, args_address, sizeof(args));
-    // The chip swimlane is the one diagnostic a kernel context carries, so its
-    // two addresses and its flag bit are the only DFX state admitted here. The
-    // bit and the addresses must agree: a base without the bit is a region no
-    // producer writes, and the bit without a base is a producer writing to
-    // nothing.
+    // Registration validates configured swimlane and dependency capabilities.
+    // Each diagnostic's bit must agree with its addresses here; host window
+    // boundaries can disable its bit after registration without releasing storage.
     const bool swimlane_requested = SIMPLER_GET_DFX_FLAG(args.enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
     const bool swimlane_addressed = args.chip_swimlane_data_base != 0 && args.chip_swimlane_aicore_rotation_table != 0;
     const bool dep_gen_requested = SIMPLER_GET_DFX_FLAG(args.enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
@@ -87,7 +96,7 @@ int register_kernel_context(Executor &executor, const void *arg) noexcept {
                    0 :
                    -1;
     }
-    // Per-DSO platform fields publish once, never concurrently from launch.
+    // Per-DSO addresses publish once. The round leader refreshes enable bits.
     set_platform_regs(args.regs);
     set_dump_args_enabled(false);
     set_platform_dump_base(0);

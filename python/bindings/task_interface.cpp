@@ -3614,12 +3614,17 @@ NB_MODULE(_task_interface, m) {
             "execution may still be in flight and may still fail asynchronously."
         )
         .def(
-            "kernel_begin_dfx", &ChipWorker::kernel_begin_dfx, nb::call_guard<nb::gil_scoped_release>(),
+            "kernel_begin_dfx",
+            [](ChipWorker &self, uint64_t caller_stream) {
+                self.kernel_begin_dfx(reinterpret_cast<void *>(caller_stream));
+            },
+            nb::arg("caller_stream"), nb::call_guard<nb::gil_scoped_release>(),
             "Open a chip-swimlane collection window over the launches that "
             "follow. One artifact describes the bracket, not the worker, so an "
             "operator measured on its own is bracketed on its own. Requires a "
             "kernel context initialized with CallConfig.enable_chip_swimlane "
-            "nonzero; opening a second window before closing the first raises."
+            "nonzero; opening a second window before closing the first raises. "
+            "Drains caller_stream before enabling capture; must be called outside ACLGraph capture."
         )
         .def(
             "kernel_end_dfx",

@@ -42,21 +42,11 @@ static ChipSwimlaneAicpuTaskPool *s_aicpu_task_pools[PLATFORM_MAX_CORES] = {};
 
 // Per-core ChipSwimlaneAicoreTaskPool cache (lives in the same shared region;
 // host writes initial pool + the rotation channel that AICore polls).
-//
-// All AICore-side bookkeeping (rotation channel, free queue,
-// total_record_count, current_buf_seq) is owned by this shared struct — see
-// chip_swimlane_profiling.h. We deliberately do not keep AICPU-process-local
-// mirror counters because the struct's volatile fields are the single
-// source of truth across init/complete/rotate/flush. The high-water-mark
-// formula `total_record_count - current_buf_seq * BUFFER_SIZE` correctly
-// handles the failed-rotation case (free_queue empty or ready_queue full)
-// since current_buf_seq only bumps on a successful rotation.
 static ChipSwimlaneAicoreTaskPool *s_aicore_task_pools[PLATFORM_MAX_CORES] = {};
 
-// Per-core AICPU-side dispatch count. Incremented on every
-// `chip_swimlane_aicpu_on_aicore_dispatch` call (= once per AICore dispatch).
-// When the pre-bump value is a non-zero multiple of PLATFORM_AICORE_BUFFER_SIZE,
-// AICPU rotates the AICore buffer before the upcoming write_reg(DATA_MAIN_BASE).
+// Dispatches into the current AICore buffer, reset on each launch and successful
+// rotation. Launch-end flush publishes every non-empty buffer; only empty
+// buffers survive into the next launch. The window total lives in the pool head.
 // Single-writer per cell (the scheduler thread that owns the core).
 static uint32_t s_aicore_dispatched_count[PLATFORM_MAX_CORES] = {};
 
@@ -116,7 +106,13 @@ extern "C" void set_platform_chip_swimlane_base(uint64_t chip_swimlane_data_base
     g_platform_chip_swimlane_base = chip_swimlane_data_base;
 }
 extern "C" uint64_t get_platform_chip_swimlane_base() { return g_platform_chip_swimlane_base; }
-extern "C" void set_chip_swimlane_enabled(bool enable) { g_enable_chip_swimlane = enable; }
+extern "C" void set_chip_swimlane_enabled(bool enable) {
+    g_enable_chip_swimlane = enable;
+    if (!enable) {
+        g_chip_swimlane_level = ChipSwimlaneLevel::DISABLED;
+        s_phase_initialized = false;
+    }
+}
 extern "C" bool is_chip_swimlane_enabled() { return g_enable_chip_swimlane; }
 extern "C" void set_platform_chip_swimlane_aicore_rotation_table(uint64_t table_addr) {
     g_platform_chip_swimlane_aicore_rotation_table = table_addr;
@@ -343,7 +339,7 @@ void chip_swimlane_aicpu_init(int worker_count) {
     // keeps the host side decoupled from the AICore shared-memory layout.
     uint64_t *head_table = reinterpret_cast<uint64_t *>(g_platform_chip_swimlane_aicore_rotation_table);
 
-    // Pop first buffer from free_queue for each core
+    // Empty active buffers remain device-owned across launches.
     for (int i = 0; i < worker_count; i++) {
         ChipSwimlaneAicpuTaskPool *state = get_perf_buffer_state(chip_swimlane_base, i);
         ChipSwimlaneAicoreTaskPool *ac_state = get_aicore_buffer_state(chip_swimlane_base, i);
@@ -360,12 +356,14 @@ void chip_swimlane_aicpu_init(int worker_count) {
         uint32_t head = state->free_queue.head;
         uint32_t tail = state->free_queue.tail;
 
-        if (head != tail) {
+        if (state->head.current_buf_ptr != 0) {
+            s_current_aicpu_task_buffers[i] =
+                reinterpret_cast<ChipSwimlaneAicpuTaskBuffer *>(state->head.current_buf_ptr);
+        } else if (head != tail) {
             uint64_t buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
             rmb();
             state->free_queue.head = head + 1;
             state->head.current_buf_ptr = buf_ptr;
-            state->head.current_buf_seq = 0;
             wmb();
 
             ChipSwimlaneAicpuTaskBuffer *buf = reinterpret_cast<ChipSwimlaneAicpuTaskBuffer *>(buf_ptr);
@@ -379,32 +377,27 @@ void chip_swimlane_aicpu_init(int worker_count) {
             s_current_aicpu_task_buffers[i] = nullptr;
         }
 
-        // Prime the AICore head channel with the initial buffer. Seq starts
-        // at 0; AICore's local `cached_buf_seq` defaults to UINT32_MAX so the
-        // first record_task call observes a mismatch and loads the buffer.
+        // AICore resets its local slot cursor at launch entry. A retained
+        // buffer is empty, and its first reservation starts at slot zero.
         rmb();
+        if (ac_state->head.current_buf_ptr != 0) continue;
         uint32_t ac_head = ac_state->free_queue.head;
         uint32_t ac_tail = ac_state->free_queue.tail;
         if (ac_head != ac_tail) {
             uint64_t ac_buf_ptr = ac_state->free_queue.buffer_ptrs[ac_head % PLATFORM_PROF_SLOT_COUNT];
             rmb();
             ac_state->free_queue.head = ac_head + 1;
-            // Same publish pattern as aicore_rotate: ptr first, then a fence,
-            // then seq. AICore lazy-resolves the head on its first task, so
-            // strict ordering here matters only if AICore is ever changed to
-            // start polling before the first dispatch — keeping the patterns
-            // aligned future-proofs that.
-            ac_state->head.current_buf_ptr = ac_buf_ptr;
-            wmb();
-            ac_state->head.current_buf_seq = 0;
-            wmb();
             ChipSwimlaneAicoreTaskBuffer *ac_buf = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(ac_buf_ptr);
             ac_buf->count = 0;
-            LOG_DEBUG("Core %d: primed AICore head with buf=0x%lx, seq=0", i, ac_buf_ptr);
+            wmb();
+            ac_state->head.current_buf_ptr = ac_buf_ptr;
+            wmb();
+            LOG_DEBUG(
+                "Core %d: primed AICore head with buf=0x%lx, seq=%u", i, ac_buf_ptr, ac_state->head.current_buf_seq
+            );
         } else {
             LOG_ERROR("Core %d: AICore free_queue is empty during init!", i);
             ac_state->head.current_buf_ptr = 0;
-            ac_state->head.current_buf_seq = 0;
             wmb();
         }
     }
@@ -546,6 +539,7 @@ static void aicore_rotate(int core_id, int thread_idx, uint32_t new_buf_first_re
     wmb();
     ac_state->head.current_buf_seq = seq + 1;
     wmb();
+    s_aicore_dispatched_count[core_id] = 0;
 }
 
 // Pre-dispatch hook. Called from the dispatch path (scheduler_dispatch in
@@ -579,13 +573,12 @@ void chip_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx, uint32_
         return;
     }
     uint32_t prev = s_aicore_dispatched_count[core_id];
-    // Rotate exactly on the first dispatch of each non-initial BUFFER_SIZE
-    // batch (prev = BUFFER_SIZE, 2*BUFFER_SIZE, ...). PLATFORM_AICORE_BUFFER_SIZE
-    // is asserted power-of-two so the mod lowers to a bitwise AND.
+    // A full buffer rotates before the next dispatch. Failed rotations retry
+    // once per BUFFER_SIZE attempts while the AICore slot guard drops overflow.
     if (prev > 0 && (prev & (PLATFORM_AICORE_BUFFER_SIZE - 1)) == 0) {
         aicore_rotate(core_id, thread_idx, reg_task_id);
     }
-    s_aicore_dispatched_count[core_id] = prev + 1;
+    s_aicore_dispatched_count[core_id] += 1;
     ac_state->head.total_record_count += 1;
 }
 
@@ -714,19 +707,13 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
                     s_current_aicpu_task_buffers[core_id] = nullptr;
                     wmb();
                 }
+                state->head.current_buf_seq = seq + 1;
+                wmb();
             }
         }
 
-        // Also flush the current AICore buffer to the ready queue so the host
-        // sees this session's final batch of AICore timestamps.
-        //
-        // High-water mark uses the rotation accounting (total_record_count -
-        // current_buf_seq * BUFFER_SIZE). total_record_count is bumped per
-        // dispatch in chip_swimlane_aicpu_on_aicore_dispatch and is therefore
-        // accurate at all levels — including level=1 where complete_task is
-        // bypassed. The formula clamps to BUFFER_SIZE if an earlier rotation
-        // failed (no free buffer), so we never stamp a partial count when
-        // the buffer is actually full.
+        // The current-buffer dispatch count is independent of the window total
+        // and includes TASK_TIMING, where complete_task is bypassed.
         ChipSwimlaneAicoreTaskPool *ac_state = s_aicore_task_pools[core_id];
         if (ac_state == nullptr) continue;
 
@@ -740,26 +727,11 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
         uint64_t ac_buf_ptr = ac_state->head.current_buf_ptr;
         if (ac_buf_ptr == 0) continue;
 
-        // At SCHEDULE_TIMING+, `total_record_count` is bumped on every complete
-        // and gives an accurate live count for the current buffer. At
-        // TASK_TIMING (level=1) complete_task is skipped, so that counter
-        // stays 0 and the formula bails even when AICore has filled records.
-        // Fall back to the buffer's full capacity in that case; the host-side
-        // copy_aicore_buffer skips trailing slots whose start_time is still 0,
-        // so over-stating count costs only a scan pass — never spurious records.
-        uint32_t ac_mark;
-        if (g_chip_swimlane_level >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
-            uint32_t live = ac_state->head.total_record_count -
-                            ac_state->head.current_buf_seq * static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
-            if (live == 0) {
-                continue;
-            }
-            ac_mark = (live > static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE)) ?
-                          static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE) :
-                          live;
-        } else {
-            ac_mark = static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
-        }
+        uint32_t live = s_aicore_dispatched_count[core_id];
+        if (live == 0) continue;
+        uint32_t ac_mark = (live > static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE)) ?
+                               static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE) :
+                               live;
         ChipSwimlaneAicoreTaskBuffer *ac_buf = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(ac_buf_ptr);
         ac_buf->count = ac_mark;
         wmb();
@@ -780,6 +752,9 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
             ac_state->head.current_buf_ptr = 0;
             wmb();
         }
+        ac_state->head.current_buf_seq = ac_seq + 1;
+        s_aicore_dispatched_count[core_id] = 0;
+        wmb();
     }
 
     wmb();
@@ -787,16 +762,21 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
     LOG_INFO("Thread %d: Performance buffer flush complete, %d buffers flushed", thread_idx, flushed_count);
 }
 
-// Pop the first buffer from a pool's free_queue and cache it as the current
-// active buffer. Uses the same engine path as subsequent phase rotations.
+// Reuse a device-owned active buffer, or claim one from the free queue.
 template <typename Buffer>
 static Buffer *prime_phase_pool(
     ChipSwimlaneAicpuTaskPool *state, int thread_idx, ChipSwimlaneBufferKind kind, Buffer **current_buf_out,
     const char *kind_label
 ) {
+    rmb();
+    if (state->head.current_buf_ptr != 0) {
+        auto *buf = reinterpret_cast<Buffer *>(state->head.current_buf_ptr);
+        if (current_buf_out != nullptr) *current_buf_out = buf;
+        return buf;
+    }
     auto ctx = l2_buffer_context(thread_idx, 0, kind, current_buf_out);
     Buffer *buf = profiling_device::DeviceProfilerEngine<ChipSwimlaneDeviceModule<Buffer>>::try_pop_free(
-        ctx, state, /*next_seq=*/0
+        ctx, state, state->head.current_buf_seq
     );
     if (buf == nullptr) {
         LOG_ERROR("Thread %d: %s phase free_queue is empty during init!", thread_idx, kind_label);
@@ -1078,6 +1058,7 @@ static void flush_phase_pool(
         *count_ptr = 0;
     }
     state->head.current_buf_ptr = 0;
+    state->head.current_buf_seq = seq + 1;
     wmb();
 }
 

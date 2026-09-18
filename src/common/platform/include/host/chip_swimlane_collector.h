@@ -420,6 +420,8 @@ public:
         output_prefix_ = output_prefix;
         chip_swimlane_level_ = chip_swimlane_level;
         json_extensions_.fill({});
+        run_boundaries_.clear();
+        dropped_run_boundaries_ = 0;
         reset_collector_shards();
         publish_run_config();
     }

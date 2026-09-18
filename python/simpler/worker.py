@@ -7076,17 +7076,21 @@ class Worker:
         finally:
             self._kernel_gate.release()
 
-    def kernel_begin_dfx(self) -> None:
+    def kernel_begin_dfx(self, caller_stream: int) -> None:
         """Open a chip-swimlane collection window over the launches that follow.
 
         What one artifact describes is the bracket, not the Worker, so an operator measured on its
         own is bracketed on its own. Requires a kernel-mode Worker whose ``CallConfig`` carried a
         nonzero ``enable_chip_swimlane``; opening a second window before closing the first raises.
-        Enqueues nothing and touches no caller stream, so it belongs beside ``kernel_prepare_callable``
-        rather than beside a launch, and must not be called inside an ACLGraph capture. Takes the
-        same gate as prepare/launch/close: the caller serializes them.
+        Waits for all prior work on ``caller_stream`` before enabling capture. Prior work on
+        other streams must be joined onto this stream. Kernels outside the bracket execute without
+        recording diagnostics. This is a synchronizing call and must not be called inside an
+        ACLGraph capture. Takes the same gate as prepare/launch/close: the caller serializes them.
         """
         self._require_execution_mode("kernel_begin_dfx", "kernel")
+        stream = int(caller_stream)
+        if not stream:
+            raise ValueError("Worker.kernel_begin_dfx requires a non-null caller_stream")
         self._require_kernel_process("kernel_begin_dfx")
         if not self._kernel_gate.acquire(blocking=False):
             raise RuntimeError(
@@ -7099,7 +7103,7 @@ class Worker:
                 ) from self._startup_error
             chip = self._chip_worker
             assert chip is not None
-            chip.kernel_begin_dfx()
+            chip.kernel_begin_dfx(stream)
         finally:
             self._kernel_gate.release()
 

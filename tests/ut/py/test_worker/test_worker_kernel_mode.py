@@ -109,6 +109,7 @@ class _FakeKernelChip:
         self.kernel_init_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.prepared: list[tuple[int, Any]] = []
         self.launches: list[tuple[int, Any, int]] = []
+        self.dfx_calls: list[tuple[str, int]] = []
         self.finalize_threads: list[threading.Thread] = []
         # len(finalize_threads) observed by each launch as it returns.
         self.finalizes_at_launch_return: list[int] = []
@@ -142,6 +143,12 @@ class _FakeKernelChip:
             assert script.launch_release.wait(TEST_WALL_BUDGET_S)
         self.launches.append((callable_id, args, caller_stream))
         self.finalizes_at_launch_return.append(len(self.finalize_threads))
+
+    def kernel_begin_dfx(self, caller_stream: int) -> None:
+        self.dfx_calls.append(("begin", caller_stream))
+
+    def kernel_end_dfx(self, caller_stream: int) -> None:
+        self.dfx_calls.append(("end", caller_stream))
 
     def finalize(self) -> None:
         self.finalize_threads.append(threading.current_thread())
@@ -507,6 +514,29 @@ class TestPrepare:
         finally:
             worker.close()
         assert worker._kernel_callables == {}
+
+
+class TestDfxCallerStream:
+    def test_bracket_forwards_the_caller_stream(self, script):
+        worker, chip = _ready_kernel_worker(script)
+        try:
+            worker.kernel_begin_dfx(caller_stream=_STREAM)
+            worker.kernel_end_dfx(caller_stream=_STREAM)
+            assert chip.dfx_calls == [("begin", _STREAM), ("end", _STREAM)]
+        finally:
+            worker.close()
+
+    @pytest.mark.parametrize("method", ["kernel_begin_dfx", "kernel_end_dfx"])
+    def test_null_stream_is_refused_before_native_call(self, script, method):
+        worker, chip = _ready_kernel_worker(script)
+        try:
+            with pytest.raises(ValueError, match="non-null caller_stream"):
+                getattr(worker, method)(caller_stream=0)
+            assert chip.dfx_calls == []
+            assert worker._kernel_gate.acquire(blocking=False)
+            worker._kernel_gate.release()
+        finally:
+            worker.close()
 
 
 class TestLaunch:

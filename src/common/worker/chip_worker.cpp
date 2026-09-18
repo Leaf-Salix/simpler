@@ -656,14 +656,17 @@ int32_t ChipWorker::kernel_prepare_callable(const void *callable, size_t callabl
     return callable_id;
 }
 
-void ChipWorker::kernel_begin_dfx() {
+void ChipWorker::kernel_begin_dfx(void *caller_stream) {
     if (!initialized_) {
         throw ChipWorkerError(PTO_RUNTIME_ERR_INVALID_STATE, "ChipWorker not initialized; call kernel_init() first");
+    }
+    if (caller_stream == nullptr) {
+        throw ChipWorkerError(PTO_RUNTIME_ERR_INVALID_ARGUMENT, "kernel_begin_dfx: caller_stream must not be null");
     }
     if (kernel_begin_dfx_fn_ == nullptr) {
         throw UnsupportedRuntimeOperation("this host runtime does not support kernel mode");
     }
-    const int rc = kernel_begin_dfx_fn_(device_ctx_);
+    const int rc = kernel_begin_dfx_fn_(device_ctx_, caller_stream);
     if (rc != 0) {
         throw ChipWorkerError(rc, "simpler_kernel_mode_begin_dfx failed with code " + std::to_string(rc));
     }

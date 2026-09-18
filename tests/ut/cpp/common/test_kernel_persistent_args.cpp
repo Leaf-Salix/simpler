@@ -109,6 +109,7 @@ struct FakeArgsOps {
         void *block = alloc(context, kBlockAlign);
         if (block == nullptr) return kInjectedRc;
         args->regs = reinterpret_cast<uint64_t>(block);
+        args->enable_profiling_flag = ops->dfx_flags;
         if (ops->fail_after_arch_alloc) return kInjectedRc;
         return 0;
     }
@@ -130,6 +131,7 @@ struct FakeArgsOps {
     int fail_copy_on = 0;
     int fail_fill_on = 0;
     bool fail_after_arch_alloc = false;
+    uint32_t dfx_flags = 0;
     uint64_t last_device_id = 0;
     std::vector<Copy> copies;
     std::vector<void *> free_order;
@@ -637,6 +639,34 @@ TEST(PersistentKernelArgs, LeavesEveryDfxFieldZero) {
     EXPECT_EQ(uploaded->enable_profiling_flag, 0u);
 
     EXPECT_EQ(args.finalize_once(), 0);
+}
+
+TEST(PersistentKernelArgs, DfxWindowUpdatesOnlyTheDeviceFlagWithoutAllocating) {
+    FakeArgsOps ops;
+    ops.dfx_flags = SIMPLER_DFX_FLAG_CHIP_SWIMLANE | SIMPLER_DFX_FLAG_DEP_GEN;
+    Runtime runtime;
+    PersistentKernelArgs args;
+    EXPECT_EQ(args.set_dfx_enabled(true), PTO_RUNTIME_ERR_INVALID_STATE);
+    ASSERT_EQ(args.prepare_once(runtime, ops.table(), kDeviceId), 0);
+    const KernelArgs before = *args.device_k_args();
+    const int allocations = ops.alloc_calls;
+    for (bool enabled : {false, true, false, true}) {
+        ASSERT_EQ(args.set_dfx_enabled(enabled), 0);
+        EXPECT_EQ(args.device_k_args()->enable_profiling_flag, enabled ? ops.dfx_flags : 0u);
+        EXPECT_EQ(args.args().enable_profiling_flag, ops.dfx_flags);
+        KernelArgs restored = *args.device_k_args();
+        restored.enable_profiling_flag = before.enable_profiling_flag;
+        EXPECT_EQ(std::memcmp(&restored, &before, sizeof(before)), 0);
+        EXPECT_EQ(ops.copies.back().dst, &args.device_k_args()->enable_profiling_flag);
+        EXPECT_EQ(ops.copies.back().src_bytes, sizeof(uint32_t));
+        EXPECT_EQ(ops.copies.back().dst_bytes, sizeof(uint32_t));
+    }
+    EXPECT_EQ(ops.alloc_calls, allocations);
+    ops.fail_copy_on = ops.copy_calls + 1;
+    EXPECT_EQ(args.set_dfx_enabled(false), kInjectedRc);
+    EXPECT_EQ(args.args().enable_profiling_flag, ops.dfx_flags);
+    EXPECT_EQ(args.finalize_once(), 0);
+    EXPECT_EQ(args.set_dfx_enabled(false), PTO_RUNTIME_ERR_INVALID_STATE);
 }
 
 }  // namespace

@@ -828,11 +828,12 @@ public:
      * that wants its operator separated from its neighbours brackets just that
      * operator. Reopening is what makes a second artifact; the records and
      * counters of the window that closed do not carry into it.
+     * Drains prior work on caller_stream before enabling capture.
      *
      * Rejects a second open on a context that already has one, so an unbalanced
      * pair is a caller error rather than a silently merged window.
      */
-    int begin_kernel_dfx();
+    int begin_kernel_dfx(void *caller_stream);
 
     /**
      * Close the open window and write its artifact.

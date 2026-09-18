@@ -189,6 +189,7 @@ def kernel_symbol_runtime(tmp_path_factory):
     unused_symbols = """
         device_malloc_ctx device_free_ctx committed_device_memory_ctx device_memory_info_ctx
         copy_to_device_ctx copy_from_device_ctx simpler_register_callable simpler_run
+        simpler_kernel_mode_begin_dfx simpler_kernel_mode_end_dfx
         simpler_prepare_run simpler_launch_run simpler_poll_run simpler_wait_run simpler_finalize_run
         supports_concurrent_native_prepare_ctx get_arena_bank_gm_heap_base_ctx get_retained_temp_addr_ctx
         simpler_unregister_callable get_aicpu_dlopen_count get_host_dlopen_count get_run_stream_set_create_count

@@ -718,13 +718,15 @@ int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, con
  * own is bracketed on its own. Each launch round stamps a boundary the artifact
  * carries, which is what separates several launches inside one window.
  *
- * Synchronous and called outside ACLGraph capture, like preparation: it
- * synchronizes no caller stream and no device, and enqueues nothing. Requires a
+ * Synchronous and called outside ACLGraph capture. It drains caller_stream
+ * before enabling capture, so previously enqueued work remains outside the
+ * window. The caller must join any prior context work onto this stream. A null
+ * stream is PTO_RUNTIME_ERR_INVALID_ARGUMENT. Requires a
  * context initialized with `enable_chip_swimlane` nonzero; a second open before
  * a close is PTO_RUNTIME_ERR_INVALID_STATE rather than a silently merged
  * window.
  */
-int simpler_kernel_mode_begin_dfx(DeviceContextHandle ctx);
+int simpler_kernel_mode_begin_dfx(DeviceContextHandle ctx, void *caller_stream);
 
 /**
  * Close the open window and write its artifact.

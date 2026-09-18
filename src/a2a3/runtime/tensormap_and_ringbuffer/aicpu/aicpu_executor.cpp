@@ -980,6 +980,7 @@ void AicpuExecutor::deinit(Runtime *runtime, bool invalidate_host_image) {
 
 int32_t AicpuExecutor::prepare_kernel_round(const simpler::tmr::KernelExecutionRequest &request) {
     using namespace simpler::tmr;
+    refresh_kernel_dfx(kernel_context_);
     if (request.execution_threads > MAX_AICPU_THREADS ||
         validate_execution_binding(request.binding) != InvocationStatus::Ok ||
         request.binding.resident->dev.aicpu_thread_num != request.execution_threads ||

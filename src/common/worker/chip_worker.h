@@ -161,8 +161,9 @@ public:
     /// Open a chip-swimlane window over the launches that follow. What one
     /// artifact describes is the bracket, not the worker, so an operator
     /// measured on its own is bracketed on its own. Requires a kernel context
-    /// initialized with CallConfig.enable_chip_swimlane nonzero.
-    void kernel_begin_dfx();
+    /// initialized with CallConfig.enable_chip_swimlane nonzero. Drains
+    /// caller_stream before enabling capture; belongs outside ACLGraph capture.
+    void kernel_begin_dfx(void *caller_stream);
 
     /// Close the open window and write its artifact. Drains `caller_stream`
     /// first -- the window's launches end there -- so the caller owes no

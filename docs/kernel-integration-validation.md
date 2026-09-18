@@ -680,6 +680,57 @@ bracketed by `begin_dfx` / `end_dfx`.
 | Unbalanced brackets | close-without-open and double-open both refused |
 | `swimlane_converter` on the pair | labels resolve from `task(t0)` to `func_0_a(t0)`; `Func_ID` 0 rather than -1 |
 
+**Multi-launch follow-up (2026-09-18).** The hardware Worker suite passes 9/9
+cases, including 32 launches in one bracket at levels 1 and 4. Both capture
+32 AICore records; level 4 also captures 32 scheduler records and 32 boundaries,
+with no count-mismatch or empty-record warnings. Empty task and phase buffers
+remain device-owned across launches. AICore flush counts use the current
+buffer's dispatch count independently of the window total and buffer sequence.
+CPU regression tests cover both a2a3 and a5 pool reuse, partial flushes, full
+buffer rotation and recovery after a rejected rotation.
+
+**Window isolation follow-up (2026-09-18).** The device DFX flag is disabled
+after context registration, enabled at `begin_dfx`, and disabled at `end_dfx`.
+The AICPU round leader refreshes it before initializing each round; AICore
+already reads it at launch entry. `begin_dfx(caller_stream)` drains the
+caller stream before resetting counters and enabling capture, matching
+`end_dfx(caller_stream)`. Prior work on other streams must be joined onto the
+caller stream. These operations remain outside ACLGraph capture and
+add no synchronization to the launch path.
+
+The eager hardware regression at levels 1 and 4 enqueues an asynchronous
+warm-up, captures windows with 3, 0 and 2 launches, and runs 16 unbracketed
+launches after each window. AICore, scheduler and dependency task counts match
+each bracket exactly; the empty bracket produces no swimlane artifact and an
+empty dependency graph. Launch boundaries restart at zero in each window and
+are exported even without phase metadata. The Python fake runtime also exports
+the bracket symbols required by the kernel entry loader.
+
+Evidence is under `outputs/swimlane-window-fix/`: `after-2.log` covers window
+isolation, `cpp-tests-final.log` records 9 passing native test targets, and
+`python-tests-final.log` records 378 passing Python tests. The baseline run in
+`before.log` fails with an empty AICore record and stream timeout after an
+unbracketed asynchronous warm-up.
+
+`worker-regression-retry.log` records 11/11 passing kernel Worker hardware
+cases, including both 32-launch cases. The initial combined regression had
+one level-4 case stall on its first task (`S1:running-stalled`, core 26), then
+export an empty slot during timeout cleanup. Its isolated rerun and the full
+Worker rerun passed on the same device; the trigger remains unconfirmed.
+`hardware-regression.log` and `sim-regression.log` also record passing TMR
+vector/mixed and HBG scheduler-phase program captures. All changed-file
+pre-commit checks passed (`pre-commit.log`).
+
+**Caller-stream API follow-up (2026-09-18).** Begin requires the caller stream
+through the Python wrappers, native binding and C API. Null streams are
+rejected before opening the window. Evidence under
+`outputs/swimlane-caller-stream/` records 381 passing Python tests and passing
+pre-commit checks. The hardware suite passes 10/11 cases, including both
+window-isolation levels; the level-4 32-launch case repeats the first-task
+stall described above, then passes in isolation on the same device
+(`hardware-retry.log`). This API change does not resolve that intermittent
+stall.
+
 **How the four gates were found.** Each was opened in turn and the symptom moved
 rather than cleared, which is what identified the next one:
 
@@ -699,12 +750,9 @@ rather than cleared, which is what identified the next one:
   Whether such a call fails alone or invalidates the caller's capture is not
   stated in the CANN docs and was not measured. a2a3 is unaffected: its mgmt
   thread reads the `halHostRegister` SVM mapping and calls no ACL memory API.
-- **Multi-launch windows.** Only one launch per bracket was measured. A window
-  covering many back-to-back launches drains the per-core free queues faster than
-  the host refills them; the boundary ring and `dropped_record_count` report it,
-  but the behaviour was not characterized.
 - **Converter segmentation.** `run_boundaries` reaches the artifact; nothing reads
-  it yet, so a multi-launch window renders as one undivided trace.
+  it yet. Per-launch task identifiers repeat, so multi-launch conversion still
+  needs launch-aware join keys and dependency lookup.
 - **ACLGraph capture.** The bracket entries are documented as outside-capture and
   were exercised eagerly only.
 

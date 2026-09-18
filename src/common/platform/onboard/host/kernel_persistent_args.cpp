@@ -76,6 +76,13 @@ int PersistentKernelArgs::prepare_once(const Runtime &host_runtime, const Persis
     return 0;
 }
 
+int PersistentKernelArgs::set_dfx_enabled(bool enabled) {
+    if (!prepared_) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (args_.enable_profiling_flag == 0) return 0;
+    const uint32_t flags = enabled ? args_.enable_profiling_flag : 0;
+    return ops_.copy_h2d(ops_.context, &device_k_args_->enable_profiling_flag, sizeof(flags), &flags, sizeof(flags));
+}
+
 int PersistentKernelArgs::release_block(void *block, int &first_error) {
     const int rc = ops_.free_(ops_.context, block);
     if (rc != 0 && first_error == 0) first_error = rc;

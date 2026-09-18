@@ -1071,10 +1071,10 @@ diagnostics and the clock anchors stay refused.
 2. **The region is committed at init, the window is bracketed by the caller.**
    The launch `KernelArgs` names the swimlane region and is uploaded once, so the
    region cannot be deferred past init. Collection is not the region: two new
-   entries, `simpler_kernel_mode_begin_dfx` and
+   entries, `simpler_kernel_mode_begin_dfx(ctx, caller_stream)` and
    `simpler_kernel_mode_end_dfx(ctx, caller_stream)`, open and close the window.
    What one artifact describes is the bracket, so an operator measured on its own
-   is bracketed on its own. `end` drains `caller_stream` itself -- the chained
+   is bracketed on its own. Both entries drain `caller_stream` -- the chained
    topology records each invocation's serial tail there -- so the caller owes no
    synchronize, and both entries sit beside preparation, outside capture.
 3. **A device-side boundary per launch round.** A window can cover several

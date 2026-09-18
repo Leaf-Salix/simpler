@@ -39,6 +39,7 @@ import signal
 import struct
 import subprocess
 import sys
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -62,6 +63,10 @@ _CASE_RUNTIMES = {
     "launch_refusals": (_TMR,),
     "second_worker_same_device": (_TMR,),
     "dfx_bracket": (_TMR,),
+    "dfx_many_launches": (_TMR,),
+    "dfx_many_launches_task_timing": (_TMR,),
+    "dfx_window_scope": (_TMR,),
+    "dfx_window_scope_task_timing": (_TMR,),
     "hbg_init_refused": (_HBG,),
 }
 
@@ -428,15 +433,15 @@ def _case_second_worker_same_device(platform: str, device: int) -> None:
             _assert_closed_cleanly(successor, successor_pin)
 
 
-def _case_dfx_bracket(platform: str, device: int) -> None:
-    """A begin/end bracket around one launch writes the swimlane and the graph that names it."""
+def _case_dfx_bracket(platform: str, device: int, *, rounds: int = 1, level: int = 4) -> None:
+    """A begin/end bracket collects every launch without exhausting idle profiling pools."""
     import json
     import tempfile
 
     chip = _build_eager_callable(platform)
     with tempfile.TemporaryDirectory() as output_prefix:
         config = _kernel_config()
-        config.enable_chip_swimlane = 4
+        config.enable_chip_swimlane = level
         # dep_gen rides the same bracket: its graph is what resolves the
         # swimlane's func_ids and draws its arrows.
         config.enable_dep_gen = True
@@ -450,12 +455,13 @@ def _case_dfx_bracket(platform: str, device: int) -> None:
             with pytest.raises(RuntimeError):
                 worker.kernel_end_dfx(caller.stream)
 
-            worker.kernel_begin_dfx()
+            worker.kernel_begin_dfx(caller.stream)
             # A second open would silently merge two brackets into one artifact.
             with pytest.raises(RuntimeError):
-                worker.kernel_begin_dfx()
+                worker.kernel_begin_dfx(caller.stream)
 
-            _launch_and_check(caller, worker, callable_id, scalar=1.25, seed=0)
+            for round_index in range(rounds):
+                _launch_and_check(caller, worker, callable_id, scalar=1.25, seed=round_index)
             # end drains the caller's stream itself, so the case owes no synchronize here.
             worker.kernel_end_dfx(caller.stream)
             worker.close()
@@ -464,20 +470,71 @@ def _case_dfx_bracket(platform: str, device: int) -> None:
         assert records.is_file(), f"no swimlane artifact under {output_prefix}"
         captured = json.loads(records.read_text())
         metadata = captured["metadata"]
-        assert captured["chip_swimlane_level"] == 4
-        # One launch inside the bracket, so one round boundary and no round past the ring.
-        assert len(metadata["run_boundaries"]) == 1
+        assert captured["chip_swimlane_level"] == level
+        assert len(metadata["run_boundaries"]) == rounds
         assert metadata["dropped_run_boundaries"] == 0
-        # The kernel submits a single AIV task, which both producers must have recorded.
-        assert len(captured["aicore_tasks"]) == 1
-        assert len(captured["scheduler_tasks"]["records"]) == 1
+        assert len(captured["aicore_tasks"]) == rounds
+        if level >= 2:
+            assert len(captured["scheduler_tasks"]["records"]) == rounds
+        else:
+            assert "scheduler_tasks" not in captured
 
         # The bracket closes dep_gen too, so the graph that names those tasks
         # lands beside them rather than leaving the trace anonymous.
         deps = Path(output_prefix) / "deps.json"
         assert deps.is_file(), f"no deps.json under {output_prefix}"
         graph = json.loads(deps.read_text())
-        assert len(graph["tasks"]) == 1
+        assert len(graph["tasks"]) == rounds
+
+
+def _case_dfx_window_scope(platform: str, device: int, *, level: int = 4) -> None:
+    """Unbracketed launches execute normally and do not enter any capture window."""
+    import json
+    import tempfile
+
+    chip = _build_eager_callable(platform)
+    with tempfile.TemporaryDirectory() as output_prefix:
+        config = _kernel_config()
+        config.enable_chip_swimlane = level
+        config.enable_dep_gen = True
+        config.output_prefix = output_prefix
+        with _caller_device(device) as caller, _kernel_worker(caller, platform) as worker:
+            worker.init(config=config)
+            callable_id = worker.kernel_prepare_callable(chip)
+            values = _input_values(0)
+            source = caller.device_buffer(values)
+            destination = caller.device_buffer([_SENTINEL] * _COUNT)
+            args = _launch_args(source, destination, 1.25)
+
+            # No caller synchronize between the warm-up and begin_dfx.
+            worker.kernel_launch(callable_id, args, caller_stream=caller.stream)
+            for window, rounds in enumerate((3, 0, 2)):
+                worker.kernel_begin_dfx(caller.stream)
+                for _ in range(rounds):
+                    worker.kernel_launch(callable_id, args, caller_stream=caller.stream)
+                worker.kernel_end_dfx(caller.stream)
+                assert caller.read(destination) == [value + 1.25 for value in values]
+                directory = Path(output_prefix) if window == 0 else Path(output_prefix) / f"window_{window}"
+                records = directory / "chip_swimlane_records.json"
+                if rounds == 0:
+                    assert not records.exists(), "an empty window must not export previous records"
+                else:
+                    captured = json.loads(records.read_text())
+                    assert len(captured["aicore_tasks"]) == rounds, captured["aicore_tasks"]
+                    if level >= 2:
+                        assert len(captured["scheduler_tasks"]["records"]) == rounds
+                    boundaries = captured["metadata"]["run_boundaries"]
+                    assert [boundary[0] for boundary in boundaries] == list(range(rounds))
+                    assert captured["metadata"]["dropped_run_boundaries"] == 0
+                graph = json.loads((directory / "deps.json").read_text())
+                assert len(graph["tasks"]) == rounds
+
+                # More than the free queue's capacity, including after the final window.
+                for _ in range(16):
+                    worker.kernel_launch(callable_id, args, caller_stream=caller.stream)
+            assert caller.synchronize() == 0
+            assert caller.read(destination) == [value + 1.25 for value in values]
+            worker.close()
 
 
 def _case_hbg_init_refused(platform: str, device: int) -> None:
@@ -500,6 +557,10 @@ _CASES = {
     "launch_refusals": _case_launch_refusals,
     "second_worker_same_device": _case_second_worker_same_device,
     "dfx_bracket": _case_dfx_bracket,
+    "dfx_many_launches": partial(_case_dfx_bracket, rounds=32),
+    "dfx_many_launches_task_timing": partial(_case_dfx_bracket, rounds=32, level=1),
+    "dfx_window_scope": _case_dfx_window_scope,
+    "dfx_window_scope_task_timing": partial(_case_dfx_window_scope, level=1),
     "hbg_init_refused": _case_hbg_init_refused,
 }
 
@@ -539,6 +600,9 @@ def _run_case_in_subprocess(case: str, platform: str, device: int) -> None:
         output, _ = proc.communicate()
         pytest.fail(f"case {case} did not exit within {_CASE_TIMEOUT_S}s:\n{output}")
     assert proc.returncode == 0, f"case {case} exited with {proc.returncode}:\n{output}"
+    if case.startswith("dfx_"):
+        for diagnostic in ("count mismatch", "start_time=0", "free_queue is empty during init"):
+            assert diagnostic not in output, output
 
 
 @pytest.mark.requires_hardware
