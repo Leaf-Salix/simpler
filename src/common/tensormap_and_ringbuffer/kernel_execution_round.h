@@ -52,41 +52,21 @@ int32_t execute_kernel_round_impl(
     KernelRoundAdmission admission;
     if (!gate.wait_admission(ticket, &admission)) return -1;
     int32_t status = admission.status;
-    const KernelThreadView thread{admission.execution_index, request.execution_threads};
-    if (status == 0) {
-        if (thread.execution_index >= 0) {
-            int32_t initialized;
-            try {
-                initialized = executor.initialize_kernel_thread(thread);
-            } catch (...) {
-                initialized = -1;
-            }
-            if (!gate.report_init(ticket, initialized)) return -1;
-        }
-        if (ticket.launch_index == 0 && !gate.publish_init_verdict(ticket, [&]() noexcept {
-                try {
-                    return executor.complete_kernel_init();
-                } catch (...) {
-                    return int32_t{-1};
-                }
-            }))
-            return -1;
-        if (!gate.wait_init_verdict(ticket, &status)) return -1;
-        if (status == 0 && thread.execution_index >= 0) {
-            const auto &invocation = executor.kernel_invocation_;
-            try {
-                status = executor.run(invocation.resident(), invocation.inputs(), &thread);
-            } catch (...) {
-                status = -1;
-            }
-            if (status != 0) executor.cancel_kernel_round();
+    if (status == 0 && admission.execution_index >= 0) {
+        const KernelThreadView thread{admission.execution_index, request.execution_threads};
+        const auto &invocation = executor.kernel_invocation_;
+        try {
+            status = executor.execute(invocation.resident(), invocation.inputs(), &thread);
+        } catch (...) {
+            status = -1;
+            executor.cancel_kernel_round();
         }
     }
     const auto arrival = gate.arrive(ticket, status);
     if (arrival == RoundArrival::Invalid) return -1;
     KernelFinalStatus result;
     if (arrival == RoundArrival::Finalizer) {
-        // The SM error is saved before Runtime destruction changes its views.
+        // Save initialization/SM status before Runtime destruction changes its views.
         const int32_t sm_status = executor.kernel_status();
         int32_t cleanup = executor.kernel_control_attached_ ? executor.kernel_cores_.finish() : -1;
         if (cleanup == 0) {

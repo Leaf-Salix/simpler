@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <functional>
 #include <iterator>
+#include <thread>
 #include <vector>
 
 #include "tensormap_and_ringbuffer/kernel_core_group.h"
@@ -244,6 +245,36 @@ protected:
     PlatformModel model;
 };
 
+TEST_F(TmrKernelCoreGroupTest, OwnedReportPollingDoesNotWaitForUnreadyPeers) {
+    model.report_ready(2, 74);
+    KernelCoreGroup group;
+    ASSERT_TRUE(group.attach(model.view()));
+    ASSERT_TRUE(group.control_valid());
+    EXPECT_EQ(group.poll_owned_report(model.registers.data(), PlatformModel::kPhysicalCount, 0), 1);
+    EXPECT_EQ(group.poll_owned_report(model.registers.data(), PlatformModel::kPhysicalCount, 2), 0);
+    EXPECT_EQ(group.physical_id(2), 74u);
+    EXPECT_EQ(model.count(EventKind::Open), 0u);
+    group.request_cancel();
+    EXPECT_EQ(load_word(model.reports[2].command), 0u);
+    EXPECT_EQ(group.poll_owned_report(model.registers.data(), PlatformModel::kPhysicalCount, 0), -1);
+}
+
+TEST_F(TmrKernelCoreGroupTest, OwnedReportsRejectInvalidAddressTypeAndRound) {
+    for (int invalid = 0; invalid < 5; ++invalid) {
+        model.reset();
+        model.ready_all();
+        if (invalid == 0) model.reports[2].physical_core_id = PlatformModel::kPhysicalCount;
+        if (invalid == 1) model.reports[2].core_type = static_cast<uint32_t>(CoreType::AIC);
+        if (invalid == 2) model.reports[2].round_epoch = 1;
+        if (invalid == 3) model.registers[2] = 0;
+        if (invalid == 4) model.control.host_cancel = 1;
+        KernelCoreGroup group;
+        ASSERT_TRUE(group.attach(model.view()));
+        EXPECT_EQ(group.poll_owned_report(model.registers.data(), PlatformModel::kPhysicalCount, 2), -1);
+        EXPECT_EQ(model.count(EventKind::Open), 0u);
+    }
+}
+
 TEST_F(TmrKernelCoreGroupTest, InvalidDuplicateAndWrongTypeReportsNeverOpenRegisters) {
     for (int invalid = 0; invalid < 6; ++invalid) {
         SCOPED_TRACE(invalid);
@@ -261,6 +292,39 @@ TEST_F(TmrKernelCoreGroupTest, InvalidDuplicateAndWrongTypeReportsNeverOpenRegis
         EXPECT_EQ(model.count(EventKind::Open), 0u);
         EXPECT_EQ(model.count(EventKind::PublishOpen), 0u);
         EXPECT_EQ(model.count(EventKind::SignalExit), 0u);
+    }
+}
+
+TEST_F(TmrKernelCoreGroupTest, ParallelPartitionsValidateAcrossPartitionBoundaries) {
+    for (int threads : {2, 3, 4}) {
+        for (int invalid = 0; invalid < 4; ++invalid) {
+            SCOPED_TRACE(threads);
+            SCOPED_TRACE(invalid);
+            model.reset();
+            model.ready_all();
+            if (invalid == 1) model.reports[2].physical_core_id = model.reports[0].physical_core_id;
+            if (invalid == 2) model.reports[1].core_type = static_cast<uint32_t>(CoreType::AIC);
+            if (invalid == 3) model.reports[2].core_type = 99;
+            KernelCoreGroup group;
+            ASSERT_TRUE(group.attach(model.view()));
+            std::vector<int32_t> results(threads);
+            std::vector<std::thread> workers;
+            for (int i = 0; i < threads; ++i)
+                workers.emplace_back([&, i] {
+                    results[i] = group.collect_reports_partition(
+                        model.registers.data(), PlatformModel::kPhysicalCount, i, threads
+                    );
+                });
+            for (auto &worker : workers)
+                worker.join();
+            for (int32_t result : results)
+                EXPECT_EQ(result, invalid == 0 ? 0 : -1);
+            EXPECT_EQ(model.count(EventKind::Open), 0u);
+            if (invalid == 0) {
+                for (int i = 0; i < 3; ++i)
+                    EXPECT_EQ(group.register_address(i), model.registers[i]);
+            }
+        }
     }
 }
 

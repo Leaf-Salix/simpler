@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <chrono>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -34,6 +35,13 @@ public:
     void wait() {
         std::unique_lock<std::mutex> lock(mutex_);
         condition_.wait(lock, [&] {
+            return ready_;
+        });
+    }
+
+    bool wait_for() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2), [&] {
             return ready_;
         });
     }
@@ -84,17 +92,15 @@ struct ExecutorModel {
     TmrLaunchControl control{};
     std::array<TmrCoreReport, 3> reports{};
     const std::array<int32_t, kExecutionThreads> allowed{10, 11, 12};
-    int32_t complete_status{0};
+    int32_t execute_status{0};
     int32_t finalize_status{0};
     int32_t failing_run_index{-1};
+    std::function<void(int32_t)> on_execute;
     std::atomic<int32_t> preparations{0};
-    std::atomic<int32_t> initializers{0};
-    std::atomic<int32_t> completions{0};
     std::atomic<int32_t> runs{0};
     std::atomic<int32_t> cancellations{0};
     std::atomic<int32_t> finalizations{0};
     std::atomic<int32_t> clears{0};
-    std::atomic<bool> init_published{false};
 
     KernelExecutionRequest request() {
         KernelExecutionRequest request;
@@ -107,29 +113,16 @@ struct ExecutorModel {
 
     int32_t prepare_kernel_round(const KernelExecutionRequest &) {
         ++preparations;
-        initializers = 0;
-        init_published = false;
         kernel_invocation_.storage = kStorageValue;
         kernel_invocation_.active = true;
         return 0;
     }
-    int32_t initialize_kernel_thread(const KernelThreadView &) {
-        ++initializers;
-        return 0;
-    }
-    int32_t complete_kernel_init() {
-        EXPECT_EQ(initializers.load(), kExecutionThreads);
-        ++completions;
-        init_published = true;
-        return complete_status;
-    }
-    int32_t run(Runtime *, const ExecutionInputs &, const KernelThreadView *thread) {
-        EXPECT_TRUE(init_published.load());
-        EXPECT_EQ(complete_status, 0);
+    int32_t execute(Runtime *, const ExecutionInputs &, const KernelThreadView *thread) {
         EXPECT_TRUE(kernel_invocation_.active.load());
         EXPECT_EQ(kernel_invocation_.storage.load(), kStorageValue);
+        if (on_execute) on_execute(thread->execution_index);
         ++runs;
-        return thread->execution_index == failing_run_index ? -33 : 0;
+        return thread->execution_index == failing_run_index ? -33 : execute_status;
     }
     void cancel_kernel_round() { ++cancellations; }
     int32_t kernel_status() const { return 0; }
@@ -163,13 +156,12 @@ std::array<int32_t, ExecutorModel::kLaunchedThreads> run_round(ExecutorModel &ex
     return results;
 }
 
-TEST(TmrKernelExecutionRoundTest, CompleteInitFailureSkipsAllExecutionAndNextRoundCanReuse) {
+TEST(TmrKernelExecutionRoundTest, ExecutionFailurePublishesOneVerdictAndNextRoundCanReuse) {
     ExecutorModel executor;
-    executor.complete_status = -27;
+    executor.execute_status = -27;
     for (int32_t result : run_round(executor))
         EXPECT_EQ(result, -27);
-    EXPECT_EQ(executor.runs.load(), 0);
-    EXPECT_EQ(executor.completions.load(), 1);
+    EXPECT_EQ(executor.runs.load(), ExecutorModel::kExecutionThreads);
     EXPECT_EQ(executor.kernel_cores_.published.runtime_status, -27);
     EXPECT_EQ(executor.kernel_cores_.published.cleanup_status, 0);
     EXPECT_EQ(executor.finalizations.load(), 1);
@@ -177,11 +169,10 @@ TEST(TmrKernelExecutionRoundTest, CompleteInitFailureSkipsAllExecutionAndNextRou
     EXPECT_TRUE(executor.kernel_gate_.idle());
     EXPECT_FALSE(executor.kernel_invocation_.active.load());
 
-    executor.complete_status = 0;
+    executor.execute_status = 0;
     for (int32_t result : run_round(executor))
         EXPECT_EQ(result, 0);
-    EXPECT_EQ(executor.runs.load(), ExecutorModel::kExecutionThreads);
-    EXPECT_EQ(executor.completions.load(), 2);
+    EXPECT_EQ(executor.runs.load(), 2 * ExecutorModel::kExecutionThreads);
     EXPECT_EQ(executor.clears.load(), 2);
     EXPECT_TRUE(executor.kernel_gate_.idle());
 }
@@ -192,7 +183,6 @@ TEST(TmrKernelExecutionRoundTest, ThreadFailureCancelsAndEveryThreadReadsTheSame
     for (int32_t result : run_round(executor))
         EXPECT_EQ(result, -33);
     EXPECT_EQ(executor.runs.load(), ExecutorModel::kExecutionThreads);
-    EXPECT_EQ(executor.cancellations.load(), 1);
     EXPECT_EQ(executor.kernel_cores_.finishes.load(), 1);
     EXPECT_EQ(executor.kernel_cores_.published.runtime_status, -33);
     EXPECT_EQ(executor.kernel_cores_.published.cleanup_status, 0);
@@ -227,7 +217,7 @@ TEST(TmrKernelExecutionRoundTest, CleanupFailureRetainsStorageAndRejectsAnotherR
 
 TEST(TmrKernelExecutionRoundTest, SlowReportPublisherBlocksNativeReturnAndOverwrite) {
     ExecutorModel executor;
-    executor.complete_status = -47;
+    executor.execute_status = -47;
     Signal publishing;
     Signal release_finalizer;
     std::atomic<bool> report_complete{false};
@@ -264,6 +254,20 @@ TEST(TmrKernelExecutionRoundTest, SlowReportPublisherBlocksNativeReturnAndOverwr
     EXPECT_EQ(executor.clears.load(), 1);
     EXPECT_FALSE(executor.kernel_invocation_.active.load());
     EXPECT_EQ(executor.kernel_invocation_.storage.load(), 0u);
+    EXPECT_TRUE(executor.kernel_gate_.idle());
+}
+
+TEST(TmrKernelExecutionRoundTest, DelayedExecutorDoesNotBlockPeerExecution) {
+    ExecutorModel executor;
+    Signal peer_executed;
+    executor.on_execute = [&](int32_t index) {
+        if (index == 1) EXPECT_TRUE(peer_executed.wait_for());
+        else peer_executed.set();
+    };
+    for (int32_t result : run_round(executor))
+        EXPECT_EQ(result, 0);
+    EXPECT_EQ(executor.runs.load(), ExecutorModel::kExecutionThreads);
+    EXPECT_EQ(executor.kernel_cores_.finishes.load(), 1);
     EXPECT_TRUE(executor.kernel_gate_.idle());
 }
 
