@@ -92,7 +92,6 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
         const hbg::HbgCallableRegistration *registration;
         uint64_t clear_address;
         size_t clear_bytes;
-        uint64_t cancel_address;
     };
     const uint64_t runtime_address = reinterpret_cast<uint64_t>(persistent_args_.args().runtime_args);
     const auto *host_runtime_base = reinterpret_cast<const uint8_t *>(&kernel_runtime_);
@@ -111,8 +110,7 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
         &state.hbg_launch_state->graph_template,
         &registration->second,
         clear_address,
-        static_cast<size_t>(workers_end - clear_address),
-        clear_address
+        static_cast<size_t>(workers_end - clear_address)
     };
     kl::KernelLaunchGateOps gate;
     gate.context = &submission;
@@ -159,13 +157,6 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
     ops.memset_handshake = [](void *context, void *stream) noexcept {
         const auto &s = *static_cast<Submission *>(context);
         return aclrtMemsetAsync(reinterpret_cast<void *>(s.clear_address), s.clear_bytes, 0, s.clear_bytes, stream);
-    };
-    ops.cancel_waiting_aicore = [](void *context, void *stream) noexcept {
-        const auto &s = *static_cast<Submission *>(context);
-        return aclrtMemsetAsync(
-            reinterpret_cast<void *>(s.cancel_address), sizeof(HbgKernelPrelaunchControl), 0xff,
-            sizeof(HbgKernelPrelaunchControl), stream
-        );
     };
     ops.launch_aicore = [](void *context, void *stream) noexcept {
         auto &r = *static_cast<Submission *>(context)->runner;
