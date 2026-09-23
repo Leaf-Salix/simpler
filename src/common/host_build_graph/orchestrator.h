@@ -99,6 +99,12 @@ struct OrchestratorState {
     // hold across those threads rather than only within one.
     std::atomic<int32_t> fatal_code{SIMPLER_ERROR_NONE};
 
+    // A forbidden kernel-mode Host tensor access must stop user control flow,
+    // not return a fabricated value. Publish this before latching fatal_code so
+    // sibling Graph recorders also take the cancellation path instead of the
+    // ordinary post-fatal no-op path.
+    std::atomic<bool> host_tensor_access_abort_requested{false};
+
     // Hidden alloc tasks complete synchronously inside the orchestrator and
     // therefore bypass the executor's normal worker-completion counter path.
     // rt_orchestration_done publishes this into RuntimeContext, which is the copy

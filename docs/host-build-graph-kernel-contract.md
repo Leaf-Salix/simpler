@@ -330,8 +330,11 @@ row-major layout or row-major rows with outer padding: the innermost stride is
 one and each outer stride covers the complete next dimension. Broadcast,
 transpose and stepped innermost views are rejected before Host build. Host
 orchestration receives an accessor that exposes no tensor storage; a real
-`get_tensor_data` or `set_tensor_data` call marks the build fatal and returns
-the existing invalid-argument status before any Device execution is submitted.
+`get_tensor_data` or `set_tensor_data` call marks the build fatal, terminates the
+current Host orchestration control flow, drains any Graph recording work, and
+returns the existing invalid-argument status before any Device execution is
+submitted. The fatal code remains the error source; the internal cancellation
+does not change the runtime ABI or make an ordinary reported fatal throw.
 
 The resulting graph packet contains caller-owned Device addresses and the
 captured graph structure. Capture builds this immutable packet once. Replay

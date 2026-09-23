@@ -12,10 +12,17 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <future>
+#include <memory>
+#include <mutex>
+#include <unistd.h>
 #include <vector>
 
+#include "host_build_graph/graph_recorder_pool.h"
 #include "host_build_graph/host_graph_build.h"
 #include "host_build_graph/kernel_external_tensor.h"
 #include "host_build_graph/kernel_argument_snapshot.h"
@@ -25,6 +32,7 @@
 #include "host_build_graph/kernel_graph_restore.h"
 #include "host_build_graph/graph_execution.h"
 #include "host_build_graph/host_tensor_access.h"
+#include "host_build_graph/host_tensor_access_abort.h"
 #include "host_build_graph/runtime_core.h"
 #include "host_build_graph/runtime.h"
 #include "common/host_api.h"
@@ -111,6 +119,28 @@ struct Platform {
 thread_local RuntimeContext *bound_runtime = nullptr;
 void bind(RuntimeContext *rt) { bound_runtime = rt; }
 void empty_entry(const ChipTaskArgs &) {}
+
+std::atomic<int> post_access_side_effects{0};
+
+struct RecorderAbortProbe {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool access_aborted{false};
+    bool release_worker{false};
+    std::atomic<bool> closure_destroyed{false};
+};
+
+struct RecorderClosureLifetime {
+    explicit RecorderClosureLifetime(RecorderAbortProbe &probe) :
+        probe(probe) {}
+    ~RecorderClosureLifetime() {
+        probe.closure_destroyed.store(true, std::memory_order_release);
+        probe.cv.notify_all();
+    }
+    RecorderAbortProbe &probe;
+};
+
+RecorderAbortProbe *active_recorder_abort_probe{nullptr};
 
 void chain_entry(const ChipTaskArgs &) {
     const uint32_t shape[] = {16};
@@ -217,9 +247,61 @@ void read_entry_tensor_on_host(const ChipTaskArgs &args) {
     (void)bound_runtime->ops->get_tensor_data(bound_runtime, args.tensor(0).ref(), 1, index);
 }
 
+void read_entry_tensor_controls_loop(const ChipTaskArgs &args) {
+    const uint32_t index[] = {0};
+    const uint64_t step = bound_runtime->ops->get_tensor_data(bound_runtime, args.tensor(0).ref(), 1, index);
+    for (volatile uint64_t i = 0; i < 16; i += step) {}
+}
+
 void write_entry_tensor_on_host(const ChipTaskArgs &args) {
     const uint32_t index[] = {0};
     bound_runtime->ops->set_tensor_data(bound_runtime, args.tensor(0).ref(), 1, index, 7);
+}
+
+void write_entry_tensor_then_continue(const ChipTaskArgs &args) {
+    write_entry_tensor_on_host(args);
+    post_access_side_effects.fetch_add(1, std::memory_order_relaxed);
+}
+
+void fatal_then_read_entry(const ChipTaskArgs &args) {
+    bound_runtime->orchestrator->report_fatal(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, __FUNCTION__, "%s", "test fatal");
+    read_entry_tensor_on_host(args);
+    post_access_side_effects.fetch_add(1, std::memory_order_relaxed);
+}
+
+void async_graph_read_entry(const ChipTaskArgs &args) {
+    auto &orch = *bound_runtime->orchestrator;
+    GraphTaskArgs graph_args;
+    graph_args.add_input(args.tensor(0).ref());
+    const auto scope = orch.graph_begin(0x93, graph_args, bound_runtime->active_callable_hash);
+    ASSERT_TRUE(scope.recording);
+    ASSERT_NE(active_recorder_abort_probe, nullptr);
+
+    RecorderAbortProbe &probe = *active_recorder_abort_probe;
+    RuntimeContext *rt = bound_runtime;
+    auto lifetime = std::make_shared<RecorderClosureLifetime>(probe);
+    std::function<void(const GraphTaskArgs &)> job = [rt, handle = scope.recording_handle,
+                                                      lifetime](const GraphTaskArgs &record_args) {
+        if (!rt->orchestrator->graph_prepare(handle, record_args)) {
+            rt->orchestrator->graph_abort(handle);
+            return;
+        }
+        try {
+            const uint32_t index[] = {0};
+            (void)rt->ops->get_tensor_data(rt, record_args.tensor(0).ref(), 1, index);
+            (void)rt->orchestrator->graph_end();
+        } catch (const hbg::HostTensorAccessAbort &) {
+            rt->orchestrator->graph_abort(handle);
+            std::unique_lock<std::mutex> lock(lifetime->probe.mutex);
+            lifetime->probe.access_aborted = true;
+            lifetime->probe.cv.notify_all();
+            lifetime->probe.cv.wait(lock, [&]() {
+                return lifetime->probe.release_worker;
+            });
+        }
+    };
+    ASSERT_TRUE(graph_recorder_pool().start(*scope.params, std::move(job)));
+    lifetime.reset();
 }
 
 TEST(HbgKernelExternalTensor, RejectsHostDeviceArgsAndUnsupportedStrides) {
@@ -380,6 +462,24 @@ TEST_F(HostGraphBuildTest, KernelDeviceTensorReadFailsAtTheAccessSite) {
     EXPECT_TRUE(platform.allocations.empty());
 }
 
+TEST_F(HostGraphBuildTest, KernelDeviceTensorReadFailureReturnsInsteadOfHangingInOrchestration) {
+    const uint32_t shape[] = {1};
+    const auto boundary =
+        make_tensor_external(reinterpret_cast<void *>(0x22000), shape, 1, DataType::UINT64, AddressSpace::DEVICE);
+    const auto tensor = simpler::hbg::Tensor::from_boundary(boundary);
+    ChipTaskArgs args;
+    args.add_input(tensor);
+
+    EXPECT_EXIT(
+        {
+            alarm(5);
+            const int status = build_kernel(read_entry_tensor_controls_loop, args);
+            _exit(status == runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS) ? 0 : 1);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
+}
+
 TEST_F(HostGraphBuildTest, KernelDeviceTensorWriteFailsAtTheAccessSite) {
     const uint32_t shape[] = {4};
     const auto boundary =
@@ -394,6 +494,73 @@ TEST_F(HostGraphBuildTest, KernelDeviceTensorWriteFailsAtTheAccessSite) {
     EXPECT_FALSE(result.build_complete);
     EXPECT_TRUE(platform.copies.empty());
     EXPECT_TRUE(platform.allocations.empty());
+}
+
+TEST_F(HostGraphBuildTest, KernelDeviceTensorWriteDoesNotContinueUserControlFlow) {
+    const uint32_t shape[] = {1};
+    const auto boundary =
+        make_tensor_external(reinterpret_cast<void *>(0x22000), shape, 1, DataType::UINT64, AddressSpace::DEVICE);
+    const auto tensor = simpler::hbg::Tensor::from_boundary(boundary);
+    ChipTaskArgs args;
+    args.add_input(tensor);
+    post_access_side_effects.store(0, std::memory_order_relaxed);
+
+    EXPECT_EQ(
+        build_kernel(write_entry_tensor_then_continue, args), runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS)
+    );
+    EXPECT_EQ(post_access_side_effects.load(std::memory_order_relaxed), 0);
+}
+
+TEST_F(HostGraphBuildTest, OrdinaryFatalKeepsExistingPostFatalNoOpBehavior) {
+    const uint32_t shape[] = {1};
+    const auto boundary =
+        make_tensor_external(reinterpret_cast<void *>(0x22000), shape, 1, DataType::UINT64, AddressSpace::DEVICE);
+    const auto tensor = simpler::hbg::Tensor::from_boundary(boundary);
+    ChipTaskArgs args;
+    args.add_input(tensor);
+    post_access_side_effects.store(0, std::memory_order_relaxed);
+
+    EXPECT_EQ(
+        build_kernel(fatal_then_read_entry, args), runtime_status_from_error_code(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL)
+    );
+    EXPECT_EQ(post_access_side_effects.load(std::memory_order_relaxed), 1);
+}
+
+TEST_F(HostGraphBuildTest, FailedAsyncRecordingIsDrainedBeforeBuildReturnsAndCanRecover) {
+    const uint32_t shape[] = {1};
+    const auto boundary =
+        make_tensor_external(reinterpret_cast<void *>(0x22000), shape, 1, DataType::UINT64, AddressSpace::DEVICE);
+    const auto tensor = simpler::hbg::Tensor::from_boundary(boundary);
+    ChipTaskArgs args;
+    args.add_input(tensor);
+    RecorderAbortProbe probe;
+    active_recorder_abort_probe = &probe;
+
+    auto build_future = std::async(std::launch::async, [&]() {
+        return build_kernel(async_graph_read_entry, args);
+    });
+    bool saw_abort = false;
+    {
+        std::unique_lock<std::mutex> lock(probe.mutex);
+        saw_abort = probe.cv.wait_for(lock, std::chrono::seconds(5), [&]() {
+            return probe.access_aborted;
+        });
+    }
+    EXPECT_TRUE(saw_abort);
+    EXPECT_EQ(build_future.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout)
+        << "build must retain the orchestration image until the recorder closure is destroyed";
+    {
+        std::lock_guard<std::mutex> lock(probe.mutex);
+        probe.release_worker = true;
+    }
+    probe.cv.notify_all();
+    ASSERT_EQ(build_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_EQ(build_future.get(), runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS));
+    EXPECT_TRUE(probe.closure_destroyed.load(std::memory_order_acquire));
+    active_recorder_abort_probe = nullptr;
+
+    EXPECT_EQ(build(empty_entry), 0) << "a failed build must not poison the next orchestration";
+    EXPECT_TRUE(result.build_complete);
 }
 
 TEST_F(HostGraphBuildTest, GraphDefinitionsSurviveBuildAndUploadBeforeRuntimeImage) {

@@ -352,9 +352,6 @@ inline uint64_t rt_orch_phase_now_ns() {
 template <typename T = uint64_t>
 static inline T get_tensor_data(const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
     RuntimeContext *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
-        return from_u64<T>(0);
-    }
     return from_u64<T>(rt->ops->get_tensor_data(rt, tensor, ndims, indices));
 }
 
@@ -376,9 +373,6 @@ template <typename T = uint64_t>
 static inline void
 set_tensor_data(const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[], T value) {
     RuntimeContext *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
-        return;
-    }
     rt->ops->set_tensor_data(rt, tensor, ndims, indices, to_u64(value));
 }
 

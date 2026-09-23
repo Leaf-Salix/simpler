@@ -62,6 +62,7 @@
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
 #include "host_build_graph/host_tensor_access.h"
+#include "host_build_graph/host_tensor_access_abort.h"
 #include "host_build_graph/graph_host_state.h"
 #include "host_build_graph/host_graph_build.h"
 #include "host_build_graph/graph_definition_pack.h"
@@ -1190,7 +1191,12 @@ int32_t hbg::build_graph(
 
     const BindPhaseMark orch_phase = bind_phase_begin();
     rt_scope_begin(rt);
-    entry_points.entry(args);
+    try {
+        entry_points.entry(args);
+    } catch (const hbg::HostTensorAccessAbort &) {
+        // The runtime op already latched the specific fatal code and diagnostic.
+        // This catch only restores the common build/finalization path.
+    }
     rt_scope_end(rt);
     rt_orchestration_done(rt);
 #if SIMPLER_ORCH_PROFILING
