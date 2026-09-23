@@ -153,10 +153,11 @@ static bool require_no_producer(RuntimeContext *rt, const simpler::hbg::Tensor &
 uint64_t
 get_tensor_data(RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
     OrchestratorState &orch = *rt->orchestrator;
+    const bool fatal = orch.is_fatal();
     if (orch.host_tensor_access_abort_requested.load(std::memory_order_acquire)) {
         throw hbg::HostTensorAccessAbort{};
     }
-    if (orch.is_fatal()) return 0;
+    if (fatal) return 0;
 
     if (tensor.buffer.addr == 0) {
         unified_log_error(
@@ -202,10 +203,11 @@ void set_tensor_data(
     RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
 ) {
     OrchestratorState &orch = *rt->orchestrator;
+    const bool fatal = orch.is_fatal();
     if (orch.host_tensor_access_abort_requested.load(std::memory_order_acquire)) {
         throw hbg::HostTensorAccessAbort{};
     }
-    if (orch.is_fatal()) return;
+    if (fatal) return;
 
     if (tensor.buffer.addr == 0) {
         unified_log_error(

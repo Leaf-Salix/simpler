@@ -100,9 +100,9 @@ struct OrchestratorState {
     std::atomic<int32_t> fatal_code{SIMPLER_ERROR_NONE};
 
     // A forbidden kernel-mode Host tensor access must stop user control flow,
-    // not return a fabricated value. Publish this before latching fatal_code so
-    // sibling Graph recorders also take the cancellation path instead of the
-    // ordinary post-fatal no-op path.
+    // not return a fabricated value. Writers publish this before latching
+    // fatal_code; readers snapshot fatal_code before loading this flag, so
+    // observing the fatal also observes the preceding cancellation request.
     std::atomic<bool> host_tensor_access_abort_requested{false};
 
     // Hidden alloc tasks complete synchronously inside the orchestrator and

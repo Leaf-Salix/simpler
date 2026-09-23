@@ -15,12 +15,16 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <future>
 #include <memory>
 #include <mutex>
-#include <unistd.h>
+#include <thread>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "host_build_graph/graph_recorder_pool.h"
 #include "host_build_graph/host_graph_build.h"
@@ -121,6 +125,34 @@ void bind(RuntimeContext *rt) { bound_runtime = rt; }
 void empty_entry(const ChipTaskArgs &) {}
 
 std::atomic<int> post_access_side_effects{0};
+
+class ScopedStderrSilencer {
+public:
+    ScopedStderrSilencer() {
+        std::fflush(stderr);
+        saved_stderr_ = dup(STDERR_FILENO);
+        const int null_fd = open("/dev/null", O_WRONLY);
+        if (saved_stderr_ >= 0 && null_fd >= 0 && dup2(null_fd, STDERR_FILENO) >= 0) active_ = true;
+        if (null_fd >= 0) close(null_fd);
+    }
+
+    ~ScopedStderrSilencer() {
+        std::fflush(stderr);
+        if (saved_stderr_ >= 0) {
+            (void)dup2(saved_stderr_, STDERR_FILENO);
+            close(saved_stderr_);
+        }
+    }
+
+    bool active() const { return active_; }
+
+    ScopedStderrSilencer(const ScopedStderrSilencer &) = delete;
+    ScopedStderrSilencer &operator=(const ScopedStderrSilencer &) = delete;
+
+private:
+    int saved_stderr_{-1};
+    bool active_{false};
+};
 
 struct RecorderAbortProbe {
     std::mutex mutex;
@@ -267,6 +299,52 @@ void fatal_then_read_entry(const ChipTaskArgs &args) {
     bound_runtime->orchestrator->report_fatal(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, __FUNCTION__, "%s", "test fatal");
     read_entry_tensor_on_host(args);
     post_access_side_effects.fetch_add(1, std::memory_order_relaxed);
+}
+
+template <typename Access>
+int concurrent_forbidden_access_return_count(Access access) {
+    constexpr int rounds = 100000;
+    ScopedStderrSilencer silence_expected_fatal_diagnostics;
+    if (!silence_expected_fatal_diagnostics.active()) return -1;
+
+    OrchestratorState orch;
+    RuntimeContext rt{};
+    HostTensorAccessor device_only(nullptr, HostTensorAccessMode::KernelDeviceOnly);
+    rt.orchestrator = &orch;
+    rt.tensor_access = &device_only;
+
+    const uint32_t shape[] = {1};
+    const auto boundary =
+        make_tensor_external(reinterpret_cast<void *>(0x22000), shape, 1, DataType::UINT64, AddressSpace::DEVICE);
+    const auto tensor = simpler::hbg::Tensor::from_boundary(boundary);
+    const uint32_t index[] = {0};
+    std::atomic<int> phase{0};
+    std::atomic<int> finished{0};
+    std::atomic<int> returned_values{0};
+
+    auto accessor = [&]() {
+        for (int round = 1; round <= rounds; ++round) {
+            while (phase.load(std::memory_order_acquire) < round) {}
+            try {
+                access(rt, tensor, index);
+                returned_values.fetch_add(1, std::memory_order_relaxed);
+            } catch (const hbg::HostTensorAccessAbort &) {}
+            finished.fetch_add(1, std::memory_order_release);
+        }
+    };
+
+    std::thread first(accessor);
+    std::thread second(accessor);
+    for (int round = 1; round <= rounds; ++round) {
+        orch.host_tensor_access_abort_requested.store(false, std::memory_order_relaxed);
+        orch.fatal_code.store(SIMPLER_ERROR_NONE, std::memory_order_relaxed);
+        finished.store(0, std::memory_order_relaxed);
+        phase.store(round, std::memory_order_release);
+        while (finished.load(std::memory_order_acquire) != 2) {}
+    }
+    first.join();
+    second.join();
+    return returned_values.load(std::memory_order_relaxed);
 }
 
 void async_graph_read_entry(const ChipTaskArgs &args) {
@@ -524,6 +602,26 @@ TEST_F(HostGraphBuildTest, OrdinaryFatalKeepsExistingPostFatalNoOpBehavior) {
         build_kernel(fatal_then_read_entry, args), runtime_status_from_error_code(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL)
     );
     EXPECT_EQ(post_access_side_effects.load(std::memory_order_relaxed), 1);
+}
+
+TEST(HbgHostAccessAbortTest, ConcurrentForbiddenReadsNeverReturnAFallbackValue) {
+    const int returned =
+        concurrent_forbidden_access_return_count([](RuntimeContext &rt, const simpler::hbg::Tensor &tensor,
+                                                    const uint32_t index[]) {
+            (void)get_tensor_data(&rt, tensor, 1, index);
+        });
+    ASSERT_GE(returned, 0);
+    EXPECT_EQ(returned, 0);
+}
+
+TEST(HbgHostAccessAbortTest, ConcurrentForbiddenWritesNeverReturnNormally) {
+    const int returned =
+        concurrent_forbidden_access_return_count([](RuntimeContext &rt, const simpler::hbg::Tensor &tensor,
+                                                    const uint32_t index[]) {
+            set_tensor_data(&rt, tensor, 1, index, 7);
+        });
+    ASSERT_GE(returned, 0);
+    EXPECT_EQ(returned, 0);
 }
 
 TEST_F(HostGraphBuildTest, FailedAsyncRecordingIsDrainedBeforeBuildReturnsAndCanRecover) {
