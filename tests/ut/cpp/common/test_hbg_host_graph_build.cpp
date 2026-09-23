@@ -31,7 +31,6 @@
 #include "worker/runtime_c_api.h"
 #include "host/kernel_pipeline_contract.h"
 #include "call_config.h"
-#include "orchestration_requirements.h"
 
 extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count);
 extern "C" const char *const *runtime_l1_extra_aicpu_symbols(size_t *count);
@@ -213,83 +212,29 @@ void fatal_entry(const ChipTaskArgs &) {
     bound_runtime->orchestrator->report_fatal(SIMPLER_ERROR_INVALID_ARGS, "entry", "%s", "test build failure");
 }
 
-TEST(HbgKernelExternalTensor, RequirementsFailClosedAndAllowExplicitHostReads) {
-    using simpler::orchestration::HbgKernelRequirementsStatus;
-    using simpler::orchestration::REQUIREMENT_TENSOR_DATA_READ;
-    using simpler::orchestration::REQUIREMENT_TENSOR_DATA_WRITE;
-    using simpler::orchestration::validate_hbg_kernel_requirements;
-
-    EXPECT_EQ(validate_hbg_kernel_requirements(false, 0, 0), HbgKernelRequirementsStatus::MetadataUnavailable);
-    EXPECT_EQ(
-        validate_hbg_kernel_requirements(true, UINT64_C(1) << 63, 0), HbgKernelRequirementsStatus::UnknownRequirement
-    );
-    EXPECT_EQ(
-        validate_hbg_kernel_requirements(true, REQUIREMENT_TENSOR_DATA_WRITE, 1),
-        HbgKernelRequirementsStatus::TensorDataWriteUnsupported
-    );
-    EXPECT_EQ(
-        validate_hbg_kernel_requirements(true, REQUIREMENT_TENSOR_DATA_READ, 0),
-        HbgKernelRequirementsStatus::HostCopyRequired
-    );
-    EXPECT_EQ(validate_hbg_kernel_requirements(true, REQUIREMENT_TENSOR_DATA_READ, 1), HbgKernelRequirementsStatus::Ok);
-    EXPECT_EQ(validate_hbg_kernel_requirements(true, 0, 0), HbgKernelRequirementsStatus::Ok);
+void read_entry_tensor_on_host(const ChipTaskArgs &args) {
+    const uint32_t index[] = {0};
+    (void)bound_runtime->ops->get_tensor_data(bound_runtime, args.tensor(0).ref(), 1, index);
 }
 
-TEST(HbgKernelExternalTensor, HostCopySuffixIsTheOnlyHostReadableStorage) {
-    const uint32_t data_shape[] = {8};
-    const uint32_t table_shape[] = {4};
-    std::array<int32_t, 4> table_host{3, 1, 4, 1};
-    ChipStorageTaskArgs args;
-    args.add_tensor(
-        make_tensor_external(reinterpret_cast<void *>(0x22000), data_shape, 1, DataType::FLOAT32, AddressSpace::DEVICE)
-    );
-    args.add_tensor(
-        make_tensor_external(reinterpret_cast<void *>(0x33000), table_shape, 1, DataType::INT32, AddressSpace::DEVICE)
-    );
-    args.add_tensor(make_tensor_external(table_host.data(), table_shape, 1, DataType::INT32, AddressSpace::HOST));
-
-    HostTensorAccessor accessor(nullptr, HostTensorAccessMode::KernelHostCopiesOnly);
-    hbg::HostOrchEntryPoints entry_points{};
-    entry_points.requirements_v1_available = true;
-    entry_points.requirements_v1 = simpler::orchestration::REQUIREMENT_TENSOR_DATA_READ;
-    ASSERT_EQ(
-        hbg::prepare_kernel_external_tensors(args, 1, entry_points, accessor), hbg::KernelExternalTensorStatus::Ok
-    );
-    int32_t value = 0;
-    EXPECT_FALSE(host_tensor_read(&accessor, 0x33000, &value, sizeof(value)));
-    ASSERT_TRUE(host_tensor_read(&accessor, reinterpret_cast<uintptr_t>(table_host.data() + 2), &value, sizeof(value)));
-    EXPECT_EQ(value, 4);
-    const int32_t replacement = 9;
-    EXPECT_FALSE(
-        host_tensor_write(&accessor, reinterpret_cast<uintptr_t>(table_host.data()), &replacement, sizeof(replacement))
-    );
-    EXPECT_EQ(table_host[0], 3);
-    EXPECT_EQ(accessor.mapping_count(), 0u);
-    EXPECT_EQ(accessor.device_copy_count(), 0u);
+void write_entry_tensor_on_host(const ChipTaskArgs &args) {
+    const uint32_t index[] = {0};
+    bound_runtime->ops->set_tensor_data(bound_runtime, args.tensor(0).ref(), 1, index, 7);
 }
 
-TEST(HbgKernelExternalTensor, RejectsHostDeviceArgsUnsupportedStridesAndMismatchedCopies) {
+TEST(HbgKernelExternalTensor, RejectsHostDeviceArgsAndUnsupportedStrides) {
     const uint32_t shape[] = {2, 3};
     const uint32_t transposed_stride[] = {1, 2};
     std::array<float, 6> host{};
     ChipStorageTaskArgs args;
     args.add_tensor(make_tensor_external(host.data(), shape, 2, DataType::FLOAT32, AddressSpace::HOST));
-    EXPECT_EQ(hbg::validate_kernel_external_tensors(args, 0), hbg::KernelExternalTensorStatus::NonDeviceTensor);
+    EXPECT_EQ(hbg::validate_kernel_external_tensors(args), hbg::KernelExternalTensorStatus::NonDeviceTensor);
 
     args.clear();
     args.add_tensor(make_tensor_strided(
         reinterpret_cast<void *>(0x44000), shape, transposed_stride, 2, DataType::FLOAT32, AddressSpace::DEVICE
     ));
-    EXPECT_EQ(hbg::validate_kernel_external_tensors(args, 0), hbg::KernelExternalTensorStatus::UnsupportedStrideFamily);
-
-    const uint32_t device_shape[] = {4};
-    const uint32_t host_shape[] = {2};
-    args.clear();
-    args.add_tensor(
-        make_tensor_external(reinterpret_cast<void *>(0x55000), device_shape, 1, DataType::INT32, AddressSpace::DEVICE)
-    );
-    args.add_tensor(make_tensor_external(host.data(), host_shape, 1, DataType::INT32, AddressSpace::HOST));
-    EXPECT_EQ(hbg::validate_kernel_external_tensors(args, 1), hbg::KernelExternalTensorStatus::HostCopyMismatch);
+    EXPECT_EQ(hbg::validate_kernel_external_tensors(args), hbg::KernelExternalTensorStatus::UnsupportedStrideFamily);
 }
 
 class HostGraphBuildTest : public ::testing::Test {
@@ -331,6 +276,13 @@ protected:
         return hbg::build_graph(
             &runtime, tensor_access, {rt, mirror.data(), mirror.size(), capacity, definition_arena}, {entry, bind},
             ChipTaskArgs{}, result
+        );
+    }
+    int32_t build_kernel(void (*entry)(const ChipTaskArgs &), const ChipTaskArgs &args) {
+        HostTensorAccessor device_only(nullptr, HostTensorAccessMode::KernelDeviceOnly);
+        return hbg::build_graph(
+            &runtime, device_only, {rt, mirror.data(), mirror.size(), capacity, definition_arena}, {entry, bind}, args,
+            result
         );
     }
     int32_t upload() { return hbg::upload_for_program_mode(&runtime, &api, rt, host_arena, layout, result); }
@@ -410,6 +362,38 @@ TEST_F(HostGraphBuildTest, FailedBuildCannotBeUploaded) {
     EXPECT_TRUE(platform.copies.empty());
     EXPECT_EQ(platform.commits, 0);
     EXPECT_EQ(rt->orchestrator, nullptr);
+}
+
+TEST_F(HostGraphBuildTest, KernelDeviceTensorReadFailsAtTheAccessSite) {
+    const uint32_t shape[] = {4};
+    const auto boundary =
+        make_tensor_external(reinterpret_cast<void *>(0x22000), shape, 1, DataType::INT32, AddressSpace::DEVICE);
+    const auto tensor = simpler::hbg::Tensor::from_boundary(boundary);
+    ChipTaskArgs args;
+    args.add_input(tensor);
+
+    EXPECT_EQ(
+        build_kernel(read_entry_tensor_on_host, args), runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS)
+    );
+    EXPECT_FALSE(result.build_complete);
+    EXPECT_TRUE(platform.copies.empty());
+    EXPECT_TRUE(platform.allocations.empty());
+}
+
+TEST_F(HostGraphBuildTest, KernelDeviceTensorWriteFailsAtTheAccessSite) {
+    const uint32_t shape[] = {4};
+    const auto boundary =
+        make_tensor_external(reinterpret_cast<void *>(0x22000), shape, 1, DataType::INT32, AddressSpace::DEVICE);
+    const auto tensor = simpler::hbg::Tensor::from_boundary(boundary);
+    ChipTaskArgs args;
+    args.add_input(tensor);
+
+    EXPECT_EQ(
+        build_kernel(write_entry_tensor_on_host, args), runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS)
+    );
+    EXPECT_FALSE(result.build_complete);
+    EXPECT_TRUE(platform.copies.empty());
+    EXPECT_TRUE(platform.allocations.empty());
 }
 
 TEST_F(HostGraphBuildTest, GraphDefinitionsSurviveBuildAndUploadBeforeRuntimeImage) {
@@ -772,7 +756,14 @@ TEST(HbgKernelResourcePlan, RejectsAggregateAndAlignmentOverflowWithoutPublishin
     EXPECT_EQ(hbg::KernelResourcePlan::create(nullptr, 1, plan), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     EXPECT_EQ(hbg::KernelResourcePlan::create(&good, 0, plan), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     const auto after = plan.pipeline_contract();
-    EXPECT_EQ(std::memcmp(&after, &original, sizeof(after)), 0);
+    EXPECT_EQ(after.abi_version, original.abi_version);
+    EXPECT_EQ(after.resource_count, original.resource_count);
+    EXPECT_EQ(after.pipeline_depth, original.pipeline_depth);
+    for (uint32_t i = 0; i < original.resource_count; ++i) {
+        EXPECT_EQ(after.resources[i].kind, original.resources[i].kind);
+        EXPECT_EQ(after.resources[i].resource_class, original.resources[i].resource_class);
+        EXPECT_EQ(after.resources[i].bytes_per_copy, original.resources[i].bytes_per_copy);
+    }
     EXPECT_EQ(plan.definition_offset(), 8192u);
     EXPECT_TRUE(plan.admits(good));
 }
@@ -1713,16 +1704,15 @@ TEST_F(HbgGraphPacketTest, RejectsHostStorageBeforeItCanEnterAKernelGraphPacket)
     EXPECT_EQ(provider.allocation_calls, allocations);
 }
 
-TEST_F(HbgGraphPacketTest, EnvelopeCarriesTheHostCopySuffixCount) {
+TEST_F(HbgGraphPacketTest, EnvelopeKeepsReservedHostCopyCountZero) {
     ASSERT_EQ(build(chain_entry), 2);
     prepare();
     identity.tensor_count = 2;
-    identity.host_copy_tensor_count = 1;
     ASSERT_EQ(snapshot_graph(), 0);
     SimplerKernelInvocationHeader invocation{};
     std::memcpy(&invocation, snapshot.data(), sizeof(invocation));
     EXPECT_EQ(invocation.tensor_count, 2);
-    EXPECT_EQ(invocation.host_copy_tensor_count, 1);
+    EXPECT_EQ(invocation.host_copy_tensor_count, 0);
     EXPECT_EQ(
         hbg::validate_graph_packet(snapshot.data(), snapshot.size(), hbg::GraphPacketAddress::HostTemplate),
         hbg::GraphPacketStatus::Ok

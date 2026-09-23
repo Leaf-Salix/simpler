@@ -69,15 +69,14 @@ int prepare_kernel_graph_resources(
 }
 
 int build_kernel_graph_template(
-    Runtime &runtime, const HostApi &api, const ChipStorageTaskArgs &args, void *host_orch_func_ptr,
-    const KernelExecutionState &context, int device_id, uint64_t generation, uint64_t runtime_binary_id,
-    uint64_t task_window, const GraphInvocationIdentity &identity, GraphLaunchTemplate &out
+    Runtime &runtime, const ChipStorageTaskArgs &args, void *host_orch_func_ptr, const KernelExecutionState &context,
+    int device_id, uint64_t generation, uint64_t runtime_binary_id, uint64_t task_window,
+    const GraphInvocationIdentity &identity, GraphLaunchTemplate &out
 ) try {
     if (host_orch_func_ptr == nullptr || task_window == 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     const auto &entry_points = *static_cast<const HostOrchEntryPoints *>(host_orch_func_ptr);
-    HostTensorAccessor tensor_access(&api, HostTensorAccessMode::KernelHostCopiesOnly);
-    const auto external =
-        prepare_kernel_external_tensors(args, identity.host_copy_tensor_count, entry_points, tensor_access);
+    HostTensorAccessor tensor_access(nullptr, HostTensorAccessMode::KernelDeviceOnly);
+    const auto external = validate_kernel_external_tensors(args);
     if (external != KernelExternalTensorStatus::Ok) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
 
     runtime.set_orch_args(args);

@@ -135,8 +135,8 @@ int consume_kernel_task(void *arg) {
         return -1;
     }
     if (registration.callable_hash != graph.callable_hash || registration.function_hash != graph.function_hash ||
-        invocation.scalar_count != registration.scalar_count ||
-        invocation.tensor_count - invocation.host_copy_tensor_count != registration.tensor_count) {
+        invocation.scalar_count != registration.scalar_count || invocation.tensor_count != registration.tensor_count ||
+        invocation.host_copy_tensor_count != 0) {
         LOG_ERROR(
             "HBG invocation identity mismatch: callable=%llu/%llu function=%llu/%llu tensors=%d/%d host_copies=%d "
             "scalars=%d/%d",

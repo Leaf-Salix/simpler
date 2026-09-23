@@ -28,9 +28,9 @@ int prepare_kernel_graph_resources(
 );
 
 int build_kernel_graph_template(
-    Runtime &runtime, const HostApi &api, const ChipStorageTaskArgs &args, void *host_orch_func_ptr,
-    const KernelExecutionState &context, int device_id, uint64_t generation, uint64_t runtime_binary_id,
-    uint64_t task_window, const GraphInvocationIdentity &identity, GraphLaunchTemplate &out
+    Runtime &runtime, const ChipStorageTaskArgs &args, void *host_orch_func_ptr, const KernelExecutionState &context,
+    int device_id, uint64_t generation, uint64_t runtime_binary_id, uint64_t task_window,
+    const GraphInvocationIdentity &identity, GraphLaunchTemplate &out
 );
 
 }  // namespace hbg

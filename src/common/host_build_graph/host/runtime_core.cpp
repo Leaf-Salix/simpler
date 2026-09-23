@@ -164,13 +164,22 @@ get_tensor_data(RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t
     uint64_t elem_addr = tensor.buffer.addr + flat_offset * elem_size;
     uint64_t result = 0;
     if (!host_tensor_read(rt->tensor_access, elem_addr, &result, elem_size)) {
-        rt->orchestrator->report_fatal(
-            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
-            "no host view for device address %#llx (%llu bytes): during host orchestration only host-memory "
-            "tensors the runtime copied in and child-memory tensors the caller passed in are readable, not "
-            "runtime-created buffers",
-            (unsigned long long)elem_addr, (unsigned long long)elem_size
-        );
+        if (rt->tensor_access != nullptr && rt->tensor_access->device_only()) {
+            rt->orchestrator->report_fatal(
+                SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
+                "HBG kernel Host orchestration cannot read Device tensor data at %#llx (%llu bytes); pass the "
+                "required Host value as a non-Tensor orchestration argument",
+                (unsigned long long)elem_addr, (unsigned long long)elem_size
+            );
+        } else {
+            rt->orchestrator->report_fatal(
+                SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
+                "no host view for device address %#llx (%llu bytes): during host orchestration only host-memory "
+                "tensors the runtime copied in and child-memory tensors the caller passed in are readable, not "
+                "runtime-created buffers",
+                (unsigned long long)elem_addr, (unsigned long long)elem_size
+            );
+        }
         return 0;
     }
     return result;
@@ -195,13 +204,22 @@ void set_tensor_data(
     uint64_t elem_size = get_element_size(tensor.dtype);
     uint64_t elem_addr = tensor.buffer.addr + flat_offset * elem_size;
     if (!host_tensor_write(rt->tensor_access, elem_addr, &value, elem_size)) {
-        rt->orchestrator->report_fatal(
-            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
-            "no writable host view for device address %#llx (%llu bytes): during host orchestration only "
-            "host-memory tensors the runtime copied in and child-memory tensors the caller passed in are "
-            "writable, not runtime-created buffers",
-            (unsigned long long)elem_addr, (unsigned long long)elem_size
-        );
+        if (rt->tensor_access != nullptr && rt->tensor_access->device_only()) {
+            rt->orchestrator->report_fatal(
+                SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
+                "HBG kernel Host orchestration cannot write Device tensor data at %#llx (%llu bytes); pass the "
+                "required Host value as a non-Tensor orchestration argument",
+                (unsigned long long)elem_addr, (unsigned long long)elem_size
+            );
+        } else {
+            rt->orchestrator->report_fatal(
+                SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
+                "no writable host view for device address %#llx (%llu bytes): during host orchestration only "
+                "host-memory tensors the runtime copied in and child-memory tensors the caller passed in are "
+                "writable, not runtime-created buffers",
+                (unsigned long long)elem_addr, (unsigned long long)elem_size
+            );
+        }
     }
 }
 

@@ -52,9 +52,7 @@ inline bool valid_invocation_counts(int32_t tensors, int32_t scalars) noexcept {
            tensors + scalars <= CHIP_MAX_TENSOR_ARGS;
 }
 
-inline bool valid_host_copy_tensor_count(int32_t tensors, int32_t host_copies) noexcept {
-    return host_copies >= 0 && host_copies <= tensors / 2;
-}
+inline bool valid_host_copy_tensor_count(int32_t, int32_t host_copies) noexcept { return host_copies == 0; }
 
 // signature names a readable, aligned array of sig_count entries; its owning
 // callable's flexible-array bounds are validated before this function is called.

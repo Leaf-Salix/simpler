@@ -18,10 +18,11 @@
  * `set_tensor_data` cannot assume the CPU executing them can load that address.
  * This is the seam where that platform capability is resolved.
  *
- * Kernel mode instead accepts only explicit caller-owned Host-copy arguments.
- * It registers their Host addresses directly, permits reads, and denies writes.
- * Device mappings and device-copy fallbacks are disabled, so Host build cannot
- * inspect device storage or introduce a stream synchronization.
+ * Kernel mode accepts only caller-owned Device tensors and deliberately
+ * registers no readable or writable regions. Host build may inspect tensor
+ * descriptors, but an actual get_tensor_data / set_tensor_data call fails at
+ * the access site. Values needed by Host orchestration must be passed as
+ * non-Tensor arguments.
  *
  * The current bind path registers one region per host-memory tensor, backed by
  * the caller's host tensor buffer, which the bind has just copied in H2D:
@@ -86,9 +87,9 @@ enum class HostTensorAccessMode : uint8_t {
     // Program mode may stage, map or copy device storage as part of its
     // self-managed synchronous run.
     Program,
-    // Kernel-mode Host build may read only explicit caller-owned Host copies.
-    // Device mappings, D2H fallback and Host writes are unrepresentable.
-    KernelHostCopiesOnly,
+    // Kernel-mode Host build cannot access tensor storage. Device mappings,
+    // copies and Host views are unrepresentable.
+    KernelDeviceOnly,
 };
 
 /**
@@ -145,16 +146,11 @@ public:
      */
     bool add_child_memory(uint64_t dev_base, uint64_t size);
 
-    /**
-     * Register an explicit host-only duplicate for HBG kernel Host build.
-     * `logical_base` is the address carried by that HOST ChipTensor and
-     * `host_view` is the same caller-owned storage. No platform mapping or
-     * device copy is attempted, and writes through the accessor remain denied.
-     */
-    bool add_host_copy(uint64_t logical_base, uint64_t size, const void *host_view);
-
     bool read(uint64_t dev_addr, void *dst, uint64_t bytes);
     bool write(uint64_t dev_addr, const void *src, uint64_t bytes);
+
+    /** True when this accessor intentionally exposes no tensor storage. */
+    bool device_only() const noexcept;
 
     /** Drop every region and unregister every mapping this accessor installed. */
     void close() noexcept;

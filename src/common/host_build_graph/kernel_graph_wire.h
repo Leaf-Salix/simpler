@@ -119,8 +119,8 @@ validate_graph_packet(const void *packet, size_t size, GraphPacketAddress addres
     if (invocation.mode != SIMPLER_MODE_KERNEL || invocation.callable_id < 0 ||
         invocation.callable_id >= MAX_REGISTERED_CALLABLE_IDS ||
         !simpler::kernel::valid_invocation_counts(invocation.tensor_count, invocation.scalar_count) ||
-        !simpler::kernel::valid_host_copy_tensor_count(invocation.tensor_count, invocation.host_copy_tensor_count) ||
-        invocation.reserved_ != 0 || invocation.payload_bytes != size - prefix)
+        invocation.host_copy_tensor_count != 0 || invocation.reserved_ != 0 ||
+        invocation.payload_bytes != size - prefix)
         return GraphPacketStatus::InvalidEnvelope;
     GraphPacketHeader header{};
     std::memcpy(&header, bytes + prefix, sizeof(header));
