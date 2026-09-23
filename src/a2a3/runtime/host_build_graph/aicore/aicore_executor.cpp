@@ -83,8 +83,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
     // The HBG kernel-mode binder starts AICore before it submits the AICPU
-    // HostArgs task.  Wait until that task restores the captured graph, or
-    // until binder compensation cancels this launch after an enqueue failure.
+    // HostArgs task.  Wait until the running AICPU task publishes the captured
+    // graph restore result.  A Host-side partial submission is terminal and
+    // leaves this context unavailable until external quiescence.
     uint32_t prelaunch = HBG_KERNEL_PRELAUNCH_WAIT;
     do {
         dcci(&runtime->kernel_prelaunch, SINGLE_CACHE_LINE);

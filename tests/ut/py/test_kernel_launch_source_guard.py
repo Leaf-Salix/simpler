@@ -20,6 +20,7 @@ SOURCES = (
     "src/common/platform/onboard/host/kernel_launch_sequence.h",
     "src/common/platform/onboard/host/kernel_launch_owner.cpp",
 )
+HBG_HOST_ARGS_ADAPTER = "src/common/aicpu_loader/host/kernel_graph_launch.h"
 ALLOWED_ACL = {
     "aclrtQueryEventStatus",
     "aclrtStreamWaitEvent",
@@ -92,3 +93,11 @@ def test_submission_module_does_not_import_unmerged_context_or_hbg_interfaces():
     for path in paths:
         includes = re.findall(r'^#include\s+[<"]([^>"]+)', (ROOT / path).read_text(), re.M)
         assert not [include for include in includes if any(item in include for item in forbidden)], path
+
+
+def test_hbg_host_args_adapter_does_not_synchronize_or_retry():
+    source = (ROOT / HBG_HOST_ARGS_ADAPTER).read_text()
+    code = re.sub(r"/\*.*?\*/|//[^\n]*", "", source, flags=re.S)
+    calls = set(re.findall(r"\b((?:aclrt|acl|rts|rt)[A-Z]\w*)\s*\(", code))
+    assert calls == {"aclrtLaunchKernelWithHostArgs"}
+    assert "ACL_ERROR_RT_MEMORY_ALLOCATION" not in code

@@ -251,7 +251,7 @@ thread-local capture 中测试首次 prepare，以及已有一次 launch 后 pre
 | launch 的 callable id 越界 | 返回 `INVALID_ARGUMENT`，与 prepare 一致 |
 | kernel 入口符号解析 | 每个 runtime 仍导出全部四个入口；ChipWorker 只在 `supported` 非零时解析 init、prepare、launch |
 | kernel 模式容量规则 | 使用 K3 的共享 static arena bank，同时覆盖 onboard 与仿真 |
-| 同步语义说明 | init 会同步上下文自己的 AICPU stream，必须在 capture 外完成；TMR/HBG prepare 无 stream/event/device 同步，允许 capture 内首次调用；HBG 每次 launch 按 AICPU stream 顺序注册后执行，正常 launch 不同步，HostArgs 内存不足的有界恢复路径例外 |
+| 同步语义说明 | init 会同步上下文自己的 AICPU stream，必须在 capture 外完成；TMR/HBG prepare 无 stream/event/device 同步，允许 capture 内首次调用；HBG 每次 launch 按 AICPU stream 顺序注册后执行，launch 不同步，HostArgs 入队失败直接返回并使 context 进入 poison |
 | callable id 与版本 | prepare 铸 id 经出参返回，失败写 `-1`；纯注册不去重，id 在 context 内不复用、close 后整体失效，不带 generation |
 | 设备侧如何找到 callable | TMR 参数包直接携带 callable 的设备镜像地址与长度；HBG 每次 launch 先入队幂等注册，再由图执行按 callable id 与 context generation 查表 |
 

@@ -1,6 +1,6 @@
 # Kernel launch submission module
 
-This module implements the three-stream submission and failure-compensation part
+This module implements the three-stream submission and fail-closed ownership part
 of the [v9 design](https://icc.gt.tc/vllm-pto?i=1#v9-design). It compiles on main
 without K1 or HBG headers. All interfaces are internal C++ types in
 `simpler::kernel_launch`; no public C ABI or runtime packet layout is introduced.
@@ -10,7 +10,7 @@ without K1 or HBG headers. All interfaces are internal C++ types in
 `launch_bound_kernel(binding, caller, gate, ops)` consumes a readable Host packet,
 trusted placeholder descriptors and prepared stream/event handles. The native
 variant also consumes registered function handles, prepared AICore/HostArgs
-buffers and clear/cancel regions. Nothing is allocated or registered in launch.
+buffers and clear regions. Nothing is allocated or registered in launch.
 
 `KernelLaunchGateOps::acquire` obtains an exclusive submission lease and validates
 context phase, current device, callable registration/generation, frozen capacity,
@@ -25,7 +25,7 @@ Every successful acquisition is paired with exactly one `finish(result)`:
 | ------ | --------------------------------------- |
 | Success | Store caller identity and consume the pending preparation dependency |
 | Rejection before enqueue | Preserve phase, previous caller and preparation state |
-| Enqueue failure | Poison context; retain submission and compensation errors separately |
+| Enqueue failure | Poison context; retain all device-visible resources until external quiescence |
 
 The owner serializes preparation, close and submission through this lease. It
 must not call binder recursively. Neither owner callback may allocate, enqueue,
@@ -69,31 +69,25 @@ The chain is caller ⇄ AICPU ⇄ AICore: caller and AICore are never adjacent, 
 ACLGraph capture propagates in two hops rather than forking from the caller.
 `AicoreStart` must be recorded before the AICPU launch — the AICPU orchestrator
 spins on AICore's handshake report, so recording it after would close a cycle.
-AICore-first in Host enqueue order also permits pre-AICPU cancellation after
-checking the core branch submissions; device cooperation still runs through the
-handshake protocol, and the event chain fixes only entry and exit order. Host
-success means submission only.
+AICore-first in Host enqueue order keeps the AICore binary-load path ahead of
+the resident AICPU work; device cooperation still runs through the handshake
+protocol, and the event chain fixes only entry and exit order. Host success
+means submission only.
 
 ## Failure behavior
 
-Every failure after entry into the enqueue sequence tells the owner to poison.
-Before successful AICore launch, stop. Only a failure between the AICore launch
-and the AICPU launch can leave AICore spinning on a handshake no AICPU will
-write, so only those sites compensate. Failure recording AicoreDone cancels the
-waiting core and retries the record once; AICPU launch failure cancels with
-AicoreDone already recorded. Both then drive the chain back to the caller —
-AICPU waits AicoreDone, records AicpuDone, the caller waits it and records
-SerialTail — because AicpuDone is the caller's only path to a tail.
-Cancellation is one all-ones async fill of the prepared 32-bit cancel words,
-publishing `UINT32_MAX`, issued on the caller's stream, which carries nothing
-but Start at that point. After successful AICPU launch, stop on errors without
-Host cancel.
+Every failure after entry into the enqueue sequence tells the owner to poison
+and stops further Host submission. The binder does not publish a Host-side
+cancel, retry an enqueue, or fabricate a completion tail. In particular, a
+failure after AICore launch may leave device work waiting for a peer task that
+was never submitted. `tail_recorded` remains false because no trustworthy join
+exists.
 
-Compensation stops on its first error. `cleanup_status` never replaces the
-original `status`, and `tail_recorded` identifies whether a tail was established.
-Failed compensation can leave no provable join and an uncancelled waiter; this
-is a terminal execution failure requiring external quiescence/reset ownership,
-not permission for binder to synchronize, reset or reuse the context.
+This is a terminal partial-submission failure. All device-visible arguments,
+streams, events and execution storage remain retained until the caller has
+established external quiescence/reset ownership. Poison is an admission guard,
+not proof that stop-on-failure has stopped already-running cores, and it never
+permits the binder to synchronize, reset or reuse the context.
 
 ## Integration and tests
 
@@ -105,7 +99,7 @@ launch after poison, and retain resources through graph destruction. There is
 no duplicate context phase machine in this module.
 
 Fake-owner tests verify acquire/finish pairing, same/cross-caller behavior,
-concurrent submission rejection and all enqueue/compensation failure positions.
+concurrent submission rejection and every enqueue failure position.
 The SDK-enabled native unit target uses real CANN declarations and fake symbols.
 Source guards reject forbidden ACL/RTS operations and dependency guards prevent
 importing the unmerged K1/HBG interfaces. These tests establish Host protocol

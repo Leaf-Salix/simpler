@@ -115,10 +115,12 @@ enum : uint32_t {
 
 // The AICore kernel is enqueued before the AICPU HostArgs task so ACLGraph can
 // capture caller -> AICPU -> AICore as one ordered chain.  It must therefore
-// wait until AICPU has restored the graph snapshot before reading Runtime.  A
-// failed AICPU enqueue publishes CANCEL from the caller stream and releases the
-// already-enqueued AICore.  This line is context-owned and lives immediately
-// before workers[] so launch can clear both with one fixed-address memset.
+// wait until AICPU has restored the graph snapshot before reading Runtime.  An
+// executing AICPU restore leader publishes READY or CANCEL.  A Host-side partial
+// submission publishes neither: the owner poisons the context and retains its
+// resources until external quiescence.  This line is context-owned and lives
+// immediately before workers[] so launch can clear both with one fixed-address
+// memset.
 struct alignas(64) HbgKernelPrelaunchControl {
     // Program mode has no prelaunch gate. Kernel launch explicitly clears this
     // line to WAIT before enqueueing AICore and restores READY from AICPU.
