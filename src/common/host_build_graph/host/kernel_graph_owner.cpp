@@ -23,6 +23,7 @@
 #include "call_config.h"
 #include "host/kernel_execution_state.h"
 #include "host/memory_allocator.h"
+#include "host_build_graph/host_graph_build.h"
 #include "host_build_graph/host_tensor_access.h"
 #include "host_build_graph/kernel_external_tensor.h"
 #include "host_build_graph/kernel_callable_registration.h"
