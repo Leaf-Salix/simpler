@@ -24,8 +24,6 @@
 
 #include <unistd.h>
 
-#include "common/log_level.h"
-#include "host_log.h"
 #include "host_build_graph/graph_recorder_pool.h"
 #include "host_build_graph/host_graph_build.h"
 #include "host_build_graph/kernel_external_tensor.h"
@@ -126,24 +124,20 @@ void empty_entry(const ChipTaskArgs &) {}
 
 std::atomic<int> post_access_side_effects{0};
 
-class ScopedHostLogSilencer {
+extern "C" bool set_test_unified_log_suppressed(bool suppressed);
+
+class ScopedTestLogSilencer {
 public:
-    ScopedHostLogSilencer() :
-        previous_level_(HostLogger::get_instance().level()) {
-        HostLogger::get_instance().set_level(simpler::log::LogLevel::NUL, /*defer_writer=*/true);
-    }
+    ScopedTestLogSilencer() :
+        previously_suppressed_(set_test_unified_log_suppressed(true)) {}
 
-    ~ScopedHostLogSilencer() {
-        HostLogger::get_instance().set_level(
-            static_cast<simpler::log::LogLevel>(previous_level_), /*defer_writer=*/true
-        );
-    }
+    ~ScopedTestLogSilencer() { (void)set_test_unified_log_suppressed(previously_suppressed_); }
 
-    ScopedHostLogSilencer(const ScopedHostLogSilencer &) = delete;
-    ScopedHostLogSilencer &operator=(const ScopedHostLogSilencer &) = delete;
+    ScopedTestLogSilencer(const ScopedTestLogSilencer &) = delete;
+    ScopedTestLogSilencer &operator=(const ScopedTestLogSilencer &) = delete;
 
 private:
-    int previous_level_;
+    bool previously_suppressed_;
 };
 
 struct RecorderAbortProbe {
@@ -296,7 +290,7 @@ void fatal_then_read_entry(const ChipTaskArgs &args) {
 template <typename Access>
 int concurrent_forbidden_access_return_count(Access access) {
     constexpr int rounds = 100000;
-    ScopedHostLogSilencer silence_expected_fatal_diagnostics;
+    ScopedTestLogSilencer silence_expected_fatal_diagnostics;
 
     OrchestratorState orch;
     RuntimeContext rt{};
