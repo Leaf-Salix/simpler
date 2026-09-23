@@ -105,7 +105,7 @@ TEST(KernelBinder, ReadOnlyRejectionsReleaseOwnerAndPreservePrepareDependency) {
     }
 }
 
-TEST(KernelBinder, EveryEnqueueFailurePoisonsWithExactCompensationTrace) {
+TEST(KernelBinder, EveryEnqueueFailurePoisonsWithExactSubmissionTrace) {
     for (int fail = 1; fail <= static_cast<int>(success.size()); ++fail) {
         SCOPED_TRACE(fail);
         Fixture f;

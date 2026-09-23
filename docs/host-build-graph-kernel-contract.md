@@ -140,7 +140,7 @@ Each launch enqueues an idempotent callable registration immediately before grap
 execution on the same AICPU stream. Both operations are captured and replayed in
 order. An eager launch or another captured graph carries its own registration,
 so neither depends on the original capture having executed. A registration enqueue
-failure returns through binder cancellation and poisons the context.
+failure returns through the binder and poisons the context.
 Launch receives only frozen bindings. It performs Host build, constructs or
 reuses an immutable graph template, makes a fresh HostArgs copy, and enters the
 shared three-stream binder. The TMR public launch keeps its independent packet
@@ -177,9 +177,10 @@ keep the existing `KernelContextOps` signature. The context event set is
 `Start`, `AicoreStart`, `AicoreDone`, `AicpuDone`, and `SerialTail`, chained
 caller ⇄ AICPU ⇄ AICore. The shared binder submits AICore before AICPU. HBG
 clears a fixed prelaunch control line together with the worker handshakes;
-AICore waits there until the AICPU restore leader publishes `READY`. If AICPU
-enqueue fails after AICore was submitted, binder compensation publishes
-`CANCEL`, releases that kernel, and poisons the context.
+AICore waits there until an executing AICPU restore leader publishes `READY` or
+`CANCEL`. If the AICPU enqueue itself fails after AICore was submitted, there is
+no trustworthy completion fence: the binder poisons the context and retains all
+device-visible resources until the caller establishes external quiescence/reset.
 
 The no-argument C `get_pipeline_contract()` remains the static program contract
 with zero byte fields. The internal TMR-shaped
@@ -274,17 +275,16 @@ a synchronous HostArgs consumer; only task execution is asynchronous.
 `aicpu_loader/host/kernel_graph_launch.h::launch_graph_template` adapts this to
 `aclrtLaunchKernelWithHostArgs`, forwarding the supplied dedicated AICPU stream,
 function, block count and config, with exactly one `aclrtPlaceHolderInfo`.
-On an RTS memory-allocation error, the adapter synchronizes the AicoreStart
-event recorded before the current AICore launch, then retries once. It never
-waits on the current AicoreDone or stream tail. A failed synchronization or
-retry returns its error to binder cancellation and context poisoning; ordinary
-launches do not synchronize. Capture-time synchronization rejection follows
-the same failure path.
+The adapter submits exactly once and returns the RTS status unchanged. It does
+not synchronize or retry on memory pressure; any enqueue failure follows the
+shared terminal partial-submission path. Capacity/workspace policy must prevent
+recoverable memory pressure outside this launch helper.
 
 The adapter assumes the enclosing protocol has established entry/exit events
 and retained the function/context leases. The public HBG launch owner and shared
-binder create streams, record events, enqueue cross-stream waits and compensate
-for partial enqueue failures.
+binder create streams, record events and enqueue cross-stream waits. They do not
+compensate a partial submission or claim that already-running device work has
+stopped.
 Only the live heap prefix is cleared; unused heap capacity is untouched.
 The A5 scheduler image is restored from its zeroed template. The common
 scheduler queues, mailbox and runtime pointers are rebuilt by the leader restore;

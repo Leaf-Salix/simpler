@@ -173,8 +173,7 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
         if (registered != 0) return registered;
         return hbg::launch_graph_template(
             *s.graph, s.runner->kernel_aicpu_handle_,
-            static_cast<uint32_t>(s.runner->kernel_runtime_.get_aicpu_launch_count()), static_cast<aclrtStream>(stream),
-            nullptr, s.runner->kernel_exec_state_.event(KernelEventKind::AicoreStart)
+            static_cast<uint32_t>(s.runner->kernel_runtime_.get_aicpu_launch_count()), static_cast<aclrtStream>(stream)
         );
     };
     return kl::launch_bound_kernel(

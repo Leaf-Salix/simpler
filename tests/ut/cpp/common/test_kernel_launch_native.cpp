@@ -30,8 +30,6 @@ struct NativeFake {
     std::vector<std::vector<uint8_t>> copies;
     std::vector<int> memset_values;
     std::vector<int> host_args_errors;
-    int recovery_syncs{0};
-    int recovery_status{0};
     void initialize() {
         fixture.initialize();
         fixture.binding.packet = reinterpret_cast<const uint8_t *>(packet.data());
@@ -120,47 +118,20 @@ extern "C" aclError aclrtLaunchKernelWithHostArgs(
     return active->fixture.fake.append(Step::AicpuLaunch);
 }
 
-extern "C" aclError aclrtSynchronizeEvent(aclrtEvent event) {
-    // This event precedes the current AICore launch; its done event is ptr(5).
-    EXPECT_EQ(event, ptr(4));
-    ++active->recovery_syncs;
-    return active->recovery_status;
-}
-
-TEST(HbgKernelHostArgs, MemoryPressureRetriesOnceAfterThePrelaunchEvent) {
-    for (const auto errors :
-         {std::vector<int>{ACL_ERROR_RT_MEMORY_ALLOCATION, 0},
-          std::vector<int>{ACL_ERROR_RT_MEMORY_ALLOCATION, ACL_ERROR_RT_MEMORY_ALLOCATION}, std::vector<int>{12345},
-          std::vector<int>{0}}) {
+TEST(HbgKernelHostArgs, ForwardsEveryLaunchStatusWithoutSynchronizationOrRetry) {
+    for (const int error : {ACL_ERROR_RT_MEMORY_ALLOCATION, 12345, 0}) {
         NativeFake f;
         active = &f;
         f.initialize();
-        f.host_args_errors = errors;
+        f.host_args_errors = {error};
         hbg::GraphHostArgs args;
         args.storage.assign(10, 0);
         args.bytes = 80;
         args.address_offset = 64;
         args.data_offset = 72;
-        EXPECT_EQ(hbg::launch_graph_host_args(args, ptr(201), 6, ptr(1), nullptr, ptr(4)), errors.back());
-        EXPECT_EQ(f.copies.size(), errors.size());
-        EXPECT_EQ(f.recovery_syncs, errors.size() == 2 ? 1 : 0);
+        EXPECT_EQ(hbg::launch_graph_host_args(args, ptr(201), 6, ptr(1), nullptr), error);
+        EXPECT_EQ(f.copies.size(), 1u);
     }
-}
-
-TEST(HbgKernelHostArgs, FailedRecoverySynchronizationDoesNotRetry) {
-    NativeFake f;
-    active = &f;
-    f.initialize();
-    f.host_args_errors = {ACL_ERROR_RT_MEMORY_ALLOCATION};
-    f.recovery_status = 12346;
-    hbg::GraphHostArgs args;
-    args.storage.assign(10, 0);
-    args.bytes = 80;
-    args.address_offset = 64;
-    args.data_offset = 72;
-    EXPECT_EQ(hbg::launch_graph_host_args(args, ptr(201), 6, ptr(1), nullptr, ptr(4)), 12346);
-    EXPECT_EQ(f.copies.size(), 1u);
-    EXPECT_EQ(f.recovery_syncs, 1);
 }
 
 TEST(KernelNativeBinder, RoutesThreeStreamsAndCopiesIndependentHostArgs) {
