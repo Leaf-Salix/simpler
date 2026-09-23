@@ -207,8 +207,8 @@ void set_tensor_data(
         if (rt->tensor_access != nullptr && rt->tensor_access->device_only()) {
             rt->orchestrator->report_fatal(
                 SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
-                "HBG kernel Host orchestration cannot write Device tensor data at %#llx (%llu bytes); pass the "
-                "required Host value as a non-Tensor orchestration argument",
+                "HBG kernel Host orchestration cannot write Device tensor data at %#llx (%llu bytes); express the "
+                "update as a Device task",
                 (unsigned long long)elem_addr, (unsigned long long)elem_size
             );
         } else {
