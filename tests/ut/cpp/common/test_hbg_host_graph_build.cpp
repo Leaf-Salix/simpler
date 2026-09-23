@@ -15,7 +15,6 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstdio>
 #include <cstring>
 #include <future>
 #include <memory>
@@ -23,9 +22,10 @@
 #include <thread>
 #include <vector>
 
-#include <fcntl.h>
 #include <unistd.h>
 
+#include "common/log_level.h"
+#include "host_log.h"
 #include "host_build_graph/graph_recorder_pool.h"
 #include "host_build_graph/host_graph_build.h"
 #include "host_build_graph/kernel_external_tensor.h"
@@ -126,32 +126,24 @@ void empty_entry(const ChipTaskArgs &) {}
 
 std::atomic<int> post_access_side_effects{0};
 
-class ScopedStderrSilencer {
+class ScopedHostLogSilencer {
 public:
-    ScopedStderrSilencer() {
-        std::fflush(stderr);
-        saved_stderr_ = dup(STDERR_FILENO);
-        const int null_fd = open("/dev/null", O_WRONLY);
-        if (saved_stderr_ >= 0 && null_fd >= 0 && dup2(null_fd, STDERR_FILENO) >= 0) active_ = true;
-        if (null_fd >= 0) close(null_fd);
+    ScopedHostLogSilencer() :
+        previous_level_(HostLogger::get_instance().level()) {
+        HostLogger::get_instance().set_level(simpler::log::LogLevel::NUL, /*defer_writer=*/true);
     }
 
-    ~ScopedStderrSilencer() {
-        std::fflush(stderr);
-        if (saved_stderr_ >= 0) {
-            (void)dup2(saved_stderr_, STDERR_FILENO);
-            close(saved_stderr_);
-        }
+    ~ScopedHostLogSilencer() {
+        HostLogger::get_instance().set_level(
+            static_cast<simpler::log::LogLevel>(previous_level_), /*defer_writer=*/true
+        );
     }
 
-    bool active() const { return active_; }
-
-    ScopedStderrSilencer(const ScopedStderrSilencer &) = delete;
-    ScopedStderrSilencer &operator=(const ScopedStderrSilencer &) = delete;
+    ScopedHostLogSilencer(const ScopedHostLogSilencer &) = delete;
+    ScopedHostLogSilencer &operator=(const ScopedHostLogSilencer &) = delete;
 
 private:
-    int saved_stderr_{-1};
-    bool active_{false};
+    int previous_level_;
 };
 
 struct RecorderAbortProbe {
@@ -304,8 +296,7 @@ void fatal_then_read_entry(const ChipTaskArgs &args) {
 template <typename Access>
 int concurrent_forbidden_access_return_count(Access access) {
     constexpr int rounds = 100000;
-    ScopedStderrSilencer silence_expected_fatal_diagnostics;
-    if (!silence_expected_fatal_diagnostics.active()) return -1;
+    ScopedHostLogSilencer silence_expected_fatal_diagnostics;
 
     OrchestratorState orch;
     RuntimeContext rt{};
@@ -610,7 +601,6 @@ TEST(HbgHostAccessAbortTest, ConcurrentForbiddenReadsNeverReturnAFallbackValue) 
                                                     const uint32_t index[]) {
             (void)get_tensor_data(&rt, tensor, 1, index);
         });
-    ASSERT_GE(returned, 0);
     EXPECT_EQ(returned, 0);
 }
 
@@ -620,7 +610,6 @@ TEST(HbgHostAccessAbortTest, ConcurrentForbiddenWritesNeverReturnNormally) {
                                                     const uint32_t index[]) {
             set_tensor_data(&rt, tensor, 1, index, 7);
         });
-    ASSERT_GE(returned, 0);
     EXPECT_EQ(returned, 0);
 }
 

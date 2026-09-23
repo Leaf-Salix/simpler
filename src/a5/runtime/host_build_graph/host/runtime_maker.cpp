@@ -1174,11 +1174,9 @@ int32_t hbg::build_graph(
     orchestrator.total_cluster_count = block_dim * PLATFORM_AIC_CORES_PER_BLOCKDIM;
     orchestrator.total_aiv_count = block_dim * PLATFORM_AIV_CORES_PER_BLOCKDIM;
     rt->mode = MODE_EXECUTE;
-    // get_tensor_data/set_tensor_data resolve buffer.addr through the host
-    // views registered at copy-in time (host_build_graph/host_tensor_access.h),
-    // so the host orchestrator can read control tensors (e.g. paged_attention's
-    // context_lens/block_table) whether or not the platform maps device memory
-    // into the host address space.
+    // tensor_access owns the data-access policy for this build. Program mode
+    // may expose staged Host views; HBG kernel mode exposes descriptors only
+    // and rejects get_tensor_data/set_tensor_data at the access site.
 
     rt->active_callable_hash = reinterpret_cast<uint64_t>(entry_points.entry);
     rt->tensor_access = &tensor_access;

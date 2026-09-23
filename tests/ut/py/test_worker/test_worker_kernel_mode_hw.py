@@ -246,8 +246,8 @@ def _build_eager_callable(platform: str, runtime: str = _TMR):
     )
 
 
-def _build_hbg_forbidden_host_access_callable(platform: str):
-    """An HBG callable whose Host orchestration illegally reads a Device tensor."""
+def _build_hbg_forbidden_host_access_callable(platform: str, *, graph_body: bool = False):
+    """An HBG callable whose direct entry or queued Graph body reads a Device tensor."""
     import tempfile
 
     from simpler.task_interface import ArgDirection, ChipCallable
@@ -255,7 +255,8 @@ def _build_hbg_forbidden_host_access_callable(platform: str):
     from simpler_setup.kernel_compiler import KernelCompiler
 
     compiler = KernelCompiler(platform)
-    source = _PROJECT_ROOT / "tests/ut/py/kernel_hbg_forbidden_host_access.cpp"
+    source_name = "kernel_hbg_forbidden_graph_host_access.cpp" if graph_body else "kernel_hbg_forbidden_host_access.cpp"
+    source = _PROJECT_ROOT / "tests/ut/py" / source_name
     with tempfile.TemporaryDirectory(prefix="worker-hbg-forbidden-host-access-") as build_dir:
         orchestration = compiler.compile_orchestration(_HBG, str(source), build_dir=build_dir)
     return ChipCallable.build(
@@ -584,7 +585,10 @@ def _case_hbg_forbidden_host_access_lifecycle(platform: str, device: int) -> Non
     """A Host-access failure unwinds through the orchestration SO and leaves the context reusable."""
     from simpler.task_interface import ChipStorageTaskArgs, ChipTensor, DataType
 
-    invalid_chip = _build_hbg_forbidden_host_access_callable(platform)
+    invalid_chips = (
+        _build_hbg_forbidden_host_access_callable(platform),
+        _build_hbg_forbidden_host_access_callable(platform, graph_body=True),
+    )
     valid_chip = _build_eager_callable(platform, _HBG)
     with _caller_device(device) as caller:
         source = caller.device_buffer([0.0] * _COUNT)
@@ -592,17 +596,19 @@ def _case_hbg_forbidden_host_access_lifecycle(platform: str, device: int) -> Non
         invalid_args.add_tensor(ChipTensor.make(source, (_COUNT,), DataType.FLOAT32, child_memory=True))
 
         # Each close unregisters the callable and dlcloses its Host orchestration
-        # SO. Repeating the cycle catches unwind or recorder state retained past
-        # the worker/context lifetime rather than proving only one lucky failure.
-        for _ in range(3):
-            with _kernel_worker(caller, platform, runtime=_HBG) as worker:
-                pin_finalizer = _init_kernel_worker(worker)
-                callable_id = worker.kernel_prepare_callable(invalid_chip)
-                with pytest.raises(RuntimeError, match=r"failed with code -5\b"):
-                    worker.kernel_launch(callable_id, invalid_args, caller_stream=caller.stream)
-                assert caller.synchronize() == 0
-                worker.close()
-                _assert_closed_cleanly(worker, pin_finalizer)
+        # SO. Cover both a direct entry and a queued Graph recorder; repeating
+        # each cycle catches unwind or recorder state retained past the
+        # worker/context lifetime rather than proving only one lucky failure.
+        for invalid_chip in invalid_chips:
+            for _ in range(3):
+                with _kernel_worker(caller, platform, runtime=_HBG) as worker:
+                    pin_finalizer = _init_kernel_worker(worker)
+                    callable_id = worker.kernel_prepare_callable(invalid_chip)
+                    with pytest.raises(RuntimeError, match=r"failed with code -5\b"):
+                        worker.kernel_launch(callable_id, invalid_args, caller_stream=caller.stream)
+                    assert caller.synchronize() == 0
+                    worker.close()
+                    _assert_closed_cleanly(worker, pin_finalizer)
 
         # The same caller-owned device and stream must remain usable after the
         # repeated failure/unregister/dlclose cycles.
