@@ -304,44 +304,40 @@ reject any blocking synchronization through an interposer, and execute the new
 callable eagerly before its first replay. Preparation may grow callable residency;
 the committed-memory baseline is taken after that preparation.
 
-## Host tensor-data requirement semantics
+## Host orchestration and tensor-data access
 
-The independent orchestration requirements metadata describes generated Host
-behavior, not whether a tensor argument exists or carries a device address.
-New orchestration libraries may export
-`pypto_orchestration_requirements_v1`. Kernel mode requires the symbol and
-rejects unknown bits before Host build. Program mode records the metadata when
-present but retains its existing behavior for legacy libraries.
+Kernel-mode tensor arguments are caller-owned Device tensors. Simpler does not
+load an orchestration-requirements symbol, infer a Host mirror, or encode a
+Host-copy tensor suffix. `host_copy_tensor_count` remains in the common 32-byte
+invocation header only for wire compatibility and must be zero.
 
-| Host orchestration operation | Requires Host tensor-data capability |
-| ---------------------------- | ------------------------------------ |
-| Inspect shape, dtype, stride or scalar arguments | No |
-| Carry device addresses or construct tensor views without dereferencing storage | No |
-| Emit device predicate metadata (address, comparison, element size) | No; device evaluates the value |
-| Execute `get_tensor_data` / read tensor element values on Host | Yes; kernel mode also requires an explicit Host-copy argument |
-| Execute `set_tensor_data` / write tensor values on Host | Yes; unsupported in kernel mode |
+| Host orchestration operation | Kernel-mode behavior |
+| ---------------------------- | -------------------- |
+| Inspect shape, dtype, stride or scalar arguments | Allowed |
+| Carry device addresses or construct tensor views without dereferencing storage | Allowed |
+| Emit device predicate metadata (address, comparison, element size) | Allowed; the device evaluates the value |
+| Execute `get_tensor_data` / read tensor element values on Host | Fails at the access site |
+| Execute `set_tensor_data` / write tensor values on Host | Fails at the access site |
 
-H6 encodes arguments as `[device tensors][host-only copies][scalars]`.
-`host_copy_tensor_count` names the trailing tensor suffix. The suffix is paired
-in order with the equally sized suffix of the device-tensor prefix. A pair must
-have identical shape, stride, dtype, start offset and buffer size; only its
-address space and address differ. This gives `pa(..., block_table,
-block_table_host)` a deterministic wire form without another pointer table.
+Values needed while constructing an HBG graph on the Host must be explicit
+non-Tensor orchestration arguments, represented by the existing scalar argument
+pool. PyPTO is responsible for lowering such values to that interface. Simpler
+does not reinterpret a Host pointer as a Device tensor and does not perform an
+implicit H2D or D2H copy.
 
-All main tensors must carry `AddressSpace::DEVICE`. V1 accepts a dense
+All tensor arguments must carry `AddressSpace::DEVICE`. V1 accepts a dense
 row-major layout or row-major rows with outer padding: the innermost stride is
 one and each outer stride covers the complete next dimension. Broadcast,
-transpose and stepped innermost views are rejected before Host build.
+transpose and stepped innermost views are rejected before Host build. Host
+orchestration receives an accessor that exposes no tensor storage; a real
+`get_tensor_data` or `set_tensor_data` call marks the build fatal, terminates the
+current Host orchestration control flow, drains any Graph recording work, and
+returns the existing invalid-argument status before any Device execution is
+submitted. The fatal code remains the error source; the internal cancellation
+does not change the runtime ABI or make an ordinary reported fatal throw.
 
-Kernel Host build registers only the explicit Host-copy suffix as read-only.
-It never maps a device tensor, performs fallback D2H, synchronizes a stream or
-allows Host writes. The Host-only copy is build input and cannot enter a task
-payload, Graph Definition, predicate operand or device graph packet. The host
-packet producer checks this before binding the frozen working slot, and the
-AICPU restore path checks again before writing any device destination.
-
-The resulting graph packet contains caller-owned device addresses and the
+The resulting graph packet contains caller-owned Device addresses and the
 captured graph structure. Capture builds this immutable packet once. Replay
 restores it into the existing fixed-capacity slot and does not re-enter Host
-build or read the Host copy. A changed shape, stride family, task topology or
-address specialization requires another captured graph.
+build. A changed shape, stride family, task topology or address specialization
+requires another captured graph.

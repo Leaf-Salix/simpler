@@ -118,18 +118,6 @@ bool HostTensorAccessor::add_child_memory(uint64_t dev_base, uint64_t size) {
     return true;
 }
 
-bool HostTensorAccessor::add_host_copy(uint64_t logical_base, uint64_t size, const void *host_view) {
-    if (impl_->mode != HostTensorAccessMode::KernelHostCopiesOnly || logical_base == 0 || size == 0 ||
-        host_view == nullptr || logical_base != reinterpret_cast<uintptr_t>(host_view)) {
-        return false;
-    }
-    impl_->regions.push_back(
-        {logical_base, size, const_cast<unsigned char *>(static_cast<const unsigned char *>(host_view)), false,
-         AccessMeans::HostView}
-    );
-    return true;
-}
-
 // Pick the means for a child-memory region. The platform owns any mapping it
 // hands back for the allocation's lifetime, so this accessor records the
 // address without taking responsibility for releasing it.
@@ -145,6 +133,7 @@ void resolve_means(const HostApi *api, HostTensorRegion *region) {
 }
 
 bool HostTensorAccessor::read(uint64_t dev_addr, void *dst, uint64_t bytes) {
+    if (impl_->mode == HostTensorAccessMode::KernelDeviceOnly) return false;
     uint64_t offset = 0;
     HostTensorRegion *region = find_region(impl_->regions, dev_addr, bytes, &offset);
     if (region == nullptr) {
@@ -162,7 +151,7 @@ bool HostTensorAccessor::read(uint64_t dev_addr, void *dst, uint64_t bytes) {
 }
 
 bool HostTensorAccessor::write(uint64_t dev_addr, const void *src, uint64_t bytes) {
-    if (impl_->mode == HostTensorAccessMode::KernelHostCopiesOnly) return false;
+    if (impl_->mode == HostTensorAccessMode::KernelDeviceOnly) return false;
     uint64_t offset = 0;
     HostTensorRegion *region = find_region(impl_->regions, dev_addr, bytes, &offset);
     if (region == nullptr) {
@@ -188,6 +177,8 @@ size_t HostTensorAccessor::mapping_count() const noexcept { return impl_->mappin
 uint64_t HostTensorAccessor::mapped_bytes() const noexcept { return impl_->mapped_bytes; }
 
 uint64_t HostTensorAccessor::device_copy_count() const noexcept { return impl_->device_copy_count; }
+
+bool HostTensorAccessor::device_only() const noexcept { return impl_->mode == HostTensorAccessMode::KernelDeviceOnly; }
 
 void HostTensorAccessor::close() noexcept {
     for (void *dev_ptr : impl_->mappings) {

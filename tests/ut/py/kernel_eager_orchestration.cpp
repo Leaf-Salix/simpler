@@ -14,8 +14,6 @@
 // HBG kernel mode must be able to prove that Host build does not read tensor
 // payload bytes. This orchestration only consumes tensor metadata and scalar
 // values, so it declares an empty requirements mask.
-extern "C" uint64_t pypto_orchestration_requirements_v1() { return 0; }
-
 extern "C" void kernel_eager_orchestration(const ChipTaskArgs &args) {
     CoreTaskArgs task;
     task.add_input(args.tensor(0).ref());

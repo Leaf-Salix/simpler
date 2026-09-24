@@ -26,6 +26,7 @@
 
 #include "common/unified_log.h"
 #include "host_build_graph/runtime_status.h"
+#include "host_build_graph/host_tensor_access_abort.h"
 #include "host_build_graph/host_tensor_access.h"
 #include "host_build_graph/task_id.h"
 
@@ -88,6 +89,10 @@ void rt_orchestration_done(RuntimeContext *rt) {
     // orchestration-SO wrapper. Commit here as well so an all-Graph entry has a
     // final synchronization point for its asynchronous recording and deferred
     // outer shells even when no later non-Graph task forced an earlier commit.
+    // graph_commit waits for every Definition to leave RECORDING, but a worker
+    // may still be unwinding and destroying a closure from the orchestration
+    // image. Drain the runtime-owned jobs before the caller may unload that SO.
+    graph_record_wait_impl(rt);
     rt->orchestrator->graph_commit();
     rt->orchestrator->mark_done();
     // The orchestrator itself never crosses to the device, so the count of tasks
@@ -147,12 +152,30 @@ static bool require_no_producer(RuntimeContext *rt, const simpler::hbg::Tensor &
 
 uint64_t
 get_tensor_data(RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
+    OrchestratorState &orch = *rt->orchestrator;
+    const bool fatal = orch.is_fatal();
+    if (orch.host_tensor_access_abort_requested.load(std::memory_order_acquire)) {
+        throw hbg::HostTensorAccessAbort{};
+    }
+    if (fatal) return 0;
+
     if (tensor.buffer.addr == 0) {
         unified_log_error(
             __FUNCTION__, "get_tensor_data: buffer not allocated (addr=0). "
                           "Use the simpler::hbg::Tensor returned by add_output(TensorCreateInfo) after submit returns."
         );
         return 0;
+    }
+
+    if (rt->tensor_access != nullptr && rt->tensor_access->device_only()) {
+        orch.host_tensor_access_abort_requested.store(true, std::memory_order_release);
+        orch.report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
+            "HBG kernel Host orchestration cannot read Device tensor data at %#llx; pass the required Host value "
+            "as a non-Tensor orchestration argument",
+            (unsigned long long)tensor.buffer.addr
+        );
+        throw hbg::HostTensorAccessAbort{};
     }
 
     if (!require_no_producer(rt, tensor, __FUNCTION__)) {
@@ -179,12 +202,30 @@ get_tensor_data(RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t
 void set_tensor_data(
     RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
 ) {
+    OrchestratorState &orch = *rt->orchestrator;
+    const bool fatal = orch.is_fatal();
+    if (orch.host_tensor_access_abort_requested.load(std::memory_order_acquire)) {
+        throw hbg::HostTensorAccessAbort{};
+    }
+    if (fatal) return;
+
     if (tensor.buffer.addr == 0) {
         unified_log_error(
             __FUNCTION__, "set_tensor_data: buffer not allocated (addr=0). "
                           "Use the simpler::hbg::Tensor returned by add_output(TensorCreateInfo) after submit returns."
         );
         return;
+    }
+
+    if (rt->tensor_access != nullptr && rt->tensor_access->device_only()) {
+        orch.host_tensor_access_abort_requested.store(true, std::memory_order_release);
+        orch.report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
+            "HBG kernel Host orchestration cannot write Device tensor data at %#llx; express the update as a "
+            "Device task",
+            (unsigned long long)tensor.buffer.addr
+        );
+        throw hbg::HostTensorAccessAbort{};
     }
 
     if (!require_no_producer(rt, tensor, __FUNCTION__)) {

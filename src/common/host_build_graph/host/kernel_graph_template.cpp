@@ -230,7 +230,6 @@ int make_graph_launch_template(
         return PTO_RUNTIME_ERR_INVALID_STATE;
     if (identity.callable_id < 0 || identity.callable_id >= MAX_REGISTERED_CALLABLE_IDS ||
         !simpler::kernel::valid_invocation_counts(identity.tensor_count, identity.scalar_count) ||
-        !simpler::kernel::valid_host_copy_tensor_count(identity.tensor_count, identity.host_copy_tensor_count) ||
         identity.callable_hash == 0 || identity.argument_hash == 0 || identity.function_hash == 0 ||
         runtime_binary_id == 0)
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -323,7 +322,7 @@ int make_graph_launch_template(
     invocation.callable_id = identity.callable_id;
     invocation.tensor_count = identity.tensor_count;
     invocation.scalar_count = identity.scalar_count;
-    invocation.host_copy_tensor_count = identity.host_copy_tensor_count;
+    invocation.host_copy_tensor_count = 0;
     invocation.payload_bytes = header.total_bytes;
     std::memcpy(packet, &invocation, sizeof(invocation));
     std::memcpy(packet + sizeof(invocation), &header, sizeof(header));

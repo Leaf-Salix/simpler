@@ -12,32 +12,20 @@
 #pragma once
 
 #include <cstdint>
-#include <new>
 
-#include "host_build_graph/host_graph_build.h"
-#include "host_build_graph/host_tensor_access.h"
 #include "host_build_graph/runtime_types.h"
-#include "orchestration_requirements.h"
 #include "task_args.h"
 
 namespace hbg {
 
-// H6 wire convention:
-//   [device tensors][host-only duplicates][scalars]
-// host_copy_tensor_count names the trailing tensor suffix. Each host copy is
-// paired, in order, with the equally-sized suffix of the DEVICE prefix. This
-// makes the pairing recoverable from the existing K9 count without placing
-// pointers or an index table in the invocation header.
+// HBG kernel mode borrows caller-owned Device tensors. Host orchestration may
+// inspect their descriptors, but it cannot read or write their storage.
 enum class KernelExternalTensorStatus : uint8_t {
     Ok = 0,
     InvalidCounts,
     InvalidTensor,
     NonDeviceTensor,
     UnsupportedStrideFamily,
-    InvalidHostCopy,
-    HostCopyMismatch,
-    RequirementsRejected,
-    AllocationFailure,
 };
 
 inline bool valid_external_tensor_span(const ChipTensor &tensor, uint64_t *extent_out = nullptr) noexcept {
@@ -76,71 +64,17 @@ inline bool supported_external_stride_family(const ChipTensor &tensor) noexcept 
     return true;
 }
 
-inline bool matching_host_copy_metadata(const ChipTensor &device, const ChipTensor &host) noexcept {
-    if (device.buffer.size != host.buffer.size || device.start_offset != host.start_offset ||
-        device.ndims != host.ndims || device.dtype != host.dtype)
-        return false;
-    for (uint32_t i = 0; i < device.ndims; ++i)
-        if (device.shapes[i] != host.shapes[i] || device.strides[i] != host.strides[i]) return false;
-    return true;
-}
-
-inline KernelExternalTensorStatus
-validate_kernel_external_tensors(const ChipStorageTaskArgs &args, int32_t host_copy_tensor_count) noexcept {
+inline KernelExternalTensorStatus validate_kernel_external_tensors(const ChipStorageTaskArgs &args) noexcept {
     const int32_t tensor_count = args.tensor_count();
     const int32_t scalar_count = args.scalar_count();
     if (tensor_count < 0 || tensor_count > CHIP_MAX_TENSOR_ARGS || scalar_count < 0 ||
-        scalar_count > CHIP_MAX_SCALAR_ARGS || tensor_count + scalar_count > CHIP_MAX_TENSOR_ARGS ||
-        host_copy_tensor_count < 0 || host_copy_tensor_count > tensor_count / 2)
+        scalar_count > CHIP_MAX_SCALAR_ARGS || tensor_count + scalar_count > CHIP_MAX_TENSOR_ARGS)
         return KernelExternalTensorStatus::InvalidCounts;
-    const int32_t device_count = tensor_count - host_copy_tensor_count;
-    for (int32_t i = 0; i < device_count; ++i) {
+    for (int32_t i = 0; i < tensor_count; ++i) {
         const ChipTensor &tensor = args.tensor(i);
         if (tensor.address_space != AddressSpace::DEVICE) return KernelExternalTensorStatus::NonDeviceTensor;
         if (!valid_external_tensor_span(tensor)) return KernelExternalTensorStatus::InvalidTensor;
         if (!supported_external_stride_family(tensor)) return KernelExternalTensorStatus::UnsupportedStrideFamily;
-    }
-    const int32_t paired_device_begin = device_count - host_copy_tensor_count;
-    for (int32_t i = 0; i < host_copy_tensor_count; ++i) {
-        const ChipTensor &host = args.tensor(device_count + i);
-        if (host.address_space != AddressSpace::HOST || !valid_external_tensor_span(host))
-            return KernelExternalTensorStatus::InvalidHostCopy;
-        if (!supported_external_stride_family(host)) return KernelExternalTensorStatus::UnsupportedStrideFamily;
-        if (!matching_host_copy_metadata(args.tensor(paired_device_begin + i), host))
-            return KernelExternalTensorStatus::HostCopyMismatch;
-    }
-    return KernelExternalTensorStatus::Ok;
-}
-
-// Validate everything before adding a readable region. On success only the
-// trailing host-copy suffix is readable; DEVICE addresses have no region and a
-// get_tensor_data call against one fails closed without mapping, D2H or sync.
-inline KernelExternalTensorStatus prepare_kernel_external_tensors(
-    const ChipStorageTaskArgs &args, int32_t host_copy_tensor_count, const HostOrchEntryPoints &entry_points,
-    HostTensorAccessor &accessor
-) noexcept {
-    const auto tensor_status = validate_kernel_external_tensors(args, host_copy_tensor_count);
-    if (tensor_status != KernelExternalTensorStatus::Ok) return tensor_status;
-    if (simpler::orchestration::validate_hbg_kernel_requirements(
-            entry_points.requirements_v1_available, entry_points.requirements_v1, host_copy_tensor_count
-        ) != simpler::orchestration::HbgKernelRequirementsStatus::Ok)
-        return KernelExternalTensorStatus::RequirementsRejected;
-    if ((entry_points.requirements_v1 & simpler::orchestration::REQUIREMENT_TENSOR_DATA_READ) == 0)
-        return KernelExternalTensorStatus::Ok;
-    const int32_t first_host_copy = args.tensor_count() - host_copy_tensor_count;
-    try {
-        for (int32_t i = first_host_copy; i < args.tensor_count(); ++i) {
-            const ChipTensor &host = args.tensor(i);
-            if (!accessor.add_host_copy(
-                    host.buffer.addr, host.buffer.size, reinterpret_cast<const void *>(host.buffer.addr)
-                )) {
-                accessor.close();
-                return KernelExternalTensorStatus::InvalidHostCopy;
-            }
-        }
-    } catch (const std::bad_alloc &) {
-        accessor.close();
-        return KernelExternalTensorStatus::AllocationFailure;
     }
     return KernelExternalTensorStatus::Ok;
 }

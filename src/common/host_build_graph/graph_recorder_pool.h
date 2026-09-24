@@ -26,7 +26,7 @@
  * sound and are relied on here:
  *
  *   - No job outlives the bind that queued it. rt_orchestration_done() ->
- *     rt_graph_commit() -> graph_record_wait() drains the pool at the end of every
+ *     graph_record_wait() -> graph_commit() drains the pool at the end of every
  *     orchestration, so a job's code cannot still be queued when unregister_callable
  *     dlcloses the .so it lives in.
  *   - The runtime a job binds to is a plain global in its own .so

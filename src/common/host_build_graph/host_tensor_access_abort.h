@@ -10,27 +10,12 @@
  */
 #pragma once
 
-#include "host_build_graph/kernel_graph_template.h"
-#include "host_build_graph/kernel_resource_requirements.h"
-#include "task_interface/task_args.h"
-
-class MemoryAllocator;
-class Runtime;
-class KernelExecutionState;
-struct HostApi;
-struct CallConfig;
-
 namespace hbg {
 
-int prepare_kernel_graph_resources(
-    KernelExecutionState &context, MemoryAllocator &allocator, const CallConfig &config,
-    RuntimeArchitecture architecture, KernelResourcePlan *plan_out
-);
-
-int build_kernel_graph_template(
-    Runtime &runtime, const ChipStorageTaskArgs &args, void *host_orch_func_ptr, const KernelExecutionState &context,
-    int device_id, uint64_t generation, uint64_t runtime_binary_id, uint64_t task_window,
-    const GraphInvocationIdentity &identity, GraphLaunchTemplate &out
-);
+// Host-only control-flow cancellation for a forbidden kernel-mode tensor-data
+// access. The latched OrchestratorState fatal code remains the error/status
+// source; this type only prevents user orchestration from continuing with a
+// fabricated fallback value.
+struct HostTensorAccessAbort final {};
 
 }  // namespace hbg

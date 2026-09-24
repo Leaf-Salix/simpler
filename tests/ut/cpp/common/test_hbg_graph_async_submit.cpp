@@ -62,6 +62,7 @@ struct FakeRuntime {
     // A recorded body reports a fatal on the recorder thread while the bind thread
     // reads it, which is what the runtime's own fatal_code is atomic for.
     std::atomic<bool> fatal{false};
+    std::atomic<int> tensor_access_calls{0};
     // graph_end's view of the fatal at the moment it ran, so a test can tell "end
     // was reached after the body latched" from "end was reached at all".
     bool end_saw_fatal{false};
@@ -106,6 +107,16 @@ static_assert(offsetof(FakeRuntime, pending_scope_mode) == offsetof(RuntimeConte
 FakeRuntime *as_fake(RuntimeContext *rt) { return reinterpret_cast<FakeRuntime *>(rt); }
 
 bool fake_is_fatal(RuntimeContext *rt) { return as_fake(rt)->fatal.load(std::memory_order_acquire); }
+
+struct HostAccessAbortProbe final {};
+
+uint64_t fake_get_tensor_data(RuntimeContext *rt, const simpler::hbg::Tensor &, uint32_t, const uint32_t[]) {
+    FakeRuntime &fake = *as_fake(rt);
+    fake.tensor_access_calls.fetch_add(1, std::memory_order_acq_rel);
+    fake.fatal.store(true, std::memory_order_release);
+    fake.cv.notify_all();
+    throw HostAccessAbortProbe{};
+}
 
 GraphScopeResult fake_graph_begin(RuntimeContext *rt, uint64_t, const GraphTaskArgs &args) {
     FakeRuntime &fake = *as_fake(rt);
@@ -234,6 +245,7 @@ const RuntimeOps kFakeOps = {
     .scope_begin = fake_scope_begin,
     .scope_end = fake_scope_end,
     .is_fatal = fake_is_fatal,
+    .get_tensor_data = fake_get_tensor_data,
     .graph_begin = fake_graph_begin,
     .graph_prepare = fake_graph_prepare,
     .graph_abort = fake_graph_abort,
@@ -244,6 +256,45 @@ const RuntimeOps kFakeOps = {
 };
 
 }  // namespace
+
+TEST(HbgGraphAsyncSubmit, FatalTensorAccessStillCancelsSiblingRecorderThroughPublicWrapper) {
+    FakeRuntime fake{};
+    fake.ops = &kFakeOps;
+    framework_bind_runtime(reinterpret_cast<RuntimeContext *>(&fake));
+
+    uint32_t storage[1]{};
+    uint32_t shape[] = {1};
+    const simpler::hbg::Tensor tensor = simpler::hbg::make_tensor_external(storage, shape, 1);
+    GraphTaskArgs empty_args;
+    std::atomic<int> aborted_recorders{0};
+    std::atomic<int> post_access_side_effects{0};
+    const uint32_t index[] = {0};
+    auto record = [&](const GraphTaskArgs &) {
+        try {
+            (void)get_tensor_data(tensor, 1, index);
+            post_access_side_effects.fetch_add(1, std::memory_order_relaxed);
+        } catch (const HostAccessAbortProbe &) {
+            aborted_recorders.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+
+    ASSERT_TRUE(test_pool().start(empty_args, record));
+    {
+        std::unique_lock<std::mutex> lock(fake.mutex);
+        ASSERT_TRUE(fake.cv.wait_for(lock, kHandshakeTimeout, [&]() {
+            return fake.fatal.load(std::memory_order_acquire);
+        }));
+    }
+    ASSERT_TRUE(test_pool().start(empty_args, record));
+    test_pool().wait();
+    framework_bind_runtime(nullptr);
+
+    EXPECT_EQ(fake.tensor_access_calls.load(std::memory_order_acquire), 2)
+        << "the public wrapper must enter the runtime op even after a sibling latched fatal";
+    EXPECT_EQ(aborted_recorders.load(std::memory_order_acquire), 2);
+    EXPECT_EQ(post_access_side_effects.load(std::memory_order_acquire), 0)
+        << "neither recorder may continue with a fabricated tensor value";
+}
 
 TEST(HbgGraphAsyncSubmit, PrewarmedRecorderPoolGrowsPastThePrewarmedCount) {
     // One more than the prewarmed count, so the pool must create a worker for

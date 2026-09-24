@@ -17,6 +17,7 @@
  * Ascend hardware or SDK.
  */
 
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdint>
@@ -32,6 +33,16 @@
 // unified_log.h stubs
 // =============================================================================
 
+namespace {
+
+std::atomic<bool> g_test_unified_log_suppressed{false};
+
+}  // namespace
+
+extern "C" bool set_test_unified_log_suppressed(bool suppressed) {
+    return g_test_unified_log_suppressed.exchange(suppressed, std::memory_order_acq_rel);
+}
+
 extern "C" {
 
 int unified_log_host_span_enabled() { return 0; }
@@ -39,6 +50,7 @@ int unified_log_host_span_enabled() { return 0; }
 void unified_log_host_span(const struct SimplerHostSpan *) {}
 
 void unified_log_error(const char *func, const char *fmt, ...) {
+    if (g_test_unified_log_suppressed.load(std::memory_order_acquire)) return;
     va_list args;
     va_start(args, fmt);
     fprintf(stderr, "[ERROR] %s: ", func);
@@ -48,6 +60,7 @@ void unified_log_error(const char *func, const char *fmt, ...) {
 }
 
 void unified_log_warn(const char *func, const char *fmt, ...) {
+    if (g_test_unified_log_suppressed.load(std::memory_order_acquire)) return;
     va_list args;
     va_start(args, fmt);
     fprintf(stderr, "[WARN]  %s: ", func);
@@ -57,6 +70,7 @@ void unified_log_warn(const char *func, const char *fmt, ...) {
 }
 
 void unified_log_timing(const char *func, const char *fmt, ...) {
+    if (g_test_unified_log_suppressed.load(std::memory_order_acquire)) return;
     va_list args;
     va_start(args, fmt);
     fprintf(stderr, "[TIMING] %s: ", func);
@@ -66,6 +80,7 @@ void unified_log_timing(const char *func, const char *fmt, ...) {
 }
 
 void unified_log_info(const char *func, const char *fmt, ...) {
+    if (g_test_unified_log_suppressed.load(std::memory_order_acquire)) return;
     va_list args;
     va_start(args, fmt);
     fprintf(stderr, "[INFO] %s: ", func);

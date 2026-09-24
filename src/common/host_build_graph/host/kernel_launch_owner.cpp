@@ -44,33 +44,25 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
             &callable.scalar_count
         ) != simpler::kernel::InvocationStatus::Ok)
         return PTO_RUNTIME_ERR_INTERNAL;
-    int32_t host_copy_tensor_count = 0;
-    for (int32_t i = args.tensor_count() - 1; i >= 0 && args.tensor(i).address_space == AddressSpace::HOST; --i)
-        ++host_copy_tensor_count;
-    if (args.scalar_count() != callable.scalar_count ||
-        args.tensor_count() != callable.tensor_count + host_copy_tensor_count)
+    if (args.scalar_count() != callable.scalar_count || args.tensor_count() != callable.tensor_count)
         return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    if (hbg::validate_kernel_external_tensors(args, host_copy_tensor_count) != hbg::KernelExternalTensorStatus::Ok)
+    if (hbg::validate_kernel_external_tensors(args) != hbg::KernelExternalTensorStatus::Ok)
         return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
 
     const uint64_t argument_hash = hbg::kernel_argument_snapshot_hash(args);
     if (argument_hash == 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     const auto &cached = state.hbg_launch_state;
-    // Host-copy tensors are tiling-data inputs to Host build. Their contents may
-    // change while the pointer and shape stay stable, so eager launches rebuild
-    // them. ACLGraph replay still reuses the HostArgs snapshot captured by its
-    // node and therefore never enters this host launch path again.
-    const bool cache_hit = host_copy_tensor_count == 0 && cached != nullptr && cached->argument_snapshot != nullptr &&
+    const bool cache_hit = cached != nullptr && cached->argument_snapshot != nullptr &&
                            cached->graph_template.size() != 0 && cached->argument_hash == argument_hash &&
                            hbg::same_kernel_argument_snapshot(*cached->argument_snapshot, args);
     if (!cache_hit) {
         hbg::GraphInvocationIdentity identity{
-            callable_id,   args.tensor_count(),     args.scalar_count(),    state.chip_buffer_hash,
-            argument_hash, state.aicore_image_hash, host_copy_tensor_count,
+            callable_id,   args.tensor_count(),     args.scalar_count(), state.chip_buffer_hash,
+            argument_hash, state.aicore_image_hash,
         };
         hbg::GraphLaunchTemplate candidate;
         int rc = hbg::build_kernel_graph_template(
-            kernel_runtime_, *api, args, state.host_orch_func_ptr, kernel_exec_state_, device_id_,
+            kernel_runtime_, args, state.host_orch_func_ptr, kernel_exec_state_, device_id_,
             kernel_static_config_.generation(), kernel_runtime_binary_id_,
             hbg_kernel_state_->resource_plan.capacity().layout.task_capacity, identity, candidate
         );

@@ -57,10 +57,10 @@
 #include "host_build_graph/dep_gen_host_graph.h"
 #include "host_build_graph/graph_execution.h"
 #include "host_build_graph/host_tensor_access.h"
+#include "host_build_graph/host_tensor_access_abort.h"
 #include "host_build_graph/graph_host_state.h"
 #include "host_build_graph/host_graph_build.h"
 #include "host_build_graph/graph_definition_pack.h"
-#include "orchestration_requirements.h"
 #include "host_build_graph/host_phase_trace.h"
 #include "host_build_graph/orchestrator.h"
 #include "host_build_graph/ready_queue_sizing.h"
@@ -524,11 +524,9 @@ int32_t hbg::build_graph(
     orchestrator.total_cluster_count = block_dim * PLATFORM_AIC_CORES_PER_BLOCKDIM;
     orchestrator.total_aiv_count = block_dim * PLATFORM_AIV_CORES_PER_BLOCKDIM;
     rt->mode = MODE_EXECUTE;
-    // get_tensor_data/set_tensor_data resolve buffer.addr through the host
-    // views registered at copy-in time (host_build_graph/host_tensor_access.h),
-    // so the host orchestrator can read control tensors (e.g. paged_attention's
-    // context_lens/block_table) whether or not the platform maps device memory
-    // into the host address space.
+    // tensor_access owns the data-access policy for this build. Program mode
+    // may expose staged Host views; HBG kernel mode exposes descriptors only
+    // and rejects get_tensor_data/set_tensor_data at the access site.
 
     rt->active_callable_hash = reinterpret_cast<uint64_t>(entry_points.entry);
     rt->tensor_access = &tensor_access;
@@ -541,7 +539,12 @@ int32_t hbg::build_graph(
 
     const BindPhaseMark orch_phase = bind_phase_begin();
     rt_scope_begin(rt);
-    entry_points.entry(args);
+    try {
+        entry_points.entry(args);
+    } catch (const hbg::HostTensorAccessAbort &) {
+        // The runtime op already latched the specific fatal code and diagnostic.
+        // This catch only restores the common build/finalization path.
+    }
     rt_scope_end(rt);
     rt_orchestration_done(rt);
 #if SIMPLER_ORCH_PROFILING
@@ -1014,13 +1017,6 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
         auto *eps = new HostOrchEntryPoints{};
         eps->entry = reinterpret_cast<OrchestrationEntryFunc>(entry);
         eps->bind = reinterpret_cast<OrchestrationBindFunc>(bind_sym);
-        if (void *requirements_sym = dlsym(handle, simpler::orchestration::REQUIREMENTS_V1_SYMBOL);
-            requirements_sym != nullptr) {
-            const auto requirements =
-                reinterpret_cast<simpler::orchestration::RequirementsV1Function>(requirements_sym);
-            eps->requirements_v1 = requirements();
-            eps->requirements_v1_available = true;
-        }
         out->host_dlopen_handle = handle;
         out->host_orch_func_ptr = eps;
         LOG_INFO("host-orch: loaded orchestration entry '%s' on host", orch_func_name);
