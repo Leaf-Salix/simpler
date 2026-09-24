@@ -679,7 +679,10 @@ def test_simulated_components_report_kernel_mode_unsupported(arch: str, runtime:
 
 
 @pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_CASES)
-def test_kernel_context_init_respects_runtime_support_on_a_borrowed_device(arch: str, runtime: str, request):
+@pytest.mark.parametrize("event_mode", [None, 0, 1], ids=["default", "software", "hardware"])
+def test_kernel_context_init_respects_runtime_support_on_a_borrowed_device(
+    arch: str, runtime: str, event_mode, request
+):
     """Both onboard runtimes claim the borrowed device without owning its lifecycle."""
     lib = _load(arch, "onboard", runtime)
     aicpu, aicore, dispatcher = _binaries(arch, runtime)
@@ -688,6 +691,10 @@ def test_kernel_context_init_respects_runtime_support_on_a_borrowed_device(arch:
     lib.rtSetDevice.argtypes = [ctypes.c_int]
     lib.rtSetDevice.restype = ctypes.c_int
     assert lib.rtSetDevice(device_id) == 0
+    if event_mode is not None:
+        lib.rtEventWorkModeSet.argtypes = [ctypes.c_uint8]
+        lib.rtEventWorkModeSet.restype = ctypes.c_int
+        assert lib.rtEventWorkModeSet(event_mode) in (0, 207000)
 
     ctx = lib.create_device_context()
     assert ctx
@@ -705,6 +712,14 @@ def test_kernel_context_init_respects_runtime_support_on_a_borrowed_device(arch:
                 1,
             )  # fmt: skip
         assert status == 0
+        mode = ctypes.c_uint8()
+        lib.rtEventWorkModeGet.argtypes = [ctypes.POINTER(ctypes.c_uint8)]
+        lib.rtEventWorkModeGet.restype = ctypes.c_int
+        mode_status = lib.rtEventWorkModeGet(ctypes.byref(mode))
+        # CANN fixes hardware mode on chips that do not expose this query.
+        assert mode_status in (0, 207000)
+        if mode_status == 0:
+            assert mode.value == (0 if event_mode == 0 else 1)
         assert lib.simpler_kernel_mode_supported(ctx) == 1
         # The claim is exclusive for the context's whole life.
         assert (
