@@ -49,7 +49,9 @@ using simpler::tmr::TmrCoreReport;
 using simpler::tmr::TmrKernelContextDescriptor;
 using simpler::tmr::TmrLaunchControl;
 
-__aicore__ static void execute_dispatch_loop(__gm__ Handshake *my_hank) {
+__aicore__ static void execute_dispatch_loop(
+    __gm__ Handshake *my_hank, bool trace_round, uint64_t *trace_child_start, uint64_t *trace_child_end
+) {
     dcci(my_hank, SINGLE_CACHE_LINE);
     __gm__ DispatchPayload *payload = reinterpret_cast<__gm__ DispatchPayload *>(my_hank->task);
 
@@ -181,12 +183,14 @@ __aicore__ static void execute_dispatch_loop(__gm__ Handshake *my_hank) {
                 pmu_aicore_begin();
             }
 
-            uint64_t start_time = chip_swimlane_enabled ? get_sys_cnt_aicore() : 0;
+            uint64_t start_time = (chip_swimlane_enabled || trace_round) ? get_sys_cnt_aicore() : 0;
+            if (trace_round && *trace_child_start == 0) *trace_child_start = start_time;
 
             execute_task(exec_payload);
 
             // Keep start_time -> end_time scoped to AICore execution.
-            uint64_t end_time = chip_swimlane_enabled ? get_sys_cnt_aicore() : 0;
+            uint64_t end_time = (chip_swimlane_enabled || trace_round) ? get_sys_cnt_aicore() : 0;
+            if (trace_round && *trace_child_end == 0) *trace_child_end = end_time;
 
             last_reg_val = reg_val;
             write_reg(RegId::COND, MAKE_FIN_VALUE(task_id));
@@ -225,6 +229,10 @@ __aicore__ static void execute_dispatch_loop(__gm__ Handshake *my_hank) {
 __aicore__ static void execute_worker(
     __gm__ Runtime *runtime, __gm__ Handshake *my_hank, int block_idx, CoreType core_type, uint64_t report_epoch = 0
 ) {
+    const bool trace_round = report_epoch == 64;
+    const uint64_t trace_entry = trace_round ? get_sys_cnt_aicore() : 0;
+    uint64_t trace_child_start = 0;
+    uint64_t trace_child_end = 0;
     my_hank->physical_core_id = get_physical_core_id();
     my_hank->core_type = core_type;
     OUT_OF_ORDER_STORE_BARRIER();
@@ -234,13 +242,23 @@ __aicore__ static void execute_worker(
         my_hank->report_epoch = report_epoch;
     }
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
-
+    const uint64_t trace_report = trace_round ? get_sys_cnt_aicore() : 0;
     // Each launch resets this SPR; the AICPU publishes task before opening it.
     while (read_reg(RegId::DATA_MAIN_BASE) == 0) {
         SPIN_WAIT_HINT();
     }
     write_reg(RegId::COND, AICORE_IDLE_VALUE);
-    execute_dispatch_loop(my_hank);
+    const uint64_t trace_window_open = trace_round ? get_sys_cnt_aicore() : 0;
+    execute_dispatch_loop(my_hank, trace_round, &trace_child_start, &trace_child_end);
+    if (trace_round) {
+        // Five bounded 32-bit deltas plus two absolute stamps fit in the report's diagnostic padding.
+        my_hank->trace_entry = trace_entry;
+        my_hank->trace_report_published = ((trace_window_open - trace_report) << 32) | (trace_report - trace_entry);
+        my_hank->trace_window_open = trace_child_start == 0 ? 0 :
+                                                              ((trace_child_end - trace_child_start) << 32) |
+                                                                  (trace_child_start - trace_window_open);
+        my_hank->trace_dispatch_exit = get_sys_cnt_aicore();
+    }
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
     wait_for_post_close_release(&runtime->dev.teardown_gates[block_idx].post_close_release);
 }

@@ -65,7 +65,9 @@
 #include "scheduler/scheduler_context.h"
 #include "tensormap_and_ringbuffer/kernel_execution_inputs.h"
 #include "tensormap_and_ringbuffer/kernel_execution.h"
+#define SIMPLER_A2A3_GATE_TRACE 1
 #include "tensormap_and_ringbuffer/kernel_execution_round.h"
+#undef SIMPLER_A2A3_GATE_TRACE
 #include "tensormap_and_ringbuffer/kernel_registration.h"
 #include "utils/thread_completion_gate.h"
 
@@ -124,6 +126,35 @@ struct OrchSoEntry {
 };
 
 struct AicpuExecutor {
+    struct KernelGateTraceThread {
+        uint64_t join_start{0};
+        uint64_t join_end{0};
+        uint64_t admission_end{0};
+        uint64_t execution_end{0};
+        uint64_t arrival_end{0};
+        uint64_t final_read_end{0};
+        uint64_t depart_end{0};
+    };
+    struct KernelTraceThread {
+        uint64_t init_start{0};
+        uint64_t init_end{0};
+        uint64_t run_end{0};
+        uint64_t shutdown_end{0};
+        uint64_t completion_end{0};
+    };
+    struct KernelTrace {
+        uint64_t prepare_start{0};
+        uint64_t residency_end{0};
+        uint64_t admission_end{0};
+        uint64_t load_end{0};
+        uint64_t config_end{0};
+        uint64_t prepare_end{0};
+        uint64_t clear_start{0};
+        uint64_t clear_end{0};
+        KernelGateTraceThread gate[MAX_GATE_THREADS]{};
+        KernelTraceThread threads[MAX_AICPU_THREADS]{};
+    } kernel_trace_{};
+
     int32_t sched_thread_num_;
     bool serial_orch_sched_{false};
 
@@ -350,11 +381,17 @@ int32_t AicpuExecutor::prepare_execution(Runtime *runtime, const ExecutionInputs
 int32_t
 AicpuExecutor::execute(Runtime *runtime, const ExecutionInputs &inputs, const simpler::tmr::KernelThreadView *thread) {
     if (thread != nullptr) platform_aicpu_affinity_set_thread_idx(thread->execution_index);
+    const bool trace_round = thread != nullptr && kernel_storage_.expected_epoch() == 64;
+    const int32_t trace_thread = trace_round ? thread->execution_index : -1;
+    if (trace_thread >= 0 && trace_thread < MAX_AICPU_THREADS)
+        kernel_trace_.threads[trace_thread].init_start = get_sys_cnt_aicpu();
     int32_t status;
     {
         AicpuPhaseScope preamble(AicpuPhase::Preamble);
         status = init(runtime, inputs);
     }
+    if (trace_thread >= 0 && trace_thread < MAX_AICPU_THREADS)
+        kernel_trace_.threads[trace_thread].init_end = get_sys_cnt_aicpu();
     if (status == 0) {
         AicpuPhaseScope graph_build(AicpuPhase::GraphBuild);
         try {
@@ -363,6 +400,8 @@ AicpuExecutor::execute(Runtime *runtime, const ExecutionInputs &inputs, const si
             status = -1;
         }
     }
+    if (trace_thread >= 0 && trace_thread < MAX_AICPU_THREADS)
+        kernel_trace_.threads[trace_thread].run_end = get_sys_cnt_aicpu();
     const int32_t index = platform_aicpu_affinity_thread_idx();
     if (status != 0) {
         int32_t expected = 0;
@@ -375,6 +414,8 @@ AicpuExecutor::execute(Runtime *runtime, const ExecutionInputs &inputs, const si
         const int32_t shutdown = sched_ctx_.shutdown(index, runtime);
         if (status == 0) status = shutdown;
     }
+    if (trace_thread >= 0 && trace_thread < MAX_AICPU_THREADS)
+        kernel_trace_.threads[trace_thread].shutdown_end = get_sys_cnt_aicpu();
     if (status == 0) status = read_runtime_status(inputs.sm);
     if (status != 0) {
         int32_t expected = 0;
@@ -384,6 +425,8 @@ AicpuExecutor::execute(Runtime *runtime, const ExecutionInputs &inputs, const si
         aicpu_publish_task_timing_tail_usage(aicpu_thread_num_);
         if (execution_error_.load(std::memory_order_acquire) == 0) finalize_execution(inputs);
     });
+    if (trace_thread >= 0 && trace_thread < MAX_AICPU_THREADS)
+        kernel_trace_.threads[trace_thread].completion_end = get_sys_cnt_aicpu();
     return status;
 }
 
@@ -953,6 +996,10 @@ void AicpuExecutor::deinit(Runtime *runtime, bool invalidate_host_image) {
 
 int32_t AicpuExecutor::prepare_kernel_round(const simpler::tmr::KernelExecutionRequest &request) {
     using namespace simpler::tmr;
+    const bool trace_round = kernel_storage_.expected_epoch() == 64;
+    if (trace_round) {
+        kernel_trace_.prepare_start = get_sys_cnt_aicpu();
+    }
     refresh_kernel_dfx(kernel_context_);
     if (request.execution_threads > MAX_AICPU_THREADS ||
         validate_execution_binding(request.binding) != InvocationStatus::Ok ||
@@ -968,9 +1015,11 @@ int32_t AicpuExecutor::prepare_kernel_round(const simpler::tmr::KernelExecutionR
             kernel_context_.descriptor.context_generation
         ))
         return static_cast<int32_t>(KernelDispatchStatus::InvalidBinding);
+    if (trace_round) kernel_trace_.residency_end = get_sys_cnt_aicpu();
     const auto callable = orch_so_table_[request.callable_id].kernel.view();
     const auto admitted = kernel_invocation_.admit(request.packet, callable, request.binding);
     if (admitted != InvocationStatus::Ok) return invocation_dispatch_status(admitted);
+    if (trace_round) kernel_trace_.admission_end = get_sys_cnt_aicpu();
     const auto &inputs = kernel_invocation_.inputs();
     const int32_t cid = inputs.callable_id;
     if (cid < 0 || cid >= MAX_REGISTERED_CALLABLE_IDS) return -1;
@@ -991,14 +1040,17 @@ int32_t AicpuExecutor::prepare_kernel_round(const simpler::tmr::KernelExecutionR
             return -1;
         orch_so_table_[cid].needs_load = false;
     }
+    if (trace_round) kernel_trace_.load_end = get_sys_cnt_aicpu();
     if (!orch_so_table_[cid].in_use || orch_so_table_[cid].handle == nullptr || orch_so_table_[cid].func == nullptr)
         return -1;
     if (!configure_orchestration_args(inputs, orch_args_cached_, orch_so_table_[cid].config_func))
         return static_cast<int32_t>(KernelDispatchStatus::InvalidArgs);
+    if (trace_round) kernel_trace_.config_end = get_sys_cnt_aicpu();
     Runtime *resident = kernel_invocation_.resident();
     sched_ctx_.bind_handshakes(kernel_storage_.reports(), kernel_storage_.expected_epoch());
     const int32_t status = prepare_execution(resident, inputs);
     if (status != 0) return status;
+    if (trace_round) kernel_trace_.prepare_end = get_sys_cnt_aicpu();
     chip_swimlane_aicpu_record_run_boundary();
     return 0;
 }
@@ -1027,9 +1079,48 @@ int32_t AicpuExecutor::finalize_execution(const ExecutionInputs &inputs) {
 }
 
 void AicpuExecutor::clear_kernel_round() noexcept {
+    const bool trace_round = kernel_storage_.expected_epoch() == 64;
+    if (trace_round) kernel_trace_.clear_start = get_sys_cnt_aicpu();
+    const int32_t trace_threads = trace_round ? aicpu_thread_num_ : 0;
     deinit(kernel_invocation_.resident(), false);
     kernel_invocation_.clear();
     kernel_storage_attached_ = false;
+    if (!trace_round) return;
+    kernel_trace_.clear_end = get_sys_cnt_aicpu();
+    const auto &trace = kernel_trace_;
+    LOG_ERROR(
+        "INNERTRACE AICPU prepare=%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+        " clear=%" PRIu64 ",%" PRIu64,
+        trace.prepare_start, trace.residency_end, trace.admission_end, trace.load_end, trace.config_end,
+        trace.prepare_end, trace.clear_start, trace.clear_end
+    );
+    for (int32_t thread = 0; thread < trace_threads; ++thread) {
+        const auto &t = trace.threads[thread];
+        LOG_ERROR(
+            "INNERTRACE AICPU thread=%d times=%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64, thread,
+            t.init_start, t.init_end, t.run_end, t.shutdown_end, t.completion_end
+        );
+    }
+    for (int32_t thread = 0; thread < kernel_context_.descriptor.launch_threads; ++thread) {
+        const auto &t = trace.gate[thread];
+        LOG_ERROR(
+            "FULLTRACE AICPU gate=%d times=%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+            ",%" PRIu64,
+            thread, t.join_start, t.join_end, t.admission_end, t.execution_end, t.arrival_end, t.final_read_end,
+            t.depart_end
+        );
+    }
+    auto *reports = kernel_storage_.reports();
+    const int32_t worker_count = kernel_context_.descriptor.worker_count;
+    cache_invalidate_range(reports, static_cast<size_t>(worker_count) * sizeof(*reports));
+    for (int32_t core = 0; core < worker_count; ++core) {
+        const auto &r = reports[core];
+        LOG_ERROR(
+            "FULLTRACE AICORE core=%d times=%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64, core,
+            static_cast<uint64_t>(r.trace_entry), static_cast<uint64_t>(r.trace_report_published),
+            static_cast<uint64_t>(r.trace_window_open), static_cast<uint64_t>(r.trace_dispatch_exit)
+        );
+    }
 }
 
 namespace simpler::tmr {

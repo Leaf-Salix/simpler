@@ -33,7 +33,18 @@ int32_t execute_kernel_round_impl(
     }
     auto &gate = executor.kernel_gate_;
     KernelRoundTicket ticket;
+#ifdef SIMPLER_A2A3_GATE_TRACE
+    const uint64_t join_start = get_sys_cnt_aicpu();
+#endif
     if (!gate.join(request.launched_threads, cpu, &ticket)) return -1;
+#ifdef SIMPLER_A2A3_GATE_TRACE
+    const bool trace_round = ticket.epoch == 64;
+    if (trace_round) {
+        auto &trace = executor.kernel_trace_.gate[ticket.launch_index];
+        trace.join_start = join_start;
+        trace.join_end = get_sys_cnt_aicpu();
+    }
+#endif
     if (ticket.launch_index == 0) {
         executor.kernel_storage_attached_ = executor.kernel_storage_.attach(request.handshake);
         int32_t status = request.admission_status;
@@ -49,6 +60,9 @@ int32_t execute_kernel_round_impl(
     }
     KernelRoundAdmission admission;
     if (!gate.wait_admission(ticket, &admission)) return -1;
+#ifdef SIMPLER_A2A3_GATE_TRACE
+    if (trace_round) executor.kernel_trace_.gate[ticket.launch_index].admission_end = get_sys_cnt_aicpu();
+#endif
     int32_t status = admission.status;
     if (status == 0 && admission.execution_index >= 0) {
         const KernelThreadView thread{admission.execution_index, request.execution_threads};
@@ -60,8 +74,14 @@ int32_t execute_kernel_round_impl(
             executor.cancel_kernel_round();
         }
     }
+#ifdef SIMPLER_A2A3_GATE_TRACE
+    if (trace_round) executor.kernel_trace_.gate[ticket.launch_index].execution_end = get_sys_cnt_aicpu();
+#endif
     const auto arrival = gate.arrive(ticket, status);
     if (arrival == RoundArrival::Invalid) return -1;
+#ifdef SIMPLER_A2A3_GATE_TRACE
+    if (trace_round) executor.kernel_trace_.gate[ticket.launch_index].arrival_end = get_sys_cnt_aicpu();
+#endif
     KernelFinalStatus result;
     if (arrival == RoundArrival::Finalizer) {
         // All execution threads have published their status before the native result.
@@ -79,9 +99,15 @@ int32_t execute_kernel_round_impl(
     } else if (!gate.read_final_status(ticket, &result)) {
         return -1;
     }
+#ifdef SIMPLER_A2A3_GATE_TRACE
+    if (trace_round) executor.kernel_trace_.gate[ticket.launch_index].final_read_end = get_sys_cnt_aicpu();
+#endif
     if (out != nullptr) *out = result;
     const auto departure = gate.depart(ticket);
     if (departure == RoundDeparture::Invalid) return -1;
+#ifdef SIMPLER_A2A3_GATE_TRACE
+    if (trace_round) executor.kernel_trace_.gate[ticket.launch_index].depart_end = get_sys_cnt_aicpu();
+#endif
     if (departure == RoundDeparture::Last && result.cleanup_status == 0 && result.runtime_status == 0) {
         executor.clear_kernel_round();
         if (!gate.complete_departure(ticket)) return -1;

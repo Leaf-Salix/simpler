@@ -29,6 +29,10 @@ struct alignas(64) TmrCoreReport {
     volatile CoreType core_type;
     volatile uint32_t physical_core_id;
     volatile uint64_t report_epoch;
+    volatile uint64_t trace_entry;
+    volatile uint64_t trace_report_published;
+    volatile uint64_t trace_window_open;
+    volatile uint64_t trace_dispatch_exit;
 };
 
 struct alignas(64) TmrLaunchControl {
@@ -49,6 +53,7 @@ static_assert(sizeof(TmrCoreReport) == 64 && alignof(TmrCoreReport) == 64);
 static_assert(offsetof(TmrCoreReport, task) == 8);
 static_assert(offsetof(TmrCoreReport, physical_core_id) == 20);
 static_assert(offsetof(TmrCoreReport, report_epoch) == 24);
+static_assert(offsetof(TmrCoreReport, trace_entry) == 32);
 static_assert(std::is_standard_layout_v<TmrLaunchControl> && std::is_trivially_copyable_v<TmrLaunchControl>);
 static_assert(sizeof(TmrLaunchControl) == 64 && alignof(TmrLaunchControl) == 64);
 
