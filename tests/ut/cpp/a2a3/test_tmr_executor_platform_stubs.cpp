@@ -11,6 +11,7 @@
 
 #include "aicpu/platform_regs.h"
 #include "common/kernel_args.h"
+bool fail_executor_retirement(uint64_t first);
 
 void corrupt_kernel_arch_argument(KernelArgs &args, int fault) {
     if (fault == 0) ++args.ffts_base_addr;
@@ -24,5 +25,5 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
         for (size_t i = 0; i < count; ++i)
             released[i] = true;
     }
-    return 0;
+    return count != 0 && fail_executor_retirement(targets[0].reg_addr) ? -1 : 0;
 }

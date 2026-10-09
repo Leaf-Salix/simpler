@@ -10,6 +10,7 @@
  */
 
 #include "orchestration_api.h"
+#include <stdexcept>
 
 namespace {
 OrchestrationConfig configure(const ChipTaskArgs &args, uint64_t id) {
@@ -42,4 +43,8 @@ extern "C" void orchestration_error(const ChipTaskArgs &args) {
     execute(args, 3);
     RuntimeContext *rt = current_runtime();
     rt->ops->report_fatal(rt, SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "intentional executor failure");
+}
+
+extern "C" void orchestration_throw(const ChipTaskArgs &) {
+    throw std::runtime_error("intentional orchestration exception");
 }

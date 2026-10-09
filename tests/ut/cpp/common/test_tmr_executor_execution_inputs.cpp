@@ -42,13 +42,16 @@
 namespace {
 thread_local int affinity_index = 0;
 std::array<uint64_t, PLATFORM_MAX_CORES> register_bases{};
-std::array<uint64_t, 6> register_cells{};
+std::array<uint64_t, 12> register_cells{};
+std::array<std::atomic<int32_t>, 12> retired_roles{};
+std::array<std::atomic<int32_t>, 12> retirement_calls{};
 std::atomic<int> opened_windows{0};
 std::atomic<int> closed_windows{0};
 std::atomic<uint64_t> closed_mask{0};
 std::atomic<int> register_publications{0};
 std::atomic<const void *> watched_image{nullptr};
 std::atomic<int> image_invalidations{0};
+std::atomic<bool> fail_first_retirement{false};
 }  // namespace
 
 namespace aicpu_cache_maintenance {
@@ -82,8 +85,16 @@ void platform_init_aicore_regs(uint64_t) { ++opened_windows; }
 uint64_t platform_aicore_exit_deadline() { return get_sys_cnt_aicpu() + 10000000000ULL; }
 void platform_close_aicore_window(uint64_t base) {
     const uint64_t index = (base - reinterpret_cast<uint64_t>(register_cells.data())) / sizeof(uint64_t);
+    if (index < register_cells.size()) {
+        retired_roles[index].store(affinity_index, std::memory_order_relaxed);
+        retirement_calls[index].fetch_add(1, std::memory_order_relaxed);
+    }
     if (index < register_cells.size() && (closed_mask.fetch_or(uint64_t{1} << index) & (uint64_t{1} << index)) == 0)
         ++closed_windows;
+}
+
+bool fail_executor_retirement(uint64_t first) {
+    return fail_first_retirement.load() && first == reinterpret_cast<uint64_t>(register_cells.data());
 }
 
 extern "C" int32_t aicpu_execute(Runtime *);
@@ -122,6 +133,7 @@ protected:
         register_publications = 0;
         watched_image = nullptr;
         image_invalidations = 0;
+        fail_first_retirement = false;
         ASSERT_EQ(set_host_log_state(HostLogger::get_instance().state()), 0);
         uint64_t windows[CHIP_MAX_RING_DEPTH] = {16, 16, 16, 16};
         uint64_t heaps[CHIP_MAX_RING_DEPTH] = {1024, 1024, 1024, 1024};
@@ -217,10 +229,10 @@ protected:
         descriptor.control_address = reinterpret_cast<uint64_t>(&control);
         descriptor.control_bytes = sizeof(control);
         descriptor.reports_address = reinterpret_cast<uint64_t>(reports.data());
-        descriptor.reports_bytes = sizeof(reports);
+        descriptor.reports_bytes = report_count * sizeof(TmrCoreReport);
         descriptor.launch_threads = execution_threads + 1;
         descriptor.execution_threads = execution_threads;
-        descriptor.worker_count = 3;
+        descriptor.worker_count = report_count;
         registration = {descriptor.self_address, descriptor.context_generation};
         ASSERT_EQ(simpler_aicpu_prepare_tmr_context(&registration), 0);
         registered_context = true;
@@ -267,6 +279,10 @@ protected:
         closed_mask = 0;
         control = {};
         reports = {};
+        for (size_t i = 0; i < retired_roles.size(); ++i) {
+            retired_roles[i] = -1;
+            retirement_calls[i] = 0;
+        }
         for (auto &cell : register_cells)
             cell = 0;
         std::vector<int32_t> allowed(execution_threads);
@@ -287,18 +303,18 @@ protected:
             EXPECT_EQ(simpler_aicpu_register_tmr_kernel_callable(&registration), 0);
         }
         request.binding = binding;
-        request.handshake = {&control, reports.data(), 3, 0};
+        request.handshake = {&control, reports.data(), report_count, 0};
         request.allowed_cpus = allowed.data();
         request.execution_threads = execution_threads;
         request.launched_threads = execution_threads + 1;
         request.admission_status = admission;
         std::vector<std::thread> cores;
-        for (size_t i = 0; i < reports.size(); ++i) {
+        for (int32_t i = 0; i < report_count; ++i) {
             cores.emplace_back([&, i] {
                 if (before_core_report) before_core_report();
                 auto &report = reports[i];
                 report.physical_core_id = invalid_reports && i == 2 ? PLATFORM_MAX_CORES : i;
-                report.core_type = i == 0 ? CoreType::AIC : CoreType::AIV;
+                report.core_type = i < report_count / PLATFORM_CORES_PER_BLOCKDIM ? CoreType::AIC : CoreType::AIV;
                 __atomic_store_n(&report.aicore_done, static_cast<uint32_t>(i + 1), __ATOMIC_RELEASE);
             });
         }
@@ -316,7 +332,7 @@ protected:
             thread.join();
         EXPECT_EQ(control.completion, static_cast<uint32_t>(TmrCompletion::Complete));
         EXPECT_EQ(control.cleanup_status, 0);
-        for (size_t i = 0; i < reports.size(); ++i)
+        for (int32_t i = 0; i < report_count; ++i)
             EXPECT_EQ(reports[i].aicore_done, i + 1);
         return result;
     }
@@ -372,7 +388,8 @@ protected:
     std::array<uint64_t, 6> output{};
     std::array<std::vector<uint8_t>, 7> orchestration_images;
     TmrLaunchControl control{};
-    std::array<TmrCoreReport, 3> reports{};
+    int32_t report_count{3};
+    std::array<TmrCoreReport, 12> reports{};
     TmrKernelContextDescriptor descriptor{};
     KernelArgs resident_args{};
     TmrContextRegistrationArgs registration{};
@@ -791,6 +808,70 @@ TEST_F(TmrExecutorExecutionInputsTest, CoordinatedMultipleSchedulersShareOnePubl
         }
         EXPECT_EQ(revoke_context(registration.context_generation), 0);
     }
+}
+
+TEST_F(TmrExecutorExecutionInputsTest, CooperativeRetirementCoversEveryCoreAndUsesOrchestrator) {
+    if constexpr (PLATFORM_MAX_AICPU_THREADS != 4) GTEST_SKIP() << "A2/A3 retirement experiment";
+    report_count = 12;
+    resident->dev.worker_count = report_count;
+    resident->dev.aicpu_thread_num = 4;
+    prepare_native_context("orchestration_a", 4);
+    for (int id : {3, 4, 3}) {
+        PreparedInvocationView callable{id, 1, 1};
+        TmrEncodingCandidate packet;
+        TmrEncodingCache cache;
+        auto args = arguments(54);
+        ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
+        const auto results = coordinated_round({callable, {}}, packet.packet(), 0, 4);
+        for (int result : results)
+            EXPECT_EQ(result, 0);
+        for (int32_t i = 0; i < report_count; ++i) {
+            EXPECT_EQ(retirement_calls[i].load(), 1);
+            EXPECT_EQ(retired_roles[i].load(), i / 3);
+        }
+        EXPECT_EQ(closed_windows.load(), report_count);
+    }
+}
+
+TEST_F(TmrExecutorExecutionInputsTest, RetirementFailureDoesNotChangeCooperativePartition) {
+    if constexpr (PLATFORM_MAX_AICPU_THREADS != 4) GTEST_SKIP() << "A2/A3 retirement experiment";
+    isolated_round([&] {
+        report_count = 12;
+        resident->dev.worker_count = report_count;
+        resident->dev.aicpu_thread_num = 4;
+        prepare_native_context("orchestration_a", 4);
+        PreparedInvocationView callable{3, 1, 1};
+        TmrEncodingCandidate packet;
+        TmrEncodingCache cache;
+        auto args = arguments(54);
+        ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
+        fail_first_retirement = true;
+        const auto results = coordinated_round({callable, {}}, packet.packet(), 0, 4);
+        for (int result : results)
+            EXPECT_NE(result, 0);
+        for (int32_t i = 0; i < report_count; ++i) {
+            EXPECT_EQ(retirement_calls[i].load(), 1);
+            EXPECT_EQ(retired_roles[i].load(), i / 3);
+        }
+    });
+}
+
+TEST_F(TmrExecutorExecutionInputsTest, OrchestrationExceptionReleasesCooperativeParticipants) {
+    if constexpr (PLATFORM_MAX_AICPU_THREADS != 4) GTEST_SKIP() << "A2/A3 retirement experiment";
+    isolated_round([&] {
+        resident->dev.aicpu_thread_num = 4;
+        make_orchestration_image(3, "orchestration_throw", "config_a");
+        prepare_native_context("orchestration_throw", 4);
+        PreparedInvocationView callable{3, 1, 1};
+        TmrEncodingCandidate packet;
+        TmrEncodingCache cache;
+        auto args = arguments(54);
+        ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
+        const auto results = coordinated_round({callable, {}}, packet.packet(), 0, 4);
+        for (int result : results)
+            EXPECT_NE(result, 0);
+        EXPECT_NE(control.runtime_status, 0);
+    });
 }
 
 TEST_F(TmrExecutorExecutionInputsTest, AdmittedSnapshotOwnsTransportAndBusyRejectionKeepsInputs) {

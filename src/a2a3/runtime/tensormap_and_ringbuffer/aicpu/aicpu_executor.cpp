@@ -133,6 +133,8 @@ struct AicpuExecutor {
     std::atomic<bool> init_failed_{false};
     simpler::ThreadCompletionGate completion_gate_;
     std::atomic<int32_t> execution_error_{0};
+    std::atomic<int32_t> kernel_quiesced_{0};
+    std::atomic<int32_t> kernel_retirement_mode_{-1};
 
     // Parallel-handshake coordination (see AicpuExecutor::init). hs_setup_done_
     // is published by the leader once the shared pre-handshake setup is visible;
@@ -319,7 +321,9 @@ int32_t AicpuExecutor::init(Runtime *runtime, const ExecutionInputs &inputs) {
     if (decouple_orch && !sched_ctx_.requires_profiling_init_barrier()) return initialization_status();
     hs_arrived_.fetch_add(1, std::memory_order_acq_rel);
     if (is_leader) {
-        while (hs_arrived_.load(std::memory_order_acquire) < hs_nthreads) {}
+        while (hs_arrived_.load(std::memory_order_acquire) < hs_nthreads) {
+            if (kernel_invocation_.active() && init_failed_.load(std::memory_order_acquire)) break;
+        }
         if (initialization_status() == 0) {
             if (decouple_orch) sched_ctx_.post_handshake_profiling_init();
             else if (sched_ctx_.post_handshake_init(runtime, inputs.functions) != 0)
@@ -353,7 +357,18 @@ AicpuExecutor::execute(Runtime *runtime, const ExecutionInputs &inputs, const si
     int32_t status;
     {
         AicpuPhaseScope preamble(AicpuPhase::Preamble);
-        status = init(runtime, inputs);
+        if (thread == nullptr) {
+            status = init(runtime, inputs);
+        } else {
+            try {
+                status = init(runtime, inputs);
+            } catch (...) {
+                init_failed_.store(true, std::memory_order_release);
+                init_done_.store(true, std::memory_order_release);
+                hs_setup_done_.store(true, std::memory_order_release);
+                status = -1;
+            }
+        }
     }
     if (status == 0) {
         AicpuPhaseScope graph_build(AicpuPhase::GraphBuild);
@@ -372,7 +387,27 @@ AicpuExecutor::execute(Runtime *runtime, const ExecutionInputs &inputs, const si
         sched_ctx_.abort_and_shutdown(runtime);
     }
     if (index >= 0 && index < aicpu_thread_num_) {
-        const int32_t shutdown = sched_ctx_.shutdown(index, runtime);
+        int32_t shutdown;
+        if (thread != nullptr) {
+            if (status == 0) status = read_runtime_status(inputs.sm);
+            if (status != 0) {
+                int32_t expected = 0;
+                execution_error_.compare_exchange_strong(expected, status, std::memory_order_acq_rel);
+                sched_ctx_.abort_and_shutdown(runtime);
+            }
+            sched_ctx_.finish_shutdown_diagnostics(index);
+            if (kernel_quiesced_.fetch_add(1, std::memory_order_acq_rel) + 1 == aicpu_thread_num_) {
+                kernel_retirement_mode_.store(
+                    execution_error_.load(std::memory_order_acquire) == 0 ? 1 : 0, std::memory_order_release
+                );
+            }
+            int32_t retirement_mode;
+            while ((retirement_mode = kernel_retirement_mode_.load(std::memory_order_acquire)) < 0) {}
+            shutdown = retirement_mode == 1 ? sched_ctx_.shutdown_cooperatively(index, aicpu_thread_num_, runtime) :
+                                              sched_ctx_.shutdown(index, runtime);
+        } else {
+            shutdown = sched_ctx_.shutdown(index, runtime);
+        }
         if (status == 0) status = shutdown;
     }
     if (status == 0) status = read_runtime_status(inputs.sm);
@@ -921,6 +956,8 @@ void AicpuExecutor::deinit(Runtime *runtime, bool invalidate_host_image) {
     sched_ctx_.deinit();
 
     completion_gate_.reset();
+    kernel_quiesced_.store(0, std::memory_order_release);
+    kernel_retirement_mode_.store(-1, std::memory_order_release);
     execution_error_.store(0, std::memory_order_release);
     runtime_init_ready_.store(false, std::memory_order_release);
 

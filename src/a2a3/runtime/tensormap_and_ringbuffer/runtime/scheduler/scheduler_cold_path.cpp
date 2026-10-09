@@ -637,16 +637,31 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
     const int32_t core_num = core_trackers_[thread_idx].core_num();
     if (core_num == 0) return 0;  // orchestrator threads own no core
 
+    finish_shutdown_diagnostics(thread_idx);
+    LOG_INFO("Thread %d: retiring %d cores", thread_idx, core_num);
+    return retire_cores(runtime, cores, core_num);
+}
+
+void SchedulerContext::finish_shutdown_diagnostics(int32_t thread_idx) {
 #if SIMPLER_DFX
     // A fatal run ends in a host-side device reset, so counters read here would
     // not survive into the next generation. Retirement below still runs: it is
     // what releases this thread's workers, and no other path will.
     if (is_pmu_enabled() && !fatal_shutdown_started_.load(std::memory_order_acquire)) {
-        pmu_aicpu_finalize(cores, core_num);
+        const auto &tracker = core_trackers_[thread_idx];
+        if (tracker.core_num() != 0) pmu_aicpu_finalize(tracker.core_ids(), tracker.core_num());
     }
 #endif
-    LOG_INFO("Thread %d: retiring %d cores", thread_idx, core_num);
-    return retire_cores(runtime, cores, core_num);
+}
+
+int32_t SchedulerContext::shutdown_cooperatively(int32_t thread_idx, int32_t threads, Runtime *runtime) {
+    if (threads <= 0 || thread_idx < 0 || thread_idx >= threads) return -1;
+    const int32_t begin = static_cast<int32_t>(static_cast<int64_t>(cores_total_num_) * thread_idx / threads);
+    const int32_t end = static_cast<int32_t>(static_cast<int64_t>(cores_total_num_) * (thread_idx + 1) / threads);
+    int32_t cores[PLATFORM_MAX_CORES];
+    for (int32_t i = begin; i < end; ++i)
+        cores[i - begin] = i;
+    return retire_cores(runtime, cores, end - begin);
 }
 
 int32_t SchedulerContext::retire_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num) {

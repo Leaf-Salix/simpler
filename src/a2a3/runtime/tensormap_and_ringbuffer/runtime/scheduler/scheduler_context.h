@@ -117,6 +117,8 @@ public:
     // Orchestrator threads own none and no-op. Runs before the completion
     // latch, so no run() exit path can leave a worker blocked on its gate.
     int32_t shutdown(int32_t thread_idx, Runtime *runtime);
+    void finish_shutdown_diagnostics(int32_t thread_idx);
+    int32_t shutdown_cooperatively(int32_t thread_idx, int32_t threads, Runtime *runtime);
 
     // Run all post-orchestration scheduler bookkeeping:
     //  - publishes core assignments to the perf collector (SIMPLER_DFX)
