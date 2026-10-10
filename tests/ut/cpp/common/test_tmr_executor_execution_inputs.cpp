@@ -37,6 +37,7 @@
 #include "tensormap_and_ringbuffer/kernel_execution_inputs.h"
 #include "tensormap_and_ringbuffer/kernel_execution.h"
 #include "tensormap_and_ringbuffer/kernel_native_status.h"
+#include "scheduler/scheduler_context.h"
 #include "worker/tmr_kernel_invocation.h"
 
 namespace {
@@ -46,9 +47,11 @@ std::array<uint64_t, 12> register_cells{};
 std::array<std::atomic<int32_t>, 12> retired_roles{};
 std::array<std::atomic<int32_t>, 12> retirement_calls{};
 std::atomic<int> opened_windows{0};
+std::atomic<uint64_t> opened_mask{0};
 std::atomic<int> closed_windows{0};
 std::atomic<uint64_t> closed_mask{0};
 std::atomic<int> register_publications{0};
+std::atomic<int> handshake_scans{0};
 std::atomic<const void *> watched_image{nullptr};
 std::atomic<int> image_invalidations{0};
 std::atomic<bool> fail_first_retirement{false};
@@ -74,14 +77,21 @@ extern "C" void set_platform_regs(uint64_t base) {
 }
 extern "C" uint64_t get_platform_regs() { return reinterpret_cast<uint64_t>(register_bases.data()); }
 extern "C" uint64_t get_platform_pmu_reg_addrs() { return 0; }
-uint32_t platform_get_physical_cores_count() { return PLATFORM_MAX_CORES; }
+uint32_t platform_get_physical_cores_count() {
+    ++handshake_scans;
+    return PLATFORM_MAX_CORES;
+}
 volatile uint32_t *get_reg_ptr(uint64_t base, RegId) { return reinterpret_cast<volatile uint32_t *>(base); }
 uint64_t read_reg(uint64_t base, RegId) {
     return __atomic_load_n(reinterpret_cast<uint64_t *>(base), __ATOMIC_ACQUIRE);
 }
 uint32_t reg_load_acquire(const volatile uint32_t *ptr) { return __atomic_load_n(ptr, __ATOMIC_ACQUIRE); }
 void reg_store_release(volatile uint32_t *, uint32_t) {}
-void platform_init_aicore_regs(uint64_t) { ++opened_windows; }
+void platform_init_aicore_regs(uint64_t base) {
+    const uint64_t index = (base - reinterpret_cast<uint64_t>(register_cells.data())) / sizeof(uint64_t);
+    if (index < register_cells.size()) opened_mask.fetch_or(uint64_t{1} << index, std::memory_order_release);
+    ++opened_windows;
+}
 uint64_t platform_aicore_exit_deadline() { return get_sys_cnt_aicpu() + 10000000000ULL; }
 void platform_close_aicore_window(uint64_t base) {
     const uint64_t index = (base - reinterpret_cast<uint64_t>(register_cells.data())) / sizeof(uint64_t);
@@ -106,6 +116,14 @@ void corrupt_kernel_arch_argument(KernelArgs &args, int fault);
 
 namespace {
 using namespace simpler::tmr;
+
+bool wait_until(const std::function<bool()> &condition) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!condition()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+    }
+    return true;
+}
 
 void isolated_round(const std::function<void()> &body) {
     EXPECT_EXIT(
@@ -275,16 +293,16 @@ protected:
         bool native = false, bool invalid_reports = false
     ) {
         opened_windows = 0;
+        opened_mask = 0;
         closed_windows = 0;
         closed_mask = 0;
-        control = {};
-        reports = {};
         for (size_t i = 0; i < retired_roles.size(); ++i) {
             retired_roles[i] = -1;
             retirement_calls[i] = 0;
         }
         for (auto &cell : register_cells)
             cell = 0;
+        const uint64_t expected_epoch = control.round_epoch + 1;
         std::vector<int32_t> allowed(execution_threads);
         for (int32_t i = 0; i < execution_threads; ++i)
             allowed[i] = 10 + i;
@@ -303,7 +321,7 @@ protected:
             EXPECT_EQ(simpler_aicpu_register_tmr_kernel_callable(&registration), 0);
         }
         request.binding = binding;
-        request.handshake = {&control, reports.data(), report_count, 0};
+        request.handshake = {&control, reports.data(), report_count};
         request.allowed_cpus = allowed.data();
         request.execution_threads = execution_threads;
         request.launched_threads = execution_threads + 1;
@@ -313,9 +331,14 @@ protected:
             cores.emplace_back([&, i] {
                 if (before_core_report) before_core_report();
                 auto &report = reports[i];
+                if (publish_core_report) {
+                    publish_core_report(i, report, expected_epoch);
+                    return;
+                }
                 report.physical_core_id = invalid_reports && i == 2 ? PLATFORM_MAX_CORES : i;
                 report.core_type = i < report_count / PLATFORM_CORES_PER_BLOCKDIM ? CoreType::AIC : CoreType::AIV;
                 __atomic_store_n(&report.aicore_done, static_cast<uint32_t>(i + 1), __ATOMIC_RELEASE);
+                __atomic_store_n(&report.report_epoch, expected_epoch, __ATOMIC_RELEASE);
             });
         }
         std::vector<int32_t> result(execution_threads + 1);
@@ -332,9 +355,102 @@ protected:
             thread.join();
         EXPECT_EQ(control.completion, static_cast<uint32_t>(TmrCompletion::Complete));
         EXPECT_EQ(control.cleanup_status, 0);
-        for (int32_t i = 0; i < report_count; ++i)
-            EXPECT_EQ(reports[i].aicore_done, i + 1);
+        if (!publish_core_report) {
+            for (int32_t i = 0; i < report_count; ++i)
+                EXPECT_EQ(reports[i].aicore_done, i + 1);
+        }
         return result;
+    }
+
+    enum class PartialReportOutcome { Success, FutureEpoch, WrongDone };
+
+    void partial_report_round(bool serial, PartialReportOutcome outcome) {
+        resident->dev.serial_orch_sched = serial;
+        resident->dev.worker_count = report_count = 6;
+        resident->dev.aicpu_thread_num = 3;
+        prepare_native_context("orchestration_a", 3);
+        ASSERT_TRUE(registered_context);
+        PreparedInvocationView callable{3, 1, 1};
+        TmrEncodingCandidate packet;
+        TmrEncodingCache cache;
+        auto args = arguments(93);
+        ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
+        const auto first = coordinated_round({callable, {}}, packet.packet(), 0, 3);
+        for (int32_t result : first)
+            ASSERT_EQ(result, 0);
+        const uint64_t completed_epoch = control.round_epoch;
+        ASSERT_EQ(completed_epoch, 1u);
+        // Serial owns contiguous pairs; decoupled owns {0,2,3} and {1,4,5}.
+        const uint64_t ready_mask = serial ? 0x3 : 0xd;
+        const int32_t partial_core = serial ? 2 : 1;
+        const int32_t late_core = serial ? 3 : 4;
+        std::atomic<bool> partial_published{false};
+        std::atomic<bool> release_late{false};
+        publish_core_report = [&](int32_t i, TmrCoreReport &report, uint64_t expected_epoch) {
+            const bool ready = (ready_mask & (uint64_t{1} << i)) != 0 || i == partial_core;
+            if (!ready) {
+                EXPECT_TRUE(wait_until([&] {
+                    return release_late.load(std::memory_order_acquire);
+                }));
+                if (outcome != PartialReportOutcome::Success && i != late_core) {
+                    return;
+                }
+            }
+            report.physical_core_id = i;
+            report.core_type = i < report_count / PLATFORM_CORES_PER_BLOCKDIM ? CoreType::AIC : CoreType::AIV;
+            const bool wrong_done = outcome == PartialReportOutcome::WrongDone && i == late_core;
+            __atomic_store_n(&report.aicore_done, static_cast<uint32_t>(wrong_done ? i + 2 : i + 1), __ATOMIC_RELEASE);
+            const bool future_epoch = outcome == PartialReportOutcome::FutureEpoch && i == late_core;
+            __atomic_store_n(&report.report_epoch, expected_epoch + (future_epoch ? 1 : 0), __ATOMIC_RELEASE);
+            if (i == partial_core) partial_published.store(true, std::memory_order_release);
+        };
+        std::thread release([&] {
+            EXPECT_TRUE(wait_until([&] {
+                return opened_mask.load(std::memory_order_acquire) == ready_mask &&
+                       partial_published.load(std::memory_order_acquire);
+            }));
+            EXPECT_EQ(opened_mask.load(std::memory_order_acquire), ready_mask);
+            EXPECT_EQ(control.round_epoch, completed_epoch);
+            EXPECT_EQ(reports[partial_core].report_epoch, completed_epoch + 1);
+            EXPECT_EQ(reports[late_core].report_epoch, completed_epoch);
+            release_late.store(true, std::memory_order_release);
+        });
+        const auto results = coordinated_round({callable, {}}, packet.packet(), 0, 3);
+        release.join();
+        const bool success = outcome == PartialReportOutcome::Success;
+        for (int32_t result : results) {
+            if (success) EXPECT_EQ(result, 0);
+            else EXPECT_NE(result, 0);
+        }
+        EXPECT_EQ(opened_mask.load(), success ? 0x3fu : ready_mask);
+        EXPECT_EQ(closed_mask.load(), opened_mask.load());
+        EXPECT_EQ(control.round_epoch, completed_epoch + (success ? 1 : 0));
+        if (success) EXPECT_EQ(control.runtime_status, 0);
+        else EXPECT_NE(control.runtime_status, 0);
+        for (int i = 0; i < report_count; ++i) {
+            const bool opened = (opened_mask.load() & (uint64_t{1} << i)) != 0;
+            if constexpr (PLATFORM_MAX_AICPU_THREADS == 4) {
+                EXPECT_EQ(retirement_calls[i].load(), opened ? 1 : 0);
+            } else if (opened) {
+                // A5 deinit is idempotent and may run in both emergency and normal shutdown.
+                EXPECT_GE(retirement_calls[i].load(), 1);
+            } else {
+                EXPECT_EQ(retirement_calls[i].load(), 0);
+            }
+        }
+        if (!success) {
+            // Failed rounds retain borrowed storage; they cannot revoke or start a new round.
+            EXPECT_EQ(revoke_context(registration.context_generation), kAicpuKernelInnerError);
+            return;
+        }
+        publish_core_report = nullptr;
+        const auto second = coordinated_round({callable, {}}, packet.packet(), 0, 3);
+        for (int32_t result : second)
+            EXPECT_EQ(result, 0);
+        EXPECT_EQ(control.round_epoch, completed_epoch + 2);
+        EXPECT_EQ(opened_windows.load(), report_count);
+        EXPECT_EQ(closed_windows.load(), report_count);
+        EXPECT_EQ(revoke_context(registration.context_generation), 0);
     }
 
     void expect_successful_reuse() {
@@ -396,7 +512,80 @@ protected:
     std::vector<uint8_t> kernel_image;
     bool registered_context{false};
     std::function<void()> before_core_report;
+    std::function<void(int32_t, TmrCoreReport &, uint64_t)> publish_core_report;
 };
+
+TEST_F(TmrExecutorExecutionInputsTest, KernelPartialReportsKeepIncompleteGroupsClosedAndPermitReuse) {
+    for (bool serial : {false, true})
+        isolated_round([&] {
+            partial_report_round(serial, PartialReportOutcome::Success);
+        });
+}
+
+TEST_F(TmrExecutorExecutionInputsTest, KernelFutureEpochAfterPartialReportsCancelsRemainingInitializers) {
+    for (bool serial : {false, true})
+        isolated_round([&] {
+            partial_report_round(serial, PartialReportOutcome::FutureEpoch);
+        });
+}
+
+TEST_F(TmrExecutorExecutionInputsTest, KernelWrongDoneAfterPartialReportsCancelsRemainingInitializers) {
+    for (bool serial : {false, true})
+        isolated_round([&] {
+            partial_report_round(serial, PartialReportOutcome::WrongDone);
+        });
+}
+
+TEST_F(TmrExecutorExecutionInputsTest, KernelHandshakeCancellationRetiresOnlyOpenedGroups) {
+    for (bool serial : {false, true}) {
+        isolated_round([&] {
+            resident->dev.serial_orch_sched = serial;
+            resident->dev.worker_count = report_count = 6;
+            resident->dev.aicpu_thread_num = 3;
+            opened_windows = closed_windows = 0;
+            opened_mask = closed_mask = 0;
+            for (auto &calls : retirement_calls)
+                calls = 0;
+            const uint64_t ready_mask = serial ? 0x3 : 0xd;
+            const int32_t partial_core = serial ? 2 : 1;
+            for (int32_t i = 0; i < report_count; ++i) {
+                if ((ready_mask & (uint64_t{1} << i)) == 0 && i != partial_core) continue;
+                reports[i].physical_core_id = i;
+                reports[i].core_type = i < 2 ? CoreType::AIC : CoreType::AIV;
+                reports[i].aicore_done = i + 1;
+                reports[i].report_epoch = 1;
+            }
+            SchedulerContext scheduler;
+            scheduler.bind_handshakes(reports.data(), 1);
+            ASSERT_EQ(scheduler.pre_handshake_init(resident.get(), 3, 2, get_platform_regs(), {}, binding.sm.base), 0);
+            const int32_t threads = serial ? 3 : 2;
+            std::atomic<uint32_t> initialized{0};
+            std::vector<std::thread> cpus;
+            for (int32_t i = 0; i < threads; ++i) {
+                cpus.emplace_back([&, i] {
+                    affinity_index = i;
+                    if (serial) scheduler.handshake_partition(resident.get(), i, threads);
+                    else scheduler.handshake_owned_clusters(resident.get(), i, threads);
+                    initialized.fetch_or(uint32_t{1} << i, std::memory_order_release);
+                });
+            }
+            EXPECT_TRUE(wait_until([&] {
+                return (initialized.load(std::memory_order_acquire) & 1u) != 0;
+            }));
+            EXPECT_EQ(opened_mask.load(), ready_mask);
+            scheduler.abort_and_shutdown(resident.get());
+            for (auto &cpu : cpus)
+                cpu.join();
+            EXPECT_TRUE(scheduler.initialization_aborted());
+            EXPECT_EQ(opened_mask.load(), ready_mask);
+            EXPECT_EQ(closed_mask.load(), ready_mask);
+            EXPECT_EQ(control.round_epoch, 0u);
+            for (int32_t i = 0; i < report_count; ++i)
+                EXPECT_EQ(retirement_calls[i].load(), (ready_mask & (uint64_t{1} << i)) != 0 ? 1 : 0);
+            scheduler.deinit();
+        });
+    }
+}
 
 TEST_F(TmrExecutorExecutionInputsTest, KernelOrchestrationSubmitsBeforeCoreReports) {
     before_core_report = [&] {
@@ -550,6 +739,7 @@ TEST_F(TmrExecutorExecutionInputsTest, PartialHandshakeFailureRetiresOpenedCores
 TEST_F(TmrExecutorExecutionInputsTest, CoordinatedRoundsRunABAWithOneFinalVerdictAndStableStorage) {
     uint64_t storage = 0;
     uint64_t invocation = 90;
+    const uint64_t first_epoch = control.round_epoch;
     for (bool serial : {false, true}) {
         resident->dev.serial_orch_sched = serial;
         for (int32_t id : {3, 4, 3}) {
@@ -563,6 +753,9 @@ TEST_F(TmrExecutorExecutionInputsTest, CoordinatedRoundsRunABAWithOneFinalVerdic
             for (int32_t result : results)
                 EXPECT_EQ(result, 0);
             EXPECT_EQ(control.runtime_status, 0);
+            EXPECT_EQ(control.round_epoch, first_epoch + invocation - 90);
+            for (int32_t i = 0; i < report_count; ++i)
+                EXPECT_EQ(reports[i].report_epoch, control.round_epoch);
             EXPECT_EQ(opened_windows.load(), 3);
             EXPECT_EQ(closed_windows.load(), 3);
             EXPECT_EQ(output[0], id);
@@ -577,6 +770,43 @@ TEST_F(TmrExecutorExecutionInputsTest, CoordinatedRoundsRunABAWithOneFinalVerdic
             expect_resident_configuration(serial);
         }
     }
+}
+
+TEST_F(TmrExecutorExecutionInputsTest, PriorRoundReportsDoNotOpenWindowsBeforeNewEpoch) {
+    PreparedInvocationView callable{3, 1, 1};
+    TmrEncodingCandidate packet;
+    TmrEncodingCache cache;
+    auto args = arguments(91);
+    ASSERT_EQ(encode_tmr_invocation(args, callable, binding.identity, cache, &packet), InvocationStatus::Ok);
+    const auto first = coordinated_round({callable, {}}, packet.packet());
+    for (int32_t result : first)
+        ASSERT_EQ(result, 0);
+    ASSERT_EQ(control.round_epoch, 1u);
+    for (int32_t i = 0; i < report_count; ++i)
+        ASSERT_EQ(reports[i].report_epoch, 1u);
+
+    std::atomic<bool> release_reports{false};
+    before_core_report = [&] {
+        while (!release_reports.load(std::memory_order_acquire))
+            std::this_thread::yield();
+    };
+    handshake_scans = 0;
+    std::vector<int32_t> second;
+    std::thread round([&] {
+        second = coordinated_round({callable, {}}, packet.packet());
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (handshake_scans.load() < 1 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    EXPECT_GE(handshake_scans.load(), 1);
+    for (int i = 0; i < 10000; ++i)
+        std::this_thread::yield();
+    EXPECT_EQ(opened_windows.load(), 0);
+    release_reports.store(true, std::memory_order_release);
+    round.join();
+    for (int32_t result : second)
+        EXPECT_EQ(result, 0);
+    EXPECT_EQ(control.round_epoch, 2u);
 }
 
 TEST_F(TmrExecutorExecutionInputsTest, InvalidReportsReportFailureBeforeAnyWindowOpens) {

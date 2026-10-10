@@ -777,14 +777,41 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
     // CoreExecState line for write, so the Phase 4 struct store hits a warm line.
     for (int32_t remaining = hi - lo; remaining > 0;) {
         if (handshake_failed_.load(std::memory_order_acquire) || initialization_aborted()) return;
-        for (int32_t i = lo; i < hi; i++) {
-            if (core_serviced[i]) continue;
-            Handshake *hank = &all_handshakes[i];
-            if (hank->aicore_done == 0) {
+        bool batch_ready[RUNTIME_MAX_WORKER];
+        if (reports_ != nullptr) {
+            memset(batch_ready, 0, sizeof(batch_ready));
+            int32_t observed = 0;
+            for (int32_t i = lo; i < hi; ++i) {
+                if (core_serviced[i]) continue;
+                const uint64_t epoch = all_handshakes[i].report_epoch;
+                if (epoch > expected_report_epoch_) {
+                    handshake_failed_.store(true, std::memory_order_release);
+                    return;
+                }
+                if (epoch == expected_report_epoch_) {
+                    batch_ready[i] = true;
+                    ++observed;
+                }
+            }
+            if (observed == 0) {
                 SPIN_WAIT_HINT();
                 continue;
             }
+            // All selected epoch loads precede every selected report metadata load.
             rmb();
+        }
+        for (int32_t i = lo; i < hi; i++) {
+            if (core_serviced[i]) continue;
+            Handshake *hank = &all_handshakes[i];
+            if (reports_ != nullptr ? !batch_ready[i] : hank->aicore_done == 0) {
+                SPIN_WAIT_HINT();
+                continue;
+            }
+            if (reports_ == nullptr) rmb();
+            if (reports_ != nullptr && hank->aicore_done != static_cast<uint32_t>(i + 1)) {
+                handshake_failed_.store(true, std::memory_order_release);
+                return;
+            }
             uint32_t physical_core_id = hank->physical_core_id;
             if (physical_core_id >= max_physical_cores_count || regs[physical_core_id] == 0) {
                 LOG_ERROR(
@@ -867,8 +894,9 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
 
     // Batched 4-phase handshake (mirrors handshake_partition over the owned set):
     // collect reports, then publish tasks / open windows / store CoreExecStates in
-    // separate passes so posted MMIO STRs and GM stores don't serialize, and only
-    // two barriers fire for the whole owned set (not one per core).
+    // separate passes so posted MMIO STRs and GM stores don't serialize. Two
+    // store barriers order publication; kernel report reads use one read barrier
+    // per nonempty batch, while program report reads use one per core.
     struct ReadyCore {
         int32_t i;
         uint32_t pcid;
@@ -881,15 +909,43 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
     // Phase 1: collect every reported owned core, prefetch its CoreExecState line.
     for (int32_t remaining = own_n; remaining > 0;) {
         if (handshake_failed_.load(std::memory_order_acquire) || initialization_aborted()) return;
+        bool batch_ready[RUNTIME_MAX_WORKER];
+        if (reports_ != nullptr) {
+            memset(batch_ready, 0, sizeof(batch_ready));
+            int32_t observed = 0;
+            for (int32_t k = 0; k < own_n; ++k) {
+                const int32_t i = owned[k];
+                if (core_serviced[i]) continue;
+                const uint64_t epoch = all_handshakes[i].report_epoch;
+                if (epoch > expected_report_epoch_) {
+                    handshake_failed_.store(true, std::memory_order_release);
+                    return;
+                }
+                if (epoch == expected_report_epoch_) {
+                    batch_ready[i] = true;
+                    ++observed;
+                }
+            }
+            if (observed == 0) {
+                SPIN_WAIT_HINT();
+                continue;
+            }
+            // All selected epoch loads precede every selected report metadata load.
+            rmb();
+        }
         for (int32_t k = 0; k < own_n; k++) {
             int32_t i = owned[k];
             if (core_serviced[i]) continue;
             Handshake *hank = &all_handshakes[i];
-            if (hank->aicore_done == 0) {
+            if (reports_ != nullptr ? !batch_ready[i] : hank->aicore_done == 0) {
                 SPIN_WAIT_HINT();
                 continue;
             }
-            rmb();
+            if (reports_ == nullptr) rmb();
+            if (reports_ != nullptr && hank->aicore_done != static_cast<uint32_t>(i + 1)) {
+                handshake_failed_.store(true, std::memory_order_release);
+                return;
+            }
             uint32_t physical_core_id = hank->physical_core_id;
             if (physical_core_id >= max_physical_cores_count || regs[physical_core_id] == 0) {
                 LOG_ERROR(
@@ -1379,6 +1435,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime, simpler::tmr::Ca
 
 void SchedulerContext::deinit() {
     reports_ = nullptr;
+    expected_report_epoch_ = 0;
     // Reset all per-core execution state
     for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
         core_exec_states_[i] = {};
