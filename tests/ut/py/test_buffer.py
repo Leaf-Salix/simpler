@@ -1311,7 +1311,7 @@ def test_mailbox_rejects_unknown_transfer_instead_of_defaulting():
 
     descriptor = _descriptor_with_path_id(0)
     raw = bytearray(encode_blob([descriptor.tensor((2,), DataType.FLOAT32)]))
-    raw[8 + 141] = 255  # Invocation transfer; offset independent of the decoder.
+    raw[16 + 141] = 255  # Invocation transfer; offset independent of the decoder.
     blob = ctypes.create_string_buffer(bytes(raw))
     with pytest.raises(ValueError, match="unknown tensor transfer"):
         read_args_from_blob(ctypes.addressof(blob), len(blob))

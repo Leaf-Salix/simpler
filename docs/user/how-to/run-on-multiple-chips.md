@@ -64,13 +64,13 @@ rank:
 def orch_fn(orch, _args, cfg):
     with orch.allocate_domain(
         name="default",
-        workers=list(range(nranks)),
+        members=list(range(nranks)),
         window_size=window_size,
         buffers=[CommBufferSpec(name="scratch", dtype="float32",
                                 count=elems, nbytes=scratch_nbytes)],
     ) as handle:
         for i in range(nranks):
-            domain = handle[i]          # domain-local rank i
+            domain = handle.local_context(i)  # dense domain rank, independent of chip id
             ...                         # build per-rank args, submit per chip
 ```
 

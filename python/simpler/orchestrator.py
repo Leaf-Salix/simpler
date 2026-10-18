@@ -51,8 +51,6 @@ from .task_interface import (
     CommDomainHandle,
     DataType,
     DeviceMemoryInfo,
-    GlobalCommDomainHandle,
-    GlobalCommDomainView,
     RemoteAddressSpace,
     TaskArgs,
     TaskHandle,
@@ -356,6 +354,8 @@ class Orchestrator:
             if needs_prov:
                 worker._child_prov_check_dispatch_locked(c_args, cpp_worker_id, api="submit_next_level")
             if worker is not None:
+                worker._validate_domain_target(c_args, cpp_worker_id)
+                worker._admit_domain_tasks((c_args,))
                 worker._adopt_remote_sidecar_refs((remote_sidecar,))
                 worker._record_touched_identities(c_args)
             _admit_task_submission(self._worker)
@@ -463,6 +463,10 @@ class Orchestrator:
             for target_worker_id, c_args in member_checks:
                 assert worker is not None
                 worker._child_prov_check_dispatch_locked(c_args, target_worker_id, api="submit_next_level_group")
+            if worker is not None:
+                for target, c_args in zip(worker_ids, c_args_list):
+                    worker._validate_domain_target(c_args, target)
+                worker._admit_domain_tasks(c_args_list)
             if worker is not None and remote_sidecars is not None:
                 worker._adopt_remote_sidecar_refs(remote_sidecars)
             if worker is not None:
@@ -489,6 +493,7 @@ class Orchestrator:
         _reject_remote_sidecar_args(args, kind="orch.submit_sub")
         _reject_device_args(args, kind="orch.submit_sub")
         if self._worker is not None:
+            self._worker._admit_domain_tasks((args,))
             self._worker._record_touched_identities(args)
         _admit_task_submission(self._worker)
         self._o.submit_sub(digest, kind, target_namespace, args)
@@ -508,6 +513,7 @@ class Orchestrator:
         # dispatched, and identities recorded for a group that never went out would refuse a
         # release of buffers no task ever received.
         if self._worker is not None:
+            self._worker._admit_domain_tasks(args_list)
             for args in args_list:
                 self._worker._record_touched_identities(args)
         _admit_task_submission(self._worker)
@@ -522,108 +528,90 @@ class Orchestrator:
         self,
         *,
         name: str,
-        workers: Sequence[int],
-        window_size: int,
-        buffers: Sequence[CommBufferSpec] = (),
-    ) -> CommDomainHandle:
-        """Collectively allocate a fresh CommDomain across `workers`.
-
-        Driven from the orch thread.  Dispatches CTRL_ALLOC_DOMAIN to each
-        participating chip in parallel and blocks until all have completed
-        the IPC handshake (HCCL: aclrtMalloc + IPC import; sim: shm + ftruncate).
-        Returns a ``CommDomainHandle`` whose ``contexts[chip_idx]`` exposes
-        the per-chip ``ChipDomainContext`` (``device_ctx``, ``local_window_base``,
-        ``buffers`` by name — each a device ``VMM_WINDOW`` Buffer).
-
-        ``name`` is a local identifier (uniqueness checked against currently-live
-        handles); peers do not need to agree on the string.  ``workers`` must be
-        a subset of the Worker's ``device_ids`` indices; their order defines
-        dense domain ranks.  ``buffers`` are carved sequentially inside the
-        window in declaration order; their ``nbytes`` sum must fit within
-        ``window_size`` — this is validated on the orch thread before any
-        chip-side allocation is dispatched, so an oversized request raises
-        ``ValueError`` here without leaking a backend allocation.
-
-        Use the handle as a context manager for auto-release:
-
-            with orch.allocate_domain(name="tp", workers=[0, 1], window_size=4096) as tp:
-                for chip_idx in tp.workers:
-                    orch.submit_next_level(chip_handle, ..., worker=chip_idx)
-        """
-        if self._worker is None:
-            raise RuntimeError("allocate_domain requires an Orchestrator bound to a Worker")
-        # Collective domain setup drives CTRL_COMM_INIT / CTRL_ALLOC_DOMAIN on
-        # every member chip, so it is a device effect and must not overtake the
-        # active run's mailbox traffic.
-        with self._control_admission("allocate_domain"):
-            return self._worker._allocate_domain(
-                name=str(name),
-                workers=tuple(int(w) for w in workers),
-                window_size=int(window_size),
-                buffers=list(buffers),
-            )
-
-    def release_domain(self, handle: CommDomainHandle) -> None:
-        """Collective release.  Equivalent to ``handle.release()``."""
-        handle.release()
-
-    def allocate_global_domain(
-        self,
-        *,
-        name: str,
-        members: Sequence[tuple[int, int]],
+        members=None,
+        workers=None,
         window_size: int,
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
-    ) -> GlobalCommDomainHandle:
-        """Create a CommDomain across local and/or remote L3 nodes without MPI.
-
-        Each member is ``(l3_worker_id, local_l2_worker_id)``. The L3 worker
-        may have been registered by ``Worker.add_worker`` or
-        ``Worker.add_remote_worker``. L4 collects every L2 export descriptor,
-        sends the complete rank-ordered table back to every L3, and commits
-        only after all L2 imports succeed.
-        ``retain_after_run=True`` keeps the domain live after the current DAG
-        drains so a later run can inspect communication results; explicit
-        release or ``Worker.close()`` still tears it down.
-        """
-        if self._worker is None:
-            raise RuntimeError("allocate_global_domain requires an Orchestrator bound to a Worker")
-        return self._worker._allocate_global_domain(
-            name=str(name),
-            members=tuple((int(node), int(local)) for node, local in members),
-            window_size=int(window_size),
-            buffers=list(buffers),
-            retain_after_run=bool(retain_after_run),
+    ) -> CommDomainHandle:
+        """Create a domain; ordered members are chip ids at L3 and (node, chip) pairs at L4+."""
+        return self._domain_allocate(
+            name=name,
+            members=members,
+            workers=workers,
+            window_size=window_size,
+            buffers=buffers,
+            retain_after_run=retain_after_run,
+            reuse=False,
         )
 
-    def release_global_domain(self, handle: GlobalCommDomainHandle) -> None:
-        handle.release()
+    def get_or_allocate_domain(
+        self,
+        *,
+        name: str,
+        members=None,
+        workers=None,
+        window_size: int,
+        buffers: Sequence[CommBufferSpec] = (),
+        retain_after_run: bool = False,
+    ) -> CommDomainHandle:
+        """Reuse the exact same handle when the complete requested configuration matches."""
+        return self._domain_allocate(
+            name=name,
+            members=members,
+            workers=workers,
+            window_size=window_size,
+            buffers=buffers,
+            retain_after_run=retain_after_run,
+            reuse=True,
+        )
 
-    def get_global_domain(self, domain_id: int) -> GlobalCommDomainView:
-        """Return the committed L3-local view for a domain created by L4."""
+    def _domain_allocate(self, **kwargs):
+        if self._worker is None:
+            raise RuntimeError("domain allocation requires an Orchestrator bound to a Worker")
+        return self._worker._allocate_domain(**kwargs)
+
+    def get_domain(self, name_or_ref) -> CommDomainHandle:
+        """Resolve a live owner domain, or a borrowed domain within its accepted task."""
+        if self._worker is None:
+            raise RuntimeError("get_domain requires an Orchestrator bound to a Worker")
+        return self._worker._get_domain(name_or_ref)
+
+    def release_domain(self, handle: CommDomainHandle) -> None:
+        if self._worker is None:
+            raise RuntimeError("release_domain requires an Orchestrator bound to a Worker")
+        self._worker._release_domain_handle(handle)
+
+    def allocate_global_domain(self, **kwargs) -> CommDomainHandle:
+        """Compatibility adapter for :meth:`allocate_domain`."""
+        return self.allocate_domain(**kwargs)
+
+    def release_global_domain(self, handle: CommDomainHandle) -> None:
+        self.release_domain(handle)
+
+    def get_global_domain(self, domain_id: int) -> CommDomainHandle:
         if self._worker is None:
             raise RuntimeError("get_global_domain requires an Orchestrator bound to a Worker")
         return self._worker._get_global_domain(int(domain_id))
 
     @staticmethod
-    def _global_copy_range(handle: GlobalCommDomainHandle, *, buffer: str | None, offset: int, nbytes: int) -> int:
+    def _domain_copy_range(handle: CommDomainHandle, *, buffer: str | None, offset: int, nbytes: int) -> int:
         absolute = int(offset)
         if absolute < 0 or nbytes <= 0:
-            raise ValueError("Global CommDomain copy offset must be non-negative and size must be positive")
+            raise ValueError("CommDomain copy offset must be non-negative and size must be positive")
         limit = handle.mapping_size
         if buffer is not None:
             buffer_offset, buffer_nbytes = handle.buffer_range(str(buffer))
             if absolute > buffer_nbytes or nbytes > buffer_nbytes - absolute:
-                raise ValueError(f"Global CommDomain copy exceeds buffer {buffer!r}")
+                raise ValueError(f"CommDomain copy exceeds buffer {buffer!r}")
             absolute += buffer_offset
         elif absolute > limit or nbytes > limit - absolute:
-            raise ValueError("Global CommDomain copy exceeds the mapped window")
+            raise ValueError("CommDomain copy exceeds the mapped window")
         return absolute
 
-    def copy_to_global_domain(
+    def copy_to_domain(
         self,
-        handle: GlobalCommDomainHandle,
+        handle: CommDomainHandle,
         domain_rank: int,
         data: bytes,
         *,
@@ -631,24 +619,32 @@ class Orchestrator:
         offset: int = 0,
     ) -> None:
         payload = bytes(data)
-        absolute = self._global_copy_range(handle, buffer=buffer, offset=int(offset), nbytes=len(payload))
+        absolute = self._domain_copy_range(handle, buffer=buffer, offset=int(offset), nbytes=len(payload))
         if self._worker is None:
-            raise RuntimeError("copy_to_global_domain requires an Orchestrator bound to a Worker")
-        self._worker._copy_to_global_domain(handle, int(domain_rank), payload, absolute)
+            raise RuntimeError("copy_to_domain requires an Orchestrator bound to a Worker")
+        with self._control_admission("copy_to_domain"):
+            self._worker._copy_domain(handle, int(domain_rank), absolute, len(payload), payload)
 
-    def copy_from_global_domain(
+    def copy_from_domain(
         self,
-        handle: GlobalCommDomainHandle,
+        handle: CommDomainHandle,
         domain_rank: int,
         nbytes: int,
         *,
         buffer: str | None = None,
         offset: int = 0,
     ) -> bytes:
-        absolute = self._global_copy_range(handle, buffer=buffer, offset=int(offset), nbytes=int(nbytes))
+        absolute = self._domain_copy_range(handle, buffer=buffer, offset=int(offset), nbytes=int(nbytes))
         if self._worker is None:
-            raise RuntimeError("copy_from_global_domain requires an Orchestrator bound to a Worker")
-        return self._worker._copy_from_global_domain(handle, int(domain_rank), int(nbytes), absolute)
+            raise RuntimeError("copy_from_domain requires an Orchestrator bound to a Worker")
+        with self._control_admission("copy_from_domain"):
+            return self._worker._copy_domain(handle, int(domain_rank), absolute, int(nbytes))
+
+    def copy_to_global_domain(self, *args, **kwargs):
+        return self.copy_to_domain(*args, **kwargs)
+
+    def copy_from_global_domain(self, *args, **kwargs):
+        return self.copy_from_domain(*args, **kwargs)
 
     def create_worker_chip_region(self, *, worker_id: int, payload_bytes: int, counter_bytes: int):
         """Create an L3-L2 communication region on one NEXT_LEVEL chip worker."""
@@ -863,6 +859,9 @@ class Orchestrator:
 
     def _run_done(self, run_id: int) -> bool:
         return bool(self._o._run_done(run_id))
+
+    def _run_domain_use_settled(self, run_id: int) -> bool:
+        return bool(self._o._run_domain_use_settled(run_id))
 
     def _release_run(self, run_id: int) -> None:
         self._o._release_run(run_id)

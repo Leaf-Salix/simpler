@@ -271,7 +271,7 @@ class TestDynamicAllocateExceptionUnwind:
             assert ei.value is sentinel
             # After the failed run, no live handle should remain.  Otherwise
             # the next Worker.run would see a name collision.
-            assert worker.live_domains == {}
+            assert worker.live_domains() == {}
         finally:
             worker.close()
 

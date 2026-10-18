@@ -872,7 +872,7 @@ class TestDomainReleaseOrdering:
     def _domain_worker(self) -> tuple[Worker, SimpleNamespace, tuple[Buffer, Buffer]]:
         """A level-3 Worker holding one domain allocation's two carved buffers, plus a native worker."""
         w = _l3()
-        w._worker = MagicMock()  # non-None so _release_domain_now proceeds
+        w._worker = MagicMock()
         bufs = (
             wrap_vmm_window(0x5000, 64, w._owner_instance_id, buffer_id=0x5000, owner_worker_id=0),
             wrap_vmm_window(0x6000, 64, w._owner_instance_id, buffer_id=0x6000, owner_worker_id=1),
@@ -881,11 +881,7 @@ class TestDomainReleaseOrdering:
             for buf in bufs:
                 w._record_device_alloc(buf, domain_allocation_id=9)
         handle = SimpleNamespace(
-            name="d",
-            workers=(0, 1),
-            allocation_id=9,
-            _domain_size=2,
-            _domain_ranks={0: 0, 1: 1},
+            ref=9, backend={"kind": "local", "allocation_id": 9, "workers": (0, 1), "ranks": {0: 0, 1: 1}}
         )
         return w, handle, bufs
 
@@ -898,7 +894,7 @@ class TestDomainReleaseOrdering:
             seen_live_at_dispatch["still_live"] = _is_live(w, 0x5000, 0)
 
         monkeypatch.setattr(w, "_dispatch_control_domain", _fake_dispatch)
-        w._release_domain_now(handle)  # type: ignore[arg-type]
+        w._destroy_domain_record(handle)  # type: ignore[arg-type]
         assert seen_live_at_dispatch["still_live"] is False
         assert not _is_live(w, 0x5000, 0)
         assert not _is_live(w, 0x6000, 1)
@@ -922,7 +918,7 @@ class TestDomainReleaseOrdering:
                 outcome["dispatch"] = "rejected"
 
         monkeypatch.setattr(w, "_dispatch_control_domain", _fake_dispatch)
-        w._release_domain_now(handle)  # type: ignore[arg-type]
+        w._destroy_domain_record(handle)  # type: ignore[arg-type]
         assert outcome["dispatch"] == "rejected"
 
     def test_release_backend_failure_leaves_provenance_dropped(self, monkeypatch):
@@ -935,7 +931,7 @@ class TestDomainReleaseOrdering:
 
         monkeypatch.setattr(w, "_dispatch_control_domain", _boom)
         with pytest.raises(RuntimeError, match="release failed"):
-            w._release_domain_now(handle)  # type: ignore[arg-type]
+            w._destroy_domain_record(handle)  # type: ignore[arg-type]
         assert not _is_live(w, 0x5000, 0)
         assert not _is_live(w, 0x6000, 1)
 

@@ -167,8 +167,19 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | `submit_next_level(callable_handle, args, config=None, *, worker: int) -> TaskHandle` | Hands a callable to one exact NEXT_LEVEL child and returns an opaque handle for explicit task dependencies |
 | `submit_next_level_group(callable_handle, args_list, config=None, *, workers: list[int]) -> TaskHandle` | Submits one group DAG node and returns its opaque handle |
 | `submit_sub(callable_handle, args=None)` | Schedules a registered host-side Python callable |
-| `allocate_domain(*, name, workers, window_size, buffers=())` | Context manager returning a handle indexed by domain-local rank |
+| `allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | Same handle/ref model at L3 and L4; member order defines domain ranks |
+| `get_or_allocate_domain(...)` | Reuses the identical handle only for an exact configuration match |
+| `get_domain(name_or_ref)` | Lookup only; borrowed access requires an accepted task use |
+| `release_domain(handle)` | Closes new uses; physical free waits for accepted users |
+| `copy_to_domain(handle, rank, data, *, buffer=None, offset=0)` | Bounded control-plane upload |
+| `copy_from_domain(handle, rank, nbytes, *, buffer=None, offset=0)` | Bounded control-plane download |
 | `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Delegates allocation to the owning Worker; target chip memory is named by the returned handle |
+
+Domain Tensor arguments automatically carry their `CommDomainRef`. Tasks using
+only a raw `device_ctx` must also call `TaskArgs.add_domain_ref(domain.ref)`.
+At L3, members are chip ids; at L4+, they are `(node, chip)` pairs. Use
+`domain.member(rank)` for logical buffers and `domain.local_context(rank)` for
+addresses mapped on the current node. See [Communication Domains](../../comm-domain.md).
 
 ## Callables and task args
 

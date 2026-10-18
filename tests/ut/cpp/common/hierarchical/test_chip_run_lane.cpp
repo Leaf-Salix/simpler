@@ -181,14 +181,19 @@ TEST(ChipRunLaneTest, OwnsFifoPreparationAndLaunch) {
 
     second.activate();
     EXPECT_FALSE(second.done());
+    EXPECT_FALSE(first.domain_use_settled());
+    EXPECT_FALSE(second.domain_use_settled());
     g_complete[0] = true;
     EXPECT_TRUE(first.done());
+    EXPECT_TRUE(first.domain_use_settled());
+    EXPECT_FALSE(second.domain_use_settled());
     EXPECT_FALSE(second.done());
     EXPECT_TRUE(second.launched());
     EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0", "prepare1", "finalize0", "launch1"}));
 
     g_complete[1] = true;
     EXPECT_TRUE(second.done());
+    EXPECT_TRUE(second.domain_use_settled());
     lane.close();
     worker.finalize();
 }
@@ -589,6 +594,7 @@ TEST(ChipRunLaneTest, FinalizeFailurePoisonsAdmissionAndCloseReportsIt) {
     g_complete[0] = true;
     g_finalize_rc[0] = -7;
     EXPECT_TRUE(first.done());
+    EXPECT_FALSE(first.domain_use_settled());
     try {
         (void)first.wait_until(ChipRunLane::Clock::time_point::max());
         FAIL() << "expected the poisoned-lane error";
@@ -615,6 +621,7 @@ TEST(ChipRunLaneTest, LaunchFailureWhoseFinalizeFailsReportsThePoisonedLane) {
 
     ChipRun failed = submit(lane, 101, 0);
     EXPECT_TRUE(failed.done());
+    EXPECT_FALSE(failed.domain_use_settled());
     try {
         (void)failed.wait_until(ChipRunLane::Deadline::max());
         FAIL() << "expected the poisoned-lane error";
@@ -665,6 +672,7 @@ TEST(ChipRunLaneTest, PollFailureReportsTheTerminalNativeError) {
     g_wait_rc[0] = 507015;
 
     EXPECT_TRUE(run.done());
+    EXPECT_FALSE(run.domain_use_settled());
     EXPECT_THROW(run.wait_until(ChipRunLane::Deadline::max()), std::runtime_error);
     try {
         run.wait_until(ChipRunLane::Deadline::max());

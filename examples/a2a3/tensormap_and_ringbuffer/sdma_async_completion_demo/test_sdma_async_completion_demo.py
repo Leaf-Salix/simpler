@@ -14,13 +14,15 @@ the peer rank's input into local ``out`` and registers its async event. The
 consumer depends on that output and writes ``result = out + 1``.
 """
 
+import ctypes
+
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import CommBufferSpec, DataType, TaskArgs, TensorArgType
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
-from simpler_setup.scene_test import _rehosted_buffer_for, _rehosted_ref_for
+from simpler_setup.scene_test import _rehosted_ref_for
 
 N = 128 * 128
 NRANKS = 2
@@ -37,7 +39,7 @@ def sdma_async_completion_orch_fn(orch, callables, task_args, config):
     ) as handle:
         for rank in range(NRANKS):
             source = getattr(task_args, f"in_{rank}")
-            orch.copy_to(handle[rank].buffers["input_window"], _rehosted_buffer_for(task_args, source))
+            orch.copy_to_domain(handle, rank, ctypes.string_at(source.data_ptr(), input_nbytes), buffer="input_window")
         for rank in range(NRANKS):
             domain = handle[rank]
             args = TaskArgs()

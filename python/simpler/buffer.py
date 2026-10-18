@@ -343,6 +343,7 @@ class Buffer:
     _source_registration: tuple[_DeviceBufferSource, CanonicalIdentity] | None = field(
         default=None, init=False, compare=False, repr=False
     )
+    _domain_check: Callable[[], None] | None = field(default=None, init=False, compare=False, repr=False)
 
     @classmethod
     def wrap(
@@ -369,6 +370,8 @@ class Buffer:
 
     def to_descriptor(self) -> BufferDescriptor:
         """The wire descriptor for this backing — what a consumer needs to resolve it."""
+        if self._domain_check is not None:
+            self._domain_check()
         if self.closed:
             raise ValueError(f"Buffer: cannot derive a descriptor from a released buffer ({self.identity})")
         if self._descriptor is not None:
@@ -1056,14 +1059,15 @@ class ImportContext:
 
     deployment: EndpointDeployment
     device_owner_instance_id: bytes | None = None
+    domain_resolver: Callable[[BufferDescriptor], int] | None = None
 
 
 class ImportRegistry:
-    """Per-consumer-endpoint lazy import cache: materialize a ``Tensor``'s embedded descriptor to a
-    local base on first receipt (map-once), keyed by canonical identity.
+    """Resolve domain windows through their catalog; cache other imports by canonical identity.
 
-    A consumer calls ``materialize`` for each tensor's embedded descriptor as it arrives; the first
-    sight of an identity maps its backing into this process, later sights reuse the cached base
+    A consumer calls ``materialize`` for each tensor's embedded descriptor as it arrives. Domain
+    windows revalidate their task grant in the domain store on every receipt. For other backings,
+    the first sight of an identity maps it into this process, later sights reuse the cached base
     (a bumped generation is a distinct identity, materialized fresh). Keyed by the canonical identity
     itself so lookups are exact — never a numeric-range guess, and never split by the wire padding
     the identity's equality and hashing deliberately ignore.
@@ -1077,8 +1081,7 @@ class ImportRegistry:
         self._context = context
 
     def materialize(self, desc: BufferDescriptor) -> ImportedBuffer:
-        """Map ``desc``'s backing into this process on first sight of its identity; reuse the
-        cached ImportedBuffer thereafter (map-once).
+        """Resolve a domain window's installed mapping, or map/cache another backing by identity.
 
         Takes the descriptor, never its bytes: every producer of one — an owner's ``to_descriptor()``,
         a re-export, an element pulled out of a received TaskArgs — hands over the bound type, and
@@ -1089,12 +1092,27 @@ class ImportRegistry:
         POSIX shm object smaller than the ``nbytes`` its descriptor claims — every view bound check
         is computed against that number, so an unverified one makes them all vacuous.
 
-        Selection is the capability judgment: ``select_adapter`` either names the mechanism that
+        For other backings, ``select_adapter`` either names the mechanism that
         reaches this backing from this endpoint or refuses, and the resolver below only carries the
         named mechanism out. Nothing after selection looks at ``backend_kind`` again. A mechanism
         that reaches the backing without producing an address is refused *here* rather than there --
         this returns a mapping, and that is the only narrowing it applies to the judgment.
         """
+        if desc.backend_kind == BackendKind.DOMAIN_WINDOW:
+            if self._context.deployment != DEVICE_AICPU or self._context.domain_resolver is None:
+                raise ValueError("domain windows require an installed chip mapping")
+            # The domain store owns the mapping/catalog lifetime; every use needs its task grant.
+            base = self._context.domain_resolver(desc)
+            return ImportedBuffer(
+                desc.identity,
+                base,
+                desc.nbytes,
+                desc.address_space,
+                None,
+                desc,
+                AdapterProfile.DEVICE_LOCAL,
+                capabilities_for_adapter(AdapterKind.DIRECT_MAP, desc.access),
+            )
         key = desc.identity
         cached = self._by_identity.get(key)
         if cached is not None:

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import socket
@@ -22,7 +23,17 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from simpler.buffer import AddressSpace
+from simpler.buffer import AddressSpace, CanonicalIdentity
+from simpler.comm_domain import (
+    CommBufferSpec,
+    CommDomainRef,
+    _DomainConfig,
+    _DomainMember,
+    _DomainRecord,
+    _DomainRegistry,
+    decode_domain_metadata,
+    encode_domain_metadata,
+)
 from simpler.comm_endpoints import (
     _ADAPTER_KIND_IDS,
     _ADAPTER_PROFILE_IDS,
@@ -85,6 +96,62 @@ from tests.ut.py.test_worker.test_comm_endpoints import (
     FROZEN_ADAPTER_PROFILE_LE_U32,
     FROZEN_ADAPTER_PROFILE_U32,
 )
+
+
+def _domain_command(**kwargs):
+    command = GlobalDomainCommand(**kwargs)
+    if command.domain_metadata:
+        return command
+    try:
+        config = _DomainConfig.capture(
+            members=[
+                _DomainMember(
+                    m.node_worker_id,
+                    m.local_worker_id,
+                    m.global_device_rank,
+                    ("fixture", m.node_worker_id, m.local_worker_id),
+                )
+                for m in command.members
+            ],
+            window_size=command.window_size,
+            buffers=[CommBufferSpec(b.name, "uint8", b.nbytes, b.nbytes) for b in command.buffers],
+            retain_after_run=False,
+            topology=(),
+        )
+        ref = CommDomainRef(b"testnode", command.domain_id, command.generation)
+        identities = iter(range(command.domain_id * 4096 + 1, command.domain_id * 4096 + 4097))
+        registry = _DomainRegistry(
+            owner_instance_id=b"testnode",
+            mint_identity=lambda: CanonicalIdentity(b"testnode", next(identities), command.generation),
+            allocate=lambda _: None,
+            destroy=lambda _: None,
+        )
+        record = _DomainRecord(command.name, ref, config)
+        registry._catalog(record)
+        return replace(command, domain_metadata=encode_domain_metadata(record))
+    except (ValueError, OverflowError):
+        # Invalid wire inputs must reach the encoder's own validation in their test.
+        return command
+
+
+def _release_command(domain_id, generation, owner_instance_id=b"testnode"):
+    return GlobalDomainReleaseCommand(domain_id, generation, owner_instance_id)
+
+
+def _copy_command(*args, **kwargs):
+    kwargs.setdefault("owner_instance_id", b"testnode")
+    return GlobalDomainCopyCommand(*args, **kwargs)
+
+
+def _install_prepared_node(worker, command, *, prepared=True):
+    from simpler.worker import _GlobalNodeDomainState  # noqa: PLC0415
+
+    record = worker._domain_registry.import_domain(command.domain_metadata)
+    state = _GlobalNodeDomainState(command=command, allocation_id=command.domain_id, view=record.handle)
+    if prepared:
+        state.prepared_domain_ranks.update(m.domain_rank for m in command.members)
+    worker._global_node_domains[command.key] = state
+    return state
 
 
 def _members() -> tuple[GlobalDomainMember, ...]:
@@ -233,7 +300,7 @@ def test_local_l3_comm_init_rejects_unsupported_capability_without_caching_topol
 
 def test_global_domain_wire_round_trips_topology_and_descriptor_table():
     init = GlobalCommInitCommand("cluster", "topology", "sim", 0, 2, _members())
-    prepare = GlobalDomainCommand(
+    prepare = _domain_command(
         phase=GlobalDomainPhase.PREPARE_EXPORT,
         domain_id=11,
         generation=1,
@@ -244,7 +311,7 @@ def test_global_domain_wire_round_trips_topology_and_descriptor_table():
         buffers=(GlobalDomainBuffer("payload", 128),),
         attachments=_attachments(),
     )
-    command = GlobalDomainCommand(
+    command = _domain_command(
         phase=GlobalDomainPhase.IMPORT,
         domain_id=11,
         generation=1,
@@ -266,7 +333,7 @@ def test_global_domain_wire_round_trips_topology_and_descriptor_table():
 
 
 def test_global_domain_wire_rejects_attachments_after_prepare():
-    command = GlobalDomainCommand(
+    command = _domain_command(
         phase=GlobalDomainPhase.IMPORT,
         domain_id=11,
         generation=1,
@@ -285,7 +352,7 @@ def test_global_domain_wire_rejects_attachments_after_prepare():
 
 def test_global_domain_attachment_table_requires_complete_unique_receiver_rows():
     def make_command(attachments: tuple[GlobalDomainAttachment, ...]) -> GlobalDomainCommand:
-        return GlobalDomainCommand(
+        return _domain_command(
             phase=GlobalDomainPhase.PREPARE_EXPORT,
             domain_id=11,
             generation=1,
@@ -314,7 +381,7 @@ def test_global_domain_attachment_names_every_unknown_enum_field():
     # ValueError, which names the value but not the field it came from.
     def make_command(attachment: GlobalDomainAttachment) -> GlobalDomainCommand:
         row = (attachment, replace(attachment, adapter_kind=None, adapter_profile=None))
-        return GlobalDomainCommand(
+        return _domain_command(
             phase=GlobalDomainPhase.PREPARE_EXPORT,
             domain_id=12,
             generation=1,
@@ -373,10 +440,10 @@ def test_release_and_copy_commands_round_trip_and_reject_a_missized_release():
     """RELEASE is the one command whose decoder has no length-delimited field to disagree on, so
     its fixed size is the whole frame check: a blob of any other length is rejected outright.
     """
-    release = GlobalDomainReleaseCommand(11, 1)
+    release = _release_command(11, 1)
     assert decode_release_command(encode_release_command(release)) == release
 
-    copy = GlobalDomainCopyCommand(11, 1, 0, 0, 4, b"abcd")
+    copy = _copy_command(11, 1, 0, 0, 4, b"abcd")
     assert decode_copy_command(encode_copy_command(copy, include_data=True), include_data=True) == copy
 
     with pytest.raises(ValueError, match="release size mismatch"):
@@ -384,7 +451,7 @@ def test_release_and_copy_commands_round_trip_and_reject_a_missized_release():
 
 
 def test_global_domain_encode_rejects_too_many_buffers():
-    command = GlobalDomainCommand(
+    command = _domain_command(
         phase=GlobalDomainPhase.PREPARE_EXPORT,
         domain_id=11,
         generation=1,
@@ -425,6 +492,7 @@ def _failure_injection_worker(*, platform: str = "a2a3sim", profile: str = "sim"
     resources = _RunResources()
     worker._worker = object()
     worker._building_run_resources = resources
+    worker._control_admission = lambda _api: contextlib.nullcontext()
     return worker, resources, node_ids
 
 
@@ -473,8 +541,7 @@ def _install_global_domain_failure_injector(monkeypatch, worker, *, fail_phase, 
 
 def _close_failure_injection_worker(worker, resources):
     worker._building_run_resources = None
-    worker._live_global_domains.clear()
-    resources.live_global_domains.clear()
+    worker._comm_domains = None
     worker._worker = None
     worker.close()
 
@@ -545,8 +612,8 @@ def test_global_domain_transaction_aborts_all_prepared_nodes_after_phase_failure
 
         abort_nodes = [node_id for phase, node_id in calls if phase is GlobalDomainPhase.ABORT]
         assert abort_nodes == list(node_ids)
-        assert worker._live_global_domains == {}
-        assert resources.live_global_domains == {}
+        assert worker.live_domains() == {}
+        assert not any(r.state == "live" and r.owner for r in worker._domain_registry.records.values())
     finally:
         _close_failure_injection_worker(worker, resources)
 
@@ -652,7 +719,7 @@ def test_attachment_adapter_pair_survives_a_wire_round_trip_with_and_without_an_
     assert any(attachment.adapter_kind is None for attachment in cross_host)
     assert any(attachment.adapter_kind is not None for attachment in cross_host)
 
-    command = GlobalDomainCommand(
+    command = _domain_command(
         phase=GlobalDomainPhase.PREPARE_EXPORT,
         domain_id=7,
         generation=1,
@@ -700,17 +767,15 @@ def test_global_domain_abort_failure_preserves_primary_error_and_poisons_admissi
 
         abort_nodes = [node_id for phase, node_id in calls if phase is GlobalDomainPhase.ABORT]
         assert abort_nodes == list(node_ids)
-        # A failed ABORT leg leaves backend windows that nothing tracks: the
-        # domain is never registered, so no run fence and no close() sweep can
-        # reach it. Refusing further work is the only remaining boundary.
+        # Rollback debt stays registered and prevents further admission.
         leaked = worker._ordered_cleanup_error
         assert leaked is not None
         assert "abort-failure-injection" in str(leaked)
-        assert f"node worker {node_ids[0]}" in str(leaked)
+        assert f"node worker {node_ids[0]}" in str(leaked.__cause__)
         assert isinstance(leaked.__cause__, RuntimeError)
         assert "injected ABORT failure" in str(leaked.__cause__)
-        assert worker._live_global_domains == {}
-        assert resources.live_global_domains == {}
+        assert worker.live_domains() == {}
+        assert not any(r.state == "live" and r.owner for r in worker._domain_registry.records.values())
     finally:
         _close_failure_injection_worker(worker, resources)
 
@@ -865,8 +930,8 @@ def test_mixed_local_remote_import_failure_rolls_back_local_node(monkeypatch):
         assert local._global_node_domains == {}
         assert ("local", GlobalDomainPhase.ABORT) in calls
         assert ("remote", GlobalDomainPhase.ABORT) in calls
-        assert parent._live_global_domains == {}
-        assert resources.live_global_domains == {}
+        assert parent.live_domains() == {}
+        assert not any(r.state == "live" and r.owner for r in parent._domain_registry.records.values())
     finally:
         parent._building_run_resources = None
         parent._worker = None
@@ -892,8 +957,8 @@ def test_allocate_global_domain_rejects_unsupported_capability_before_control(mo
             )
 
         assert calls == []
-        assert worker._live_global_domains == {}
-        assert resources.live_global_domains == {}
+        assert worker.live_domains() == {}
+        assert not any(r.state == "live" and r.owner for r in worker._domain_registry.records.values())
     finally:
         _close_failure_injection_worker(worker, resources)
 
@@ -911,160 +976,6 @@ def test_global_domain_descriptor_table_rejects_different_mapping_sizes():
 
     with pytest.raises(ValueError, match="mapping sizes differ"):
         validate_descriptor_table(tuple(descriptors), rank_count=2, profile="sim")
-
-
-def test_global_domain_release_stays_released_after_callback_failure():
-    from simpler.task_interface import GlobalCommDomainHandle  # noqa: PLC0415
-
-    attempts = 0
-
-    def release_fn(_handle):
-        nonlocal attempts
-        attempts += 1
-        raise RuntimeError("release failure")
-
-    handle = GlobalCommDomainHandle(
-        name="retry",
-        members=(),
-        buffers=(),
-        domain_id=17,
-        generation=1,
-        mapping_size=4096,
-        retain_after_run=False,
-        _release_fn=release_fn,
-    )
-
-    with pytest.raises(RuntimeError, match="release failure"):
-        handle.release()
-
-    assert handle.released
-    handle.release()
-    assert attempts == 1
-
-
-def test_old_global_domain_release_does_not_remove_same_name_replacement():
-    from simpler.task_interface import GlobalCommDomainHandle  # noqa: PLC0415
-    from simpler.worker import Worker, _RunResources  # noqa: PLC0415
-
-    worker = Worker(level=4, num_sub_workers=0)
-    resources = _RunResources()
-
-    def make_handle(domain_id: int) -> GlobalCommDomainHandle:
-        return GlobalCommDomainHandle(
-            name="reuse",
-            members=(),
-            buffers=(),
-            domain_id=domain_id,
-            generation=1,
-            mapping_size=4096,
-            retain_after_run=False,
-            _release_fn=lambda released: worker._release_global_domain_handle(released, resources),
-        )
-
-    first = make_handle(17)
-    second = make_handle(18)
-    worker._worker = object()
-    worker._building_run_resources = resources
-    worker._live_global_domains[first.name] = first
-    resources.live_global_domains[first.name] = first
-    try:
-        first.release()
-        worker._live_global_domains[second.name] = second
-        resources.live_global_domains[second.name] = second
-
-        worker._execute_pending_global_domain_releases(resources)
-
-        assert first.freed
-        assert worker._live_global_domains[second.name] is second
-        assert resources.live_global_domains[second.name] is second
-    finally:
-        worker._building_run_resources = None
-        worker._live_global_domains.clear()
-        resources.live_global_domains.clear()
-        worker._worker = None
-        worker.close()
-
-
-def test_global_domain_backend_release_failure_is_terminal(monkeypatch):
-    from simpler.task_interface import GlobalCommDomainHandle  # noqa: PLC0415
-    from simpler.worker import Worker, _RunResources  # noqa: PLC0415
-
-    attempts = 0
-    worker = Worker(level=4, num_sub_workers=0)
-    worker._worker = object()
-    resources = _RunResources()
-
-    def fail_control(_worker_id, _control_name, _payload):
-        nonlocal attempts
-        attempts += 1
-        raise RuntimeError("partial backend release")
-
-    monkeypatch.setattr(worker, "_global_domain_control", fail_control)
-    handle = GlobalCommDomainHandle(
-        name="terminal",
-        members=(_members()[0],),
-        buffers=(),
-        domain_id=19,
-        generation=1,
-        mapping_size=4096,
-        retain_after_run=False,
-        _release_fn=lambda released: worker._release_global_domain_handle(released, resources),
-    )
-    try:
-        with pytest.raises(RuntimeError, match="partial backend release"):
-            worker._free_global_domain_after_fence(handle)
-        with pytest.raises(RuntimeError, match="partial backend release"):
-            worker._free_global_domain_after_fence(handle)
-
-        assert attempts == 1
-        assert not handle.freed
-        assert worker._failed_global_domain_releases[handle.domain_id] is handle
-    finally:
-        worker._failed_global_domain_releases.clear()
-        worker._worker = None
-        worker.close()
-
-
-def test_global_domain_release_uses_allocation_run_after_graph_build(monkeypatch):
-    from simpler.remote_l3_protocol import ControlName  # noqa: PLC0415
-    from simpler.task_interface import CommBufferSpec  # noqa: PLC0415
-
-    worker, resources, node_ids = _failure_injection_worker()
-    _install_global_domain_failure_injector(
-        monkeypatch,
-        worker,
-        fail_phase=None,
-        fail_node=-1,
-    )
-    try:
-        handle = worker._allocate_global_domain(
-            name="run-owned-release",
-            members=((node_ids[0], 0), (node_ids[1], 0)),
-            window_size=4096,
-            buffers=[CommBufferSpec("payload", "uint8", 4096, 4096)],
-            retain_after_run=True,
-        )
-        release_nodes = []
-
-        def release_control(worker_id, control_name, _payload):
-            assert ControlName(control_name) is ControlName.RELEASE_DOMAIN
-            release_nodes.append(worker_id)
-            return b""
-
-        monkeypatch.setattr(worker, "_global_domain_control", release_control)
-        worker._building_run_resources = None
-        handle.release()
-
-        assert resources.pending_release_global_domains == [handle]
-        assert release_nodes == []
-        assert not handle.freed
-
-        worker._execute_pending_global_domain_releases(resources)
-        assert release_nodes == list(node_ids)
-        assert resources.pending_release_global_domains == []
-        assert handle.freed
-    finally:
-        _close_failure_injection_worker(worker, resources)
 
 
 def _local_node_domain_commands():
@@ -1092,9 +1003,87 @@ def _local_node_domain_commands():
         "members": members,
         "buffers": (GlobalDomainBuffer("payload", 64),),
     }
-    prepare = GlobalDomainCommand(phase=GlobalDomainPhase.PREPARE_EXPORT, attachments=_attachments()[:2], **common)
-    imported = GlobalDomainCommand(phase=GlobalDomainPhase.IMPORT, descriptors=descriptors, **common)
+    prepare = _domain_command(phase=GlobalDomainPhase.PREPARE_EXPORT, attachments=_attachments()[:2], **common)
+    imported = _domain_command(phase=GlobalDomainPhase.IMPORT, descriptors=descriptors, **common)
     return prepare, imported
+
+
+@pytest.mark.parametrize("release_fails", [False, True], ids=["rollback-succeeds", "rollback-fails"])
+def test_node_abort_result_preserves_owner_cleanup_obligation(release_fails):
+    from simpler.worker import (  # noqa: PLC0415
+        Worker,
+        _GlobalNodeDomainState,
+        _GlobalNodeRuntime,
+        _run_local_global_domain_control,
+    )
+
+    prepare, _ = _local_node_domain_commands()
+    _, _, config, _ = decode_domain_metadata(prepare.domain_metadata)
+    owner, node = Worker(level=4, num_sub_workers=0), Worker(level=3, device_ids=(0, 1), num_sub_workers=0)
+    captured, releases = [], []
+    runtime = _GlobalNodeRuntime(0, (0, 1), "a2a3sim", "sim", (0, 1), 0, 1, "test", False)
+
+    class NativeNode:
+        def control_payload(self, _kind, chip, _control, _payload, _timeout):
+            releases.append(chip)
+            if release_fails:
+                raise RuntimeError("chip release failed")
+            return b""
+
+    node._worker = NativeNode()
+
+    def allocate(record):
+        captured.append(record)
+        command = replace(
+            prepare,
+            name=record.name,
+            domain_id=record.ref.domain_id,
+            generation=record.ref.generation,
+            domain_metadata=encode_domain_metadata(record),
+        )
+        view = node._domain_registry.import_domain(command.domain_metadata).handle
+        node._global_node_domains[command.key] = _GlobalNodeDomainState(
+            command=command,
+            view=view,
+            allocation_id=1,
+            prepared_domain_ranks={0, 1},
+            phase=GlobalDomainPhase.IMPORT,
+        )
+        record.backend = {"kind": "global", "nodes": [0], "mpi_group": None, "committed": False, "command": command}
+        owner._global_domain_control = lambda _node, control, payload: _run_local_global_domain_control(
+            node,
+            runtime,
+            {"tp": GlobalCommInitCommand("test", "topology", command.profile, 0, 1, command.members)},
+            control,
+            payload,
+        )
+        raise RuntimeError("original import failure")
+
+    owner._domain_registry._allocate = allocate
+    try:
+        with pytest.raises(RuntimeError, match="original import failure"):
+            owner._domain_registry.allocate("tp", config)
+        (record,) = captured
+        assert releases == [0, 1]
+        if release_fails:
+            assert record.state == "released" and record.free_error is not None
+            assert record.backend["nodes"] == [0]
+            assert owner._ordered_cleanup_error is not None and node._ordered_cleanup_error is not None
+            assert record.ref in owner._domain_registry.records
+            with pytest.raises(RuntimeError, match="chip release failed"):
+                owner._destroy_global_domain_record(record)
+            assert releases == [0, 1], "failed node free must not be replayed"
+        else:
+            assert record.state == "freed" and record.free_error is None
+            assert record.backend["nodes"] == [] and node._global_node_domains == {}
+            assert owner._ordered_cleanup_error is None and node._ordered_cleanup_error is None
+            assert node._domain_registry.records == {}
+    finally:
+        for worker in (owner, node):
+            worker._worker = None
+            worker._comm_domains = None
+            worker._global_node_domains.clear()
+            worker.close()
 
 
 def test_node_import_failure_rolls_back_partial_local_ranks_and_uses_configured_timeout():
@@ -1104,7 +1093,6 @@ def test_node_import_failure_rolls_back_partial_local_ranks_and_uses_configured_
         LOCAL_DOMAIN_MAGIC,
         LOCAL_IMPORT_REPLY,
         Worker,
-        _GlobalNodeDomainState,
     )
 
     prepare, imported = _local_node_domain_commands()
@@ -1132,9 +1120,7 @@ def test_node_import_failure_rolls_back_partial_local_ranks_and_uses_configured_
 
     worker = Worker(level=3, device_ids=(0, 1), py_control_timeout_s=7.25)
     worker._worker = FakeNativeWorker()
-    state = _GlobalNodeDomainState(command=prepare)
-    state.prepared_domain_ranks.update((0, 1))
-    worker._global_node_domains[prepare.domain_id] = state
+    _install_prepared_node(worker, prepare)
     try:
         with pytest.raises(RuntimeError, match="second local import failed"):
             worker._import_global_domain_node(imported, 0)
@@ -1155,7 +1141,6 @@ def test_node_import_reuses_prepared_attachment_row_for_view():
         LOCAL_DOMAIN_MAGIC,
         LOCAL_IMPORT_REPLY,
         Worker,
-        _GlobalNodeDomainState,
     )
 
     prepare, imported = _local_node_domain_commands()
@@ -1177,8 +1162,8 @@ def test_node_import_reuses_prepared_attachment_row_for_view():
 
     worker = Worker(level=3, device_ids=(0, 1))
     worker._worker = FakeNativeWorker()
-    worker._global_node_domains[prepare.domain_id] = _GlobalNodeDomainState(command=prepare)
-    commit = GlobalDomainCommand(
+    _install_prepared_node(worker, prepare)
+    commit = _domain_command(
         phase=GlobalDomainPhase.COMMIT,
         domain_id=imported.domain_id,
         generation=imported.generation,
@@ -1191,7 +1176,7 @@ def test_node_import_reuses_prepared_attachment_row_for_view():
     )
     try:
         worker._import_global_domain_node(imported, 0)
-        state = worker._global_node_domains[prepare.domain_id]
+        state = worker._global_node_domains[prepare.key]
         assert state.command.attachments == prepare.attachments
         assert state.view is not None
         assert state.view.attachments == prepare.attachments_for_node(0)
@@ -1199,13 +1184,12 @@ def test_node_import_reuses_prepared_attachment_row_for_view():
         worker._commit_global_domain_node(commit)
         assert state.view.committed
     finally:
-        worker._release_global_domain_node(GlobalDomainReleaseCommand(prepare.domain_id, prepare.generation))
+        worker._release_global_domain_node(_release_command(prepare.domain_id, prepare.generation))
         worker._worker = None
         worker.close()
 
 
 def test_node_release_invalidates_committed_view_before_partial_fanout_failure():
-    from simpler.task_interface import GlobalCommDomainView  # noqa: PLC0415
     from simpler.worker import (  # noqa: PLC0415
         CTRL_GLOBAL_DOMAIN_RELEASE,
         Worker,
@@ -1228,39 +1212,38 @@ def test_node_release_invalidates_committed_view_before_partial_fanout_failure()
     native = FakeNativeWorker()
     worker = Worker(level=3, device_ids=(0, 1), py_control_timeout_s=6.5)
     worker._worker = native
-    view = GlobalCommDomainView(
-        name=imported.name,
-        members=imported.members,
-        contexts={},
-        domain_id=imported.domain_id,
-        generation=imported.generation,
-        mapping_size=4096,
-    )
-    view._committed = True
+    view = worker._domain_registry.import_domain(imported.domain_metadata).handle
+    view._record.state = "live"
+    view._record.mapping_size = 4096
     state = _GlobalNodeDomainState(
         command=imported,
+        allocation_id=imported.domain_id,
         prepared_domain_ranks={0, 1},
         view=view,
         phase=GlobalDomainPhase.COMMIT,
     )
-    worker._global_node_domains[imported.domain_id] = state
+    worker._global_node_domains[imported.key] = state
     try:
         with pytest.raises(RuntimeError, match="partial release failed"):
-            worker._release_global_domain_node(GlobalDomainReleaseCommand(imported.domain_id, imported.generation))
+            worker._release_global_domain_node(_release_command(imported.domain_id, imported.generation))
 
         assert state.phase is GlobalDomainPhase.ABORT
         assert not view.committed
         with pytest.raises(KeyError, match="not committed"):
             worker._get_global_domain(imported.domain_id)
-        with pytest.raises(RuntimeError, match="not committed"):
+        with pytest.raises(RuntimeError, match="released"):
             view[0]
 
         native.fail_second = False
-        worker._release_global_domain_node(GlobalDomainReleaseCommand(imported.domain_id, imported.generation))
-        assert worker._global_node_domains == {}
-        assert timeouts == [6.5, 6.5, 6.5, 6.5]
+        with pytest.raises(RuntimeError, match="partial release failed"):
+            worker._release_global_domain_node(_release_command(imported.domain_id, imported.generation))
+        assert worker._global_node_domains[imported.key] is state
+        assert state.view._record.free_error is not None
+        assert worker._ordered_cleanup_error is not None
+        assert not state.view.freed and timeouts == [6.5, 6.5]
     finally:
         worker._global_node_domains.clear()
+        worker._domain_registry.context_torn_down()
         worker._worker = None
         worker.close()
 
@@ -1549,8 +1532,8 @@ def test_mpirun_group_global_domain_uses_mpi_prepare_commit_without_l4_import(mo
             if phase in (GlobalDomainPhase.PREPARE_EXPORT, GlobalDomainPhase.COMMIT)
         ]
         assert group_phases == [node_ids[0], node_ids[0]]
-        assert worker._live_global_domains["mpi-static"] is handle
-        assert resources.live_global_domains["mpi-static"] is handle
+        assert worker.live_domains()["mpi-static"] is handle
+        assert resources.domain_use_token in handle._record.uses
     finally:
         _close_failure_injection_worker(worker, resources)
 
@@ -1642,7 +1625,7 @@ def test_mpi_global_domain_prepare_failure_releases_before_collective():
             assert suppress_errors
             self.released = True
 
-    command = GlobalDomainCommand(
+    command = _domain_command(
         phase=GlobalDomainPhase.PREPARE_EXPORT,
         domain_id=20,
         generation=1,
@@ -1706,3 +1689,28 @@ def test_mpirun_group_cleanup_continues_after_one_process_wait_fails():
     finally:
         worker._mpi_l3_groups.clear()
         _close_failure_injection_worker(worker, resources)
+
+
+@pytest.mark.parametrize("field", ["domain_id", "generation", "name", "window_size", "members", "buffers"])
+def test_domain_command_rejects_metadata_that_disagrees_with_outer_command(field):
+    command = _domain_command(
+        phase=GlobalDomainPhase.PREPARE_EXPORT,
+        domain_id=11,
+        generation=1,
+        name="tp",
+        profile="sim",
+        window_size=2048,
+        members=_members(),
+        buffers=(GlobalDomainBuffer("payload", 128),),
+        attachments=_attachments(),
+    )
+    changes = dict(
+        domain_id=12,
+        generation=2,
+        name="other",
+        window_size=4096,
+        members=tuple(replace(member, global_device_rank=member.global_device_rank + 10) for member in command.members),
+        buffers=(GlobalDomainBuffer("payload", 64),),
+    )
+    with pytest.raises(ValueError, match="metadata"):
+        encode_domain_command(replace(command, **{field: changes[field]}))

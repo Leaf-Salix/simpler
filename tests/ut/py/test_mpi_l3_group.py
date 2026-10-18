@@ -14,10 +14,11 @@ import json
 from typing import Any, cast
 from unittest.mock import MagicMock
 
+import pytest
 import simpler.mpi_group_mailbox as mailbox_mod
 import simpler.worker as worker_mod
 from simpler import mpi_l3_session
-from simpler.mpi_group_mailbox import MAILBOX_SIZE, MailboxGroupState
+from simpler.mpi_group_mailbox import MAILBOX_SIZE, MailboxGroupState, MpiRankError
 from simpler.remote_l3_protocol import ControlName
 from simpler.worker import MpiL3GroupSpec, Worker
 
@@ -190,3 +191,218 @@ def test_mpi_rank_worker_uses_parent_topology_id_before_init(monkeypatch):
 
     assert rc == 1
     assert captured["worker"]._topology_worker_id == 7
+
+
+def test_group_task_completion_preserves_errors_and_all_rank_settlement():
+    import struct  # noqa: PLC0415
+
+    from simpler.mpi_group_mailbox import MailboxOpcode, MailboxRequest, MailboxTarget  # noqa: PLC0415
+    from simpler.remote_l3_protocol import (  # noqa: PLC0415
+        FrameHeader,
+        FrameType,
+        decode_frame,
+        encode_completion,
+        encode_frame,
+    )
+
+    def frame(rank, *, error=0, settled=True):
+        header = FrameHeader(frame_type=FrameType.COMPLETION, session_id=1, worker_id=rank + 10, sequence=8)
+        return encode_frame(
+            header, encode_completion(8, error, "kernel failed" if error else "", domain_use_settled=settled)
+        )
+
+    request_frame = encode_frame(FrameHeader(frame_type=FrameType.TASK, session_id=1, worker_id=10, sequence=5), b"")
+    request = MailboxRequest(
+        sequence_id=5, opcode=MailboxOpcode.TASK, target=MailboxTarget.GROUP, target_rank=-1, payloads=(request_frame,)
+    )
+    for rank_one_settled in (True, False):
+        replies = mpi_l3_session._select_mailbox_replies(
+            request, [(0, True, frame(0), None), (1, True, frame(1, error=7, settled=rank_one_settled), None)], (10, 11)
+        )
+        result = decode_frame(replies[0])
+        sequence, error, size = struct.unpack_from("<QiI", result.payload)
+        assert sequence == 5 and error == 7
+        assert result.payload[16 : 16 + size] == b"MPI rank 1: kernel failed"
+        assert result.payload[-1] == int(rank_one_settled)
+
+
+@pytest.mark.parametrize("message", ["x" * 4096, "\u754c" * 1365 + "x"], ids=["ascii", "utf8"])
+@pytest.mark.parametrize("settled", [False, True])
+def test_group_completion_bounds_rank_prefix_by_utf8_bytes(message, settled):
+    import struct  # noqa: PLC0415
+
+    from simpler.mpi_group_mailbox import MailboxOpcode, MailboxRequest, MailboxTarget  # noqa: PLC0415
+    from simpler.remote_l3_protocol import (  # noqa: PLC0415
+        MAX_ERROR_BYTES,
+        FrameHeader,
+        FrameType,
+        decode_frame,
+        encode_completion,
+        encode_frame,
+    )
+
+    request = MailboxRequest(
+        sequence_id=5,
+        opcode=MailboxOpcode.TASK,
+        target=MailboxTarget.GROUP,
+        target_rank=-1,
+        payloads=(encode_frame(FrameHeader(frame_type=FrameType.TASK, session_id=1, worker_id=10, sequence=5), b""),),
+    )
+    gathered = []
+    for rank in range(2):
+        header = FrameHeader(frame_type=FrameType.COMPLETION, session_id=1, worker_id=rank + 10, sequence=8)
+        payload = encode_completion(8, 7 if rank else 0, message if rank else "", domain_use_settled=settled)
+        gathered.append((rank, True, encode_frame(header, payload), None))
+    (reply,) = mpi_l3_session._select_mailbox_replies(request, gathered, (10, 11))
+    result = decode_frame(reply)
+    sequence, error, size = struct.unpack_from("<QiI", result.payload)
+    text = result.payload[16 : 16 + size].decode("utf-8")
+    assert sequence == 5 and error == 7
+    assert text.startswith("MPI rank 1: ")
+    assert len(text.encode("utf-8")) <= MAX_ERROR_BYTES
+    assert message.startswith(text.removeprefix("MPI rank 1: "))
+    assert result.payload[-1] == int(settled)
+
+
+def test_group_task_completion_with_missing_or_malformed_rank_never_proves_settlement():
+    import struct  # noqa: PLC0415
+
+    from simpler.mpi_group_mailbox import MailboxOpcode, MailboxRequest, MailboxTarget  # noqa: PLC0415
+    from simpler.remote_l3_protocol import (  # noqa: PLC0415
+        FrameHeader,
+        FrameType,
+        decode_frame,
+        encode_completion,
+        encode_frame,
+    )
+
+    request_frame = encode_frame(FrameHeader(frame_type=FrameType.TASK, session_id=1, worker_id=10, sequence=5), b"")
+    request = MailboxRequest(
+        sequence_id=5, opcode=MailboxOpcode.TASK, target=MailboxTarget.GROUP, target_rank=-1, payloads=(request_frame,)
+    )
+    first = encode_frame(
+        FrameHeader(frame_type=FrameType.COMPLETION, session_id=1, worker_id=10, sequence=8),
+        encode_completion(8, 0, ""),
+    )
+    for worker_id, payload in ((11, b"\0" * 16), (10, encode_completion(8, 0, ""))):
+        malformed = encode_frame(
+            FrameHeader(frame_type=FrameType.COMPLETION, session_id=1, worker_id=worker_id, sequence=8), payload
+        )
+        gathered: list[tuple[int, bool, bytes, MpiRankError | None]] = [
+            (0, True, first, None),
+            (1, True, malformed, None),
+        ]
+        result = decode_frame(mpi_l3_session._select_mailbox_replies(request, gathered, (10, 11))[0])
+        assert result.payload[-1] == 0
+        assert struct.unpack_from("<i", result.payload, 8)[0] != 0
+    result = decode_frame(mpi_l3_session._select_mailbox_replies(request, [(0, True, first, None)], (10, 11))[0])
+    assert result.payload[-1] == 0
+    assert b"missing a rank" in result.payload
+
+
+@pytest.mark.parametrize("failure", ["aggregate", "publish", "report"])
+def test_rank_zero_failure_still_broadcasts_group_termination(monkeypatch, failure):
+    import queue  # noqa: PLC0415
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from simpler.mpi_group_mailbox import (  # noqa: PLC0415
+        MailboxOpcode,
+        MailboxRequest,
+        MailboxRequestState,
+        MailboxTarget,
+    )
+    from simpler.remote_l3_protocol import FrameHeader, FrameType, encode_completion, encode_frame  # noqa: PLC0415
+
+    header = FrameHeader(frame_type=FrameType.TASK, session_id=1, worker_id=10, sequence=1)
+    request = MailboxRequest(
+        sequence_id=1,
+        opcode=MailboxOpcode.TASK,
+        target=MailboxTarget.GROUP,
+        target_rank=-1,
+        payloads=(encode_frame(header, b""),),
+    )
+    reply = encode_frame(
+        FrameHeader(frame_type=FrameType.COMPLETION, session_id=1, worker_id=10, sequence=1),
+        encode_completion(1, 0, ""),
+    )
+    broadcasts, errors, closed = [], [], []
+
+    class Comm:
+        def Get_rank(self):
+            return 0
+
+        def allgather(self, value):
+            return [value]
+
+        def gather(self, value, root=0):
+            return [value]
+
+        def bcast(self, value, root=0):
+            broadcasts.append(value)
+            return value
+
+    class Mailbox:
+        request_state = MailboxRequestState.REQUEST_READY
+        group_state = MailboxGroupState.READY
+
+        def publish_ready(self):
+            pass
+
+        def accept_request(self, **_kwargs):
+            return request
+
+        def complete_request(self, **_kwargs):
+            raise RuntimeError("publish failed")
+
+        def fail_request(self, **kwargs):
+            errors.append(kwargs)
+            if failure == "report":
+                raise RuntimeError("report failed")
+
+        def close(self):
+            closed.append("mailbox")
+
+    class Connection:
+        def __init__(self):
+            self.events = queue.Queue()
+
+        def next_reply(self):
+            return encode_frame(FrameHeader(frame_type=FrameType.HELLO, session_id=1, worker_id=10, sequence=0), b"")
+
+        def exchange(self, _payload):
+            return reply
+
+    class Thread(_InertThread):
+        def is_alive(self):
+            return False
+
+    worker = SimpleNamespace(init=lambda **_kw: None, close=lambda: closed.append("worker"))
+    monkeypatch.setattr(mpi_l3_session, "Worker", lambda **_kw: worker)
+    monkeypatch.setattr(mpi_l3_session, "_install_manifest_dispatcher_registry", lambda _manifest: {})
+    monkeypatch.setattr(mpi_l3_session, "_install_manifest_inner_registry", lambda *_args: {})
+    monkeypatch.setattr(mpi_l3_session, "_InMemoryCommandConnection", Connection)
+    monkeypatch.setattr(mpi_l3_session, "open_rank_mailbox", lambda *_args, **_kwargs: Mailbox())
+    monkeypatch.setattr(mpi_l3_session.threading, "Thread", Thread)
+    if failure != "publish":
+
+        def fail_aggregate(*_args):
+            raise RuntimeError("aggregate failed")
+
+        monkeypatch.setattr(mpi_l3_session, "_select_mailbox_replies", fail_aggregate)
+
+    def run():
+        return mpi_l3_session._run_group_session(
+            dispatch_comm=Comm(),
+            domain_comm=Comm(),
+            group_manifest={"worker_ids": [10], "mailbox": {}},
+            manifest={"worker_id": 10, "session_id": 1, "platform": "a2a3sim", "session_timeout_s": 1},
+        )
+
+    if failure == "report":
+        with pytest.raises(RuntimeError, match="report failed"):
+            run()
+    else:
+        assert run() == 1
+    assert broadcasts[-1] is True
+    assert errors[0]["terminal"] and errors[0]["sequence_id"] == 1
+    assert closed == ["worker", "mailbox"]

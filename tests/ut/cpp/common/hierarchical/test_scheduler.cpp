@@ -1746,6 +1746,9 @@ TEST(WorkerManagerTest, AdmissionRejectionsCompleteClaimedDispatchesWithoutThrow
         }
         for (const WorkerCompletion &completion : completed) {
             EXPECT_EQ(completion.outcome, EndpointOutcome::ENDPOINT_FAILURE);
+            EXPECT_FALSE(completion.domain_use_settled);
+            EXPECT_EQ(completion.worker_id, -1);
+            EXPECT_EQ(completion.admissible_run_resource_sets, 0u);
             completed_slots.insert(completion.task_slot);
         }
         EXPECT_EQ(accepted_slots, (std::set<TaskSlot>{capacity_rejected, lane_rejected}));
@@ -1867,6 +1870,43 @@ TEST(WorkerManagerTest, StopBeforeProgressDoesNotActivatePreparedSuccessor) {
     worker.progress();
     EXPECT_EQ(completed.size(), 2u);
     EXPECT_FALSE(worker.busy());
+    allocator.shutdown();
+}
+
+TEST(WorkerManagerTest, RejectedPublicationPreservesUnsettledDomainUse) {
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    Ring allocator;
+    allocator.init(/*heap_bytes=*/0);
+    TaskSlot slot = make_progress_slot(allocator, /*run_id=*/21, /*pipeline_slot=*/0, /*generation=*/0);
+    ASSERT_NE(slot, INVALID_SLOT);
+
+    WorkerThread worker;
+    std::mutex callback_mu;
+    std::condition_variable callback_cv;
+    std::vector<WorkerCompletion> completed;
+    worker.start(
+        &allocator,
+        [&](WorkerCompletion completion) {
+            std::lock_guard<std::mutex> lk(callback_mu);
+            completed.push_back(std::move(completion));
+            callback_cv.notify_all();
+        },
+        [](WorkerDispatch) {},
+        std::make_unique<LocalMailboxEndpoint>(0, mailbox.data(), mailbox.size(), /*child_pid=*/-1)
+    );
+    worker.dispatch(WorkerDispatch{slot, 0});
+    {
+        std::unique_lock<std::mutex> lk(callback_mu);
+        ASSERT_TRUE(callback_cv.wait_for(lk, std::chrono::seconds(3), [&] {
+            return completed.size() == 1;
+        }));
+        EXPECT_EQ(completed[0].outcome, EndpointOutcome::ENDPOINT_FAILURE);
+        EXPECT_FALSE(completed[0].domain_use_settled);
+        EXPECT_EQ(completed[0].worker_id, -1);
+        EXPECT_EQ(completed[0].admissible_run_resource_sets, 0u);
+        EXPECT_NE(completed[0].error_message.find("invalid pipeline lease identity"), std::string::npos);
+    }
+    worker.stop();
     allocator.shutdown();
 }
 
@@ -2469,6 +2509,10 @@ TEST(WorkerManagerTest, StaleFrameIdentityWithholdsCompletionUntilChildQuiesces)
     EXPECT_EQ(second.kind, WorkerProgressKind::COMPLETED);
     EXPECT_EQ(first.completion.outcome, EndpointOutcome::ENDPOINT_FAILURE);
     EXPECT_EQ(second.completion.outcome, EndpointOutcome::ENDPOINT_FAILURE);
+    EXPECT_FALSE(first.completion.domain_use_settled);
+    EXPECT_FALSE(second.completion.domain_use_settled);
+    EXPECT_EQ(first.completion.worker_id, -1);
+    EXPECT_EQ(second.completion.worker_id, -1);
     EXPECT_NE(first.completion.error_message.find("stale run-state entry identity"), std::string::npos);
     EXPECT_NE(second.completion.error_message.find("stale run-state entry identity"), std::string::npos);
     EXPECT_EQ(

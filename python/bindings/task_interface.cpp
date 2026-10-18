@@ -2263,7 +2263,65 @@ NB_MODULE(_task_interface, m) {
         .value("REMOTE_SIDECAR", BackendKind::REMOTE_SIDECAR)
         .value("DEVICE_MALLOC", BackendKind::DEVICE_MALLOC)
         .value("FORK_COW", BackendKind::FORK_COW)
-        .value("VMM_SHAREABLE", BackendKind::VMM_SHAREABLE);
+        .value("VMM_SHAREABLE", BackendKind::VMM_SHAREABLE)
+        .value("DOMAIN_WINDOW", BackendKind::DOMAIN_WINDOW);
+
+    nb::class_<CommDomainRef>(m, "CommDomainRef")
+        .def(
+            "__init__",
+            [](CommDomainRef *self, nb::bytes owner, uint64_t id, uint32_t generation) {
+                if (owner.size() != OWNER_INSTANCE_ID_BYTES)
+                    throw std::invalid_argument("CommDomainRef owner_instance_id must be 8 bytes");
+                new (self) CommDomainRef{};
+                std::memcpy(self->owner_instance_id, owner.c_str(), OWNER_INSTANCE_ID_BYTES);
+                self->domain_id = id;
+                self->generation = generation;
+                validate_comm_domain_ref(*self);
+            },
+            nb::arg("owner_instance_id"), nb::arg("domain_id"), nb::arg("generation") = 1
+        )
+        .def_prop_ro(
+            "owner_instance_id",
+            [](const CommDomainRef &self) {
+                return nb::bytes(reinterpret_cast<const char *>(self.owner_instance_id), OWNER_INSTANCE_ID_BYTES);
+            }
+        )
+        .def_ro("domain_id", &CommDomainRef::domain_id)
+        .def_ro("generation", &CommDomainRef::generation)
+        .def(
+            "__eq__",
+            [](const CommDomainRef &a, const CommDomainRef &b) {
+                return a == b;
+            }
+        )
+        .def(
+            "__ne__",
+            [](const CommDomainRef &a, const CommDomainRef &b) {
+                return a != b;
+            }
+        )
+        .def(
+            "__hash__",
+            [](const CommDomainRef &self) {
+                return CommDomainRefHash{}(self);
+            }
+        )
+        .def(
+            "__reduce__",
+            [](const CommDomainRef &self) {
+                return nb::make_tuple(
+                    nb::module_::import_("_task_interface").attr("CommDomainRef"),
+                    nb::make_tuple(
+                        nb::bytes(reinterpret_cast<const char *>(self.owner_instance_id), OWNER_INSTANCE_ID_BYTES),
+                        self.domain_id, self.generation
+                    )
+                );
+            }
+        )
+        .def("__repr__", [](const CommDomainRef &self) {
+            return "CommDomainRef(domain_id=" + std::to_string(self.domain_id) +
+                   ", generation=" + std::to_string(self.generation) + ")";
+        });
 
     // --- CanonicalIdentity ---
     // Equality and hashing fold exactly the three meaningful fields, so a decode with dirty wire
@@ -2930,13 +2988,22 @@ NB_MODULE(_task_interface, m) {
                 const int32_t n = self.tensor_count();
                 for (int32_t i = 0; i < n; ++i) {
                     const auto backend = static_cast<BackendKind>(self.tensor(i).buffer.backend_kind);
-                    if (backend == BackendKind::DEVICE_MALLOC || backend == BackendKind::VMM_WINDOW) return true;
+                    if (backend == BackendKind::DEVICE_MALLOC || backend == BackendKind::VMM_WINDOW ||
+                        backend == BackendKind::DOMAIN_WINDOW)
+                        return true;
                 }
                 return false;
             },
             "Whether any arg names memory behind a chip boundary, which a dispatch must authorize."
         )
 
+        .def("add_domain_ref", &TaskArgs::add_domain_ref, nb::arg("ref"))
+        .def(
+            "domain_refs",
+            [](const TaskArgs &self) {
+                return self.domain_refs();
+            }
+        )
         .def("clear", &TaskArgs::clear)
 
         .def(
@@ -3012,7 +3079,9 @@ NB_MODULE(_task_interface, m) {
                 for (int32_t i = 0; i < n; ++i) {
                     const BufferDescriptor &d = args.tensor(i).buffer;
                     const auto backend = static_cast<BackendKind>(d.backend_kind);
-                    if (backend != BackendKind::DEVICE_MALLOC && backend != BackendKind::VMM_WINDOW) continue;
+                    if (backend != BackendKind::DEVICE_MALLOC && backend != BackendKind::VMM_WINDOW &&
+                        backend != BackendKind::DOMAIN_WINDOW)
+                        continue;
                     auto it = self.entries.find(d.identity);
                     if (it == self.entries.end() || it->second.owner_worker_id != target_worker_id) {
                         return nb::make_tuple(i, PROV_NOT_LIVE);
@@ -3562,6 +3631,7 @@ NB_MODULE(_task_interface, m) {
         .def("abandon", &ChipRun::abandon, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("launched", &ChipRun::launched)
         .def_prop_ro("lane_poisoned", &ChipRun::lane_poisoned)
+        .def_prop_ro("domain_use_settled", &ChipRun::domain_use_settled)
         .def_prop_ro("preparation_disposition", &ChipRun::preparation_disposition)
         .def(
             "wait",
@@ -3726,6 +3796,12 @@ NB_MODULE(_task_interface, m) {
                     owner_instance_id, chip_rank, capture_index, task_slot, group_index, group_size
                 );
                 nb::gil_scoped_release release;
+                if (generation == 0 && activated) {
+                    return self.submit_chip_run(
+                        callable_id, args, config, reinterpret_cast<volatile int32_t *>(accepted_state_addr),
+                        accepted_value
+                    );
+                }
                 return self.submit_chip_run(
                     callable_id, args, config, PipelineSlotLease{slot_id, 0, generation}, run_id, dispatch_id,
                     reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value, activated, provenance
@@ -4086,6 +4162,10 @@ NB_MODULE(_task_interface, m) {
             "(device_ctx, local_window_base) for this rank and publishes the commit flag before result conversion."
         )
         .def(
+            "comm_get_domain_window_size", &ChipWorker::comm_get_domain_window_size, nb::arg("comm_handle"),
+            nb::arg("allocation_id"), nb::call_guard<nb::gil_scoped_release>()
+        )
+        .def(
             "comm_release_domain_windows", &ChipWorker::comm_release_domain_windows, nb::arg("comm_handle"),
             nb::arg("allocation_id"), nb::arg("rank_count"), nb::arg("domain_rank"),
             "Pair to comm_alloc_domain_windows: collectively release the per-rank pool."
@@ -4176,6 +4256,8 @@ NB_MODULE(_task_interface, m) {
             for (int32_t i = 0; i < view.scalar_count; i++) {
                 args.add_scalar(view.scalars[i]);
             }
+            for (int32_t i = 0; i < view.domain_ref_count; ++i)
+                args.add_domain_ref(view.domain_ref(i));
             return args;
         },
         nb::arg("blob_ptr"), nb::arg("capacity"),

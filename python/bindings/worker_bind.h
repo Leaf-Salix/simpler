@@ -434,6 +434,7 @@ inline void bind_worker(nb::module_ &m) {
             "_wait_run_for", &Orchestrator::wait_run_for, nb::arg("run_id"), nb::arg("timeout_seconds"),
             nb::call_guard<nb::gil_scoped_release>(), "Wait up to timeout_seconds for one run to become terminal."
         )
+        .def("_run_domain_use_settled", &Orchestrator::run_domain_use_settled, nb::arg("run_id"))
         .def("_run_done", &Orchestrator::run_done, nb::arg("run_id"))
         .def(
             "_current_run_failed_for_test", &Orchestrator::current_building_run_failed_for_test,
@@ -954,6 +955,7 @@ inline void bind_worker(nb::module_ &m) {
     entry_offsets["task_slot"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, task_slot));
     entry_offsets["group_index"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, group_index));
     entry_offsets["group_size"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, group_size));
+    entry_offsets["domain_use_settled"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, domain_use_settled));
     entry_offsets["error_text"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, error_text));
     entry_offsets["admissible_run_resource_sets"] =
         static_cast<uint64_t>(offsetof(MailboxRunEntry, admissible_run_resource_sets));

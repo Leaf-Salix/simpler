@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 from _task_interface import AddressSpace  # pyright: ignore[reportMissingImports]
 
+from .comm_domain import CommDomainRef, decode_domain_metadata
 from .comm_endpoints import (
     _ADAPTER_KIND_IDS,  # noqa: F401 — re-export of the comm_endpoints numeric table
     _ADAPTER_PROFILE_IDS,  # noqa: F401 — re-export of the comm_endpoints numeric table
@@ -213,6 +214,11 @@ class GlobalDomainCommand:
     buffers: tuple[GlobalDomainBuffer, ...]
     descriptors: tuple[GlobalDomainDescriptor, ...] = ()
     attachments: tuple[GlobalDomainAttachment, ...] = ()
+    domain_metadata: bytes = b""
+
+    @property
+    def key(self):
+        return decode_domain_metadata(self.domain_metadata)[1]
 
     def attachments_for_node(self, node_worker_id: int) -> tuple[GlobalDomainAttachment, ...]:
         """Return the row addressed to one receiving L3 node.
@@ -238,6 +244,11 @@ class GlobalDomainCommand:
 class GlobalDomainReleaseCommand:
     domain_id: int
     generation: int
+    owner_instance_id: bytes = b""
+
+    @property
+    def key(self):
+        return CommDomainRef(self.owner_instance_id, self.domain_id, self.generation)
 
 
 @dataclass(frozen=True)
@@ -248,6 +259,11 @@ class GlobalDomainCopyCommand:
     offset: int
     nbytes: int
     data: bytes = b""
+    owner_instance_id: bytes = b""
+
+    @property
+    def key(self):
+        return CommDomainRef(self.owner_instance_id, self.domain_id, self.generation)
 
 
 class _Reader:
@@ -669,6 +685,17 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
     elif command.descriptors:
         raise ValueError("global domain PREPARE/ABORT must not carry descriptors")
 
+    metadata_name, ref, config, _ = decode_domain_metadata(command.domain_metadata)
+    expected_members = tuple((m.node_worker_id, m.local_worker_id, m.global_device_rank) for m in command.members)
+    metadata_members = tuple((m.node_worker_id, m.local_worker_id, m.global_device_rank) for m in config.members)
+    if (
+        (ref.domain_id, ref.generation, metadata_name, config.window_size)
+        != (command.domain_id, command.generation, command.name, command.window_size)
+        or expected_members != metadata_members
+        or tuple((b.name, b.nbytes) for b in config.buffers) != tuple((b.name, b.nbytes) for b in command.buffers)
+    ):
+        raise ValueError("global domain metadata conflicts with command")
+
     out = bytearray(
         struct.pack(
             "<IQQQ",
@@ -693,6 +720,7 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
     out.extend(struct.pack("<I", len(command.descriptors)))
     for descriptor in command.descriptors:
         out.extend(descriptor.encode())
+    _put_blob(out, command.domain_metadata, 4 * 1024 * 1024, "domain metadata")
     return bytes(out)
 
 
@@ -726,6 +754,7 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
         GlobalDomainDescriptor.decode(reader.fixed(GLOBAL_DOMAIN_DESCRIPTOR_BYTES, "descriptor"))
         for _ in range(descriptor_count)
     )
+    domain_metadata = reader.blob(4 * 1024 * 1024, "domain metadata")
     reader.done("ALLOC_DOMAIN")
     command = GlobalDomainCommand(
         phase=phase,
@@ -738,6 +767,7 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
         buffers=buffers,
         descriptors=descriptors,
         attachments=attachments,
+        domain_metadata=domain_metadata,
     )
     encode_domain_command(command)
     return command
@@ -764,16 +794,18 @@ def decode_descriptor_table(data: bytes) -> tuple[GlobalDomainDescriptor, ...]:
 def encode_release_command(command: GlobalDomainReleaseCommand) -> bytes:
     if command.domain_id == 0 or command.generation == 0:
         raise ValueError("global domain release identity must be positive")
-    return struct.pack("<QQ", int(command.domain_id), int(command.generation))
+    if len(command.owner_instance_id) != 8:
+        raise ValueError("domain release requires the creator instance id")
+    return struct.pack("<QQ8s", int(command.domain_id), int(command.generation), command.owner_instance_id)
 
 
 def decode_release_command(data: bytes) -> GlobalDomainReleaseCommand:
-    if len(data) != struct.calcsize("<QQ"):
+    if len(data) != struct.calcsize("<QQ8s"):
         raise ValueError("global domain release size mismatch")
-    domain_id, generation = struct.unpack("<QQ", data)
+    domain_id, generation, owner = struct.unpack("<QQ8s", data)
     if domain_id == 0 or generation == 0:
         raise ValueError("global domain release identity is invalid")
-    return GlobalDomainReleaseCommand(int(domain_id), int(generation))
+    return GlobalDomainReleaseCommand(int(domain_id), int(generation), owner)
 
 
 def encode_copy_command(command: GlobalDomainCopyCommand, *, include_data: bool) -> bytes:
@@ -800,13 +832,16 @@ def encode_copy_command(command: GlobalDomainCopyCommand, *, include_data: bool)
             int(command.nbytes),
         )
     )
+    if len(command.owner_instance_id) != 8:
+        raise ValueError("domain copy requires the creator instance id")
+    out.extend(command.owner_instance_id)
     if include_data:
         out.extend(command.data)
     return bytes(out)
 
 
 def decode_copy_command(data: bytes, *, include_data: bool) -> GlobalDomainCopyCommand:
-    header_size = struct.calcsize("<QQIQQ")
+    header_size = struct.calcsize("<QQIQQ") + 8
     if len(data) < header_size:
         raise ValueError("global domain copy request is truncated")
     domain_id, generation, domain_rank, offset, nbytes = struct.unpack_from("<QQIQQ", data)
@@ -818,6 +853,7 @@ def decode_copy_command(data: bytes, *, include_data: bool) -> GlobalDomainCopyC
         offset=int(offset),
         nbytes=int(nbytes),
         data=bytes(payload),
+        owner_instance_id=data[header_size - 8 : header_size],
     )
     encode_copy_command(command, include_data=include_data)
     return command

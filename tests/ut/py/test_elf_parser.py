@@ -21,7 +21,9 @@ The buffers are synthetic ELF64 so the tests don't depend on the CCEC
 toolchain.
 """
 
+import ctypes
 import struct
+from unittest.mock import Mock
 
 import pytest
 
@@ -111,6 +113,28 @@ class TestSingleTextNoRelocations:
         text_bytes = b"\xd6\x5f\x03\xc0" * 4  # RET x 4; arbitrary payload, never executed
         elf = _build_single_text_elf(text_bytes)
         assert extract_text_section(elf) == text_bytes
+
+
+@pytest.mark.parametrize("platform", ["a2a3", "a5", "a2a3sim", "a5sim"])
+def test_domain_callable_uses_the_platform_loadable_payload(monkeypatch, platform):
+    from tests.st.worker.comm_domain import test_unified_domain  # noqa: PLC0415
+
+    payload = b"\xd6\x5f\x03\xc0" * 4
+    elf = _build_single_text_elf(payload)
+    compiler = Mock()
+    compiler.compile_incore.return_value = elf
+    compiler.compile_orchestration.return_value = b"orchestration"
+    compiler.get_orchestration_include_dirs.return_value = []
+    monkeypatch.setattr(test_unified_domain, "KernelCompiler", lambda **kwargs: compiler)
+    monkeypatch.setattr(test_unified_domain, "ensure_pto_isa_root", lambda: "unused-pto-isa")
+
+    chip = test_unified_domain._chip_callable(platform)
+
+    assert chip.child_count == 1
+    child = chip.child(0)
+    expected = elf if platform.endswith("sim") else payload
+    assert child.binary_size == len(expected)
+    assert ctypes.string_at(child.buffer_ptr(), child.buffer_size()).endswith(expected)
 
 
 class TestRejectsOutOfLineCodeSection:

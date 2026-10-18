@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 
 import pytest
@@ -163,20 +164,6 @@ def _run_case_on_worker(worker: Worker, chip_handle, elem_count: int, nranks: in
     tput_zero = case_buffers["tput_zero"]
     status = case_buffers["status"]
 
-    # In L3 distributed mode, host buffers for copy_to must be Worker Buffer handles
-    # backed by POSIX shared memory (worker.create_buffer).
-    send_buf = [worker.create_buffer(send_nbytes) for _ in range(nranks)]
-    tget_buf = [worker.create_buffer(tget_nbytes) for _ in range(nranks)]
-    tput_buf = [worker.create_buffer(tput_nbytes) for _ in range(nranks)]
-    for r in range(nranks):
-        s_shm, tg_shm, tp_shm = send_buf[r].shm, tget_buf[r].shm, tput_buf[r].shm
-        assert s_shm is not None and s_shm.buf is not None
-        assert tg_shm is not None and tg_shm.buf is not None
-        assert tp_shm is not None and tp_shm.buf is not None
-        torch.frombuffer(s_shm.buf, dtype=torch.float32, count=elem_count).copy_(send_host[r])
-        torch.frombuffer(tg_shm.buf, dtype=torch.float32, count=tget_elems).copy_(tget_zero[r])
-        torch.frombuffer(tp_shm.buf, dtype=torch.float32, count=tput_elems).copy_(tput_zero[r])
-
     def orch_fn(orch, _args, cfg):
         with orch.allocate_domain(
             name=f"rdma_deferred_completion_{elem_count}",
@@ -195,10 +182,15 @@ def _run_case_on_worker(worker: Worker, chip_handle, elem_count: int, nranks: in
             ],
         ) as handle:
             for rank in range(nranks):
-                domain = handle[rank]
-                orch.copy_to(domain.buffers["send"], send_buf[rank])
-                orch.copy_to(domain.buffers["tget_recv"], tget_buf[rank])
-                orch.copy_to(domain.buffers["tput_recv"], tput_buf[rank])
+                orch.copy_to_domain(
+                    handle, rank, ctypes.string_at(send_host[rank].data_ptr(), send_nbytes), buffer="send"
+                )
+                orch.copy_to_domain(
+                    handle, rank, ctypes.string_at(tget_zero[rank].data_ptr(), tget_nbytes), buffer="tget_recv"
+                )
+                orch.copy_to_domain(
+                    handle, rank, ctypes.string_at(tput_zero[rank].data_ptr(), tput_nbytes), buffer="tput_recv"
+                )
 
             for rank in range(nranks):
                 domain = handle[rank]
@@ -225,11 +217,6 @@ def _run_case_on_worker(worker: Worker, chip_handle, elem_count: int, nranks: in
     except RuntimeError:
         _print_status(elem_count, status)
         raise
-    finally:
-        for r in range(nranks):
-            worker.release_buffer(send_buf[r])
-            worker.release_buffer(tget_buf[r])
-            worker.release_buffer(tput_buf[r])
 
     return _print_status(elem_count, status)
 

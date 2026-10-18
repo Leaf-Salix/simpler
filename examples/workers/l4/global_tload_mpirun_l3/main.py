@@ -45,7 +45,7 @@ import struct
 from simpler.task_interface import (
     CallConfig,
     CommBufferSpec,
-    GlobalCommDomainHandle,
+    CommDomainHandle,
     TaskArgs,
 )
 from simpler.worker import MpiL3GroupSpec, RemoteCallable, Worker
@@ -96,7 +96,7 @@ def run(  # noqa: PLR0913, PLR0915 -- mirrors the CLI surface; one linear two-ru
     )
 
     worker: Worker | None = None
-    domain_handle: GlobalCommDomainHandle | None = None
+    domain_handle: CommDomainHandle | None = None
     parent_keepalive: list[TaskArgs] = []
     try:
         chip_callable = _build_tload_callable(platform, runtime)
@@ -130,7 +130,7 @@ def run(  # noqa: PLR0913, PLR0915 -- mirrors the CLI surface; one linear two-ru
 
         def build_and_run(orch, _args, cfg):
             nonlocal domain_handle
-            domain = orch.allocate_global_domain(
+            domain = orch.allocate_domain(
                 name="global-tload-mpirun-l3",
                 members=members,
                 window_size=WINDOW_SIZE,
@@ -141,16 +141,16 @@ def run(  # noqa: PLR0913, PLR0915 -- mirrors the CLI surface; one linear two-ru
                 retain_after_run=True,
             )
             for domain_rank in range(member_count):
-                orch.copy_to_global_domain(
+                orch.copy_to_domain(
                     domain,
                     domain_rank,
                     struct.pack(f"<{COUNT}f", *_input_values(domain_rank)),
                     buffer="input",
                 )
-            for node_id, local_index in members:
+            for domain_rank, (node_id, local_index) in enumerate(members):
                 task_args = TaskArgs()
-                task_args.add_scalar(domain.domain_id)
-                task_args.add_scalar(local_index)
+                task_args.add_domain_ref(domain.ref)
+                task_args.add_scalar(domain_rank)
                 _add_digest_scalars(task_args, chip_handle.digest)
                 parent_keepalive.append(task_args)
                 orch.submit_next_level(rank_handle, task_args, cfg, worker=node_id)
@@ -161,8 +161,8 @@ def run(  # noqa: PLR0913, PLR0915 -- mirrors the CLI surface; one linear two-ru
             group_args = []
             for node_id in node_ids:
                 task_args = TaskArgs()
-                task_args.add_scalar(domain.domain_id)
-                task_args.add_scalar(0)
+                task_args.add_domain_ref(domain.ref)
+                task_args.add_scalar(members.index((node_id, 0)))
                 _add_digest_scalars(task_args, chip_handle.digest)
                 parent_keepalive.append(task_args)
                 group_args.append(task_args)
@@ -178,7 +178,7 @@ def run(  # noqa: PLR0913, PLR0915 -- mirrors the CLI surface; one linear two-ru
         def read_and_release(orch, _args, _cfg):
             try:
                 for domain_rank in range(member_count):
-                    raw = orch.copy_from_global_domain(domain, domain_rank, COUNT * FLOAT_NBYTES, buffer="result")
+                    raw = orch.copy_from_domain(domain, domain_rank, COUNT * FLOAT_NBYTES, buffer="result")
                     observed.append(tuple(float(value) for value in struct.unpack(f"<{COUNT}f", raw)))
             finally:
                 domain.release()

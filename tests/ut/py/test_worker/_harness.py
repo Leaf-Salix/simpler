@@ -178,6 +178,10 @@ class _FakeChipRun:
         return True
 
     @property
+    def domain_use_settled(self) -> bool:
+        return True
+
+    @property
     def lane_poisoned(self) -> bool:
         return False
 
@@ -322,6 +326,10 @@ class _FakeChipImpl(FakeWorkspaceAccounting):
 
     def run_materialized(self, *_a, **_k) -> None:
         """An L2 submit reaches the native handle here, with its args already materialized."""
+
+    def _submit_chip_run_materialized(self, cid, args, cfg, *_a, **_k):
+        self.run_materialized(cid, args, cfg)
+        return _FakeChipRun(self.run_error)
 
     def _submit_chip_run_direct(self, cid: int, args: Any, cfg: Any) -> _FakeChipRun:
         """A direct submit admits at capacity one and returns the run while it runs."""

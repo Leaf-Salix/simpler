@@ -58,11 +58,18 @@ def encode_tensor(t) -> bytes:
     return head + identity + tail + view
 
 
-def encode_blob(tensors=(), scalars=(), transfers=None) -> bytes:
-    """A task-args blob in `write_blob` format: [i32 count][i32 count][Tensor...][u64 scalar...]."""
+def encode_blob(tensors=(), scalars=(), transfers=None, domain_refs=()) -> bytes:
+    """A task-args blob with its declared domain references and zero reserved header."""
     slots = []
     for i, tensor in enumerate(tensors):
         slot = bytearray(encode_tensor(tensor))
         slot[141] = (1 if int(tensor.buffer.address_space) == 0 else 0) if transfers is None else int(transfers[i])
         slots.append(bytes(slot))
-    return struct.pack("=ii", len(tensors), len(scalars)) + b"".join(slots) + struct.pack(f"<{len(scalars)}Q", *scalars)
+    return (
+        struct.pack("<iiiI", len(tensors), len(scalars), len(domain_refs), 0)
+        + b"".join(slots)
+        + struct.pack(f"<{len(scalars)}Q", *scalars)
+        + b"".join(
+            struct.pack("<8sQII", ref.owner_instance_id, ref.domain_id, ref.generation, 0) for ref in domain_refs
+        )
+    )

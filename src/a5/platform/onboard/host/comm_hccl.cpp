@@ -85,8 +85,9 @@ static inline HcclResult hccl_comm_destroy(HcclComm c) { return HcclCommDestroy(
 // process-global and per device-pair, so releasing them per allocation would
 // tear down a route a concurrent allocation still uses.
 struct DomainAllocation {
-    int rank = 0;                            // this rank's index within the subset (domain_rank)
-    int nranks = 0;                          // subset size
+    int rank = 0;    // this rank's index within the subset (domain_rank)
+    int nranks = 0;  // subset size
+    size_t mapping_size = 0;
     void *local_buf = nullptr;               // VMM-mapped device VA
     aclrtDrvMemHandle own_handle = nullptr;  // physical handle backing local_buf
     // Per-peer imports: (mapped VA, imported physical handle).  allocate_domain
@@ -1565,6 +1566,7 @@ static int domain_alloc_via_ipc(
     out->rank = my_dr;
     out->nranks = subset_n;
     out->local_buf = localBuf;
+    out->mapping_size = aligned_size;
     out->own_handle = handle;
     // Build a host-side CommContext for the subset and upload it as device_ctx.
     // PTO-ISA async SDMA ops (SdmaTget) read the scratch workspace off
@@ -1898,6 +1900,14 @@ extern "C" int comm_alloc_domain_windows(
 } catch (...) {
     LOG_ERROR("[comm] alloc_domain: unknown exception");
     return -1;
+}
+
+extern "C" int comm_get_domain_window_size(CommHandle h, uint64_t allocation_id, size_t *size_out) {
+    if (!h || !size_out) return -1;
+    auto it = h->domain_allocations.find(allocation_id);
+    if (it == h->domain_allocations.end()) return -1;
+    *size_out = it->second->mapping_size;
+    return *size_out > 0 ? 0 : -1;
 }
 
 extern "C" int

@@ -23,9 +23,9 @@ from simpler.task_interface import (
     CallConfig,
     ChipCallable,
     CommBufferSpec,
+    CommDomainHandle,
     CoreCallable,
     DataType,
-    GlobalCommDomainHandle,
     TaskArgs,
     Tensor,
     TensorArgType,
@@ -57,9 +57,10 @@ def _window_tensor(context, buffer_name: str):
 
 
 def _submit_compute_task(orch, chip_handle: CallableHandle, args: TaskArgs, cfg: CallConfig) -> TaskArgs:
-    domain_id = int(args.scalar(0))
-    local_worker_id = int(args.scalar(1))
-    context = orch.get_global_domain(domain_id)[local_worker_id]
+    domain_rank = int(args.scalar(0))
+    domain = orch.get_domain(args.domain_refs()[0])
+    context = domain.local_context(domain_rank)
+    local_worker_id = domain.member(domain_rank).local_worker_id
 
     chip_args = TaskArgs()
     chip_args.add_tensor(_window_tensor(context, "lhs"), TensorArgType.INPUT)
@@ -70,9 +71,10 @@ def _submit_compute_task(orch, chip_handle: CallableHandle, args: TaskArgs, cfg:
 
 
 def _submit_tload_task(orch, chip_handle: CallableHandle, args: TaskArgs, cfg: CallConfig) -> TaskArgs:
-    domain_id = int(args.scalar(0))
-    local_worker_id = int(args.scalar(1))
-    context = orch.get_global_domain(domain_id)[local_worker_id]
+    domain_rank = int(args.scalar(0))
+    domain = orch.get_domain(args.domain_refs()[0])
+    context = domain.local_context(domain_rank)
+    local_worker_id = domain.member(domain_rank).local_worker_id
 
     chip_args = TaskArgs()
     chip_args.add_tensor(_window_tensor(context, "input"), TensorArgType.INPUT)
@@ -87,8 +89,8 @@ def local_compute_orch(orch, args: TaskArgs, cfg: CallConfig) -> None:
     """Submit the vector-add chip task from the forked local L3 worker."""
     if _LOCAL_COMPUTE_HANDLE is None:
         raise RuntimeError("local L3 compute handle was not installed before fork")
-    if args.scalar_count() != 2:
-        raise ValueError("local compute task expects domain_id and local_worker_id")
+    if args.scalar_count() != 1:
+        raise ValueError("local compute task expects a domain ref and domain_rank")
     _LOCAL_KEEPALIVE.append(_submit_compute_task(orch, _LOCAL_COMPUTE_HANDLE, args, cfg))
 
 
@@ -96,8 +98,8 @@ def local_tload_orch(orch, args: TaskArgs, cfg: CallConfig) -> None:
     """Submit the peer-TLOAD chip task from the forked local L3 worker."""
     if _LOCAL_TLOAD_HANDLE is None:
         raise RuntimeError("local L3 TLOAD handle was not installed before fork")
-    if args.scalar_count() != 2:
-        raise ValueError("local TLOAD task expects domain_id and local_worker_id")
+    if args.scalar_count() != 1:
+        raise ValueError("local TLOAD task expects a domain ref and domain_rank")
     _LOCAL_KEEPALIVE.append(_submit_tload_task(orch, _LOCAL_TLOAD_HANDLE, args, cfg))
 
 
@@ -105,9 +107,9 @@ def remote_compute_orch(orch, args: TaskArgs, cfg: CallConfig) -> None:
     """Submit the vector-add chip task from the daemon-started remote L3 worker."""
     from simpler.remote_l3_session import get_inner_handle  # noqa: PLC0415
 
-    if args.scalar_count() != 6:
-        raise ValueError("remote compute task expects domain_id, local_worker_id, and four digest scalars")
-    chip_handle = get_inner_handle(_digest_from_scalars(args, 2).hex())
+    if args.scalar_count() != 5:
+        raise ValueError("remote compute task expects a domain ref, domain_rank, and four digest scalars")
+    chip_handle = get_inner_handle(_digest_from_scalars(args, 1).hex())
     _REMOTE_KEEPALIVE.append(_submit_compute_task(orch, chip_handle, args, cfg))
 
 
@@ -115,9 +117,9 @@ def remote_tload_orch(orch, args: TaskArgs, cfg: CallConfig) -> None:
     """Submit the peer-TLOAD chip task from the daemon-started remote L3 worker."""
     from simpler.remote_l3_session import get_inner_handle  # noqa: PLC0415
 
-    if args.scalar_count() != 6:
-        raise ValueError("remote TLOAD task expects domain_id, local_worker_id, and four digest scalars")
-    chip_handle = get_inner_handle(_digest_from_scalars(args, 2).hex())
+    if args.scalar_count() != 5:
+        raise ValueError("remote TLOAD task expects a domain ref, domain_rank, and four digest scalars")
+    chip_handle = get_inner_handle(_digest_from_scalars(args, 1).hex())
     _REMOTE_KEEPALIVE.append(_submit_tload_task(orch, chip_handle, args, cfg))
 
 
@@ -220,15 +222,15 @@ def _max_diff(actual: tuple[float, ...], expected: tuple[float, ...]) -> float:
     return max(abs(observed - wanted) for observed, wanted in zip(actual, expected))
 
 
-def _local_args(domain) -> TaskArgs:
+def _local_args(domain, rank=0) -> TaskArgs:
     args = TaskArgs()
-    args.add_scalar(domain.domain_id)
-    args.add_scalar(0)
+    args.add_domain_ref(domain.ref)
+    args.add_scalar(rank)
     return args
 
 
 def _remote_args(domain, digest: bytes) -> TaskArgs:
-    args = _local_args(domain)
+    args = _local_args(domain, 1)
     _add_digest_scalars(args, digest)
     return args
 
@@ -268,7 +270,7 @@ def run(  # noqa: PLR0915 -- one linear two-phase scenario; splitting it would s
     local_l3: Worker | None = None
     local_l3_attached = False
     worker: Worker | None = None
-    domain_handle: GlobalCommDomainHandle | None = None
+    domain_handle: CommDomainHandle | None = None
     parent_keepalive: list[TaskArgs] = []
     try:
         compute_callable = _build_compute_callable(platform, runtime)
@@ -311,7 +313,7 @@ def run(  # noqa: PLR0915 -- one linear two-phase scenario; splitting it would s
 
         def compute_phase(orch, _args, cfg):
             nonlocal domain_handle
-            domain = orch.allocate_global_domain(
+            domain = orch.allocate_domain(
                 name="compute-then-tload-mixed-l3",
                 members=((local_node, 0), (remote_node, 0)),
                 window_size=WINDOW_SIZE,
@@ -324,8 +326,8 @@ def run(  # noqa: PLR0915 -- one linear two-phase scenario; splitting it would s
                 retain_after_run=True,
             )
             for rank in range(len(RANK_LABELS)):
-                orch.copy_to_global_domain(domain, rank, struct.pack(f"<{COUNT}f", *_lhs_values(rank)), buffer="lhs")
-                orch.copy_to_global_domain(domain, rank, struct.pack(f"<{COUNT}f", *_rhs_values(rank)), buffer="rhs")
+                orch.copy_to_domain(domain, rank, struct.pack(f"<{COUNT}f", *_lhs_values(rank)), buffer="lhs")
+                orch.copy_to_domain(domain, rank, struct.pack(f"<{COUNT}f", *_rhs_values(rank)), buffer="rhs")
             local_task = _local_args(domain)
             remote_task = _remote_args(domain, compute_handle.digest)
             parent_keepalive[:] = [local_task, remote_task]
@@ -345,7 +347,7 @@ def run(  # noqa: PLR0915 -- one linear two-phase scenario; splitting it would s
 
         def communication_phase(orch, _args, cfg):
             for rank in range(len(RANK_LABELS)):
-                raw = orch.copy_from_global_domain(domain, rank, COUNT * FLOAT_NBYTES, buffer="input")
+                raw = orch.copy_from_domain(domain, rank, COUNT * FLOAT_NBYTES, buffer="input")
                 observed_compute.append(_unpack_floats(raw))
             local_task = _local_args(domain)
             remote_task = _remote_args(domain, tload_handle.digest)
@@ -358,7 +360,7 @@ def run(  # noqa: PLR0915 -- one linear two-phase scenario; splitting it would s
         def verify_phase(orch, _args, _cfg):
             try:
                 for rank in range(len(RANK_LABELS)):
-                    raw = orch.copy_from_global_domain(domain, rank, COUNT * FLOAT_NBYTES, buffer="result")
+                    raw = orch.copy_from_domain(domain, rank, COUNT * FLOAT_NBYTES, buffer="result")
                     observed_communication.append(_unpack_floats(raw))
             finally:
                 domain.release()

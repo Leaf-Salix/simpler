@@ -596,10 +596,17 @@ def _materialize_task_args(
     if len(args.remote_desc) != len(args.tensors):
         raise ValueError("remote TASK descriptor count does not match tensor count")
     task_args = TaskArgs()
+    for ref in args.domain_refs:
+        task_args.add_domain_ref(ref)
     inline_backings: list[Buffer] = []
 
     try:
         for tensor, sidecar in zip(args.tensors, args.remote_desc):
+            if tensor.buffer.backend_kind == BackendKind.DOMAIN_WINDOW:
+                if sidecar.present:
+                    raise ValueError("domain tensor cannot carry a remote sidecar")
+                task_args.add_tensor(tensor)
+                continue
             if not sidecar.present:
                 raise ValueError("remote TASK tensor payload requires a RemoteTensorRef sidecar")
             desc = sidecar.desc
@@ -1129,8 +1136,9 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                             )
                         elif command.phase is GlobalDomainPhase.ABORT:
                             inner_worker._release_global_domain_node(  # noqa: SLF001
-                                GlobalDomainReleaseCommand(command.domain_id, command.generation),
-                                suppress_errors=True,
+                                GlobalDomainReleaseCommand(
+                                    command.domain_id, command.generation, command.key.owner_instance_id
+                                ),
                             )
                             _control_reply(
                                 conn,
@@ -1223,7 +1231,8 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                 )
                 try:
                     task.config.output_prefix = _level_capture_prefix(task.config.output_prefix, inner_worker)
-                    inner_worker.run(orch_fn, task_args, task.config)
+                    with inner_worker._domain_task_scope(task_args.domain_refs()):
+                        inner_worker.run(orch_fn, task_args, task.config)
                 finally:
                     for backing in inline_backings:
                         backing.close()
@@ -1236,6 +1245,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         f"remote worker_id={worker_id} hashid={frame.payload[:32].hex()} sequence={header.sequence}",
                         exc,
                     ),
+                    domain_use_settled=inner_worker._domain_uses_settled(),
                 )
             send_frame(conn, FrameHeader(FrameType.COMPLETION, session_id, worker_id, header.sequence), payload)
     finally:

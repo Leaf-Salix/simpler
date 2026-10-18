@@ -162,7 +162,7 @@ TEST(ChildMemory, TransferBelongsToEachArgumentAndSurvivesMailboxCopyAndMove) {
     EXPECT_EQ(view.tensors(0)._pad[0], 0);
     EXPECT_EQ(view.tensors(1)._pad[0], 0);
     EXPECT_EQ(view.scalars[0], 42u);
-    blob[8 + 141] = 255;
+    blob[TASK_ARGS_BLOB_HEADER_SIZE + TASK_ARG_TRANSFER_OFFSET] = 255;
     EXPECT_THROW(view.transfer(0), std::invalid_argument);
     args.clear();
     args.add_tensor(tensor);

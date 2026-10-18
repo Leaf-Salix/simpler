@@ -24,12 +24,12 @@ from .buffer import (
     CanonicalIdentity,
     Tensor,
 )
+from .comm_domain import CommDomainRef, domain_window_location
 from .task_interface import MAX_TENSOR_DIMS, CallConfig, DataType
 
-# 4: ``BufferDescriptor.nbytes`` is the whole backing extent and a ``Tensor`` may carry a
-# non-zero ``byte_offset``. Version 3 interprets those fields differently even though the wire
-# layout is identical, so the frame header rejects a peer that would decode the wrong semantics.
-PROTOCOL_VERSION = 4
+# TASK carries canonical domain references; COMPLETION carries the descendant settlement proof.
+# The handshake rejects peers that cannot preserve these lifetime guarantees.
+PROTOCOL_VERSION = 5
 MAX_FRAME_PAYLOAD_BYTES = 16 * 1024 * 1024
 MAX_STRING_BYTES = 1024
 MAX_ERROR_BYTES = 4096
@@ -170,6 +170,7 @@ class RemoteTaskArgsWire:
     remote_desc: tuple[RemoteTensorSidecar, ...]
     scalars: tuple[int, ...]
     inline_payload: bytes
+    domain_refs: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -466,7 +467,7 @@ def decode_tensor(reader: _Reader) -> Tensor:
     backend_kind = reader.u8()
     # An arg bound for a remote worker has no local backing: the authoritative descriptor of its
     # backing is the per-argument RemoteTensorDesc sidecar.
-    if backend_kind != int(BackendKind.REMOTE_SIDECAR):
+    if backend_kind not in (int(BackendKind.REMOTE_SIDECAR), int(BackendKind.DOMAIN_WINDOW)):
         raise ValueError("remote_wire: a remote TASK tensor must carry no local backing")
     nbytes = reader.u64()
     owner_worker_path_id = reader.u32()
@@ -557,12 +558,28 @@ def decode_remote_task_args(data: bytes) -> RemoteTaskArgsWire:
     if inline_len > MAX_INLINE_PAYLOAD_BYTES:
         raise ValueError("remote_wire: inline payload exceeds maximum")
     inline_payload = reader.raw(inline_len, "inline payload")
+    ref_count = reader.u32()
+    if ref_count > MAX_TENSORS:
+        raise ValueError("remote_wire: domain ref count exceeds maximum")
+    refs = []
+    for _ in range(ref_count):
+        owner = reader.raw(8, "domain creator")
+        domain_id, generation, reserved = reader.u64(), reader.u32(), reader.u32()
+        if reserved:
+            raise ValueError("remote_wire: domain ref reserved field is nonzero")
+        refs.append(CommDomainRef(owner, domain_id, generation))
     reader.done("RemoteTaskArgs")
+    for tensor, sidecar in zip(tensors, sidecars):
+        domain = tensor.buffer.backend_kind == BackendKind.DOMAIN_WINDOW
+        if domain and sidecar.present:
+            raise ValueError("remote_wire: domain/sidecar backing mismatch")
+        if domain and domain_window_location(tensor.buffer)[0] not in refs:
+            raise ValueError("remote_wire: domain tensor is missing its declared ref")
     for sidecar in sidecars:
         if sidecar.present:
             assert sidecar.desc is not None
             _validate_desc(sidecar.desc, len(inline_payload))
-    return RemoteTaskArgsWire(tensors, tuple(sidecars), scalars, inline_payload)
+    return RemoteTaskArgsWire(tensors, tuple(sidecars), scalars, inline_payload, tuple(refs))
 
 
 def decode_task_payload(data: bytes) -> TaskPayloadWire:
@@ -573,11 +590,11 @@ def decode_task_payload(data: bytes) -> TaskPayloadWire:
     return TaskPayloadWire(digest, cfg, args)
 
 
-def encode_completion(sequence: int, error_code: int, error_message: str) -> bytes:
+def encode_completion(sequence: int, error_code: int, error_message: str, *, domain_use_settled: bool = True) -> bytes:
     data = error_message.encode("utf-8")
     if len(data) > MAX_ERROR_BYTES:
         raise ValueError("remote_wire: completion error message too long")
-    return struct.pack("<QiI", int(sequence), int(error_code), len(data)) + data
+    return struct.pack("<QiI", int(sequence), int(error_code), len(data)) + data + bytes([int(domain_use_settled)])
 
 
 def decode_control(data: bytes) -> ControlPayload:

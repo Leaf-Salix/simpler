@@ -1264,6 +1264,7 @@ remote_l3::TaskPayloadWire RemoteL3Endpoint::build_task_payload(const TaskSlotSt
             "RemoteL3Endpoint::build_task_payload: remote sidecar tensor count does not match TaskArgs"
         );
     }
+    payload.args.domain_refs = a.domain_refs();
     payload.args.inline_payload = sidecar.inline_payload;
     payload.args.tensors.reserve(static_cast<size_t>(a.tensor_count()));
     payload.args.remote_desc.reserve(static_cast<size_t>(a.tensor_count()));
@@ -1276,14 +1277,15 @@ remote_l3::TaskPayloadWire RemoteL3Endpoint::build_task_payload(const TaskSlotSt
         // backing never crosses: an arg bound for a remote worker is a REMOTE_SIDECAR placeholder
         // whose identity names the remote buffer. Orchestrator::validate_remote_sidecars rejects a
         // local backing alongside a sidecar at submit; this is the encoder's own guard.
-        if (ref.buffer.backend_kind != static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR)) {
+        if (ref.buffer.backend_kind != static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR) &&
+            ref.buffer.backend_kind != static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW)) {
             throw std::runtime_error(
                 "RemoteL3Endpoint::build_task_payload: a remote task arg must carry no local backing"
             );
         }
         // Every argument's backing is named by its own sidecar, so an absent one leaves the
         // placeholder naming nothing the runner could resolve.
-        if (!tensor_sidecar.present) {
+        if (!tensor_sidecar.present && ref.buffer.backend_kind != static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW)) {
             throw std::runtime_error("RemoteL3Endpoint::build_task_payload: tensor submitted without remote sidecar");
         }
         payload.args.tensors.push_back(ref);
@@ -1348,6 +1350,7 @@ bool RemoteL3Endpoint::poll_progress(WorkerEndpointProgress &progress) {
     progress.dispatch = dispatch;
     progress.completion.task_slot = dispatch.task_slot;
     progress.completion.group_index = dispatch.group_index;
+    progress.completion.domain_use_settled = false;
     if (progress_stop_requested_) {
         progress.completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
         progress.completion.error_message =
@@ -1364,6 +1367,7 @@ bool RemoteL3Endpoint::poll_progress(WorkerEndpointProgress &progress) {
             throw std::runtime_error("completion session or worker mismatch");
         }
         auto decoded = remote_l3::decode_completion(reply.payload.data(), reply.payload.size(), sequence);
+        progress.completion.domain_use_settled = decoded.domain_use_settled;
         if (decoded.error_code == 0) {
             progress.completion.outcome = EndpointOutcome::SUCCESS;
         } else {

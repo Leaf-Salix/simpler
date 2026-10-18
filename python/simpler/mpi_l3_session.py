@@ -41,9 +41,11 @@ from .mpi_group_mailbox import (
     open_rank_mailbox,
 )
 from .remote_l3_protocol import (
+    MAX_ERROR_BYTES,
     FrameHeader,
     FrameType,
     decode_frame,
+    encode_completion,
     encode_frame,
 )
 from .remote_l3_session import (
@@ -113,7 +115,9 @@ class MpiGlobalDomainExchange:
         ok = True
         error_message = ""
         local_payload = b""
-        release_command = GlobalDomainReleaseCommand(command.domain_id, command.generation)
+        release_command = GlobalDomainReleaseCommand(
+            command.domain_id, command.generation, command.key.owner_instance_id
+        )
 
         def release_local() -> None:
             inner_worker._release_global_domain_node(  # noqa: SLF001
@@ -171,6 +175,7 @@ class MpiGlobalDomainExchange:
             members=command.members,
             buffers=command.buffers,
             descriptors=descriptors,
+            domain_metadata=command.domain_metadata,
         )
         import_ok = True
         import_error = ""
@@ -394,7 +399,46 @@ def _select_mailbox_replies(
         requested_worker_id = int(decode_frame(request.payloads[0]).header.worker_id)
         if requested_worker_id in worker_ids:
             requested_rank = worker_ids.index(requested_worker_id)
-            return (_for_request(replies_by_rank.get(requested_rank, b""), request.payloads[0]),)
+            selected = _for_request(replies_by_rank.get(requested_rank, b""), request.payloads[0])
+            if selected:
+                frame = decode_frame(selected)
+                if frame.header.frame_type is FrameType.COMPLETION:
+                    settled = len(replies_by_rank) == len(worker_ids)
+                    error_code = 0
+                    error_message = ""
+                    for rank, reply in sorted(replies_by_rank.items()):
+                        result = decode_frame(reply)
+                        if result.header.frame_type is not FrameType.COMPLETION or len(result.payload) < 17:
+                            settled = False
+                            error_code, error_message = 1, f"MPI rank {rank}: malformed completion"
+                            continue
+                        sequence, rank_error, message_size = struct.unpack_from("<QiI", result.payload)
+                        valid = (
+                            len(result.payload) == 17 + message_size
+                            and result.payload[-1] in (0, 1)
+                            and 0 <= rank < len(worker_ids)
+                            and result.header.worker_id == worker_ids[rank]
+                            and sequence == result.header.sequence
+                        )
+                        settled = settled and valid and result.payload[-1] == 1
+                        if not valid:
+                            error_code, error_message = 1, f"MPI rank {rank}: malformed completion"
+                        elif rank_error and not error_code:
+                            error_code = rank_error
+                            message = result.payload[16 : 16 + message_size].decode("utf-8", errors="replace")
+                            error_message = f"MPI rank {rank}: {message}"
+                    if len(replies_by_rank) != len(worker_ids):
+                        error_code, error_message = 1, "MPI group completion is missing a rank"
+                    selected = encode_frame(
+                        frame.header,
+                        encode_completion(
+                            frame.header.sequence,
+                            error_code,
+                            error_message.encode("utf-8")[:MAX_ERROR_BYTES].decode("utf-8", errors="ignore"),
+                            domain_use_settled=settled,
+                        ),
+                    )
+            return (selected,)
     if request.target is MailboxTarget.RANK:
         return (_for_request(replies_by_rank.get(request.target_rank, b""), request.payloads[0]),)
     if request.target is MailboxTarget.PER_RANK:
@@ -555,38 +599,49 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
 
             gathered = dispatch_comm.gather((rank, payload is not None, local_reply, local_error), root=0)
             terminal_dispatch_failure = False
-            if rank == 0:
-                assert mailbox is not None and gathered is not None
-                transport_errors = tuple(item[3] for item in gathered if item[3] is not None)
-                application_errors: list[MpiRankError] = []
-                for result_rank, executed, reply, _error in gathered:
-                    if not executed or not reply:
-                        continue
-                    decoded_error = _reply_error(reply)
-                    if decoded_error is not None:
-                        error_type, message = decoded_error
-                        application_errors.append(MpiRankError(int(result_rank), error_type, message))
-                if transport_errors:
-                    mailbox.fail_request(
-                        sequence_id=request.sequence_id,
-                        errors=transport_errors,
-                        terminal=True,
-                    )
-                    exit_code = 1
-                    terminal_dispatch_failure = True
-                elif application_errors:
-                    mailbox.fail_request(
-                        sequence_id=request.sequence_id,
-                        errors=tuple(application_errors),
-                        terminal=False,
-                    )
-                elif request.opcode is MailboxOpcode.SHUTDOWN:
-                    mailbox.complete_shutdown(sequence_id=request.sequence_id)
-                    mailbox.publish_closed()
-                else:
-                    replies = _select_mailbox_replies(request, gathered, worker_ids)
-                    mailbox.complete_request(sequence_id=request.sequence_id, payloads=replies)
-            terminal_dispatch_failure = dispatch_comm.bcast(terminal_dispatch_failure, root=0)
+            try:
+                if rank == 0:
+                    assert mailbox is not None and gathered is not None
+                    transport_errors = tuple(item[3] for item in gathered if item[3] is not None)
+                    application_errors: list[MpiRankError] = []
+                    for result_rank, executed, reply, _error in gathered:
+                        if not executed or not reply:
+                            continue
+                        decoded_error = _reply_error(reply)
+                        if decoded_error is not None:
+                            error_type, message = decoded_error
+                            application_errors.append(MpiRankError(int(result_rank), error_type, message))
+                    if transport_errors:
+                        mailbox.fail_request(
+                            sequence_id=request.sequence_id,
+                            errors=transport_errors,
+                            terminal=True,
+                        )
+                        exit_code = 1
+                        terminal_dispatch_failure = True
+                    elif application_errors and request.opcode is not MailboxOpcode.TASK:
+                        mailbox.fail_request(
+                            sequence_id=request.sequence_id,
+                            errors=tuple(application_errors),
+                            terminal=False,
+                        )
+                    elif request.opcode is MailboxOpcode.SHUTDOWN:
+                        mailbox.complete_shutdown(sequence_id=request.sequence_id)
+                        mailbox.publish_closed()
+                    else:
+                        replies = _select_mailbox_replies(request, gathered, worker_ids)
+                        mailbox.complete_request(sequence_id=request.sequence_id, payloads=replies)
+            except BaseException as exc:  # noqa: BLE001
+                terminal_dispatch_failure = True
+                exit_code = 1
+                assert mailbox is not None
+                mailbox.fail_request(
+                    sequence_id=request.sequence_id,
+                    errors=(MpiRankError(rank, type(exc).__name__, str(exc)),),
+                    terminal=True,
+                )
+            finally:
+                terminal_dispatch_failure = dispatch_comm.bcast(terminal_dispatch_failure, root=0)
             if terminal_dispatch_failure:
                 break
             if request.opcode is MailboxOpcode.SHUTDOWN:

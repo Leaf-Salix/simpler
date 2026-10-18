@@ -279,6 +279,9 @@ int comm_alloc_domain_windows(
  * @param domain_rank     This caller's dense rank in the subset.
  * @return 0 on success, non-zero on failure.
  */
+/** Query the actual mapping size of a committed local domain allocation. */
+int comm_get_domain_window_size(CommHandle h, uint64_t allocation_id, size_t *size_out);
+
 int comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
 
 /**

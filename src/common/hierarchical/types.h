@@ -152,6 +152,7 @@ struct RunState {
     PipelineSlotLease lease{};
     std::atomic<RunPhase> phase{RunPhase::RESERVED};
     std::atomic<int32_t> active_tasks{0};
+    std::atomic<bool> domain_use_settled{true};
     std::atomic<int32_t> pending_accepts{0};
     mutable std::mutex completion_mu;
     std::condition_variable completion_cv;
@@ -341,6 +342,7 @@ struct WorkerCompletion {
      * the word this side's to read at all.
      */
     uint32_t admissible_run_resource_sets{0};
+    bool domain_use_settled{true};
 };
 
 // =============================================================================

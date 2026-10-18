@@ -708,6 +708,14 @@ extern "C" int comm_alloc_domain_windows(
     return -1;
 }
 
+extern "C" int comm_get_domain_window_size(CommHandle h, uint64_t allocation_id, size_t *size_out) {
+    if (!h || !size_out) return -1;
+    auto it = h->domain_allocations.find(allocation_id);
+    if (it == h->domain_allocations.end()) return -1;
+    *size_out = it->second->host_ctx->winSize;
+    return *size_out > 0 ? 0 : -1;
+}
+
 extern "C" int
 comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) try {
     // The shm header's `destroy_count` atomic is the subset-scoped release

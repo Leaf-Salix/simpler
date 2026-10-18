@@ -145,6 +145,8 @@ void Scheduler::stop() {
 // =============================================================================
 
 void Scheduler::worker_done(WorkerCompletion completion) {
+    if (!completion.domain_use_settled && cfg_.on_domain_use_unsettled_cb)
+        cfg_.on_domain_use_unsettled_cb(completion.task_slot);
     TaskSlotState &s = *cfg_.ring->slot_state(completion.task_slot);
     // Recorded here, where the endpoint identity is still in hand, and applied
     // when the whole run retires. This is a capacity report, not a task

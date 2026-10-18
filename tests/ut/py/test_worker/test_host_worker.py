@@ -42,6 +42,14 @@ from simpler.callable_identity import (
     compute_callable_hashid,
     hashid_to_digest,
 )
+from simpler.comm_domain import (
+    CommDomainRef,
+    _ChipDomainStore,
+    _DomainConfig,
+    _DomainMember,
+    _DomainRecord,
+    encode_domain_metadata,
+)
 from simpler.task_interface import (
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_OFF_ERROR_MSG,
@@ -71,6 +79,58 @@ from simpler.worker import (
     _pack_py_callable_payload,
 )
 from simpler.worker_level import WorkerLevel
+
+
+def _test_domain(worker, resources, name, *, retain=True):
+    registry = worker._domain_registry
+    registry._allocate = lambda record: setattr(record, "mapping_size", 4096)
+    config = _DomainConfig.capture(
+        members=(_DomainMember(None, 0, 0, ("test-chip", 0)),),
+        window_size=4096,
+        buffers=(),
+        retain_after_run=retain,
+        topology=("test",),
+    )
+    prior = worker._building_run_resources
+    worker._building_run_resources = resources
+    try:
+        return registry.allocate(name, config)
+    finally:
+        worker._building_run_resources = prior
+
+
+def _test_domain_record(worker):
+    config = _DomainConfig.capture(
+        members=(_DomainMember(None, 0, 0, ("chip", 0)),),
+        window_size=64,
+        buffers=(),
+        retain_after_run=False,
+        topology=(),
+    )
+    return _DomainRecord(
+        "d",
+        CommDomainRef(worker._owner_instance_id, 7, 1),
+        config,
+        backend={"kind": "local", "allocation_id": 7, "workers": (0,), "ranks": {0: 0}},
+    )
+
+
+def _domain_request_shm(*, oversized_buffer=False):
+    worker = Worker(level=3, num_sub_workers=0)
+    record = _test_domain_record(worker)
+    worker._domain_registry._catalog(record)
+    metadata = encode_domain_metadata(record)
+    count = int(oversized_buffer)
+    offset = worker_mod._DOMAIN_REQ_HEADER.size + count * 8 + 4
+    request = SharedMemory(create=True, size=offset + 4 + len(metadata))
+    assert request.buf is not None
+    worker_mod._DOMAIN_REQ_HEADER.pack_into(request.buf, 0, 7, 1, 0, 64, count)
+    if count:
+        struct.pack_into("<Q", request.buf, worker_mod._DOMAIN_REQ_HEADER.size, 4096)
+    struct.pack_into("<I", request.buf, offset - 4, 0)
+    struct.pack_into("<I", request.buf, offset, len(metadata))
+    request.buf[offset + 4 :] = metadata
+    return request
 
 
 def _native_control_payload(recorder, worker_id, payload, *, fail=None):
@@ -471,29 +531,6 @@ class _TeardownShellFactory:
         return shell
 
 
-def test_sweep_l2_global_domains_attempts_every_domain_and_lists_failures_by_id():
-    impl = _RecordingDomainImpl()
-    impl.errors[7] = RuntimeError("domain 7 failed")
-    impl.errors[3] = RuntimeError("domain 3 failed")
-    store = worker_mod._L2GlobalDomainStore(
-        domains={
-            7: _dummy_l2_domain(7),
-            3: _dummy_l2_domain(3),
-            5: _dummy_l2_domain(5),
-        }
-    )
-    with pytest.raises(RuntimeError, match="domain cleanup failed") as exc_info:
-        worker_mod._sweep_l2_global_domains(cast(Any, impl), store)
-    assert impl.released == [3, 5, 7]
-    assert store.domains == {}
-    message = str(exc_info.value)
-    assert message.index("domain 3:") < message.index("domain 7:")
-    assert "domain 3: domain 3 failed" in message
-    assert "domain 7: domain 7 failed" in message
-    assert "domain 5" not in message
-    assert exc_info.value.__cause__ is impl.errors[3]
-
-
 def test_teardown_chip_process_resources_continues_and_aggregates_in_order():
     from simpler.buffer import BackendKind
     from simpler.comm_provider import (
@@ -540,16 +577,14 @@ def test_teardown_chip_process_resources_continues_and_aggregates_in_order():
     with pytest.raises(RuntimeError, match="chip process resource teardown failed") as exc_info:
         worker_mod._teardown_chip_process_resources(
             cast(Any, registry),
-            cast(Any, impl),
-            domains,
             store,
         )
     assert registry.close_calls == 1
-    assert impl.released == [4]
+    assert impl.released == []
+    assert 4 in domains.domains
     assert factory.payloads[0].release_count == 1
     message = str(exc_info.value)
-    assert message.index("import close failed") < message.index("domain cleanup failed")
-    assert message.index("domain cleanup failed") < message.index(f"provider resource {result.provider_resource_id}")
+    assert message.index("import close failed") < message.index(f"provider resource {result.provider_resource_id}")
     assert "PAYLOAD" in message
     assert "RELEASE" in message
     assert "BACKEND_ERROR" in message
@@ -603,8 +638,6 @@ def test_teardown_chip_process_resources_lists_every_retained_resource():
     with pytest.raises(RuntimeError, match="chip process resource teardown failed") as exc_info:
         worker_mod._teardown_chip_process_resources(
             cast(Any, _RecordingImportRegistry()),
-            cast(Any, _RecordingDomainImpl()),
-            worker_mod._L2GlobalDomainStore(),
             store,
         )
     message = str(exc_info.value)
@@ -632,7 +665,6 @@ def test_teardown_chip_process_resources_ignores_released_and_keeps_each_step_on
 
     registry = _RecordingImportRegistry()
     impl = _RecordingDomainImpl()
-    domains = worker_mod._L2GlobalDomainStore()
     factory = _TeardownShellFactory()
     store = ProviderRegionStore(
         RegionAllocationContext(
@@ -650,8 +682,6 @@ def test_teardown_chip_process_resources_ignores_released_and_keeps_each_step_on
     )
     worker_mod._teardown_chip_process_resources(
         cast(Any, registry),
-        cast(Any, impl),
-        domains,
         store,
     )
     assert registry.close_calls == 1
@@ -3880,14 +3910,14 @@ class TestRunHandle:
             hw.init()
             handle = hw.submit(lambda o, _args, _cfg: o.submit_sub(target))
             close_waiting = threading.Event()
-            run_handle_wait = RunHandle.wait
+            run_handle_wait = RunHandle._wait_settled
 
             def observed_wait(self, *args, **kwargs):
                 if self is handle:
                     close_waiting.set()
                 return run_handle_wait(self, *args, **kwargs)
 
-            monkeypatch.setattr(RunHandle, "wait", observed_wait)
+            monkeypatch.setattr(RunHandle, "_wait_settled", observed_wait)
 
             close_wait_observed: list[bool] = []
 
@@ -4104,7 +4134,7 @@ class TestRunHandle:
         def interrupted_wait(_self, _timeout=None):
             raise KeyboardInterrupt
 
-        monkeypatch.setattr(RunHandle, "wait", interrupted_wait)
+        monkeypatch.setattr(RunHandle, "_wait_settled", interrupted_wait)
         with pytest.raises(KeyboardInterrupt):
             handle._wait_for_serialization()
 
@@ -4115,6 +4145,9 @@ class TestRunHandle:
         completion_release = threading.Event()
 
         class FakeWorker:
+            def _maintain_domains(self):
+                pass
+
             def _wait_run_handle_accepted(self, run_id):
                 assert run_id == 1
                 acceptance_entered.set()
@@ -4151,6 +4184,9 @@ class TestRunHandle:
         wait_entered = threading.Event()
 
         class FakeWorker:
+            def _maintain_domains(self):
+                pass
+
             def _run_handle_done(self, run_id):
                 assert run_id == 1
                 done_entered.set()
@@ -4922,14 +4958,8 @@ class TestRunHandle:
             def _release_run(self, run_id):
                 self.released_runs.append(run_id)
 
-        def domain(name, allocation_id):
-            return worker_mod.CommDomainHandle(
-                name=name,
-                workers=(),
-                contexts={},
-                allocation_id=allocation_id,
-                _release_fn=lambda _handle: None,
-            )
+            def _run_domain_use_settled(self, run_id):
+                return True
 
         worker = Worker(level=3, num_sub_workers=0)
         native_worker = NativeWorker()
@@ -4941,28 +4971,21 @@ class TestRunHandle:
         second = worker_mod._RunResources()
         first_ref, second_ref = SlotRef(), SlotRef()
         first_instance, second_instance = FakeInstance(11), FakeInstance(22)
-        first_live, second_live = domain("first-live", 1), domain("second-live", 2)
-        first_pending, second_pending = domain("first-pending", 3), domain("second-pending", 4)
+        first_live, second_live = _test_domain(worker, first, "first-live"), _test_domain(worker, second, "second-live")
+        first_pending, second_pending = (
+            _test_domain(worker, first, "first-pending"),
+            _test_domain(worker, second, "second-pending"),
+        )
         first.remote_slot_refs.append(cast(Any, first_ref))
         second.remote_slot_refs.append(cast(Any, second_ref))
         first.worker_chip_orch_comm_host_buffers[0x1000] = 64
         second.worker_chip_orch_comm_host_buffers[0x2000] = 128
-        first.live_domains[first_live.name] = first_live
-        second.live_domains[second_live.name] = second_live
-        first.pending_release_domains.append(first_pending)
-        second.pending_release_domains.append(second_pending)
+        first_pending.release()
+        second_pending.release()
         worker._region_instance_registry.track(cast(Any, first_instance), first)
         worker._region_instance_registry.track(cast(Any, second_instance), second)
-        worker._live_domains.update({first_live.name: first_live, second_live.name: second_live})
-
         released_domains = []
-
-        def release_domain_now(handle):
-            released_domains.append(handle)
-            if worker._live_domains.get(handle.name) is handle:
-                worker._live_domains.pop(handle.name)
-
-        monkeypatch.setattr(worker, "_release_domain_now", release_domain_now)
+        worker._domain_registry._destroy = lambda record: released_domains.append(record.handle)
         first_handle = RunHandle(worker, 1, (), first)
         second_handle = RunHandle(worker, 2, (), second)
         worker._accepted_run_handles.update({first_handle, second_handle})
@@ -4978,10 +5001,13 @@ class TestRunHandle:
         assert second_instance in worker._region_instance_registry._instances.values()
         assert first.worker_chip_orch_comm_host_buffers == {}
         assert second.worker_chip_orch_comm_host_buffers == {0x2000: 128}
-        assert released_domains == [first_pending, first_live]
-        assert first_pending.freed and first_live.freed
-        assert not second_pending.freed and not second_live.freed
-        assert worker._live_domains == {second_live.name: second_live}
+        assert released_domains == []
+        assert first.domain_use_token not in first_pending._record.uses
+        assert second.domain_use_token in second_pending._record.uses
+        worker._domain_registry.cleanup_ready()
+        assert released_domains == [first_pending]
+        assert first_pending.freed and not second_pending.freed
+        assert worker.live_domains() == {"first-live": first_live, "second-live": second_live}
         assert native_orch.released_runs == [1]
         assert worker._accepted_run_handles == {second_handle}
 
@@ -5046,482 +5072,12 @@ class TestRunHandle:
         with pytest.raises(RuntimeError, match="no further work is admitted"):
             worker._require_no_ordered_cleanup_failure("submit")
 
-    def test_domain_released_after_its_run_retired_is_freed_inline(self):
-        """A late release has no fence left to defer behind, so it frees now.
-
-        Both deferred paths are closed to it: the run's queue is never drained
-        again, and _release_domain_handle has already dropped the handle from
-        _live_domains, so close()'s live sweep cannot reach it either.
-        """
-        worker = Worker(level=3, num_sub_workers=0)
-        worker._worker = cast(Any, object())
-        worker._orch = cast(Any, type("FakeOrch", (), {"_release_run": lambda self, run_id: None})())
-
-        freed: list[str] = []
-
-        def release_now(handle):
-            freed.append(handle.name)
-            if worker._live_domains.get(handle.name) is handle:
-                worker._live_domains.pop(handle.name)
-
-        worker._release_domain_now = cast(Any, release_now)
-
-        resources = worker_mod._RunResources()
-        late = worker_mod.CommDomainHandle(
-            name="late",
-            workers=(),
-            contexts={},
-            allocation_id=1,
-            _release_fn=lambda released, owner=resources: worker._release_domain_handle(released, owner),
-        )
-        resources.live_domains[late.name] = late
-        worker._live_domains[late.name] = late
-
-        handle = RunHandle(worker, 1, (), resources)
-        worker._accepted_run_handles.add(handle)
-        assert worker._finalize_run_handle(handle, 1, None) is None
-        assert freed == ["late"], "a domain still live at its run's fence is swept there"
-
-        second = worker_mod.CommDomainHandle(
-            name="later",
-            workers=(),
-            contexts={},
-            allocation_id=2,
-            _release_fn=lambda released, owner=resources: worker._release_domain_handle(released, owner),
-        )
-        resources.live_domains[second.name] = second
-        worker._live_domains[second.name] = second
-
-        second.release()
-
-        assert freed == ["late", "later"]
-        assert second.freed
-        assert resources.pending_release_domains == []
-
-    def test_interrupted_domain_queue_publication_keeps_live_owners(self):
-        interrupt = KeyboardInterrupt("pending-domain publication")
-
-        class InterruptingList(list):
-            def append(self, value):
-                raise interrupt
-
-        worker = Worker(level=3, num_sub_workers=0)
-        worker._worker = cast(Any, object())
-        resources = worker_mod._RunResources()
-        resources.pending_release_domains = cast(Any, InterruptingList())
-        handle = worker_mod.CommDomainHandle(
-            name="owned",
-            workers=(),
-            contexts={},
-            allocation_id=1,
-            _release_fn=lambda released, owner=resources: worker._release_domain_handle(released, owner),
-        )
-        resources.live_domains[handle.name] = handle
-        worker._live_domains[handle.name] = handle
-
-        with pytest.raises(KeyboardInterrupt) as caught:
-            handle.release()
-
-        assert caught.value is interrupt
-        assert handle.released
-        assert resources.live_domains == {handle.name: handle}
-        assert worker._live_domains == {handle.name: handle}
-        assert resources.pending_release_domains == []
-
-    def test_interrupted_post_fence_domain_free_keeps_live_owners(self):
-        interrupt = KeyboardInterrupt("post-fence domain free")
-        worker = Worker(level=3, num_sub_workers=0)
-        worker._worker = cast(Any, object())
-        resources = worker_mod._RunResources(retired=True)
-        handle = worker_mod.CommDomainHandle(
-            name="owned",
-            workers=(),
-            contexts={},
-            allocation_id=1,
-            _release_fn=lambda released, owner=resources: worker._release_domain_handle(released, owner),
-        )
-        resources.live_domains[handle.name] = handle
-        worker._live_domains[handle.name] = handle
-        worker._free_domain_after_fence = cast(Any, lambda _handle: (_ for _ in ()).throw(interrupt))
-
-        with pytest.raises(KeyboardInterrupt) as caught:
-            handle.release()
-
-        assert caught.value is interrupt
-        assert handle.released
-        assert resources.live_domains == {handle.name: handle}
-        assert worker._live_domains == {handle.name: handle}
-        assert resources.pending_release_domains == []
-
-    def test_pending_domain_drain_does_not_clear_unclaimed_owners(self):
-        class NoClearList(list):
-            def clear(self):
-                raise AssertionError("pending owners must stay published until backend success")
-
-        worker = Worker(level=3, num_sub_workers=0)
-        worker._worker = cast(Any, object())
-        resources = worker_mod._RunResources()
-        handle = worker_mod.CommDomainHandle(
-            name="pending",
-            workers=(),
-            contexts={},
-            allocation_id=1,
-            _release_fn=lambda released: None,
-        )
-        handle._released = True
-        resources.pending_release_domains = cast(Any, NoClearList([handle]))
-        freed = []
-
-        def free_domain(pending):
-            freed.append(pending)
-            pending._freed = True
-
-        worker._free_domain_after_fence = cast(Any, free_domain)
-
-        worker._execute_pending_domain_releases(resources)
-
-        assert freed == [handle]
-        assert resources.pending_release_domains == []
-
-    def test_failed_pending_domain_drain_retains_its_claim(self):
-        interrupt = KeyboardInterrupt("pending domain free")
-        worker = Worker(level=3, num_sub_workers=0)
-        worker._worker = cast(Any, object())
-        resources = worker_mod._RunResources()
-        handle = worker_mod.CommDomainHandle(
-            name="pending",
-            workers=(),
-            contexts={},
-            allocation_id=1,
-            _release_fn=lambda released: None,
-        )
-        handle._released = True
-        resources.pending_release_domains.append(handle)
-        worker._free_domain_after_fence = cast(Any, lambda _handle: (_ for _ in ()).throw(interrupt))
-
-        with pytest.raises(KeyboardInterrupt) as caught:
-            worker._execute_pending_domain_releases(resources)
-
-        assert caught.value is interrupt
-        assert resources.pending_release_domains == [handle]
-
-    def test_domain_free_outcome_precedes_caller_interrupt(self, monkeypatch):
-        interrupt = KeyboardInterrupt("after isolated domain free")
-        worker = Worker(level=3, num_sub_workers=0)
-        worker._worker = cast(Any, object())
-        handle = worker_mod.CommDomainHandle(
-            name="domain",
-            workers=(),
-            contexts={},
-            allocation_id=7,
-            _release_fn=lambda released: None,
-        )
-        backend_calls = []
-        worker._release_domain_claimed = cast(Any, lambda claimed: backend_calls.append(claimed.allocation_id))
-
-        def interrupt_after_target(items, target, **kwargs):
-            for item in items:
-                target(item)
-            raise interrupt
-
-        monkeypatch.setattr(worker_mod, "_start_and_join_threads", interrupt_after_target)
-
-        with pytest.raises(KeyboardInterrupt) as caught:
-            worker._release_domain_now(handle)
-
-        assert caught.value is interrupt
-        assert backend_calls == [7]
-        assert worker._domain_free_results == {7: None}
-
-        worker._release_domain_now(handle)
-        assert backend_calls == [7]
-
-    def test_domain_free_interrupted_before_isolated_admission_is_retryable(self, monkeypatch):
-        interrupt = KeyboardInterrupt("before isolated domain free admission")
-        worker = Worker(level=3, num_sub_workers=0)
-        worker._worker = cast(Any, object())
-        handle = worker_mod.CommDomainHandle(
-            name="domain",
-            workers=(),
-            contexts={},
-            allocation_id=7,
-            _release_fn=lambda released: None,
-        )
-        backend_calls: list[int] = []
-        worker._release_domain_claimed = cast(Any, lambda claimed: backend_calls.append(claimed.allocation_id))
-        real_isolated_call = worker_mod._run_isolated_call
-        monkeypatch.setattr(
-            worker_mod,
-            "_run_isolated_call",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(interrupt),
-        )
-
-        with pytest.raises(KeyboardInterrupt) as caught:
-            worker._release_domain_now(handle)
-
-        assert caught.value is interrupt
-        assert backend_calls == []
-        assert 7 not in worker._domain_free_results
-
-        monkeypatch.setattr(worker_mod, "_run_isolated_call", real_isolated_call)
-        worker._release_domain_now(handle)
-
-        assert backend_calls == [7]
-        assert worker._domain_free_results == {7: None}
-
-    def test_domain_free_publication_failure_never_replays_backend(self):
-        publication_error = MemoryError("domain outcome store")
-
-        class InterruptingResults(dict):
-            def __init__(self):
-                super().__init__()
-                self.interrupted = False
-
-            def __setitem__(self, key, value):
-                if value is None and not self.interrupted:
-                    self.interrupted = True
-                    raise publication_error
-                super().__setitem__(key, value)
-
-        worker = Worker(level=3, num_sub_workers=0)
-        worker._worker = cast(Any, object())
-        worker._domain_free_results = cast(Any, InterruptingResults())
-        handle = worker_mod.CommDomainHandle(
-            name="domain",
-            workers=(),
-            contexts={},
-            allocation_id=7,
-            _release_fn=lambda released: None,
-        )
-        backend_calls = []
-        worker._release_domain_claimed = cast(Any, lambda claimed: backend_calls.append(claimed.allocation_id))
-
-        with pytest.raises(MemoryError) as caught:
-            worker._release_domain_now(handle)
-
-        assert caught.value is publication_error
-        assert backend_calls == [7]
-        assert isinstance(worker._domain_free_results[7], RuntimeError)
-
-        with pytest.raises(RuntimeError, match="refusing to replay"):
-            worker._release_domain_now(handle)
-        assert backend_calls == [7]
-
-    def test_domain_released_while_its_run_retires_is_still_freed(self):
-        """A release in flight across retirement must not be stranded.
-
-        The window the fence has to close: the deferred queue has already been
-        drained for the last time, so a handle appended after that is reachable
-        from nothing — the queue is never read again, and the release itself
-        popped the handle from ``_live_domains``, blinding ``close()``'s sweep.
-
-        Forced deterministically by parking the fence in its live-domain sweep,
-        which holds no lock, while the releasing thread runs to completion.
-        """
-        worker = Worker(level=3, num_sub_workers=0)
-        worker._worker = cast(Any, object())
-        worker._orch = cast(Any, type("FakeOrch", (), {"_release_run": lambda self, run_id: None})())
-
-        freed: list[str] = []
-
-        def release_now(handle):
-            freed.append(handle.name)
-            if worker._live_domains.get(handle.name) is handle:
-                worker._live_domains.pop(handle.name)
-
-        worker._release_domain_now = cast(Any, release_now)
-
-        resources = worker_mod._RunResources()
-
-        def domain(name, allocation_id):
-            return worker_mod.CommDomainHandle(
-                name=name,
-                workers=(),
-                contexts={},
-                allocation_id=allocation_id,
-                _release_fn=lambda released, owner=resources: worker._release_domain_handle(released, owner),
-            )
-
-        raced = domain("raced", 1)
-        # A second domain keeps the sweep branch reachable so the fence parks there.
-        swept = domain("swept", 2)
-        for handle in (raced, swept):
-            resources.live_domains[handle.name] = handle
-            worker._live_domains[handle.name] = handle
-
-        in_sweep = threading.Event()
-        release_done = threading.Event()
-        real_sweep = worker._release_all_live_domains
-
-        def parked_sweep(res=None):
-            in_sweep.set()
-            assert release_done.wait(5.0), "releasing thread did not finish"
-            real_sweep(res)
-
-        worker._release_all_live_domains = cast(Any, parked_sweep)
-
-        def do_release():
-            assert in_sweep.wait(5.0), "fence never reached its sweep"
-            raced.release()
-            release_done.set()
-
-        releaser = threading.Thread(target=do_release)
-        releaser.start()
-        try:
-            handle = RunHandle(worker, 1, (), resources)
-            worker._accepted_run_handles.add(handle)
-            assert worker._finalize_run_handle(handle, 1, None) is None
-        finally:
-            releaser.join(5.0)
-
-        assert not releaser.is_alive()
-        assert raced.freed, "a release racing retirement was stranded on a drained queue"
-        assert swept.freed
-        assert resources.pending_release_domains == []
-        assert freed.count("raced") == 1, f"raced domain freed more than once: {freed}"
-
-    @staticmethod
-    def _gated_domain_worker(worker, target_id, outcome=None):
-        """Park `worker`'s backend release for `target_id`; optionally raise."""
-        entered: list[int] = []
-        in_backend = threading.Event()
-        let_go = threading.Event()
-
-        def gated(handle):
-            entered.append(handle.allocation_id)
-            if handle.allocation_id == target_id:
-                in_backend.set()
-                let_go.wait(10.0)
-                if outcome is not None:
-                    raise outcome
-
-        worker._release_domain_claimed = cast(Any, gated)
-        return entered, in_backend, let_go
-
-    def _retired_domain(self, worker, resources, name, allocation_id):
-        handle = worker_mod.CommDomainHandle(
-            name=name,
-            workers=(),
-            contexts={},
-            allocation_id=allocation_id,
-            _release_fn=lambda released, owner=resources: worker._release_domain_handle(released, owner),
-        )
-        worker._live_domains[name] = handle
-        return handle
-
-    def test_sweep_and_post_fence_release_free_a_domain_once(self):
-        """Two paths reaching one handle must not both drive the backend free.
-
-        The dangerous order is release-then-sweep: ``release()`` wins the
-        ``_released`` flag, so the sweep — still holding the handle in the
-        snapshot it took earlier — skips setting that flag and goes straight to
-        the backend call the release is already making. (Sweep-then-release is
-        already safe: the sweep sets ``_released`` before freeing, which makes
-        the later ``release()`` a no-op.)
-        """
-        worker = Worker(level=3, num_sub_workers=0)
-        worker._worker = cast(Any, object())
-        entered, in_backend, let_go = self._gated_domain_worker(worker, target_id=7)
-
-        resources = worker_mod._RunResources()
-        resources.retired = True  # the owning run's fence has already passed
-        contested = self._retired_domain(worker, resources, "contested", 7)
-
-        releaser = threading.Thread(target=contested.release)
-        releaser.start()
-        try:
-            assert in_backend.wait(5.0), "release never reached the backend"
-            # The sweep's snapshot still holds `contested`; it must not free it
-            # a second time.
-            sweeper = threading.Thread(target=worker._release_all_live_domains)
-            sweeper.start()
-            let_go.set()
-            sweeper.join(5.0)
-            assert not sweeper.is_alive()
-        finally:
-            let_go.set()
-            releaser.join(5.0)
-
-        assert entered.count(7) == 1, f"allocation 7 was released {entered.count(7)} times"
-        assert contested.freed
-
-    def test_second_domain_release_waits_for_the_first(self):
-        """A second caller blocks until the owner's backend call returns.
-
-        Returning early would let the caller mark the handle freed, drop it
-        from ``_live_domains`` and — on the ``close()`` path — tear down the
-        mailboxes the in-flight release is still using, which is exactly what
-        ``close()`` orders its domain sweep before ``_worker.close()`` to avoid.
-        """
-        worker = Worker(level=3, num_sub_workers=0)
-        worker._worker = cast(Any, object())
-        entered, in_backend, let_go = self._gated_domain_worker(worker, target_id=7)
-        second_waiting = threading.Event()
-        worker._domain_free_mu = _ObservedLock(worker._domain_free_mu, second_waiting)  # noqa: SLF001
-
-        resources = worker_mod._RunResources()
-        contested = self._retired_domain(worker, resources, "contested", 7)
-
-        owner = threading.Thread(target=worker._release_domain_now, args=(contested,))
-        second_done = threading.Event()
-
-        def second_caller():
-            worker._release_domain_now(contested)
-            second_done.set()
-
-        second = threading.Thread(target=second_caller)
-        owner.start()
-        try:
-            assert in_backend.wait(5.0), "owner never reached the backend"
-            assert not contested.freed, "freed must stay false while the backend call is in flight"
-            second.start()
-            assert second_waiting.wait(5.0)
-            assert not second_done.is_set(), "the second caller returned while the owner was still releasing"
-            assert not contested.freed
-        finally:
-            let_go.set()
-            owner.join(5.0)
-            second.join(5.0)
-
-        assert second_done.is_set()
-        assert entered.count(7) == 1, f"allocation 7 reached the backend {entered.count(7)} times"
-
-    def test_failed_domain_release_is_replayed_to_a_second_caller(self):
-        """The owner's failure reaches every later caller, so no path reports
-        success for an allocation whose backend release did not happen.
-
-        ``_release_all_live_domains`` keeps an un-freed handle in
-        ``_live_domains`` precisely so ``close()`` reports it as a residual; a
-        second caller that returned success would erase that.
-        """
-        worker = Worker(level=3, num_sub_workers=0)
-        worker._worker = cast(Any, object())
-        boom = RuntimeError("backend release failed")
-        _entered, in_backend, let_go = self._gated_domain_worker(worker, target_id=7, outcome=boom)
-        let_go.set()
-
-        resources = worker_mod._RunResources()
-        contested = self._retired_domain(worker, resources, "contested", 7)
-
-        with pytest.raises(RuntimeError, match="backend release failed"):
-            worker._release_domain_now(contested)
-        assert in_backend.is_set()
-        assert not contested.freed
-
-        # The sweep is the second caller: it must see the failure, keep the
-        # handle, leave `freed` false, and report the failure to its own caller
-        # rather than returning as if the domain were reclaimed.
-        with pytest.raises(RuntimeError, match="backend release failed"):
-            worker._release_all_live_domains()
-        assert not contested.freed, "a failed release must not be reported as freed"
-        assert "contested" in worker._live_domains, "a failed release must stay a detectable residual"
-
     def test_allocate_domain_outside_graph_construction_is_rejected(self):
         worker = Worker(level=3, num_sub_workers=0)
         worker._worker = cast(Any, object())
         assert worker._building_run_resources is None
 
-        with pytest.raises(RuntimeError, match="graph is being built"):
+        with pytest.raises(RuntimeError, match="building a run"):
             worker._allocate_domain(name="d", workers=(0,), window_size=4096, buffers=[])
 
 
@@ -5558,15 +5114,9 @@ class TestOrderedCleanupDegradation:
         """
         worker = self._worker()
 
-        # A CommDomain: its release drives CTRL_RELEASE_DOMAIN on every member.
         resources = worker_mod._RunResources()
+        _test_domain(worker, resources, "d")
         assert not resources.requires_ordered_cleanup
-        handle = worker_mod.CommDomainHandle(
-            name="d", workers=(), contexts={}, allocation_id=1, _release_fn=lambda released: None
-        )
-        resources.live_domains[handle.name] = handle
-        resources.requires_ordered_cleanup = True  # set by _allocate_domain at this point
-        assert resources.requires_ordered_cleanup
 
         # A remote slot reference: releasing it is an RPC to the owning worker.
         # `create_worker_chip_queue` is not a fourth set-point — it builds its region
@@ -5638,8 +5188,7 @@ class TestOrderedCleanupDegradation:
         def failing_release(res):
             raise boom
 
-        worker._release_all_live_domains = cast(Any, failing_release)
-        resources.live_domains["d"] = cast(Any, object())
+        worker._release_active_remote_slot_refs = cast(Any, failing_release)
 
         assert worker._finalize_run_handle(handle, 1, None) is boom
         assert worker._ordered_cleanup_error is boom
@@ -5662,8 +5211,7 @@ class TestOrderedCleanupDegradation:
             observed.append((worker._ordered_cleanup_error is not None, item._cleanup_published))
 
         worker._accepted_run_handles = cast(Any, _WatchedSet(worker._accepted_run_handles, watching_discard))
-        resources.live_domains["d"] = cast(Any, object())
-        worker._release_all_live_domains = cast(Any, _raiser(RuntimeError("cleanup failed")))
+        worker._release_active_remote_slot_refs = cast(Any, _raiser(RuntimeError("cleanup failed")))
 
         worker._finalize_run_handle(handle, 1, None)
         assert observed == [(True, True)], "the handle was dropped before its poison was visible"
@@ -6270,50 +5818,30 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         return worker
 
     def test_a_partial_domain_allocation_keeps_its_original_release_ranks(self, monkeypatch):
-        """Two chips of three committed a window and no handle exists.
-
-        The release has to reach exactly the two that allocated: driving it at
-        the third would fail on a debt it does not hold, and poison the worker
-        for a partial failure that was handled correctly.
-        """
         worker = self._worker()
         worker._config = {"device_ids": [0, 1, 2]}
-        resources = worker_mod._RunResources()
-        worker._building_run_resources = resources
+        worker._building_run_resources = worker_mod._RunResources()
         monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
+        release_headers = {}
+        allocated_ids = []
 
-        def partial_failure(*, reply_shms, **_kwargs):
-            assert reply_shms is not None
-            for chip_idx in (0, 2):
-                reply_buf = reply_shms[chip_idx].buf
-                assert reply_buf is not None
-                struct.pack_into("<Q", reply_buf, worker_mod._OFF_DOMAIN_REPLY_COMMITTED, 1)
-            raise RuntimeError("rank 1 failed")
+        def dispatch(*, workers, request_shms, reply_shms, op, **_kwargs):
+            if op == "alloc":
+                allocated_ids.append(_kwargs["allocation_id"])
+                for chip in (0, 2):
+                    struct.pack_into("<Q", reply_shms[chip].buf, worker_mod._OFF_DOMAIN_REPLY_COMMITTED, 1)
+                raise RuntimeError("rank 1 failed")
+            for chip in workers:
+                release_headers[chip] = worker_mod._DOMAIN_REQ_HEADER.unpack_from(request_shms[chip].buf, 0)[:3]
 
-        monkeypatch.setattr(worker, "_dispatch_control_domain", partial_failure)
+        monkeypatch.setattr(worker, "_dispatch_control_domain", dispatch)
         with pytest.raises(RuntimeError, match="rank 1 failed"):
             worker._allocate_domain(name="d", workers=(0, 1, 2), window_size=64, buffers=[])
-
-        handle = resources.live_domains["d"]
-        assert handle.workers == (0, 2), "release would reach a chip that never allocated"
-        assert worker._live_domains["d"] is handle
-        assert resources.requires_ordered_cleanup, "a leaked window did not degrade the successor"
-
-        release_headers = {}
-
-        def capture_release(*, workers, request_shms, **_kwargs):
-            for chip_idx in workers:
-                request_buf = request_shms[chip_idx].buf
-                assert request_buf is not None
-                release_headers[chip_idx] = worker_mod._DOMAIN_REQ_HEADER.unpack_from(request_buf, 0)[:3]
-
-        monkeypatch.setattr(worker, "_dispatch_control_domain", capture_release)
-        worker._release_domain_claimed(handle)
-
-        assert release_headers == {
-            0: (handle.allocation_id, 3, 0),
-            2: (handle.allocation_id, 3, 2),
-        }
+        (private_id,) = allocated_ids
+        assert worker._domain_registry.records == {}
+        assert release_headers == {0: (private_id, 3, 0), 2: (private_id, 3, 2)}
+        assert worker.live_domains() == {}
+        assert worker._ordered_cleanup_error is None
 
     def test_a_chip_that_committed_before_its_reply_failed_is_still_reclaimed(self):
         """The window exists before the reply is written.
@@ -6334,23 +5862,14 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         assert not worker_mod._domain_reply_committed(None), "a chip that never got a reply slot owes nothing"
 
     def test_the_child_publishes_its_commit_before_anything_that_can_fail(self):
-        """A carving overflow is raised after the window is already allocated.
+        """A window-size query can fail after the collective committed.
 
         The chip must have said so first, or the parent excludes it from
         cleanup and the window is leaked for the worker's lifetime.
         """
-        request = SharedMemory(create=True, size=worker_mod._DOMAIN_REQ_HEADER.size + 8 + 4)
+        request = _domain_request_shm()
         reply = SharedMemory(create=True, size=worker_mod._DOMAIN_REPLY_HEADER.size + 8)
         try:
-            req_buf = cast(Any, request.buf)
-            worker_mod._DOMAIN_REQ_HEADER.pack_into(
-                req_buf, 0, 7, 1, 0, 64, 1
-            )  # allocation_id, rank_count, domain_rank, window_size, buffer_count
-            # One buffer larger than the window: the carve raises after the
-            # collective has already committed.
-            struct.pack_into("<Q", req_buf, worker_mod._DOMAIN_REQ_HEADER.size, 4096)
-            struct.pack_into("<I", req_buf, worker_mod._DOMAIN_REQ_HEADER.size + 8, 0)
-
             cw = cast(Any, SimpleNamespace())
 
             def committed(*args):
@@ -6358,6 +5877,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 return 0xC7, 0xB000
 
             cw.comm_alloc_domain_windows = committed
+            cw.comm_get_domain_window_size = lambda *_: (_ for _ in ()).throw(ValueError("size query failed"))
             mailbox = memoryview(bytearray(worker_mod.mailbox_size(worker_mod._DEFAULT_PIPELINE_DEPTH_REQUEST)))
             for offset, shm_name in (
                 (worker_mod._OFF_ARGS, request.name),
@@ -6366,8 +5886,8 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 encoded = shm_name.encode("utf-8")
                 mailbox[offset : offset + len(encoded)] = encoded
 
-            with pytest.raises(ValueError, match="overflows window_size"):
-                worker_mod._handle_ctrl_alloc_domain(cw, mailbox, base_comm_handle=1)
+            with pytest.raises(ValueError, match="size query failed"):
+                worker_mod._handle_ctrl_alloc_domain(cw, mailbox, base_comm_handle=1, domain_store=_ChipDomainStore())
 
             assert worker_mod._domain_reply_committed(reply), (
                 "the window was allocated and the chip did not say so before failing"
@@ -6378,12 +5898,9 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 shm.unlink()
 
     def test_native_commit_publication_survives_result_conversion_failure(self):
-        request = SharedMemory(create=True, size=worker_mod._DOMAIN_REQ_HEADER.size + 4)
+        request = _domain_request_shm()
         reply = SharedMemory(create=True, size=worker_mod._DOMAIN_REPLY_HEADER.size)
         try:
-            req_buf = cast(Any, request.buf)
-            worker_mod._DOMAIN_REQ_HEADER.pack_into(req_buf, 0, 7, 1, 0, 64, 0)
-            struct.pack_into("<I", req_buf, worker_mod._DOMAIN_REQ_HEADER.size, 0)
 
             def committed_then_failed(*args):
                 commit_address = args[5]
@@ -6401,7 +5918,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 mailbox[offset : offset + len(encoded)] = encoded
 
             with pytest.raises(MemoryError, match="tuple conversion failed"):
-                worker_mod._handle_ctrl_alloc_domain(cw, mailbox, base_comm_handle=1)
+                worker_mod._handle_ctrl_alloc_domain(cw, mailbox, base_comm_handle=1, domain_store=_ChipDomainStore())
 
             assert worker_mod._domain_reply_committed(reply)
         finally:
@@ -6424,8 +5941,8 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         with pytest.raises(RuntimeError, match="no rank committed"):
             worker._allocate_domain(name="d", workers=(0, 1, 2), window_size=64, buffers=[])
 
-        assert "d" not in resources.live_domains
-        assert "d" not in worker._live_domains
+        assert worker.live_domains() == {}
+        assert all(r.state == "freed" for r in worker._domain_registry.records.values())
         assert not resources.requires_ordered_cleanup
 
     def test_domain_fanout_launches_later_ranks_after_a_start_boundary_interrupt(self, monkeypatch):
@@ -6922,7 +6439,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 assert reply_shms is not None
                 reply = reply_shms[0]
                 assert reply.buf is not None
-                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 0)
+                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 64, 0)
 
             monkeypatch.setattr(worker, "_dispatch_control_domain", commit_domain)
         else:
@@ -6951,14 +6468,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             return real_cleanup(*args, **kwargs)
 
         monkeypatch.setattr(worker_mod, "_close_unlink_shms", interrupt_first_cleanup)
-        handle = worker_mod.CommDomainHandle(
-            name="d",
-            workers=(0,),
-            contexts={},
-            allocation_id=7,
-            _release_fn=lambda _released: None,
-            _domain_ranks={0: 0},
-        )
+        handle = _test_domain_record(worker)
         try:
             with pytest.raises(KeyboardInterrupt) as caught:
                 if operation == "comm_init":
@@ -6966,10 +6476,10 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 elif operation == "domain_alloc":
                     worker._allocate_domain(name="d", workers=(0,), window_size=64, buffers=[])
                 else:
-                    worker._release_domain_claimed(handle)
+                    worker._destroy_domain_record(handle)
 
             assert caught.value is boundary_interrupt
-            assert cleanup_calls == 2
+            assert cleanup_calls == (3 if operation == "domain_alloc" else 2)
             assert names
             monkeypatch.setattr(SharedMemory, "__init__", real_init)
             for name in names:
@@ -7019,7 +6529,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 interrupt_main()
                 reply = reply_shms[0]
                 assert reply.buf is not None
-                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 0)
+                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 64, 0)
 
             monkeypatch.setattr(worker, "_dispatch_control_domain", commit_domain)
         else:
@@ -7036,14 +6546,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 names.append(shm.name)
 
         monkeypatch.setattr(SharedMemory, "__init__", track_created)
-        handle = worker_mod.CommDomainHandle(
-            name="d",
-            workers=(0,),
-            contexts={},
-            allocation_id=7,
-            _release_fn=lambda _released: None,
-            _domain_ranks={0: 0},
-        )
+        handle = _test_domain_record(worker)
         try:
             with pytest.raises(KeyboardInterrupt):
                 if operation == "comm_init":
@@ -7051,7 +6554,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 elif operation == "domain_alloc":
                     worker._allocate_domain(name="d", workers=(0,), window_size=64, buffers=[])
                 else:
-                    worker._release_domain_claimed(handle)
+                    worker._destroy_domain_record(handle)
 
             assert interrupt_sent.is_set()
             assert names
@@ -7274,13 +6777,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                     raise first_interrupt
 
         monkeypatch.setattr(SharedMemory, "__init__", interrupt_after_create)
-        handle = worker_mod.CommDomainHandle(
-            name="d",
-            workers=(0,),
-            contexts={},
-            allocation_id=7,
-            _release_fn=lambda _released: None,
-        )
+        handle = _test_domain_record(worker)
         try:
             with pytest.raises(KeyboardInterrupt) as caught:
                 if operation == "comm_init":
@@ -7288,7 +6785,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 elif operation == "domain_alloc":
                     worker._allocate_domain(name="d", workers=(0,), window_size=64, buffers=[])
                 else:
-                    worker._release_domain_claimed(handle)
+                    worker._destroy_domain_record(handle)
 
             assert caught.value is first_interrupt
             assert interrupted_name is not None
@@ -7637,13 +7134,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             "_dispatch_control_domain",
             lambda **_kwargs: (_ for _ in ()).throw(first_interrupt),
         )
-        handle = worker_mod.CommDomainHandle(
-            name="d",
-            workers=(0,),
-            contexts={},
-            allocation_id=7,
-            _release_fn=lambda _released: None,
-        )
+        handle = _test_domain_record(worker)
 
         created: list[SharedMemory] = []
         created_fds: list[int] = []
@@ -7668,7 +7159,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         monkeypatch.setattr(worker_mod.os, "close", interrupt_first_close)
         try:
             with pytest.raises(KeyboardInterrupt) as caught:
-                worker._release_domain_claimed(handle)
+                worker._destroy_domain_record(handle)
             assert caught.value is first_interrupt
             assert close_interrupted
         finally:
@@ -7694,7 +7185,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             staged_shms.extend(reply_shms.values())
             reply_buf = reply_shms[0].buf
             assert reply_buf is not None
-            worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply_buf, 0, 1, 0xC7, 0xB000, 0)
+            worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply_buf, 0, 1, 0xC7, 0xB000, 64, 0)
 
         monkeypatch.setattr(worker, "_dispatch_control_domain", successful_dispatch)
         real_close = worker_mod.os.close
@@ -7719,10 +7210,11 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             with pytest.raises(KeyboardInterrupt):
                 worker._allocate_domain(name="d", workers=(0,), window_size=64, buffers=[])
 
-            handle = resources.live_domains["d"]
-            assert worker._live_domains["d"] is handle
-            assert handle.workers == (0,)
-            assert resources.requires_ordered_cleanup
+            (record,) = worker._domain_registry.records.values()
+            assert record.backend["workers"] == (0,)
+            assert record.state == "released"
+            assert record.free_error is not None
+            assert worker._ordered_cleanup_error is not None
             assert interrupted
         finally:
             monkeypatch.setattr(worker_mod.os, "close", real_close)

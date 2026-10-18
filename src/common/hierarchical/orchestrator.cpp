@@ -459,6 +459,15 @@ bool Orchestrator::run_done(RunId run_id) const {
     return is_terminal(get_run(run_id)->phase.load(std::memory_order_acquire));
 }
 
+bool Orchestrator::run_domain_use_settled(RunId run_id) const {
+    return get_run(run_id)->domain_use_settled.load(std::memory_order_acquire);
+}
+
+void Orchestrator::report_domain_use_unsettled(TaskSlot slot) {
+    auto run = find_run(slot_state(slot).run_id);
+    if (run) run->domain_use_settled.store(false, std::memory_order_release);
+}
+
 bool Orchestrator::run_failed(RunId run_id) const {
     auto run = get_run(run_id);
     std::lock_guard<std::mutex> lk(run->completion_mu);
@@ -1447,6 +1456,10 @@ void Orchestrator::validate_remote_sidecars(
             const RemoteTensorSidecar &tensor_sidecar = sidecar.tensors[static_cast<size_t>(i)];
             // A remote arg carries no local backing: its Tensor is a placeholder (nbytes 0 or a
             // REMOTE_SIDECAR backend) and the real descriptor lives in the sidecar.
+            if (ref.buffer.backend_kind == static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW)) {
+                if (tensor_sidecar.present) throw std::invalid_argument("domain tensor cannot carry a remote sidecar");
+                continue;
+            }
             bool has_local_backing =
                 ref.buffer.nbytes != 0 && ref.buffer.backend_kind != static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR);
             if (tensor_sidecar.present && has_local_backing) {

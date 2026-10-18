@@ -98,7 +98,7 @@ bool mailbox_compare_exchange_state(char *frame, MailboxState expected, MailboxS
 static constexpr size_t MAILBOX_FRAME_SIZE = 65536;
 static constexpr size_t MAILBOX_CONTROL_FRAME = 0;
 static constexpr size_t MAILBOX_FIRST_TASK_FRAME = 1;
-static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 7;
+static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 8;
 
 // Error message region. 256 B of headroom is enough for
 // `<ExceptionType>: <short message>` produced by the child-side Python loops;
@@ -166,6 +166,8 @@ struct MailboxRunEntry {
     uint64_t task_slot;
     uint64_t group_index;
     uint64_t group_size;
+    /* Child, before the terminal state: accepted domain uses have completed. */
+    uint64_t domain_use_settled;
     /* Child, before the terminal state. NUL-terminated, truncated to fit. */
     char error_text[MAILBOX_ERROR_MSG_SIZE];
     /* Run-resource sets the child reports it can hold, published with this

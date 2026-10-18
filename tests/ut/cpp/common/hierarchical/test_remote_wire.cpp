@@ -403,3 +403,63 @@ TEST(RemoteWire, RejectsTransferThatTheProtocolWouldLose) {
         EXPECT_THROW((void)remote_l3::encode_remote_task_args(args), std::runtime_error);
     }
 }
+
+TEST(RemoteWire, DomainTensorAndRemoteSidecarShareOneTaskWithoutLosingIdentity) {
+    CommDomainRef ref{};
+    ref.owner_instance_id[0] = 7;
+    ref.domain_id = 19;
+    ref.generation = 2;
+    Tensor domain = remote_arg_tensor();
+    domain.buffer.address_space = static_cast<uint8_t>(AddressSpace::DEVICE);
+    domain.buffer.backend_kind = static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW);
+    domain.buffer.identity.owner_instance_id[0] = 7;
+    domain.buffer.body_len = DESC_MAX_BYTES;
+    encode_comm_domain_ref(domain.buffer.body, ref);
+    domain_write_le(domain.buffer.body + 20, 0, 4);
+    domain_write_le(domain.buffer.body + 24, 12, 8);
+    validate_tensor(domain);
+
+    remote_l3::RemoteTaskArgsWire args;
+    args.tensors = {domain, remote_arg_tensor()};
+    args.domain_refs = {ref};
+    RemoteTensorSidecar sidecar{};
+    sidecar.present = true;
+    sidecar.desc.address_space = RemoteAddressSpace::HOST_INLINE;
+    sidecar.desc.owner_worker_id = 0;
+    sidecar.desc.nbytes = 4;
+    sidecar.desc.inline_payload_len = 4;
+    args.remote_desc = {{}, sidecar};
+    args.inline_payload = {1, 2, 3, 4};
+    auto bytes = remote_l3::encode_remote_task_args(args);
+    auto decoded = remote_l3::decode_remote_task_args(bytes.data(), bytes.size());
+    ASSERT_EQ(decoded.domain_refs.size(), 1);
+    EXPECT_EQ(decoded.domain_refs[0], ref);
+    EXPECT_EQ(decoded.tensors[0].buffer, domain.buffer);
+    EXPECT_FALSE(decoded.remote_desc[0].present);
+    EXPECT_TRUE(decoded.remote_desc[1].present);
+
+    args.remote_desc[0] = sidecar;
+    EXPECT_THROW(remote_l3::encode_remote_task_args(args), std::runtime_error);
+}
+
+TEST(RemoteWire, ContextOnlyTaskAndUnsettledCompletionPreserveTheirLifetimeMetadata) {
+    CommDomainRef ref{};
+    ref.owner_instance_id[0] = 9;
+    ref.domain_id = 1;
+    ref.generation = 1;
+    remote_l3::RemoteTaskArgsWire args;
+    args.domain_refs = {ref};
+    args.scalars = {0x1234};
+    auto bytes = remote_l3::encode_remote_task_args(args);
+    auto decoded = remote_l3::decode_remote_task_args(bytes.data(), bytes.size());
+    EXPECT_EQ(decoded.domain_refs, args.domain_refs);
+    EXPECT_EQ(decoded.scalars, args.scalars);
+    remote_l3::CompletionPayload completion{42, 1, "descendant did not settle", false};
+    auto outcome = remote_l3::encode_completion(completion);
+    EXPECT_FALSE(remote_l3::decode_completion(outcome.data(), outcome.size(), 42).domain_use_settled);
+    completion.domain_use_settled = true;
+    outcome = remote_l3::encode_completion(completion);
+    EXPECT_TRUE(remote_l3::decode_completion(outcome.data(), outcome.size(), 42).domain_use_settled);
+    outcome.pop_back();
+    EXPECT_THROW(remote_l3::decode_completion(outcome.data(), outcome.size(), 42), std::runtime_error);
+}

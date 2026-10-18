@@ -730,9 +730,11 @@ void WorkerThread::complete_unpublished(WorkerDispatch dispatch, const std::stri
     } catch (...) {
         // The endpoint-publication error remains the primary task failure.
     }
-    on_complete_(
-        WorkerCompletion{dispatch.task_slot, dispatch.group_index, EndpointOutcome::ENDPOINT_FAILURE, error_message}
-    );
+    WorkerCompletion completion{
+        dispatch.task_slot, dispatch.group_index, EndpointOutcome::ENDPOINT_FAILURE, error_message
+    };
+    completion.domain_use_settled = false;
+    on_complete_(std::move(completion));
 }
 
 void WorkerThread::stop() {
@@ -834,6 +836,7 @@ void WorkerThread::fail_submission(const WorkerDispatch &dispatch, const std::st
         dispatch.task_slot, dispatch.group_index, EndpointOutcome::ENDPOINT_FAILURE,
         "WorkerThread endpoint rejected publication: " + reason
     };
+    progress.completion.domain_use_settled = false;
     finish_progress_dispatch(progress);
 }
 
@@ -1170,10 +1173,12 @@ bool LocalMailboxEndpoint::poisoned_progress_quiesced() {
 }
 
 WorkerCompletion LocalMailboxEndpoint::poisoned_completion(const EntryRecord &record) const {
-    return WorkerCompletion{
+    WorkerCompletion completion{
         record.dispatch.task_slot, record.dispatch.group_index, EndpointOutcome::ENDPOINT_FAILURE,
         "LocalMailboxEndpoint progress failed: " + endpoint_poison_reason_
     };
+    completion.domain_use_settled = false;
+    return completion;
 }
 
 WorkerCompletion LocalMailboxEndpoint::terminal_completion(
@@ -1189,6 +1194,7 @@ WorkerCompletion LocalMailboxEndpoint::terminal_completion(
     // same reason, as the two fields above.
     completion.worker_id = caps_.worker_id;
     completion.admissible_run_resource_sets = entry->admissible_run_resource_sets;
+    completion.domain_use_settled = entry->domain_use_settled == 1;
     if (state == MailboxState::TASK_FAILED || error_code != 0) {
         const size_t text_len = ::strnlen(entry->error_text, MAILBOX_ERROR_MSG_SIZE);
         completion.outcome = EndpointOutcome::TASK_FAILURE;

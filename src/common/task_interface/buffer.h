@@ -86,7 +86,7 @@ enum class AccessMode : uint8_t {
 
 // Materialization backend of a buffer. The consumer resolves a Tensor to a local address via the
 // import registry keyed by canonical identity; this tag selects how. REMOTE_SIDECAR is reserved for
-// P2 and rejected on decode in P1. Values 0–5 are frozen; VMM_SHAREABLE is 6; 7.. reserved
+// P2 and rejected on decode in P1. Values 0–5 are frozen; VMM_SHAREABLE is 6; DOMAIN_WINDOW is 7; 8.. reserved
 // (unknown tag => reject).
 //
 // FORK_SHM and FORK_COW materialize identically — the body is a base VA the child already has,
@@ -106,7 +106,68 @@ enum class BackendKind : uint8_t {
     DEVICE_MALLOC = 4,
     FORK_COW = 5,
     VMM_SHAREABLE = 6,
+    DOMAIN_WINDOW = 7,
 };
+
+struct CommDomainRef {
+    uint8_t owner_instance_id[OWNER_INSTANCE_ID_BYTES]{};
+    uint64_t domain_id{0};
+    uint32_t generation{0};
+    uint32_t reserved{0};
+};
+
+static_assert(std::is_trivially_copyable_v<CommDomainRef> && std::is_standard_layout_v<CommDomainRef>);
+static_assert(sizeof(CommDomainRef) == 24);
+
+inline bool operator==(const CommDomainRef &a, const CommDomainRef &b) {
+    return a.domain_id == b.domain_id && a.generation == b.generation &&
+           std::memcmp(a.owner_instance_id, b.owner_instance_id, OWNER_INSTANCE_ID_BYTES) == 0;
+}
+inline bool operator!=(const CommDomainRef &a, const CommDomainRef &b) { return !(a == b); }
+
+struct CommDomainRefHash {
+    size_t operator()(const CommDomainRef &ref) const {
+        size_t hash = static_cast<size_t>(ref.domain_id) ^ (static_cast<size_t>(ref.generation) << 1);
+        for (const auto byte : ref.owner_instance_id)
+            hash = (hash * 1099511628211ULL) ^ byte;
+        return hash;
+    }
+};
+
+inline void validate_comm_domain_ref(const CommDomainRef &ref) {
+    if (ref.domain_id == 0 || ref.generation == 0 || ref.reserved != 0)
+        throw std::invalid_argument("invalid CommDomainRef: domain_id/generation must be nonzero and reserved zero");
+}
+
+inline uint64_t domain_read_le(const char *bytes, size_t size) {
+    uint64_t value = 0;
+    for (size_t i = 0; i < size; ++i)
+        value |= uint64_t(static_cast<uint8_t>(bytes[i])) << (8 * i);
+    return value;
+}
+
+inline void domain_write_le(char *bytes, uint64_t value, size_t size) {
+    for (size_t i = 0; i < size; ++i)
+        bytes[i] = static_cast<char>((value >> (8 * i)) & 0xff);
+}
+
+inline void encode_comm_domain_ref(char *bytes, const CommDomainRef &ref) {
+    validate_comm_domain_ref(ref);
+    std::memcpy(bytes, ref.owner_instance_id, OWNER_INSTANCE_ID_BYTES);
+    domain_write_le(bytes + 8, ref.domain_id, 8);
+    domain_write_le(bytes + 16, ref.generation, 4);
+    domain_write_le(bytes + 20, 0, 4);
+}
+
+inline CommDomainRef decode_comm_domain_ref(const char *bytes) {
+    CommDomainRef ref{};
+    std::memcpy(ref.owner_instance_id, bytes, OWNER_INSTANCE_ID_BYTES);
+    ref.domain_id = domain_read_le(bytes + 8, 8);
+    ref.generation = static_cast<uint32_t>(domain_read_le(bytes + 16, 4));
+    ref.reserved = static_cast<uint32_t>(domain_read_le(bytes + 20, 4));
+    validate_comm_domain_ref(ref);
+    return ref;
+}
 
 /**
  * Canonical allocation identity — globally unique across owner incarnations, unchanged across every
@@ -196,6 +257,17 @@ static_assert(offsetof(BufferDescriptor, nbytes) == 40);
 static_assert(offsetof(BufferDescriptor, owner_worker_path_id) == 48);
 static_assert(offsetof(BufferDescriptor, body_len) == 52);
 static_assert(offsetof(BufferDescriptor, body) == 56);
+
+inline CommDomainRef domain_window_ref(const BufferDescriptor &desc) {
+    if (desc.backend_kind != static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW) || desc.body_len != DESC_MAX_BYTES)
+        throw std::invalid_argument("DOMAIN_WINDOW descriptor body must be exactly 32 bytes");
+    CommDomainRef ref{};
+    std::memcpy(ref.owner_instance_id, desc.body, OWNER_INSTANCE_ID_BYTES);
+    ref.domain_id = domain_read_le(desc.body + 8, 8);
+    ref.generation = static_cast<uint32_t>(domain_read_le(desc.body + 16, 4));
+    validate_comm_domain_ref(ref);
+    return ref;
+}
 
 // Field-wise, so neither the struct padding nor the unused tail of `body` takes part: two decodes of
 // one backing describe the same buffer whatever bytes sit outside the fields that carry meaning.
@@ -298,7 +370,7 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     if (h.address_space > static_cast<uint8_t>(AddressSpace::DEVICE))
         reject("invalid BufferDescriptor: address_space out of range");
     if (h.access > static_cast<uint8_t>(AccessMode::READWRITE)) reject("invalid BufferDescriptor: access out of range");
-    if (h.backend_kind > static_cast<uint8_t>(BackendKind::VMM_SHAREABLE))
+    if (h.backend_kind > static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW))
         reject("invalid BufferDescriptor: backend_kind out of range");
     if (h.body_len > DESC_MAX_BYTES) reject("invalid BufferDescriptor: body_len exceeds DESC_MAX_BYTES");
     if (h.identity.generation == 0) reject("invalid BufferDescriptor: generation 0 is reserved (uninitialized)");
@@ -308,7 +380,7 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     const bool device_space = h.address_space == static_cast<uint8_t>(AddressSpace::DEVICE);
     if (backend != BackendKind::REMOTE_SIDECAR) {
         const bool device_backend = backend == BackendKind::VMM_WINDOW || backend == BackendKind::DEVICE_MALLOC ||
-                                    backend == BackendKind::VMM_SHAREABLE;
+                                    backend == BackendKind::VMM_SHAREABLE || backend == BackendKind::DOMAIN_WINDOW;
         if (device_backend != device_space)
             reject("invalid BufferDescriptor: unsupported address_space x backend_kind (capability matrix)");
     }
@@ -323,6 +395,15 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     // does not fit the reading is not a smaller backing — it is a different value. A DEVICE_MALLOC
     // body of 3 bytes reads as a TRUNCATED pointer with nothing to distinguish it from a real one.
     switch (backend) {
+    case BackendKind::DOMAIN_WINDOW: {
+        const auto ref = domain_window_ref(h);
+        if (std::memcmp(ref.owner_instance_id, h.identity.owner_instance_id, OWNER_INSTANCE_ID_BYTES) != 0)
+            reject("invalid DOMAIN_WINDOW: creator does not match canonical identity");
+        const auto offset = domain_read_le(h.body + 24, 8);
+        if (h.nbytes == 0 || offset > UINT64_MAX - h.nbytes)
+            reject("invalid DOMAIN_WINDOW: slice extent is zero or overflows");
+        break;
+    }
     case BackendKind::FORK_SHM:
     case BackendKind::FORK_COW:
     case BackendKind::DEVICE_MALLOC:

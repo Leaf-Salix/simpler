@@ -17,6 +17,14 @@ from unittest.mock import MagicMock, call
 import pytest
 import simpler.worker as worker_mod
 from simpler.buffer import LocalEndpointBufferIdentityAllocator
+from simpler.comm_domain import (
+    CommDomainRef,
+    _DomainConfig,
+    _DomainMember,
+    _DomainRecord,
+    _DomainRegistry,
+    encode_domain_metadata,
+)
 from simpler.comm_provider import (
     DeviceAllocationTarget,
     ProviderRegionStore,
@@ -43,11 +51,13 @@ def _run_controls(monkeypatch, init_results, commands):
             "comm_init",
             "comm_alloc_domain_windows",
             "comm_release_domain_windows",
+            "comm_get_domain_window_size",
             "set_exported_device_regions_live",
         )
     )
     cw.comm_init.side_effect = init_results
     cw.comm_alloc_domain_windows.return_value = (0xC7, 0xB000)
+    cw.comm_get_domain_window_size.return_value = 64
     responses = []
     owner = worker_mod.mint_owner_instance_id()
     store = ProviderRegionStore(
@@ -69,11 +79,27 @@ def _run_controls(monkeypatch, init_results, commands):
         worker_mod._COMM_INIT_HEADER.pack_into(init_buf, 0, 0, 1)
         path_offset = worker_mod._COMM_INIT_HEADER.size
         init_buf[path_offset : path_offset + len(rootinfo_path)] = rootinfo_path
-        domain_request = allocate(worker_mod._DOMAIN_REQ_HEADER.size + 4)
+        domain_config = _DomainConfig.capture(
+            members=(_DomainMember(None, 0, 0, ("chip", 0)),),
+            window_size=64,
+            buffers=(),
+            retain_after_run=False,
+            topology=(),
+        )
+        record = _DomainRecord("test", CommDomainRef(owner, 7, 1), domain_config)
+        registry = _DomainRegistry(
+            owner_instance_id=owner, mint_identity=lambda: None, allocate=lambda _: None, destroy=lambda _: None
+        )
+        registry._catalog(record)
+        metadata = encode_domain_metadata(record)
+        metadata_offset = worker_mod._DOMAIN_REQ_HEADER.size + 4
+        domain_request = allocate(metadata_offset + 4 + len(metadata))
         domain_buf = domain_request.buf
         assert domain_buf is not None
         worker_mod._DOMAIN_REQ_HEADER.pack_into(domain_buf, 0, 7, 1, 0, 64, 0)
         struct.pack_into("<I", domain_buf, worker_mod._DOMAIN_REQ_HEADER.size, 0)
+        struct.pack_into("<I", domain_buf, metadata_offset, len(metadata))
+        domain_buf[metadata_offset + 4 : metadata_offset + 4 + len(metadata)] = metadata
         reply = allocate(worker_mod._DOMAIN_REPLY_HEADER.size)
         with memoryview(bytearray(worker_mod.mailbox_size(1))) as mailbox:
             address = ctypes.addressof(ctypes.c_char.from_buffer(mailbox))
@@ -127,7 +153,7 @@ def test_bootstrap_handle_is_forwarded_without_mutating_runtime(monkeypatch):
     assert allocated[:5] == (0x1234, 7, [0], 0, 64)
     assert allocated[5] != 0
     cw.comm_release_domain_windows.assert_called_once_with(0x1234, 7, 1, 0)
-    assert published == (1, 0xC7, 0xB000, 0)
+    assert published == (1, 0xC7, 0xB000, 64, 0)
 
     cold, refused, _ = _run_controls(monkeypatch, [], [worker_mod._CTRL_ALLOC_DOMAIN, worker_mod._CTRL_RELEASE_DOMAIN])
     assert all(code == 1 and "CTRL_COMM_INIT must succeed first" in message for code, message in refused)

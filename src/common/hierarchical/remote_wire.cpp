@@ -348,7 +348,8 @@ CallConfig decode_call_config(const uint8_t *data, size_t size, size_t &offset) 
 std::vector<uint8_t> encode_tensor(const Tensor &tensor) {
     const BufferDescriptor &desc = tensor.buffer;
     ensure(
-        desc.backend_kind == static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR),
+        (desc.backend_kind == static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR) ||
+         desc.backend_kind == static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW)),
         "remote_wire: a remote TASK tensor must carry no local backing"
     );
     ensure(
@@ -390,7 +391,8 @@ Tensor decode_tensor(const uint8_t *data, size_t size, size_t &offset) {
     desc.access = get_u8(data, size, offset);
     desc.backend_kind = get_u8(data, size, offset);
     ensure(
-        desc.backend_kind == static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR),
+        (desc.backend_kind == static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR) ||
+         desc.backend_kind == static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW)),
         "remote_wire: a remote TASK tensor must carry no local backing"
     );
     desc.nbytes = get_u64(data, size, offset);
@@ -487,6 +489,8 @@ std::vector<uint8_t> encode_remote_task_args(const RemoteTaskArgsWire &args) {
     for (size_t i = 0; i < args.tensors.size(); ++i) {
         RemoteTensorSidecar sidecar{};
         if (!args.remote_desc.empty()) sidecar = args.remote_desc[i];
+        bool domain = args.tensors[i].buffer.backend_kind == static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW);
+        ensure(!domain || !sidecar.present, "remote_wire: domain tensor must have no sidecar");
         put_u8(out, sidecar.present ? 1 : 0);
         if (sidecar.present) {
             validate_desc_against_inline_payload(sidecar.desc, args.inline_payload.size());
@@ -498,6 +502,13 @@ std::vector<uint8_t> encode_remote_task_args(const RemoteTaskArgsWire &args) {
         put_u64(out, scalar);
     put_u32(out, static_cast<uint32_t>(args.inline_payload.size()));
     put_bytes(out, args.inline_payload.data(), args.inline_payload.size());
+    ensure(args.domain_refs.size() <= MAX_TENSORS, "remote_wire: domain ref count exceeds maximum");
+    put_u32(out, static_cast<uint32_t>(args.domain_refs.size()));
+    for (const auto &ref : args.domain_refs) {
+        char bytes[24];
+        encode_comm_domain_ref(bytes, ref);
+        put_bytes(out, reinterpret_cast<const uint8_t *>(bytes), sizeof(bytes));
+    }
     return out;
 }
 
@@ -532,7 +543,25 @@ RemoteTaskArgsWire decode_remote_task_args(const uint8_t *data, size_t size) {
     ensure_available(size, offset, inline_len, "inline payload");
     args.inline_payload.assign(data + offset, data + offset + inline_len);
     offset += inline_len;
+    uint32_t ref_count = get_u32(data, size, offset);
+    ensure(ref_count <= MAX_TENSORS, "remote_wire: domain ref count exceeds maximum");
+    for (uint32_t i = 0; i < ref_count; ++i) {
+        ensure_available(size, offset, 24, "domain ref");
+        args.domain_refs.push_back(decode_comm_domain_ref(reinterpret_cast<const char *>(data + offset)));
+        offset += 24;
+    }
     ensure(offset == size, "remote_wire: trailing bytes after RemoteTaskArgs");
+    for (size_t i = 0; i < args.tensors.size(); ++i) {
+        bool domain = args.tensors[i].buffer.backend_kind == static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW);
+        ensure(!domain || !args.remote_desc[i].present, "remote_wire: domain/sidecar backing mismatch");
+        if (domain) {
+            auto ref = domain_window_ref(args.tensors[i].buffer);
+            ensure(
+                std::find(args.domain_refs.begin(), args.domain_refs.end(), ref) != args.domain_refs.end(),
+                "remote_wire: domain tensor is missing its declared ref"
+            );
+        }
+    }
 
     for (const auto &sidecar : args.remote_desc) {
         if (sidecar.present) validate_desc_against_inline_payload(sidecar.desc, args.inline_payload.size());
@@ -567,6 +596,7 @@ std::vector<uint8_t> encode_completion(const CompletionPayload &payload) {
     put_u64(out, payload.sequence);
     put_i32(out, payload.error_code);
     put_string(out, payload.error_message, MAX_ERROR_BYTES, "completion.error_message");
+    put_u8(out, payload.domain_use_settled ? 1 : 0);
     return out;
 }
 
@@ -577,6 +607,9 @@ CompletionPayload decode_completion(const uint8_t *data, size_t size, uint64_t e
     ensure(payload.sequence == expected_sequence, "remote_wire: completion sequence mismatch");
     payload.error_code = get_i32(data, size, offset);
     payload.error_message = get_string(data, size, offset, MAX_ERROR_BYTES, "completion.error_message");
+    auto settled = get_u8(data, size, offset);
+    ensure(settled <= 1, "remote_wire: invalid domain settlement proof");
+    payload.domain_use_settled = settled == 1;
     ensure(offset == size, "remote_wire: trailing bytes after completion");
     return payload;
 }

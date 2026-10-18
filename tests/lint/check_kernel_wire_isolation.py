@@ -69,6 +69,7 @@ ALLOWED = frozenset(
         # Their unit tests.
         "tests/ut/cpp/common/task_interface/test_buffer.cpp",
         "tests/ut/cpp/common/task_interface/test_child_memory.cpp",
+        "tests/ut/cpp/common/task_interface/test_comm_domain.cpp",
     }
 )
 

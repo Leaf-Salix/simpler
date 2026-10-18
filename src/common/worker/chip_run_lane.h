@@ -43,6 +43,7 @@ public:
 
     bool launched() const;
     bool lane_poisoned() const;
+    bool domain_use_settled() const;
     ChipRunPreparationDisposition preparation_disposition() const;
 
 private:

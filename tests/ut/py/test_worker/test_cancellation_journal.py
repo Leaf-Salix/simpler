@@ -367,7 +367,7 @@ class TestJournalRetryOnClose:
         ("method_name", "kind"),
         [
             ("_sweep_region_instances", "region"),
-            ("_release_all_live_domains", "domain"),
+            ("_release_all_domains", "domain"),
             ("_flush_pending_remote_frees", "remote"),
             ("_release_all_buffers", "buffer"),
         ],

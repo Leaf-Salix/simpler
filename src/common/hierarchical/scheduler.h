@@ -119,6 +119,7 @@ public:
         // Called as soon as an endpoint reports failure so the error is
         // attached to the task's run even when a group has other members live.
         std::function<void(TaskSlot, const std::string &)> on_task_failed_cb;
+        std::function<void(TaskSlot)> on_domain_use_unsettled_cb;
         // Diagnostic-only reservation stall reporting. The sink must not
         // block: it runs on the scheduler dispatch path.
         std::chrono::milliseconds reservation_stall_warn_after{std::chrono::seconds(5)};
