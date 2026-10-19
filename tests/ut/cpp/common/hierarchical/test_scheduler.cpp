@@ -4395,6 +4395,9 @@ struct GroupSchedulerFixture : public ::testing::Test {
         c.on_task_failed_cb = [this](TaskSlot s, const std::string &message) {
             orch.report_task_error(s, message);
         };
+        c.on_domain_use_unsettled_cb = [this](TaskSlot s) {
+            orch.report_domain_use_unsettled(s);
+        };
         c.reservation_stall_warn_after = reservation_stall_warn_after;
         c.reservation_stall_sink = reservation_stall_sink;
         c.reservation_stall_sink_context = reservation_stall_sink_context;
@@ -5149,6 +5152,27 @@ TEST_F(GroupSchedulerFixture, CompletionRepairPreservesRunningPeersWhenOutcomesA
     worker_b.complete();
     wait_consumed(slot);
     EXPECT_EQ(S(slot).state.load(), TaskState::CONSUMED);
+}
+
+TEST_F(GroupSchedulerFixture, AnInvalidGroupIndexIsNeverProofOfSettledDeviceWork) {
+    TaskArgs a0 = single_tensor_args(0xE0, TensorArgType::OUTPUT);
+    TaskArgs a1 = single_tensor_args(0xE1, TensorArgType::OUTPUT);
+    auto res = orch.submit_next_level_group(C(45), {a0, a1}, cfg, {0, 1});
+    worker_a.wait_running();
+    worker_b.wait_running();
+
+    // The members it skips may still be running on their devices.
+    WorkerCompletion bad;
+    bad.task_slot = res.task_slot;
+    bad.group_index = 99;
+    ASSERT_EQ(bad.outcome, EndpointOutcome::SUCCESS);
+    ASSERT_TRUE(bad.domain_use_settled);
+    sched.worker_done(std::move(bad));
+    wait_consumed(res.task_slot);
+    EXPECT_FALSE(orch.run_domain_use_settled(run_id));
+
+    worker_a.complete();
+    worker_b.complete();
 }
 
 TEST_F(GroupSchedulerFixture, InvalidGroupIndexFailsAndConsumesGroup) {

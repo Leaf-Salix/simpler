@@ -67,19 +67,14 @@ def domain_slices(
     return MappingProxyType(slices)
 
 
-def domain_slice_name(handle: CommDomainHandle, descriptor: BufferDescriptor) -> tuple[int, str]:
-    """``(domain_rank, buffer name)`` of a slice descriptor that is exactly one of ``handle``'s own."""
-    ref, rank, offset = domain_window_location(descriptor)
+def domain_slice_rank(handle: CommDomainHandle, descriptor: BufferDescriptor) -> int:
+    """The domain rank of a slice descriptor that is exactly one of ``handle``'s own."""
+    ref, rank, _offset = domain_window_location(descriptor)
     if ref != handle.ref or not 0 <= rank < len(handle.members):
         raise ValueError(f"domain tensor does not name a rank of domain {handle.name!r}")
-    position = 0
-    for spec in handle.buffers:
-        if position == offset:
-            if handle.members[rank].buffers[spec.name].to_descriptor() != descriptor:
-                break
-            return rank, spec.name
-        position += spec.nbytes
-    raise ValueError(f"domain tensor does not match the canonical slice catalog of domain {handle.name!r}")
+    if descriptor not in [buffer.to_descriptor() for buffer in handle.members[rank].buffers.values()]:
+        raise ValueError(f"domain tensor does not match the canonical slice catalog of domain {handle.name!r}")
+    return rank
 
 
 @dataclass(frozen=True)
@@ -258,8 +253,6 @@ class ChipDomainStore:
         self.task_refs: frozenset[CommDomainRef] = frozenset()
 
     def install(self, ref: CommDomainRef, mapping: ChipDomainMapping) -> None:
-        if any(identity.owner_instance_id != ref.owner_instance_id for identity, _ in mapping.slices.values()):
-            raise ValueError("domain catalog identities must belong to the domain's creator")
         self._mappings[ref] = mapping
 
     def revoke(self, ref: CommDomainRef) -> None:

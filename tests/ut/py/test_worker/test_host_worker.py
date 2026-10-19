@@ -5109,14 +5109,7 @@ class TestRunHandle:
         """
         worker = Worker(level=3, num_sub_workers=0)
         worker._worker = cast(Any, object())
-        worker._orch = cast(
-            Any,
-            type(
-                "FakeOrch",
-                (),
-                {"_release_run": lambda self, run_id: None, "_run_domain_use_settled": lambda self, run_id: True},
-            )(),
-        )
+        worker._orch = cast(Any, _StubOrch())
 
         freed: list[str] = []
 
@@ -5381,14 +5374,7 @@ class TestRunHandle:
         """
         worker = Worker(level=3, num_sub_workers=0)
         worker._worker = cast(Any, object())
-        worker._orch = cast(
-            Any,
-            type(
-                "FakeOrch",
-                (),
-                {"_release_run": lambda self, run_id: None, "_run_domain_use_settled": lambda self, run_id: True},
-            )(),
-        )
+        worker._orch = cast(Any, _StubOrch())
 
         freed: list[str] = []
 

@@ -605,10 +605,6 @@ class Orchestrator:
             name=name, members=members, window_size=window_size, buffers=buffers, retain_after_run=retain_after_run
         )
 
-    def release_global_domain(self, handle: CommDomainHandle) -> None:
-        """Former L4 spelling of :meth:`release_domain`."""
-        self.release_domain(handle)
-
     def get_global_domain(self, domain_id: int) -> CommDomainHandle:
         """Former L3 lookup of an L4 domain by its bare id, valid within the creating session."""
         if self._worker is None:
@@ -665,13 +661,10 @@ class Orchestrator:
             raise RuntimeError("copy_from_domain requires an Orchestrator bound to a Worker")
         return self._worker._copy_domain(handle, int(domain_rank), absolute, int(nbytes))
 
-    def copy_to_global_domain(self, handle: CommDomainHandle, domain_rank: int, data: bytes, **kwargs) -> None:
-        """Former L4 spelling of :meth:`copy_to_domain`."""
-        self.copy_to_domain(handle, domain_rank, data, **kwargs)
-
-    def copy_from_global_domain(self, handle: CommDomainHandle, domain_rank: int, nbytes: int, **kwargs) -> bytes:
-        """Former L4 spelling of :meth:`copy_from_domain`."""
-        return self.copy_from_domain(handle, domain_rank, nbytes, **kwargs)
+    # Former L4 spellings.
+    release_global_domain = release_domain
+    copy_to_global_domain = copy_to_domain
+    copy_from_global_domain = copy_from_domain
 
     def create_worker_chip_region(self, *, worker_id: int, payload_bytes: int, counter_bytes: int):
         """Create an L3-L2 communication region on one NEXT_LEVEL chip worker."""

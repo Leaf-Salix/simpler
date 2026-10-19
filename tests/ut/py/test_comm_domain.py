@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import struct
 import threading
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
@@ -45,7 +46,7 @@ from simpler.global_comm_domain import (
     encode_domain_command,
     resolve_global_comm_capability,
 )
-from simpler.orchestrator import Orchestrator
+from simpler.orchestrator import Orchestrator, _admit_task_submission, _callback_run
 from simpler.remote_l3_protocol import ControlName
 from simpler.task_interface import CommBufferSpec, CommDomainHandle, CommDomainRef, DataType, TaskArgs
 from simpler.worker import RunHandle, Worker
@@ -84,7 +85,8 @@ class _Runs:
         self.next_id += 1
         self.worker._building_run_resources = resources
         try:
-            value = fn(_orch(self.worker))
+            with _callback_run(run_id, self.worker):
+                value = fn(_orch(self.worker))
         finally:
             self.worker._building_run_resources = None
         return value, (run_id, resources)
@@ -505,6 +507,99 @@ def test_l3_copies_reach_the_member_chip_and_are_range_checked(l3, monkeypatch):
     ]
 
 
+def test_a_run_that_may_free_a_domain_orders_its_successor(l3):
+    _, _, runs = l3
+    domain, created = runs.build(_domain)
+    runs.finish(created)
+    # Any run holding a use may be the one whose fence frees the domain, a collective device command.
+    _, user = runs.build(_domain)
+    _, releasing = runs.build(lambda orch: _domain(orch).release())
+    assert user[1].requires_ordered_cleanup
+    assert domain in releasing[1].pending_release_domains and releasing[1].requires_ordered_cleanup
+
+
+def test_access_from_another_thread_is_not_a_use_by_the_building_run(l3):
+    _, chips, runs = l3
+    domain, created = runs.build(_domain)
+    runs.finish(created)
+    building, touched = threading.Event(), threading.Event()
+
+    def unrelated(_orch):
+        building.set()
+        assert touched.wait(5)
+
+    def monitor():
+        assert building.wait(5)
+        domain.member(0)
+        touched.set()
+
+    thread = threading.Thread(target=monitor)
+    thread.start()
+    _, run = runs.build(unrelated)
+    thread.join()
+    assert run[1] not in domain._users
+    runs.finish(run, RuntimeError("an unrelated task failed"))
+    assert not domain.released and chips.releases == []
+
+
+def test_creation_outside_a_callback_waits_its_turn_instead_of_deadlocking(l3):
+    worker, chips, _ = l3
+    holding, results = threading.Event(), {}
+
+    def building_run():
+        with worker._submit_mu.exclusive():
+            worker._building_run_resources = worker_mod._RunResources()
+            with _callback_run(1, worker):
+                holding.set()
+                time.sleep(0.2)
+                results["callback"] = _domain(_orch(worker))
+            worker._building_run_resources = None
+
+    def outside():
+        assert holding.wait(5)
+        try:
+            results["outside"] = _domain(_orch(worker))
+        except RuntimeError as exc:
+            results["outside"] = exc
+
+    threads = [threading.Thread(target=building_run, daemon=True), threading.Thread(target=outside, daemon=True)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    assert not any(thread.is_alive() for thread in threads)
+    assert isinstance(results["callback"], CommDomainHandle) and len(chips.allocations) == 1
+
+
+def test_concurrent_free_notifications_of_one_domain_are_harmless(l3):
+    worker, _, runs = l3
+    domain, _ = runs.build(_domain)
+    barrier = threading.Barrier(2, timeout=5)
+
+    class InterleavedGets(dict):
+        def get(self, key, default=None):
+            value = dict.get(self, key, default)
+            barrier.wait()
+            return value
+
+    worker._domain_by_slice = InterleavedGets(worker._domain_by_slice)
+    errors = []
+
+    def freed():
+        try:
+            worker._domain_freed(domain)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=freed) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    worker._domain_by_slice = dict(worker._domain_by_slice)
+    assert errors == [] and not worker._domain_by_slice
+
+
 # --------------------------------------------------------------------------------------------------
 # L4: the same API over the brokered backend, and the borrowed view an L3 node builds from it
 # --------------------------------------------------------------------------------------------------
@@ -725,6 +820,47 @@ def test_unproven_work_on_a_borrowed_domain_is_reported_up():
         assert worker._domain_use_unproven
         with pytest.raises(RuntimeError, match="no further work is admitted"):
             worker._require_no_ordered_cleanup_failure("submit")
+    finally:
+        worker._global_node_domains.clear()
+        worker._worker = None
+        worker.close()
+
+
+def test_borrowed_context_buffers_count_as_a_use():
+    worker, ref = _borrowing_node([])
+    runs = _Runs(worker)
+    try:
+
+        def submit(_orch):
+            with worker._task_domain_scope([ref]):
+                args = TaskArgs()
+                args.add_tensor(
+                    worker._get_domain(ref).local_context(1).buffers["scratch"].tensor([16], DataType.FLOAT32)
+                )
+                worker._admit_domain_uses((args,), (0,))
+
+        _, run = runs.build(submit)
+        runs.unproven.add(run[0])
+        runs.finish(run, RuntimeError("chip finalize failed"))
+        assert worker._domain_use_unproven
+    finally:
+        worker._global_node_domains.clear()
+        worker._worker = None
+        worker.close()
+
+
+def test_borrowed_copy_cannot_follow_a_submission():
+    worker, ref = _borrowing_node([])
+    runs = _Runs(worker)
+    try:
+
+        def copy_after_submit(orch):
+            with worker._task_domain_scope([ref]):
+                _admit_task_submission(worker)
+                with pytest.raises(RuntimeError, match="cannot follow a task submission"):
+                    orch.copy_to_domain(worker._get_domain(ref), 1, b"\1" * 8)
+
+        runs.build(copy_after_submit)
     finally:
         worker._global_node_domains.clear()
         worker._worker = None

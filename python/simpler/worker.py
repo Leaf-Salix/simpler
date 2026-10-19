@@ -155,7 +155,7 @@ from .comm_domain import (
     ChipDomainStore,
     CommDomainRegistry,
     DomainConfig,
-    domain_slice_name,
+    domain_slice_rank,
     domain_slices,
     domain_window_location,
 )
@@ -10228,13 +10228,17 @@ class Worker:
 
     def _comm_domain(self, *, name, members, window_size, buffers, retain_after_run, reuse) -> CommDomainHandle:
         config = self._domain_config(members, window_size, buffers, retain_after_run)
-        return self._comm_domains.acquire(
-            name,
-            config,
-            reuse=reuse,
-            create=lambda: self._create_comm_domain(name, config),
-            use=self._use_domain,
-        )
+        # Outside a callback, L3 creation reserves the worker before it registers a creation, so a
+        # building run that requests the same domain never waits on a creator blocked behind it.
+        outside = self.level == 3 and _callback_frame_for(self) is None
+        with self._control_admission("allocate_domain") if outside else contextlib.nullcontext():
+            return self._comm_domains.acquire(
+                name,
+                config,
+                reuse=reuse,
+                create=lambda: self._create_comm_domain(name, config),
+                use=self._use_domain,
+            )
 
     def _domain_config(self, members, window_size, buffers, retain_after_run) -> DomainConfig:
         """Normalize ordered members to full target identities; reject a bad request before any effect."""
@@ -10312,9 +10316,13 @@ class Worker:
         return handle
 
     def _use_domain(self, handle: CommDomainHandle) -> None:
-        """Accept the building run's use of an owned domain, so its backend free waits for that run."""
+        """Accept the building run's use of an owned domain, so its backend free waits for that run.
+
+        Only the run's own callback thread accepts a use. A run holding one may be the one whose fence
+        frees the domain, a collective device command, so its successor waits for that cleanup.
+        """
         resources = self._building_run_resources
-        if resources is None:
+        if resources is None or _callback_frame_for(self) is None:
             return
         live = resources.live_domains if self.level == 3 else resources.live_global_domains
         with resources.domain_lock:
@@ -10322,6 +10330,7 @@ class Worker:
                 return
             if not handle.released:
                 live[handle.name] = handle
+            resources.requires_ordered_cleanup = True
             with self._domain_claims_lock:
                 handle._users.add(resources)  # noqa: SLF001
 
@@ -10352,7 +10361,7 @@ class Worker:
         for context in handle.contexts.values():
             for buffer in context.buffers.values():
                 if self._domain_by_slice.get(buffer.identity) is handle:
-                    del self._domain_by_slice[buffer.identity]
+                    self._domain_by_slice.pop(buffer.identity, None)
 
     def _settle_domain_uses(self, resources: _RunResources, run_id: int, *, failed: bool) -> None:
         """Close what a failed run used, and keep every domain an unproven run used mapped."""
@@ -10400,6 +10409,10 @@ class Worker:
                 f"borrowed domain {handle.name!r} is accessible only inside a task that names it "
                 "(TaskArgs.add_domain_ref or a tensor over one of its slices)"
             )
+        # Its local mappings may reach a task without naming the domain, so any access counts.
+        resources = self._building_run_resources
+        if resources is not None and _callback_frame_for(self) is not None:
+            resources.borrowed_domain_used = True
 
     @contextlib.contextmanager
     def _task_domain_scope(self, refs) -> Iterator[None]:
@@ -10456,7 +10469,7 @@ class Worker:
                         accepted.append(slice_owner)
                     continue
                 handle = handles[domain_window_location(desc)[0]]
-                rank, _name = domain_slice_name(handle, desc)
+                rank = domain_slice_rank(handle, desc)
                 member = handle.members[rank]
                 holder = member.local_worker_id if self.level == 3 else member.node_worker_id
                 if holder != int(target):
@@ -10486,11 +10499,12 @@ class Worker:
             nbytes=int(nbytes),
             data=bytes(data) if copy_to_device else b"",
         )
-        if handle.borrowed:
-            return self._copy_global_domain_node(command, copy_to_device=copy_to_device)
-        self._require_owned_domain(handle)
+        if not handle.borrowed:
+            self._require_owned_domain(handle)
         if self.level == 3:
             with self._control_admission("copy_to_domain" if copy_to_device else "copy_from_domain"):
+                if handle.borrowed:
+                    return self._copy_global_domain_node(command, copy_to_device=copy_to_device)
                 return self._copy_chip_window(
                     member.local_worker_id, command, copy_to_device=copy_to_device, local=True
                 )
@@ -10887,7 +10901,7 @@ class Worker:
         for a domain that is already gone.
 
         A failed release propagates. Its run carries
-        ``requires_ordered_cleanup`` — that is set when the domain is created —
+        ``requires_ordered_cleanup`` — set when a run creates or uses the domain —
         so the error is what stops a successor from starting on top of device
         state nobody can describe.
         """

@@ -152,7 +152,11 @@ void Scheduler::worker_done(WorkerCompletion completion) {
     if (completion.admissible_run_resource_sets != 0 && cfg_.note_endpoint_capacity_cb) {
         cfg_.note_endpoint_capacity_cb(completion.worker_id, completion.admissible_run_resource_sets);
     }
-    if ((!completion.domain_use_settled || completion.outcome == EndpointOutcome::ENDPOINT_FAILURE) &&
+    // A completion naming no member of its group skips members that may still be running.
+    const bool bad_group_index =
+        s.is_group() && (completion.group_index < 0 || completion.group_index >= s.group_size());
+    if ((!completion.domain_use_settled || completion.outcome == EndpointOutcome::ENDPOINT_FAILURE ||
+         bad_group_index) &&
         cfg_.on_domain_use_unsettled_cb) {
         cfg_.on_domain_use_unsettled_cb(completion.task_slot);
     }

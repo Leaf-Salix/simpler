@@ -854,7 +854,7 @@ void Orchestrator::report_task_error(TaskSlot slot, const std::string &message) 
 }
 
 void Orchestrator::report_domain_use_unsettled(TaskSlot slot) {
-    // Reached from the scheduler's completion path, like mark_task_accepted below.
+    // Reached from a WorkerThread inside Scheduler::worker_done, like mark_task_accepted below.
     TaskSlotState *task = allocator_->slot_state(slot);
     if (task == nullptr) return;
     auto run = find_run(task->run_id);
