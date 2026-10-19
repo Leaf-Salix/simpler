@@ -11965,17 +11965,13 @@ class Worker:
         def _release(handle: GlobalCommDomainHandle) -> None:
             if handle.retain_after_run and not include_retained and not handle.released:
                 return
-            handle._released = True  # noqa: SLF001 -- runtime owns this transition
-            self._comm_domains.unpublish(handle)
-            if resources is None and self._domain_held_unproven(handle):
-                live_domains.pop(handle.name, None)
-                return
-            if resources is not None and not self._retire_domain_claim(handle, resources):
-                self._release_global_domain_handle(handle, resources)
-            else:
-                self._free_global_domain_after_fence(handle)
-            if live_domains.get(handle.name) is handle:
-                live_domains.pop(handle.name)
+            self._sweep_domain(
+                handle,
+                resources,
+                live_domains,
+                defer=self._release_global_domain_handle,
+                free=self._free_global_domain_after_fence,
+            )
 
         _raise_first(_release, list(live_domains.values())[::-1])
 
@@ -12050,28 +12046,26 @@ class Worker:
                 if live_domains.get(handle.name) is handle:
                     live_domains.pop(handle.name)
                 return
-            # Mark released first (flips handle._released so further indexing
-            # raises), then synchronously free.  The handle is not in the
-            # deferred-release queue, so we use the direct path.
-            if not handle.released:
-                handle._released = True  # noqa: SLF001 -- runtime owns the transition
-            self._comm_domains.unpublish(handle)
-            if resources is None and self._domain_held_unproven(handle):
-                # No collective free may race device work nobody proved drained; tree teardown
-                # reclaims the windows.
-                live_domains.pop(handle.name, None)
-                return
-            if resources is not None and not self._retire_domain_claim(handle, resources):
-                # Another run still uses it: its fence frees the domain.
-                self._release_domain_handle(handle, resources)
-            else:
-                self._release_domain_now(handle)
-                handle._freed = True  # noqa: SLF001
-                self._domain_freed(handle)
-            if live_domains.get(handle.name) is handle:
-                live_domains.pop(handle.name)
+            self._sweep_domain(
+                handle, resources, live_domains, defer=self._release_domain_handle, free=self._free_domain_after_fence
+            )
 
         _raise_first(_release, list(live_domains.values())[::-1])
+
+    def _sweep_domain(self, handle, resources, live_domains, *, defer, free) -> None:
+        """Release a swept domain; free it unless another run still uses it, whose fence then frees it."""
+        handle._released = True  # noqa: SLF001 -- runtime owns the transition
+        self._comm_domains.unpublish(handle)
+        if resources is None and self._domain_held_unproven(handle):
+            # No collective free may race device work nobody proved drained; tree teardown reclaims it.
+            live_domains.pop(handle.name, None)
+            return
+        if resources is not None and not self._retire_domain_claim(handle, resources):
+            defer(handle, resources)
+        else:
+            free(handle)
+        if live_domains.get(handle.name) is handle:
+            live_domains.pop(handle.name)
 
     # ------------------------------------------------------------------
     # memory management — forward to C++ Orchestrator, which holds

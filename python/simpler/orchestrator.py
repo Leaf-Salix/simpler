@@ -534,16 +534,11 @@ class Orchestrator:
     ) -> CommDomainHandle:
         """Create a communication domain; a live name raises ``ValueError``.
 
-        ``members`` are chips in dense-rank order: chip worker ids at L3 (``workers`` is that
-        level's former spelling), ``(node_worker_id, chip_worker_id)`` pairs at L4. ``name`` is a
-        key among this Worker's live domains, not a cross-Worker identity. ``buffers`` are carved
-        sequentially inside every rank's window. The whole configuration is checked before any
-        device side effect, and the handle is published only once every member committed.
-
-        ``retain_after_run=False`` reclaims the domain when the run ends; ``True`` keeps it for
-        later runs after a successful run. Either way the backend free waits for every run that
-        used the domain, and a failed run closes it. Use the handle as a context manager or call
-        ``release()``; ``Worker.close()`` reclaims anything left.
+        ``members`` are chips in dense-rank order: chip worker ids at L3 (``workers`` is the former
+        spelling), ``(node_worker_id, chip_worker_id)`` pairs at L4. The configuration is checked
+        before any device effect; the handle is published once every member committed. The backend
+        free waits for every run that used the domain; ``retain_after_run=True`` keeps it past a
+        successful run. See ``docs/comm-domain.md``.
         """
         return self._domain(name, members, workers, window_size, buffers, retain_after_run, reuse=False)
 
@@ -559,12 +554,8 @@ class Orchestrator:
     ) -> CommDomainHandle:
         """Return the live domain ``name`` when its whole configuration matches, else create it.
 
-        A hit allocates, handshakes, clears and loads nothing: it returns the registry's own
-        handle, with its identities and window contents. Every configuration field takes part —
-        ordered members, requested ``window_size``, each buffer's full definition,
-        ``retain_after_run`` and the communication topology — and a mismatch raises
-        ``ValueError`` naming the first difference. A concurrent request with the same
-        configuration waits for the one creation in progress.
+        A hit touches no device and returns the same handle; a mismatch in any field raises
+        ``ValueError`` naming the first difference.
         """
         return self._domain(name, members, workers, window_size, buffers, retain_after_run, reuse=True)
 

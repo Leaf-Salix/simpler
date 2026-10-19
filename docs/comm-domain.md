@@ -38,27 +38,21 @@ Worker's logical ids, never by physical device number. `member(rank)` and
 `handle.contexts` keep the L3 chip-id view of the local mappings. `workers=` is
 the former L3 spelling of `members=`.
 
-The handle exposes `members` (rank, node and chip of each member, plus its
-slices), `buffers` (each slice's complete immutable definition),
-`requested_window_size`, `mapping_size` (the backend's actual mapping), `ref`
-and the `released` / `freed` states. `member(rank).buffers[name]` is an
-address-free `DOMAIN_WINDOW` Buffer: a tensor over it keeps the slice's
-canonical identity for every view and offset, must be submitted toward the
-chip (L3) or node (L4) that holds that rank, and is resolved only by that chip
-against the slice catalog it installed. `local_context(rank)` is the device
-mapping this node holds for the rank and refuses a rank mapped elsewhere.
+`member(rank).buffers[name]` is an address-free `DOMAIN_WINDOW` Buffer: every
+view keeps the slice's canonical identity, a task over it must go to the chip
+(L3) or node (L4) holding that rank, and only that chip resolves it, against the
+slice catalog it installed. `local_context(rank)` is this node's device mapping
+for the rank. `mapping_size` is the backend's actual mapping.
 
 `get_or_allocate_domain` takes the same arguments. On a live name it returns
-the registry's own handle when the complete configuration matches — ordered
-members and their target identities, `window_size`, every `CommBufferSpec`
-field, `retain_after_run` and the communication topology — and raises
-`ValueError` naming the first difference otherwise. A hit allocates,
-handshakes, clears and loads nothing. A concurrent request with the same
-configuration waits for the one creation in progress; a name is published only
-after every member committed. `allocate_domain` refuses a live name, and
-`get_domain(name_or_ref)` never creates: a missing domain raises `KeyError`, a
-released one `RuntimeError`. The configuration is copied at creation, so
-mutating a caller's list or `CommBufferSpec` later changes nothing.
+the same handle when the whole configuration matches — ordered members,
+`window_size`, every `CommBufferSpec` field, `retain_after_run` and the
+topology — and otherwise raises `ValueError` naming the first difference. A hit
+allocates, handshakes, clears and loads nothing. A concurrent request with the
+same configuration waits for the one creation in progress; a name is published
+only after every member committed, and the configuration is an immutable copy.
+`allocate_domain` refuses a live name; `get_domain(name_or_ref)` never creates
+(missing: `KeyError`, released: `RuntimeError`).
 
 `ref` (`CommDomainRef`: creator Worker instance, domain id, generation) is the
 cross-node identity. A tensor over a slice adds its domain's ref to the
@@ -75,9 +69,9 @@ extent before resolving a slice.
 `GlobalCommDomainHandle` / `GlobalCommDomainView` names remain as thin
 compatibility spellings of the same registry and handle.
 
-`window_size` and the buffer layout are validated on the orch thread **before**
-any chip-side allocation: if `sum(b.nbytes) > window_size`, `allocate_domain`
-raises `ValueError` immediately and no backend allocation is registered.
+`window_size` is validated on the orch thread **before** any chip-side
+allocation: if `sum(b.nbytes) > window_size`, `allocate_domain` raises
+`ValueError` immediately and no backend allocation is registered.
 
 ### `ChipDomainContext` (a locally mapped rank, via `domain.local_context(rank)`)
 

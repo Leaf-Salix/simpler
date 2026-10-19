@@ -2302,12 +2302,6 @@ NB_MODULE(_task_interface, m) {
             }
         )
         .def(
-            "__ne__",
-            [](const CommDomainRef &a, const CommDomainRef &b) {
-                return a != b;
-            }
-        )
-        .def(
             "__hash__",
             [](const CommDomainRef &self) {
                 CanonicalIdentity key{};
