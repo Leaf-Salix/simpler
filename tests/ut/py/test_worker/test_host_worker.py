@@ -953,6 +953,10 @@ class _FakeChipRun:
         return self._lane._lane_poisoned
 
     @property
+    def domain_use_settled(self) -> bool:
+        return self.terminal and self.error is None
+
+    @property
     def preparation_disposition(self):
         return SimpleNamespace(value=self._disposition)
 
@@ -1491,6 +1495,53 @@ class _TwoFrameLoopHarness:
             self._mailbox_load_patch.stop()
             self.shm.close()
             self.shm.unlink()
+
+
+@pytest.mark.parametrize("native", ["refused", "settled", "unsettled"])
+def test_serial_chip_failure_reports_the_native_domain_use_proof(monkeypatch, native):
+    harness = _TwoFrameLoopHarness()
+    captured = {}
+    monkeypatch.setattr(
+        worker_mod, "_run_mailbox_loop", lambda _buf, _state, *, handle_task, **_kw: captured.update(task=handle_task)
+    )
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("chip run lane is closed" if native == "refused" else "terminal kernel failure")
+
+    native_run = SimpleNamespace(wait=fail, domain_use_settled=native == "settled")
+    harness.cw._submit_chip_run_materialized = fail if native == "refused" else lambda *_a, **_k: native_run
+    try:
+        worker_mod._run_chip_main_loop(
+            harness.cw,
+            harness.buf,
+            harness.mailbox_addr,
+            harness.mailbox_addr + _OFF_STATE,
+            0,
+            harness.registry,
+            harness.identity_table,
+            harness.identity_refs,
+            worker_mod.mint_owner_instance_id(),
+            chip_platform="a2a3",
+            prepared=harness.prepared,
+            granted_sets=1,
+            provider_region_store=_chip_loop_provider_region_store(chip_platform="a2a3"),
+        )
+        harness.publish(0, 1)
+        frame_offset = harness._frame_offset(0)
+        entry_offset = harness._entry_offset(0)
+        frame = harness.buf[frame_offset : frame_offset + worker_mod.MAILBOX_FRAME_SIZE]
+        entry = harness.buf[entry_offset : entry_offset + worker_mod.MAILBOX_RUN_ENTRY_STRIDE]
+        try:
+            code, msg, unproven = captured["task"](frame, entry)
+        finally:
+            frame.release()
+            entry.release()
+        assert code == 1 and ("chip run lane is closed" if native == "refused" else "terminal kernel failure") in msg
+        # A lane refusal comes before the run is queued, so it never reached the device; a run the
+        # lane returned is settled only by its own finalize or rollback.
+        assert unproven is (native == "unsettled")
+    finally:
+        harness.close()
 
 
 def test_two_frame_stages_b_without_native_prepare_until_a_finalizes():
@@ -4922,6 +4973,9 @@ class TestRunHandle:
             def _release_run(self, run_id):
                 self.released_runs.append(run_id)
 
+            def _run_domain_use_settled(self, _run_id):
+                return True
+
         def domain(name, allocation_id):
             return worker_mod.CommDomainHandle(
                 name=name,
@@ -5055,7 +5109,14 @@ class TestRunHandle:
         """
         worker = Worker(level=3, num_sub_workers=0)
         worker._worker = cast(Any, object())
-        worker._orch = cast(Any, type("FakeOrch", (), {"_release_run": lambda self, run_id: None})())
+        worker._orch = cast(
+            Any,
+            type(
+                "FakeOrch",
+                (),
+                {"_release_run": lambda self, run_id: None, "_run_domain_use_settled": lambda self, run_id: True},
+            )(),
+        )
 
         freed: list[str] = []
 
@@ -5320,7 +5381,14 @@ class TestRunHandle:
         """
         worker = Worker(level=3, num_sub_workers=0)
         worker._worker = cast(Any, object())
-        worker._orch = cast(Any, type("FakeOrch", (), {"_release_run": lambda self, run_id: None})())
+        worker._orch = cast(
+            Any,
+            type(
+                "FakeOrch",
+                (),
+                {"_release_run": lambda self, run_id: None, "_run_domain_use_settled": lambda self, run_id: True},
+            )(),
+        )
 
         freed: list[str] = []
 
@@ -6339,7 +6407,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         The chip must have said so first, or the parent excludes it from
         cleanup and the window is leaked for the worker's lifetime.
         """
-        request = SharedMemory(create=True, size=worker_mod._DOMAIN_REQ_HEADER.size + 8 + 4)
+        request = SharedMemory(create=True, size=worker_mod._DOMAIN_REQ_HEADER.size + 16 + 8 + 4)
         reply = SharedMemory(create=True, size=worker_mod._DOMAIN_REPLY_HEADER.size + 8)
         try:
             req_buf = cast(Any, request.buf)
@@ -6348,8 +6416,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             )  # allocation_id, rank_count, domain_rank, window_size, buffer_count
             # One buffer larger than the window: the carve raises after the
             # collective has already committed.
-            struct.pack_into("<Q", req_buf, worker_mod._DOMAIN_REQ_HEADER.size, 4096)
-            struct.pack_into("<I", req_buf, worker_mod._DOMAIN_REQ_HEADER.size + 8, 0)
+            struct.pack_into("<QQ8sI", req_buf, worker_mod._DOMAIN_REQ_HEADER.size, 4096, 1, b"creator1", 0)
 
             cw = cast(Any, SimpleNamespace())
 
@@ -6367,7 +6434,9 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 mailbox[offset : offset + len(encoded)] = encoded
 
             with pytest.raises(ValueError, match="overflows window_size"):
-                worker_mod._handle_ctrl_alloc_domain(cw, mailbox, base_comm_handle=1)
+                worker_mod._handle_ctrl_alloc_domain(
+                    cw, mailbox, base_comm_handle=1, domain_store=worker_mod.ChipDomainStore()
+                )
 
             assert worker_mod._domain_reply_committed(reply), (
                 "the window was allocated and the chip did not say so before failing"
@@ -6378,12 +6447,12 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 shm.unlink()
 
     def test_native_commit_publication_survives_result_conversion_failure(self):
-        request = SharedMemory(create=True, size=worker_mod._DOMAIN_REQ_HEADER.size + 4)
+        request = SharedMemory(create=True, size=worker_mod._DOMAIN_REQ_HEADER.size + 8 + 4)
         reply = SharedMemory(create=True, size=worker_mod._DOMAIN_REPLY_HEADER.size)
         try:
             req_buf = cast(Any, request.buf)
             worker_mod._DOMAIN_REQ_HEADER.pack_into(req_buf, 0, 7, 1, 0, 64, 0)
-            struct.pack_into("<I", req_buf, worker_mod._DOMAIN_REQ_HEADER.size, 0)
+            struct.pack_into("<8sI", req_buf, worker_mod._DOMAIN_REQ_HEADER.size, b"creator1", 0)
 
             def committed_then_failed(*args):
                 commit_address = args[5]
@@ -6401,7 +6470,9 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 mailbox[offset : offset + len(encoded)] = encoded
 
             with pytest.raises(MemoryError, match="tuple conversion failed"):
-                worker_mod._handle_ctrl_alloc_domain(cw, mailbox, base_comm_handle=1)
+                worker_mod._handle_ctrl_alloc_domain(
+                    cw, mailbox, base_comm_handle=1, domain_store=worker_mod.ChipDomainStore()
+                )
 
             assert worker_mod._domain_reply_committed(reply)
         finally:
@@ -6922,7 +6993,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 assert reply_shms is not None
                 reply = reply_shms[0]
                 assert reply.buf is not None
-                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 0)
+                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 64, 0)
 
             monkeypatch.setattr(worker, "_dispatch_control_domain", commit_domain)
         else:
@@ -7019,7 +7090,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 interrupt_main()
                 reply = reply_shms[0]
                 assert reply.buf is not None
-                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 0)
+                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 64, 0)
 
             monkeypatch.setattr(worker, "_dispatch_control_domain", commit_domain)
         else:
@@ -7694,7 +7765,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             staged_shms.extend(reply_shms.values())
             reply_buf = reply_shms[0].buf
             assert reply_buf is not None
-            worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply_buf, 0, 1, 0xC7, 0xB000, 0)
+            worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply_buf, 0, 1, 0xC7, 0xB000, 64, 0)
 
         monkeypatch.setattr(worker, "_dispatch_control_domain", successful_dispatch)
         real_close = worker_mod.os.close
@@ -7835,6 +7906,9 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
 class _StubOrch:
     def _release_run(self, run_id: int) -> None:
         pass
+
+    def _run_domain_use_settled(self, run_id: int) -> bool:
+        return True
 
 
 class _WatchedSet(set):

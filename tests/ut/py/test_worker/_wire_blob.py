@@ -59,10 +59,16 @@ def encode_tensor(t) -> bytes:
 
 
 def encode_blob(tensors=(), scalars=(), transfers=None) -> bytes:
-    """A task-args blob in `write_blob` format: [i32 count][i32 count][Tensor...][u64 scalar...]."""
+    """A task-args blob in `write_blob` format: [i32 count][i32 count][Tensor...][u64 scalar...]
+    [i32 domain-ref count][u32 0], with no domain references."""
     slots = []
     for i, tensor in enumerate(tensors):
         slot = bytearray(encode_tensor(tensor))
         slot[141] = (1 if int(tensor.buffer.address_space) == 0 else 0) if transfers is None else int(transfers[i])
         slots.append(bytes(slot))
-    return struct.pack("=ii", len(tensors), len(scalars)) + b"".join(slots) + struct.pack(f"<{len(scalars)}Q", *scalars)
+    return (
+        struct.pack("=ii", len(tensors), len(scalars))
+        + b"".join(slots)
+        + struct.pack(f"<{len(scalars)}Q", *scalars)
+        + struct.pack("<iI", 0, 0)
+    )

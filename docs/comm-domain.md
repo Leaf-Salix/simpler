@@ -16,29 +16,75 @@ submission internals see [orchestrator.md](orchestrator.md).
 
 ```python
 with orch.allocate_domain(
-    name="default",                       # local label (peers need not agree)
-    workers=[0, 1],                        # subset of the Worker's device_ids indices
+    name="default",                        # key among this Worker's live domains
+    members=[2, 0],                        # L3: chip worker ids; L4+: (node_worker_id, chip_worker_id)
     window_size=4096,                      # per-rank symmetric window, bytes
     buffers=[                              # named slices carved from the window
         CommBufferSpec(name="scratch", dtype="float32", count=1024, nbytes=4096),
     ],
-) as handle:
-    for chip_idx in handle.workers:
-        domain = handle[chip_idx]          # -> ChipDomainContext
-        ...
-        orch.submit_next_level(chip_handle, args, cfg, worker=chip_idx)
+) as domain:
+    for rank in range(len(domain.members)):  # member order defines dense domain ranks
+        member = domain.member(rank)
+        args = TaskArgs()
+        args.add_tensor(member.buffers["scratch"].tensor([1024], DataType.FLOAT32))
+        args.add_scalar(domain.local_context(rank).device_ctx)
+        orch.submit_next_level(chip_handle, args, cfg, worker=member.local_worker_id)
 ```
 
-`window_size` is validated on the orch thread **before** any chip-side
-allocation: if `sum(b.nbytes) > window_size`, `allocate_domain` raises
-`ValueError` immediately and no backend allocation is registered.
+L3 and L4 use the same methods and return the same `CommDomainHandle`; only
+member construction and task routing differ. `members` name chips by the
+Worker's logical ids, never by physical device number. `member(rank)` and
+`local_context(rank)` always take a dense domain rank; `handle[chip_id]` and
+`handle.contexts` keep the L3 chip-id view of the local mappings. `workers=` is
+the former L3 spelling of `members=`.
 
-### `ChipDomainContext` (one per participating chip, via `handle[chip_idx]`)
+The handle exposes `members` (rank, node and chip of each member, plus its
+slices), `buffers` (each slice's complete immutable definition),
+`requested_window_size`, `mapping_size` (the backend's actual mapping), `ref`
+and the `released` / `freed` states. `member(rank).buffers[name]` is an
+address-free `DOMAIN_WINDOW` Buffer: a tensor over it keeps the slice's
+canonical identity for every view and offset, must be submitted toward the
+chip (L3) or node (L4) that holds that rank, and is resolved only by that chip
+against the slice catalog it installed. `local_context(rank)` is the device
+mapping this node holds for the rank and refuses a rank mapped elsewhere.
+
+`get_or_allocate_domain` takes the same arguments. On a live name it returns
+the registry's own handle when the complete configuration matches — ordered
+members and their target identities, `window_size`, every `CommBufferSpec`
+field, `retain_after_run` and the communication topology — and raises
+`ValueError` naming the first difference otherwise. A hit allocates,
+handshakes, clears and loads nothing. A concurrent request with the same
+configuration waits for the one creation in progress; a name is published only
+after every member committed. `allocate_domain` refuses a live name, and
+`get_domain(name_or_ref)` never creates: a missing domain raises `KeyError`, a
+released one `RuntimeError`. The configuration is copied at creation, so
+mutating a caller's list or `CommBufferSpec` later changes nothing.
+
+`ref` (`CommDomainRef`: creator Worker instance, domain id, generation) is the
+cross-node identity. A tensor over a slice adds its domain's ref to the
+`TaskArgs`; a task that only needs `device_ctx` declares the domain with
+`args.add_domain_ref(domain.ref)`. A lower level resolves it with
+`orch.get_domain(ref)`, which grants a borrowed handle of the same type only
+inside a task that names the domain. A borrowed handle cannot `release()` or
+enter a `with` block. A ref locates a domain; the receiving chip still checks
+the task's grant, its own rank, the slice's catalog identity and the mapped
+extent before resolving a slice.
+
+`allocate_global_domain`, `release_global_domain`, `get_global_domain`,
+`copy_to_global_domain`, `copy_from_global_domain` and the
+`GlobalCommDomainHandle` / `GlobalCommDomainView` names remain as thin
+compatibility spellings of the same registry and handle.
+
+`window_size` and the buffer layout are validated on the orch thread **before**
+any chip-side allocation: if `sum(b.nbytes) > window_size`, `allocate_domain`
+raises `ValueError` immediately and no backend allocation is registered.
+
+### `ChipDomainContext` (a locally mapped rank, via `domain.local_context(rank)`)
 
 | Field | Meaning |
 | ----- | ------- |
 | `name` | the domain's local label |
-| `domain_rank` | this chip's dense rank within the subset (`workers.index(chip_idx)`) |
+| `domain_rank` | this chip's dense rank within the domain (its position in `members`) |
 | `domain_size` | number of ranks in the subset |
 | `device_ctx` | pointer to the device-side `CommContext` (pass as a kernel scalar) |
 | `local_window_base` | base device address of this rank's window |
@@ -46,8 +92,9 @@ allocation: if `sum(b.nbytes) > window_size`, `allocate_domain` raises
 | `buffers` | `{buffer_name: Buffer}` for each `CommBufferSpec` (device `VMM_WINDOW`, owned by this chip) |
 
 Kernels read peer windows through `device_ctx` (which holds every rank's
-window base, local + imported peer); `buffers[name]` is the local slice —
-name it in a task arg with `buffers[name].tensor(shapes, dtype)`.
+window base, local + imported peer); `buffers[name]` is the local slice as
+this node's device mapping — name it in a task arg with
+`buffers[name].tensor(shapes, dtype)` and dispatch it only to this chip.
 
 ### Global CommDomain across local and remote L3 nodes
 
@@ -56,7 +103,7 @@ forked local L3 workers (`add_worker`) and TCP-connected L3 workers
 (`add_remote_worker`) without `mpirun`:
 
 ```python
-with orch.allocate_global_domain(
+with orch.allocate_domain(
     name="tp",
     members=[(node0_worker_id, 0), (node1_worker_id, 0)],
     window_size=4096,
@@ -128,20 +175,22 @@ before a consumer can dereference a device window.
 
 The descriptor reports the backend's actual mapped size. A3 Fabric may align
 the requested size to its VMM granularity; buffer carving and bounds checks
-therefore use the returned mapping size. Handles and device pointers never
-cross the public Python API. Remote orchestration code calls
-`orch.get_global_domain(domain_id)` to obtain only its committed L3-local
-contexts.
+therefore use the returned mapping size. `PREPARE_EXPORT` also carries the
+creator's slice catalog, so every L3 node rebuilds the same canonical slice
+descriptors and gives each local chip the catalog for its rank. Device pointers
+never cross a node boundary. Remote orchestration code calls
+`orch.get_domain(args.domain_refs()[0])` inside its accepted task to obtain a
+borrowed handle and reaches its local rank through `local_context(rank)`.
 
-`copy_to_global_domain` and `copy_from_global_domain` provide bounded
-control-plane staging and smoke checks. Normal communication still runs in
-L2 kernels through the imported `CommContext`.
+`copy_to_domain` and `copy_from_domain` provide bounded control-plane staging
+and smoke checks at both levels. Normal communication still runs in L2 kernels
+through the imported `CommContext`.
 
-By default a live Global CommDomain is swept after the current `Worker.run`
-drains. Set `retain_after_run=True` when a communication kernel writes results
-into the window and a second L4 run must inspect them. The later run should
-call `domain.release()` after copying the results; `Worker.close()` is the
-final safety net.
+By default a live domain is swept after the current `Worker.run` drains. Set
+`retain_after_run=True` when a communication kernel writes results into the
+window and a later run must inspect them. The later run should call
+`domain.release()` after copying the results; `Worker.close()` is the final
+safety net.
 
 Repository CI exercises the complete transaction, rollback, and mixed
 local/remote paths with the `sim` backend. It also exercises the real
@@ -157,32 +206,39 @@ simulation checks. The job now drives their `test_*.py` wrappers through
 
 ## 2. Lifetime model
 
-The handle is a context manager. Its lifecycle has **two distinct states**:
+The handle is a context manager with three states:
 
+- **`live`** — published; lookup, access and submission are accepted.
 - **`released`** — set the moment `release()` is called (or the `with` block
-  exits). Further indexing (`handle[i]`) raises. This is the *user-visible*
-  state: "do not hand this domain to any new `submit_*`."
-- **`freed`** — the backend `comm_release_domain_windows` has actually run and
-  the device memory is gone. This happens **after** the owning run's completion
-  fence, never inside the `with` block.
+  exits), including on a handle `get_or_allocate_domain` returned from a hit,
+  since a hit shares the one handle. The name is free for a rebuild at once,
+  and new lookup, access and submission are refused. Tasks already accepted
+  keep resolving the domain.
+- **`freed`** — the backend windows are gone. This happens only after every
+  run that used the domain has passed its completion fence.
 
-This split exists because `submit_next_level()` only *enqueues* DAG work;
-`Worker.run()` does not wait for completion until the orch function returns.
-If `release()` freed memory immediately on `with`-exit, a still-queued task that
-captured the domain's `device_ctx` / `buffers` would read freed memory. So
-**release is deferred**: `release()` flips `released` and queues the backend
-free; the real free runs after the run fence, when every task that could
-reference the window has completed.
+This split exists because `submit_next_level()` only *enqueues* DAG work. Each
+run that creates, looks up, accesses or submits work naming a domain holds a
+use of it until its own fence; `release()` defers the backend free behind every
+such run, so a domain retained across runs is never freed under a still-running
+consumer, whichever run released it. A rebuilt domain under the same name is a
+new domain with new slice identities, and the old one's late cleanup touches
+only the old one.
 
-Mental model: like `with open(f) as fh: ...` — the user-visible close is
-lexical (end of block), the physical teardown is managed for you. Use
-`handle.released` to guard against accidental reuse; use `handle.freed` only if
-you must assert physical teardown.
+`retain_after_run=False` reclaims a domain when the run that used it ends;
+`True` keeps it after a successful run. A failed run closes every domain it
+used, retained or not, while each other run that still uses it keeps it mapped
+until that run ends. A completion that does not prove its device work drained —
+an endpoint failure, or a chip run that the chip itself could not prove
+finished, reported up from every level below — keeps every domain that run
+used mapped, refuses further work on the Worker and leaves the windows to
+whole-tree teardown, instead of marking them freed. A backend release failure
+stays tracked and is never replayed as a fresh collective free.
 
 Cleanup is **failure-safe**: even if a chip task fails and the run wait
 re-raises, `Worker.run` still executes pending releases and sweeps any live
-domains the orch fn forgot to release (LIFO), so a failed run cannot strand
-backend allocations into the next run.
+domains the orch fn forgot to release (LIFO), and `Worker.close()` reclaims
+every domain the Worker still owns.
 
 ---
 
@@ -327,8 +383,11 @@ still outstanding at that point; the AICPU poller never re-consumes them.
 
 ## 5. Staging host data into a window
 
-To preload host data (rather than have a kernel write the window), use
-`orch.copy_to`:
+To preload host bytes, use `orch.copy_to_domain(handle, rank, data, buffer=...,
+offset=...)`; `copy_from_domain(handle, rank, nbytes, ...)` reads them back.
+Both check the named buffer and the mapped window, take a domain rank, behave
+the same at L3 and L4, and do not wait for submitted DAG work. On an L3 the
+local chip mapping also works with `orch.copy_to`:
 
 ```python
 orch.copy_to(handle[chip_idx].buffers["input"], src_buffer)

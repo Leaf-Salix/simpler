@@ -389,12 +389,34 @@ def _select_mailbox_replies(
             bytes(reply_payload),
         )
 
+    def _rank_proves_settlement(rank_reply: bytes) -> bool:
+        try:
+            rank_frame = decode_frame(rank_reply)
+        except Exception:  # noqa: BLE001 -- a malformed rank reply proves nothing
+            return False
+        return rank_frame.header.frame_type is FrameType.COMPLETION and rank_frame.payload[-1:] == b"\x01"
+
+    def _with_group_settlement(reply: bytes) -> bytes:
+        # One rank answers for the group, so its completion proves the group's domain use drained
+        # only when every rank's completion does.
+        if not reply:
+            return reply
+        frame = decode_frame(reply)
+        if frame.header.frame_type is not FrameType.COMPLETION:
+            return reply
+        settled = len(replies_by_rank) == len(worker_ids) and all(
+            _rank_proves_settlement(rank_reply) for rank_reply in replies_by_rank.values()
+        )
+        return encode_frame(frame.header, frame.payload[:-1] + bytes([int(settled)]))
+
     replies_by_rank = {int(result_rank): bytes(reply) for result_rank, executed, reply, _error in gathered if executed}
     if request.target is MailboxTarget.GROUP and request.payloads and request.payloads[0]:
         requested_worker_id = int(decode_frame(request.payloads[0]).header.worker_id)
         if requested_worker_id in worker_ids:
             requested_rank = worker_ids.index(requested_worker_id)
-            return (_for_request(replies_by_rank.get(requested_rank, b""), request.payloads[0]),)
+            return (
+                _with_group_settlement(_for_request(replies_by_rank.get(requested_rank, b""), request.payloads[0])),
+            )
     if request.target is MailboxTarget.RANK:
         return (_for_request(replies_by_rank.get(request.target_rank, b""), request.payloads[0]),)
     if request.target is MailboxTarget.PER_RANK:

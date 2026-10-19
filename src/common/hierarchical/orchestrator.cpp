@@ -459,6 +459,10 @@ bool Orchestrator::run_done(RunId run_id) const {
     return is_terminal(get_run(run_id)->phase.load(std::memory_order_acquire));
 }
 
+bool Orchestrator::run_domain_use_settled(RunId run_id) const {
+    return get_run(run_id)->domain_use_settled.load(std::memory_order_acquire);
+}
+
 bool Orchestrator::run_failed(RunId run_id) const {
     auto run = get_run(run_id);
     std::lock_guard<std::mutex> lk(run->completion_mu);
@@ -847,6 +851,14 @@ size_t Orchestrator::begin_run_waiter_count_for_test() const {
 void Orchestrator::report_task_error(TaskSlot slot, const std::string &message) {
     TaskSlotState &task = slot_state(slot);
     record_run_error(task.run_id, std::make_exception_ptr(std::runtime_error(message)));
+}
+
+void Orchestrator::report_domain_use_unsettled(TaskSlot slot) {
+    // Reached from the scheduler's completion path, like mark_task_accepted below.
+    TaskSlotState *task = allocator_->slot_state(slot);
+    if (task == nullptr) return;
+    auto run = find_run(task->run_id);
+    if (run != nullptr) run->domain_use_settled.store(false, std::memory_order_release);
 }
 
 void Orchestrator::mark_task_accepted(TaskSlot slot) {
@@ -1445,6 +1457,13 @@ void Orchestrator::validate_remote_sidecars(
         for (int32_t i = 0; i < args.tensor_count(); ++i) {
             const Tensor &ref = args.tensor(i);
             const RemoteTensorSidecar &tensor_sidecar = sidecar.tensors[static_cast<size_t>(i)];
+            // A domain slice is resolved by the receiving L3 from its own mapping, never by a sidecar.
+            if (ref.buffer.backend_kind == static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW)) {
+                if (tensor_sidecar.present) {
+                    throw std::invalid_argument("Orchestrator: a domain tensor must not carry a remote sidecar");
+                }
+                continue;
+            }
             // A remote arg carries no local backing: its Tensor is a placeholder (nbytes 0 or a
             // REMOTE_SIDECAR backend) and the real descriptor lives in the sidecar.
             bool has_local_backing =

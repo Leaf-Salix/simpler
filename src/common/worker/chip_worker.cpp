@@ -398,6 +398,7 @@ void ChipWorker::init(
         comm_alloc_domain_windows_fn_ = load_symbol<CommAllocDomainWindowsFn>(handle, "comm_alloc_domain_windows");
         comm_release_domain_windows_fn_ =
             load_symbol<CommReleaseDomainWindowsFn>(handle, "comm_release_domain_windows");
+        comm_get_domain_window_size_fn_ = load_symbol<CommGetDomainWindowSizeFn>(handle, "comm_get_domain_window_size");
         comm_global_domain_prepare_fn_ = load_symbol<CommGlobalDomainPrepareFn>(handle, "comm_global_domain_prepare");
         comm_global_domain_import_fn_ = load_symbol<CommGlobalDomainImportFn>(handle, "comm_global_domain_import");
         comm_global_domain_release_fn_ = load_symbol<CommGlobalDomainReleaseFn>(handle, "comm_global_domain_release");
@@ -819,6 +820,7 @@ void ChipWorker::clear_runtime_binding() {
     comm_derive_context_fn_ = nullptr;
     comm_alloc_domain_windows_fn_ = nullptr;
     comm_release_domain_windows_fn_ = nullptr;
+    comm_get_domain_window_size_fn_ = nullptr;
     comm_global_domain_prepare_fn_ = nullptr;
     comm_global_domain_import_fn_ = nullptr;
     comm_global_domain_release_fn_ = nullptr;
@@ -2255,6 +2257,18 @@ void ChipWorker::comm_release_domain_windows(
     if (rc != 0) {
         throw std::runtime_error("comm_release_domain_windows failed with code " + std::to_string(rc));
     }
+}
+
+size_t ChipWorker::comm_get_domain_window_size(uint64_t comm_handle, uint64_t allocation_id) {
+    if (comm_get_domain_window_size_fn_ == nullptr) {
+        throw std::runtime_error("comm_get_domain_window_size is not supported by this runtime");
+    }
+    size_t size = 0;
+    int rc = comm_get_domain_window_size_fn_(reinterpret_cast<void *>(comm_handle), allocation_id, &size);
+    if (rc != 0 || size == 0) {
+        throw std::runtime_error("comm_get_domain_window_size failed with code " + std::to_string(rc));
+    }
+    return size;
 }
 
 std::tuple<std::vector<uint8_t>, uint64_t, size_t> ChipWorker::comm_global_domain_prepare(

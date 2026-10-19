@@ -282,6 +282,18 @@ int comm_alloc_domain_windows(
 int comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
 
 /**
+ * Report the bytes actually mapped for one committed domain allocation's local window.
+ *
+ * The backend may round the requested window up to its mapping granularity.
+ *
+ * @param h               Base handle from comm_init().
+ * @param allocation_id   Id of a live comm_alloc_domain_windows allocation.
+ * @param size_out        [out] Mapped window bytes.
+ * @return 0 on success, non-zero when the allocation is unknown.
+ */
+int comm_get_domain_window_size(CommHandle h, uint64_t allocation_id, size_t *size_out);
+
+/**
  * Create one local window for a Global CommDomain and export its transport
  * descriptor. This operation has no
  * HCCL or filesystem bootstrap dependency.

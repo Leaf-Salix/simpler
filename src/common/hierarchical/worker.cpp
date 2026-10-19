@@ -223,6 +223,9 @@ void Worker::init() {
     cfg.on_task_failed_cb = [this](TaskSlot slot, const std::string &message) {
         orchestrator_.report_task_error(slot, message);
     };
+    cfg.on_domain_use_unsettled_cb = [this](TaskSlot slot) {
+        orchestrator_.report_domain_use_unsettled(slot);
+    };
     cfg.reservation_stall_sink = report_reservation_stall;
 
     scheduler_.start(cfg);

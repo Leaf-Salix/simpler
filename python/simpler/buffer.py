@@ -1056,6 +1056,8 @@ class ImportContext:
 
     deployment: EndpointDeployment
     device_owner_instance_id: bytes | None = None
+    # A chip's resolver of address-free DOMAIN_WINDOW slices to its own mapping of them.
+    domain_resolver: Callable[[BufferDescriptor], int] | None = None
 
 
 class ImportRegistry:
@@ -1094,7 +1096,24 @@ class ImportRegistry:
         named mechanism out. Nothing after selection looks at ``backend_kind`` again. A mechanism
         that reaches the backing without producing an address is refused *here* rather than there --
         this returns a mapping, and that is the only narrowing it applies to the judgment.
+
+        A ``DOMAIN_WINDOW`` slice is the exception: it names a window the domain owns rather than a
+        backing this endpoint maps, so the chip's domain resolver checks its task's grant on every
+        receipt and nothing is cached.
         """
+        if desc.backend_kind == BackendKind.DOMAIN_WINDOW:
+            if self._context.deployment != DEVICE_AICPU or self._context.domain_resolver is None:
+                raise ValueError(f"ImportRegistry: {desc.identity} is a domain window slice and needs a chip mapping")
+            return ImportedBuffer(
+                desc.identity,
+                self._context.domain_resolver(desc),
+                desc.nbytes,
+                desc.address_space,
+                None,
+                desc,
+                AdapterProfile.DEVICE_LOCAL,
+                capabilities_for_adapter(AdapterKind.DIRECT_MAP, desc.access),
+            )
         key = desc.identity
         cached = self._by_identity.get(key)
         if cached is not None:

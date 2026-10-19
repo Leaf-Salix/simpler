@@ -436,6 +436,10 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def("_run_done", &Orchestrator::run_done, nb::arg("run_id"))
         .def(
+            "_run_domain_use_settled", &Orchestrator::run_domain_use_settled, nb::arg("run_id"),
+            "Whether every task of a terminal run proved its device work drained."
+        )
+        .def(
             "_current_run_failed_for_test", &Orchestrator::current_building_run_failed_for_test,
             "Report whether an asynchronous failure has reached the run whose graph is still being built."
         )
@@ -957,6 +961,7 @@ inline void bind_worker(nb::module_ &m) {
     entry_offsets["error_text"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, error_text));
     entry_offsets["admissible_run_resource_sets"] =
         static_cast<uint64_t>(offsetof(MailboxRunEntry, admissible_run_resource_sets));
+    entry_offsets["domain_use_unproven"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, domain_use_unproven));
     m.attr("MAILBOX_RUN_ENTRY_OFFSETS") = entry_offsets;
     nb::dict frame_offsets;
     frame_offsets["entry_index"] = static_cast<int64_t>(MAILBOX_OFF_FRAME_ENTRY_INDEX);

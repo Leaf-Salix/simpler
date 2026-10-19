@@ -218,6 +218,8 @@ public:
     void wait_run(RunId run_id);
     bool wait_run_for(RunId run_id, double timeout_seconds);
     bool run_done(RunId run_id) const;
+    bool run_domain_use_settled(RunId run_id) const;
+    void report_domain_use_unsettled(TaskSlot slot);
     bool run_failed(RunId run_id) const;
     bool can_dispatch_run(RunId run_id) const;
 

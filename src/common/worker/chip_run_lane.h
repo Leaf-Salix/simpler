@@ -43,6 +43,8 @@ public:
 
     bool launched() const;
     bool lane_poisoned() const;
+    /** Terminal, and finalize or rollback proved no device work of this run remains. */
+    bool domain_use_settled() const;
     ChipRunPreparationDisposition preparation_disposition() const;
 
 private:

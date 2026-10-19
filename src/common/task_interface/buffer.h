@@ -86,8 +86,8 @@ enum class AccessMode : uint8_t {
 
 // Materialization backend of a buffer. The consumer resolves a Tensor to a local address via the
 // import registry keyed by canonical identity; this tag selects how. REMOTE_SIDECAR is reserved for
-// P2 and rejected on decode in P1. Values 0–5 are frozen; VMM_SHAREABLE is 6; 7.. reserved
-// (unknown tag => reject).
+// P2 and rejected on decode in P1. Values 0–5 are frozen; VMM_SHAREABLE is 6; DOMAIN_WINDOW is 7;
+// 8.. reserved (unknown tag => reject).
 //
 // FORK_SHM and FORK_COW materialize identically — the body is a base VA the child already has,
 // inherited across the fork — but the kernel's write semantics are opposite, so they are separate
@@ -98,6 +98,9 @@ enum class AccessMode : uint8_t {
 // VMM_WINDOW and VMM_SHAREABLE are distinct tags: the former's body is an already-valid owner-chip
 // device VA that cannot leave that context, while the latter carries a shareable handle an importer
 // maps for itself.
+//
+// DOMAIN_WINDOW names one rank's slice of a communication-domain window by `DomainWindowBody`. It
+// carries no address: the worker that holds that rank's mapping resolves it.
 enum class BackendKind : uint8_t {
     FORK_SHM = 0,
     POSIX_SHM = 1,
@@ -106,7 +109,46 @@ enum class BackendKind : uint8_t {
     DEVICE_MALLOC = 4,
     FORK_COW = 5,
     VMM_SHAREABLE = 6,
+    DOMAIN_WINDOW = 7,
 };
+
+/**
+ * Immutable communication-domain identity: creator Worker instance, creator-local domain id, and the
+ * generation of that id. It locates a domain; it does not authorize access to one.
+ */
+struct CommDomainRef {
+    uint8_t owner_instance_id[OWNER_INSTANCE_ID_BYTES];
+    uint64_t domain_id;
+    uint32_t generation;
+    uint32_t reserved;
+};
+
+static_assert(std::is_trivially_copyable_v<CommDomainRef> && std::is_standard_layout_v<CommDomainRef>);
+static_assert(sizeof(CommDomainRef) == 24, "CommDomainRef is wire ABI");
+
+inline bool operator==(const CommDomainRef &a, const CommDomainRef &b) {
+    return a.domain_id == b.domain_id && a.generation == b.generation &&
+           std::memcmp(a.owner_instance_id, b.owner_instance_id, OWNER_INSTANCE_ID_BYTES) == 0;
+}
+inline bool operator!=(const CommDomainRef &a, const CommDomainRef &b) { return !(a == b); }
+
+inline void validate_comm_domain_ref(const CommDomainRef &ref) {
+    if (ref.domain_id == 0 || ref.generation == 0 || ref.reserved != 0)
+        throw std::invalid_argument("invalid CommDomainRef: domain_id/generation must be nonzero and reserved zero");
+}
+
+// DOMAIN_WINDOW body: the domain, the dense rank whose window holds the slice, and the slice's byte
+// offset in that window. The slice extent is the descriptor's `nbytes`.
+struct DomainWindowBody {
+    uint8_t owner_instance_id[OWNER_INSTANCE_ID_BYTES];
+    uint64_t domain_id;
+    uint32_t generation;
+    uint32_t domain_rank;
+    uint64_t offset;
+};
+
+static_assert(std::is_trivially_copyable_v<DomainWindowBody> && std::is_standard_layout_v<DomainWindowBody>);
+static_assert(sizeof(DomainWindowBody) == DESC_MAX_BYTES, "DomainWindowBody fills the descriptor body");
 
 /**
  * Canonical allocation identity — globally unique across owner incarnations, unchanged across every
@@ -196,6 +238,24 @@ static_assert(offsetof(BufferDescriptor, nbytes) == 40);
 static_assert(offsetof(BufferDescriptor, owner_worker_path_id) == 48);
 static_assert(offsetof(BufferDescriptor, body_len) == 52);
 static_assert(offsetof(BufferDescriptor, body) == 56);
+
+inline DomainWindowBody domain_window_body(const BufferDescriptor &desc) {
+    if (desc.backend_kind != static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW) || desc.body_len != DESC_MAX_BYTES)
+        throw std::invalid_argument("invalid BufferDescriptor: DOMAIN_WINDOW body must be exactly 32 bytes");
+    DomainWindowBody body;
+    std::memcpy(&body, desc.body, sizeof(body));
+    return body;
+}
+
+inline CommDomainRef domain_window_ref(const BufferDescriptor &desc) {
+    const DomainWindowBody body = domain_window_body(desc);
+    CommDomainRef ref{};
+    std::memcpy(ref.owner_instance_id, body.owner_instance_id, OWNER_INSTANCE_ID_BYTES);
+    ref.domain_id = body.domain_id;
+    ref.generation = body.generation;
+    validate_comm_domain_ref(ref);
+    return ref;
+}
 
 // Field-wise, so neither the struct padding nor the unused tail of `body` takes part: two decodes of
 // one backing describe the same buffer whatever bytes sit outside the fields that carry meaning.
@@ -298,7 +358,7 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     if (h.address_space > static_cast<uint8_t>(AddressSpace::DEVICE))
         reject("invalid BufferDescriptor: address_space out of range");
     if (h.access > static_cast<uint8_t>(AccessMode::READWRITE)) reject("invalid BufferDescriptor: access out of range");
-    if (h.backend_kind > static_cast<uint8_t>(BackendKind::VMM_SHAREABLE))
+    if (h.backend_kind > static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW))
         reject("invalid BufferDescriptor: backend_kind out of range");
     if (h.body_len > DESC_MAX_BYTES) reject("invalid BufferDescriptor: body_len exceeds DESC_MAX_BYTES");
     if (h.identity.generation == 0) reject("invalid BufferDescriptor: generation 0 is reserved (uninitialized)");
@@ -308,7 +368,7 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     const bool device_space = h.address_space == static_cast<uint8_t>(AddressSpace::DEVICE);
     if (backend != BackendKind::REMOTE_SIDECAR) {
         const bool device_backend = backend == BackendKind::VMM_WINDOW || backend == BackendKind::DEVICE_MALLOC ||
-                                    backend == BackendKind::VMM_SHAREABLE;
+                                    backend == BackendKind::VMM_SHAREABLE || backend == BackendKind::DOMAIN_WINDOW;
         if (device_backend != device_space)
             reject("invalid BufferDescriptor: unsupported address_space x backend_kind (capability matrix)");
     }
@@ -366,6 +426,16 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
         if (shareable_handle == 0) reject("invalid BufferDescriptor: VMM_SHAREABLE shareable_handle must be nonzero");
         if (mapping_bytes == 0) reject("invalid BufferDescriptor: VMM_SHAREABLE mapping_bytes must be nonzero");
         if (mapping_bytes < h.nbytes) reject("invalid BufferDescriptor: VMM_SHAREABLE mapping_bytes must cover nbytes");
+        break;
+    }
+    case BackendKind::DOMAIN_WINDOW: {
+        const CommDomainRef ref = domain_window_ref(h);
+        const DomainWindowBody body = domain_window_body(h);
+        // Only the domain's creator mints the catalog of its slices.
+        if (std::memcmp(ref.owner_instance_id, h.identity.owner_instance_id, OWNER_INSTANCE_ID_BYTES) != 0)
+            reject("invalid BufferDescriptor: DOMAIN_WINDOW creator does not own the canonical identity");
+        if (h.nbytes == 0 || body.offset > UINT64_MAX - h.nbytes)
+            reject("invalid BufferDescriptor: DOMAIN_WINDOW slice extent is zero or overflows");
         break;
     }
     case BackendKind::REMOTE_SIDECAR:

@@ -1059,6 +1059,7 @@ void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dis
     const uint64_t group_size = static_cast<uint64_t>(state.group_size());
     entry->error = 0;
     entry->preparation_disposition = static_cast<int32_t>(MailboxPreparationDisposition::NONE);
+    entry->domain_use_unproven = 0;
     std::memset(entry->error_text, 0, MAILBOX_ERROR_MSG_SIZE);
     entry->run_epoch = 0;
     entry->protocol = MAILBOX_TASK_PROTOCOL_VERSION;
@@ -1189,6 +1190,7 @@ WorkerCompletion LocalMailboxEndpoint::terminal_completion(
     // same reason, as the two fields above.
     completion.worker_id = caps_.worker_id;
     completion.admissible_run_resource_sets = entry->admissible_run_resource_sets;
+    completion.domain_use_settled = entry->domain_use_unproven == 0;
     if (state == MailboxState::TASK_FAILED || error_code != 0) {
         const size_t text_len = ::strnlen(entry->error_text, MAILBOX_ERROR_MSG_SIZE);
         completion.outcome = EndpointOutcome::TASK_FAILURE;

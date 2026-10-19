@@ -45,6 +45,9 @@ struct ChipRunState {
     bool pipeline_leased{true};
     bool activated{false};
     bool crossed_launch_fence{false};
+    // Set where its caller references are discharged: finalize or a clean rollback proved that no
+    // device work of this run can still reach the memory its arguments name.
+    bool domain_use_settled{false};
     bool depth_one_fallback{false};
     // Its prepare asked to wait: the device resources it needs are held by a
     // consumer this worker will finish, and its saved plan is what the next
@@ -297,6 +300,7 @@ struct ChipRunLaneState {
      * stay unreadable rather than being served mid-write.
      */
     void release_device_spans(const std::shared_ptr<ChipRunState> &run, bool proven_done) noexcept {
+        run->domain_use_settled = proven_done;
         if (!run->caller_references_live) return;
         worker->release_caller_device_borrow(borrow_identity(*run), !proven_done);
         run->caller_references_live = false;
@@ -818,6 +822,13 @@ bool ChipRun::lane_poisoned() const {
     lane_->validate_process();
     std::lock_guard<std::mutex> lk(lane_->mu);
     return lane_->poison != nullptr;
+}
+
+bool ChipRun::domain_use_settled() const {
+    if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
+    lane_->validate_process();
+    std::lock_guard<std::mutex> lk(lane_->mu);
+    return run_->phase == ChipRunState::Phase::TERMINAL && run_->domain_use_settled;
 }
 
 ChipRunPreparationDisposition ChipRun::preparation_disposition() const {

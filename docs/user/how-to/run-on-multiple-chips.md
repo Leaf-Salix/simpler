@@ -57,20 +57,20 @@ To direct a task at one specific child rather than any free one, see
 
 Cross-chip collectives run through a **communication domain**: a symmetric
 memory window that every participating rank can address. Allocate it inside the
-orchestration function, as a context manager, and index it by *domain-local*
-rank:
+orchestration function, as a context manager, and address it by *domain rank*
+(the position of a member in `members`):
 
 ```python
 def orch_fn(orch, _args, cfg):
     with orch.allocate_domain(
         name="default",
-        workers=list(range(nranks)),
+        members=list(range(nranks)),
         window_size=window_size,
         buffers=[CommBufferSpec(name="scratch", dtype="float32",
                                 count=elems, nbytes=scratch_nbytes)],
     ) as handle:
         for i in range(nranks):
-            domain = handle[i]          # domain-local rank i
+            domain = handle.local_context(i)  # domain rank i
             ...                         # build per-rank args, submit per chip
 ```
 

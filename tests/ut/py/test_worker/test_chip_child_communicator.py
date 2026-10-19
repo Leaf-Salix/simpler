@@ -42,12 +42,14 @@ def _run_controls(monkeypatch, init_results, commands):
         spec_set=(
             "comm_init",
             "comm_alloc_domain_windows",
+            "comm_get_domain_window_size",
             "comm_release_domain_windows",
             "set_exported_device_regions_live",
         )
     )
     cw.comm_init.side_effect = init_results
     cw.comm_alloc_domain_windows.return_value = (0xC7, 0xB000)
+    cw.comm_get_domain_window_size.return_value = 64
     responses = []
     owner = worker_mod.mint_owner_instance_id()
     store = ProviderRegionStore(
@@ -69,11 +71,11 @@ def _run_controls(monkeypatch, init_results, commands):
         worker_mod._COMM_INIT_HEADER.pack_into(init_buf, 0, 0, 1)
         path_offset = worker_mod._COMM_INIT_HEADER.size
         init_buf[path_offset : path_offset + len(rootinfo_path)] = rootinfo_path
-        domain_request = allocate(worker_mod._DOMAIN_REQ_HEADER.size + 4)
+        domain_request = allocate(worker_mod._DOMAIN_REQ_HEADER.size + 8 + 4)
         domain_buf = domain_request.buf
         assert domain_buf is not None
         worker_mod._DOMAIN_REQ_HEADER.pack_into(domain_buf, 0, 7, 1, 0, 64, 0)
-        struct.pack_into("<I", domain_buf, worker_mod._DOMAIN_REQ_HEADER.size, 0)
+        struct.pack_into("<8sI", domain_buf, worker_mod._DOMAIN_REQ_HEADER.size, owner, 0)
         reply = allocate(worker_mod._DOMAIN_REPLY_HEADER.size)
         with memoryview(bytearray(worker_mod.mailbox_size(1))) as mailbox:
             address = ctypes.addressof(ctypes.c_char.from_buffer(mailbox))
@@ -127,7 +129,7 @@ def test_bootstrap_handle_is_forwarded_without_mutating_runtime(monkeypatch):
     assert allocated[:5] == (0x1234, 7, [0], 0, 64)
     assert allocated[5] != 0
     cw.comm_release_domain_windows.assert_called_once_with(0x1234, 7, 1, 0)
-    assert published == (1, 0xC7, 0xB000, 0)
+    assert published == (1, 0xC7, 0xB000, 64, 0)
 
     cold, refused, _ = _run_controls(monkeypatch, [], [worker_mod._CTRL_ALLOC_DOMAIN, worker_mod._CTRL_RELEASE_DOMAIN])
     assert all(code == 1 and "CTRL_COMM_INIT must succeed first" in message for code, message in refused)

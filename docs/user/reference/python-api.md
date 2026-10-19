@@ -113,7 +113,7 @@ cannot walk a legal-looking length past the end.
 | ------ | ----- |
 | `run(callable, args=None, config=None, *, caller_stream=None) -> None` | Blocks until the run completes |
 | `submit(callable, args=None, config=None, *, caller_stream=None) -> RunHandle` | Non-blocking |
-| `live_domains() -> dict[str, CommDomainHandle]` | Currently allocated communication domains |
+| `live_domains -> dict[str, CommDomainHandle]` | Live communication domains this Worker created, at L3 or L4 |
 
 `RunHandle` exposes the `done` property, `wait(timeout=None)`, and
 `result(timeout=None)`.
@@ -167,7 +167,11 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | `submit_next_level(callable_handle, args, config=None, *, worker: int) -> TaskHandle` | Hands a callable to one exact NEXT_LEVEL child and returns an opaque handle for explicit task dependencies |
 | `submit_next_level_group(callable_handle, args_list, config=None, *, workers: list[int]) -> TaskHandle` | Submits one group DAG node and returns its opaque handle |
 | `submit_sub(callable_handle, args=None)` | Schedules a registered host-side Python callable |
-| `allocate_domain(*, name, workers, window_size, buffers=())` | Context manager returning a handle indexed by domain-local rank |
+| `allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | Creates a domain; members are chip ids at L3 and `(node, chip)` pairs at L4, and their order defines dense domain ranks |
+| `get_or_allocate_domain(...)` | Same arguments; returns the live handle only when the whole configuration matches |
+| `get_domain(name_or_ref)` | Lookup only; a ref from an upper level grants a borrowed handle inside a task that names it |
+| `release_domain(handle)` | Releases a domain this Worker created; the backend free waits for every run that used it |
+| `copy_to_domain(handle, rank, data, *, buffer=None, offset=0)` / `copy_from_domain(handle, rank, nbytes, ...)` | Bounded synchronous control-plane staging into / out of one rank's window |
 | `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Delegates allocation to the owning Worker; target chip memory is named by the returned handle |
 
 ## Callables and task args

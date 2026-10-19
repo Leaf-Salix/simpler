@@ -191,3 +191,47 @@ TEST(ChildMemory, ReusingAnOwnedViewAcrossGrowthPreservesEachRequest) {
         EXPECT_EQ(args.transfer(i), i % 2 ? TensorTransfer::NONE : TensorTransfer::H2D);
     }
 }
+
+TEST(ChildMemory, DomainRefsTravelWithTheBlobAndEveryDomainSliceDeclaresOne) {
+    CommDomainRef ref{};
+    std::memcpy(ref.owner_instance_id, "creator1", OWNER_INSTANCE_ID_BYTES);
+    ref.domain_id = 3;
+    ref.generation = 1;
+    Tensor slice = make_wire_tensor(5, AddressSpace::DEVICE);
+    slice.buffer.backend_kind = static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW);
+    std::memcpy(slice.buffer.identity.owner_instance_id, "creator1", OWNER_INSTANCE_ID_BYTES);
+    DomainWindowBody body{};
+    std::memcpy(body.owner_instance_id, "creator1", OWNER_INSTANCE_ID_BYTES);
+    body.domain_id = 3;
+    body.generation = 1;
+    slice.buffer.body_len = DESC_MAX_BYTES;
+    std::memcpy(slice.buffer.body, &body, sizeof(body));
+
+    TaskArgs args;
+    args.add_tensor(slice);
+    args.add_domain_ref(ref);
+    ASSERT_EQ(args.domain_refs().size(), 1u);
+    EXPECT_EQ(args.domain_refs()[0], ref);
+    CommDomainRef other = ref;
+    other.domain_id = 4;
+    args.add_domain_ref(other);
+    args.add_scalar(9);
+
+    std::vector<uint8_t> blob(task_args_blob_size(args));
+    write_blob(blob.data(), args);
+    TaskArgsView view = read_blob(blob.data(), blob.size());
+    ASSERT_EQ(view.domain_ref_count, 2);
+    EXPECT_EQ(view.domain_ref(0), ref);
+    EXPECT_EQ(view.domain_ref(1), other);
+    EXPECT_EQ(view.tensors(0).buffer, slice.buffer);
+    EXPECT_EQ(view.scalars[0], 9u);
+    EXPECT_THROW(read_blob(blob.data(), blob.size() - 1), std::runtime_error);
+
+    // A slice whose domain the blob does not declare names nothing its receiver may grant.
+    view.domain_ref_count = 1;
+    view.domain_ref_bytes += sizeof(CommDomainRef);
+    EXPECT_THROW(view.tensors(0), std::invalid_argument);
+
+    args.clear();
+    EXPECT_TRUE(args.domain_refs().empty());
+}

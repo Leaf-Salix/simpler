@@ -98,7 +98,7 @@ bool mailbox_compare_exchange_state(char *frame, MailboxState expected, MailboxS
 static constexpr size_t MAILBOX_FRAME_SIZE = 65536;
 static constexpr size_t MAILBOX_CONTROL_FRAME = 0;
 static constexpr size_t MAILBOX_FIRST_TASK_FRAME = 1;
-static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 7;
+static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 8;
 
 // Error message region. 256 B of headroom is enough for
 // `<ExceptionType>: <short message>` produced by the child-side Python loops;
@@ -174,6 +174,9 @@ struct MailboxRunEntry {
        a child that does not size itself leaves it alone. Appended last so no
        existing field's offset moves. */
     uint32_t admissible_run_resource_sets;
+    /* Child, before the terminal state: nonzero when the task's device work, or that of a task it
+       submitted below, is not proven drained. The parent clears it on allocate. */
+    uint32_t domain_use_unproven;
 };
 static_assert(
     std::is_trivially_copyable_v<MailboxRunEntry> && std::is_standard_layout_v<MailboxRunEntry>,
@@ -328,7 +331,8 @@ static constexpr size_t MAILBOX_ARGS_CAPACITY =
 // rather than the first 256-tensor task.
 static_assert(
     MAILBOX_ARGS_CAPACITY >= TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(CHIP_MAX_TENSOR_ARGS) * sizeof(Tensor) +
-                                 static_cast<size_t>(CHIP_MAX_SCALAR_ARGS) * sizeof(uint64_t),
+                                 static_cast<size_t>(CHIP_MAX_SCALAR_ARGS) * sizeof(uint64_t) +
+                                 TASK_ARGS_BLOB_DOMAIN_REF_HEADER_SIZE,
     "mailbox args region must hold the largest args blob the runtime accepts (issue #1024)"
 );
 

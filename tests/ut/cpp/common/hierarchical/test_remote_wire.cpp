@@ -403,3 +403,76 @@ TEST(RemoteWire, RejectsTransferThatTheProtocolWouldLose) {
         EXPECT_THROW((void)remote_l3::encode_remote_task_args(args), std::runtime_error);
     }
 }
+
+namespace {
+
+Tensor domain_arg_tensor(const CommDomainRef &ref) {
+    Tensor tensor = remote_arg_tensor();
+    tensor.buffer.address_space = static_cast<uint8_t>(AddressSpace::DEVICE);
+    tensor.buffer.backend_kind = static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW);
+    std::memcpy(tensor.buffer.identity.owner_instance_id, ref.owner_instance_id, OWNER_INSTANCE_ID_BYTES);
+    DomainWindowBody body{};
+    std::memcpy(body.owner_instance_id, ref.owner_instance_id, OWNER_INSTANCE_ID_BYTES);
+    body.domain_id = ref.domain_id;
+    body.generation = ref.generation;
+    body.domain_rank = 1;
+    body.offset = 12;
+    tensor.buffer.body_len = DESC_MAX_BYTES;
+    std::memcpy(tensor.buffer.body, &body, sizeof(body));
+    validate_tensor(tensor);
+    return tensor;
+}
+
+}  // namespace
+
+TEST(RemoteWire, DomainSliceTravelsBesideARemoteSidecarWithItsDeclaredRef) {
+    CommDomainRef ref{};
+    ref.owner_instance_id[0] = 7;
+    ref.domain_id = 19;
+    ref.generation = 2;
+    const Tensor domain = domain_arg_tensor(ref);
+
+    remote_l3::RemoteTaskArgsWire args;
+    args.tensors = {domain, remote_arg_tensor()};
+    args.domain_refs = {ref};
+    RemoteTensorSidecar sidecar{};
+    sidecar.present = true;
+    sidecar.desc.address_space = RemoteAddressSpace::HOST_INLINE;
+    sidecar.desc.owner_worker_id = 0;
+    sidecar.desc.nbytes = 4;
+    sidecar.desc.inline_payload_len = 4;
+    args.remote_desc = {{}, sidecar};
+    args.inline_payload = {1, 2, 3, 4};
+    auto bytes = remote_l3::encode_remote_task_args(args);
+    auto decoded = remote_l3::decode_remote_task_args(bytes.data(), bytes.size());
+    EXPECT_EQ(decoded.domain_refs, args.domain_refs);
+    EXPECT_EQ(decoded.tensors[0].buffer, domain.buffer);
+    EXPECT_FALSE(decoded.remote_desc[0].present);
+    EXPECT_TRUE(decoded.remote_desc[1].present);
+
+    // A ref names a domain without a tensor; a slice whose domain is undeclared is refused.
+    remote_l3::RemoteTaskArgsWire ref_only;
+    ref_only.domain_refs = {ref};
+    auto ref_bytes = remote_l3::encode_remote_task_args(ref_only);
+    EXPECT_EQ(remote_l3::decode_remote_task_args(ref_bytes.data(), ref_bytes.size()).domain_refs, ref_only.domain_refs);
+    args.domain_refs.clear();
+    bytes = remote_l3::encode_remote_task_args(args);
+    EXPECT_THROW(remote_l3::decode_remote_task_args(bytes.data(), bytes.size()), std::runtime_error);
+
+    args.domain_refs = {ref};
+    args.remote_desc[0] = sidecar;
+    EXPECT_THROW(remote_l3::encode_remote_task_args(args), std::runtime_error);
+}
+
+TEST(RemoteWire, CompletionCarriesWhetherDomainUseIsProven) {
+    remote_l3::CompletionPayload completion{42, 1, "descendant did not settle", false};
+    auto bytes = remote_l3::encode_completion(completion);
+    EXPECT_FALSE(remote_l3::decode_completion(bytes.data(), bytes.size(), 42).domain_use_settled);
+    completion.domain_use_settled = true;
+    bytes = remote_l3::encode_completion(completion);
+    EXPECT_TRUE(remote_l3::decode_completion(bytes.data(), bytes.size(), 42).domain_use_settled);
+    bytes.back() = 2;
+    EXPECT_THROW(remote_l3::decode_completion(bytes.data(), bytes.size(), 42), std::runtime_error);
+    bytes.pop_back();
+    EXPECT_THROW(remote_l3::decode_completion(bytes.data(), bytes.size(), 42), std::runtime_error);
+}

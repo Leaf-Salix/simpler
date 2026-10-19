@@ -140,6 +140,8 @@ int comm_get_local_window_base(CommHandle h, uint64_t *base_out) { return PTO_RU
 
 int comm_get_window_size(CommHandle h, size_t *size_out) { return PTO_RUNTIME_ERR_INTERNAL; }
 
+int comm_get_domain_window_size(CommHandle, uint64_t, size_t *) { return PTO_RUNTIME_ERR_INTERNAL; }
+
 int comm_derive_context(
     CommHandle h, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank, size_t window_offset,
     size_t window_size, uint64_t *device_ctx_out

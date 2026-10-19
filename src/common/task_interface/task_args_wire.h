@@ -35,6 +35,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -57,8 +58,18 @@
 class TaskArgs : private TaskArgsTpl<Tensor, uint64_t, 0, 0, TensorArgType> {
     using Base = TaskArgsTpl<Tensor, uint64_t, 0, 0, TensorArgType>;
     std::vector<TensorTransfer> transfers_;
+    // Domains this task is accepted to use: one per distinct DOMAIN_WINDOW tensor, plus any domain
+    // named without a tensor. A receiver grants borrowed access only to the domains its task lists.
+    std::vector<CommDomainRef> domain_refs_;
 
 public:
+    void add_domain_ref(const CommDomainRef &ref) {
+        validate_comm_domain_ref(ref);
+        if (std::find(domain_refs_.begin(), domain_refs_.end(), ref) == domain_refs_.end()) domain_refs_.push_back(ref);
+    }
+
+    const std::vector<CommDomainRef> &domain_refs() const { return domain_refs_; }
+
     using Base::add_dep;
     using Base::add_dep_wait;
     using Base::add_scalar;
@@ -83,6 +94,8 @@ public:
         }
         if (!scalars_.empty()) throw std::logic_error("TaskArgs: cannot add tensor after scalar");
         const Tensor value = t;  // t may refer to an existing entry invalidated by reserve.
+        if (value.buffer.backend_kind == static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW))
+            add_domain_ref(domain_window_ref(value.buffer));
         // Every append below is non-allocating, so allocation failure cannot separate a view
         // from its tag or request. Growth remains geometric for large host argument lists.
         if (tensors_.size() == tensors_.capacity() || tensors_.size() == tags_.capacity() ||
@@ -108,6 +121,7 @@ public:
     void clear() {
         Base::clear();
         transfers_.clear();
+        domain_refs_.clear();
     }
 };
 
@@ -131,6 +145,16 @@ struct TaskArgsView {
     // not promise. Copy a tensor out with tensors(i).
     const uint8_t *tensor_bytes;
     const uint64_t *scalars;  // 8-byte aligned by blob construction; safe to address as uint64_t*
+    int32_t domain_ref_count;
+    const uint8_t *domain_ref_bytes;
+
+    CommDomainRef domain_ref(int32_t i) const {
+        if (i < 0 || i >= domain_ref_count) throw std::out_of_range("TaskArgsView::domain_ref: index out of range");
+        CommDomainRef ref;
+        std::memcpy(&ref, domain_ref_bytes + static_cast<size_t>(i) * sizeof(CommDomainRef), sizeof(ref));
+        validate_comm_domain_ref(ref);
+        return ref;
+    }
 
     // Copy the i-th tensor into a properly-aligned local and gate it. Bounds-checked: a negative
     // index would otherwise wrap to a huge offset once cast to size_t. This is the ONLY validation
@@ -144,6 +168,13 @@ struct TaskArgsView {
         std::memcpy(&t, tensor_bytes + static_cast<size_t>(i) * sizeof(Tensor), sizeof(Tensor));
         t._pad[0] = 0;
         validate_tensor(t);
+        if (t.buffer.backend_kind == static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW)) {
+            const CommDomainRef ref = domain_window_ref(t.buffer);
+            bool declared = false;
+            for (int32_t j = 0; j < domain_ref_count && !declared; ++j)
+                declared = domain_ref(j) == ref;
+            if (!declared) throw std::invalid_argument("TaskArgsView: domain tensor has no declared domain reference");
+        }
         return t;
     }
 
@@ -168,7 +199,9 @@ struct TaskArgsView {
 //   offset 4:                 int32 scalar_count = S
 //   offset 8:                 argument slots[T]             (144 B each; view + transfer at byte 141)
 //   offset 8 + 144T:          uint64_t scalars[S]           (8 B each)
-// total bytes used:           8 + 144T + 8S
+//   offset 8 + 144T + 8S:     int32 domain_ref_count = R, uint32 reserved = 0
+//   offset 16 + 144T + 8S:    CommDomainRef domain_refs[R]  (24 B each)
+// total bytes used:           16 + 144T + 8S + 24R
 //
 // Each slot carries the self-describing `Tensor` view and its invocation transfer, so a
 // consumer resolves it with no prior handshake. A chip child materializes each one to a
@@ -176,9 +209,12 @@ struct TaskArgsView {
 
 inline constexpr size_t TASK_ARGS_BLOB_HEADER_SIZE = 8;
 
+inline constexpr size_t TASK_ARGS_BLOB_DOMAIN_REF_HEADER_SIZE = 8;
+
 inline size_t task_args_blob_size(const TaskArgs &a) {
     return TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(a.tensor_count()) * sizeof(Tensor) +
-           static_cast<size_t>(a.scalar_count()) * sizeof(uint64_t);
+           static_cast<size_t>(a.scalar_count()) * sizeof(uint64_t) + TASK_ARGS_BLOB_DOMAIN_REF_HEADER_SIZE +
+           a.domain_refs().size() * sizeof(CommDomainRef);
 }
 
 // Serialize a TaskArgs into `dst`. Caller must ensure `dst` has room for
@@ -199,6 +235,18 @@ inline void write_blob(uint8_t *dst, const TaskArgs &a) {
         std::memcpy(
             dst + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(T) * sizeof(Tensor), a.scalar_data(),
             static_cast<size_t>(S) * sizeof(uint64_t)
+        );
+    }
+    uint8_t *refs = dst + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(T) * sizeof(Tensor) +
+                    static_cast<size_t>(S) * sizeof(uint64_t);
+    const int32_t R = static_cast<int32_t>(a.domain_refs().size());
+    const uint32_t reserved = 0;
+    std::memcpy(refs, &R, sizeof(R));
+    std::memcpy(refs + sizeof(R), &reserved, sizeof(reserved));
+    if (R > 0) {
+        std::memcpy(
+            refs + TASK_ARGS_BLOB_DOMAIN_REF_HEADER_SIZE, a.domain_refs().data(),
+            static_cast<size_t>(R) * sizeof(CommDomainRef)
         );
     }
 }
@@ -228,8 +276,21 @@ inline TaskArgsView read_blob(const uint8_t *src, size_t capacity) {
             "read_blob: negative counts — tensors=" + std::to_string(T) + ", scalars=" + std::to_string(S)
         );
     }
-    const size_t needed = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(T) * sizeof(Tensor) +
-                          static_cast<size_t>(S) * sizeof(uint64_t);
+    const size_t refs_offset = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(T) * sizeof(Tensor) +
+                               static_cast<size_t>(S) * sizeof(uint64_t);
+    if (refs_offset + TASK_ARGS_BLOB_DOMAIN_REF_HEADER_SIZE > capacity) {
+        throw std::runtime_error(
+            "read_blob: header reports " + std::to_string(refs_offset + TASK_ARGS_BLOB_DOMAIN_REF_HEADER_SIZE) +
+            " bytes before domain references but capacity is " + std::to_string(capacity)
+        );
+    }
+    int32_t R;
+    uint32_t reserved;
+    std::memcpy(&R, src + refs_offset, sizeof(R));
+    std::memcpy(&reserved, src + refs_offset + sizeof(R), sizeof(reserved));
+    if (R < 0 || reserved != 0) throw std::runtime_error("read_blob: invalid domain reference header");
+    const size_t needed =
+        refs_offset + TASK_ARGS_BLOB_DOMAIN_REF_HEADER_SIZE + static_cast<size_t>(R) * sizeof(CommDomainRef);
     if (needed > capacity) {
         throw std::runtime_error(
             "read_blob: header reports " + std::to_string(needed) + " bytes (T=" + std::to_string(T) +
@@ -242,6 +303,8 @@ inline TaskArgsView read_blob(const uint8_t *src, size_t capacity) {
         S,
         src + TASK_ARGS_BLOB_HEADER_SIZE,
         reinterpret_cast<const uint64_t *>(src + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(T) * sizeof(Tensor)),
+        R,
+        src + refs_offset + TASK_ARGS_BLOB_DOMAIN_REF_HEADER_SIZE,
     };
 }
 

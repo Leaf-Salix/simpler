@@ -23,10 +23,12 @@
 
 namespace remote_l3 {
 
+// 5: TASK carries the task's accepted domain references and DOMAIN_WINDOW tensors; COMPLETION carries
+// whether the task's domain uses are proven complete.
 // 4: `BufferDescriptor.nbytes` is the whole backing extent and a `Tensor` may carry a non-zero
 // `byte_offset`. Version 3 interprets those fields differently even though the wire layout is
 // identical, so the frame header rejects a peer that would decode the wrong semantics.
-static constexpr uint32_t PROTOCOL_VERSION = 4;
+static constexpr uint32_t PROTOCOL_VERSION = 5;
 inline constexpr size_t FRAME_HEADER_BYTES = 40;
 static constexpr uint32_t MAX_FRAME_PAYLOAD_BYTES = 16U * 1024U * 1024U;
 static constexpr uint32_t MAX_STRING_BYTES = 1024U;
@@ -118,6 +120,7 @@ struct RemoteTaskArgsWire {
     std::vector<RemoteTensorSidecar> remote_desc;
     std::vector<uint64_t> scalars;
     std::vector<uint8_t> inline_payload;
+    std::vector<CommDomainRef> domain_refs;
 };
 
 struct TaskPayloadWire {
@@ -130,6 +133,7 @@ struct CompletionPayload {
     uint64_t sequence{0};
     int32_t error_code{0};
     std::string error_message;
+    bool domain_use_settled{false};
 };
 
 struct ControlPayload {

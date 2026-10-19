@@ -123,6 +123,7 @@ TEST(BufferAbi, EnumValuesAreFrozen) {
     EXPECT_EQ(static_cast<uint8_t>(BackendKind::DEVICE_MALLOC), 4);
     EXPECT_EQ(static_cast<uint8_t>(BackendKind::FORK_COW), 5);
     EXPECT_EQ(static_cast<uint8_t>(BackendKind::VMM_SHAREABLE), 6);
+    EXPECT_EQ(static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW), 7);
 }
 
 // --- memcpy round trip -------------------------------------------------------------------------
@@ -543,3 +544,57 @@ TEST(BufferAbi, DecodedIdentityIgnoresWirePadding) {
 }
 
 }  // namespace
+
+// --- DOMAIN_WINDOW ----------------------------------------------------------------------------
+
+namespace {
+
+BufferDescriptor make_domain_window_descriptor(uint64_t offset = 64) {
+    BufferDescriptor h{};
+    h.magic = BUFFER_DESCRIPTOR_MAGIC;
+    h.address_space = static_cast<uint8_t>(AddressSpace::DEVICE);
+    h.access = static_cast<uint8_t>(AccessMode::READWRITE);
+    h.backend_kind = static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW);
+    std::memcpy(h.identity.owner_instance_id, "creator1", OWNER_INSTANCE_ID_BYTES);
+    h.identity.buffer_id = 5;
+    h.identity.generation = 1;
+    h.nbytes = 128;
+    DomainWindowBody body{};
+    std::memcpy(body.owner_instance_id, "creator1", OWNER_INSTANCE_ID_BYTES);
+    body.domain_id = 3;
+    body.generation = 1;
+    body.domain_rank = 2;
+    body.offset = offset;
+    h.body_len = DESC_MAX_BYTES;
+    std::memcpy(h.body, &body, sizeof(body));
+    return h;
+}
+
+}  // namespace
+
+TEST(BufferAbi, DomainWindowNamesItsCreatorsSliceWithoutAnAddress) {
+    EXPECT_EQ(sizeof(CommDomainRef), 24u);
+    const BufferDescriptor h = make_domain_window_descriptor();
+    EXPECT_NO_THROW(validate_buffer_descriptor(h));
+    const CommDomainRef ref = domain_window_ref(h);
+    EXPECT_EQ(ref.domain_id, 3u);
+    EXPECT_EQ(ref.generation, 1u);
+    EXPECT_EQ(std::memcmp(ref.owner_instance_id, "creator1", OWNER_INSTANCE_ID_BYTES), 0);
+
+    BufferDescriptor host = h;
+    host.address_space = static_cast<uint8_t>(AddressSpace::HOST);
+    EXPECT_THROW(validate_buffer_descriptor(host), std::invalid_argument);
+    BufferDescriptor foreign = h;
+    foreign.identity.owner_instance_id[0] ^= 1;
+    EXPECT_THROW(validate_buffer_descriptor(foreign), std::invalid_argument);
+    BufferDescriptor empty = h;
+    empty.nbytes = 0;
+    EXPECT_THROW(validate_buffer_descriptor(empty), std::invalid_argument);
+    EXPECT_THROW(validate_buffer_descriptor(make_domain_window_descriptor(UINT64_MAX - 64)), std::invalid_argument);
+    BufferDescriptor short_body = h;
+    short_body.body_len = 24;
+    EXPECT_THROW(validate_buffer_descriptor(short_body), std::invalid_argument);
+    BufferDescriptor no_domain = h;
+    std::memset(no_domain.body + offsetof(DomainWindowBody, domain_id), 0, sizeof(uint64_t));
+    EXPECT_THROW(validate_buffer_descriptor(no_domain), std::invalid_argument);
+}

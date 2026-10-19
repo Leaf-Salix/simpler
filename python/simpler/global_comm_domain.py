@@ -69,6 +69,9 @@ CTRL_GLOBAL_DOMAIN_IMPORT = 20
 CTRL_GLOBAL_DOMAIN_RELEASE = 21
 CTRL_GLOBAL_DOMAIN_COPY_TO = 22
 CTRL_GLOBAL_DOMAIN_COPY_FROM = 23
+# The same LOCAL_COPY_* exchange against an L3-local domain allocation, named by its allocation id.
+CTRL_LOCAL_DOMAIN_COPY_TO = 28
+CTRL_LOCAL_DOMAIN_COPY_FROM = 29
 
 LOCAL_DOMAIN_MAGIC = b"SGD1"
 LOCAL_PREPARE_REQUEST = struct.Struct("<4sIQQIIIQ")
@@ -116,6 +119,33 @@ class GlobalDomainAttachment:
 class GlobalDomainBuffer:
     name: str
     nbytes: int
+
+
+@dataclass(frozen=True)
+class CommBufferDefinition:
+    """The immutable form of a ``CommBufferSpec``: one named window slice exactly as declared."""
+
+    name: str
+    dtype: str
+    count: int
+    nbytes: int
+    load_from_host: bool = False
+    store_to_host: bool = False
+
+
+@dataclass(frozen=True)
+class GlobalDomainCatalog:
+    """The creator's logical slice catalog, carried by PREPARE_EXPORT only.
+
+    ``buffer_ids[rank * len(buffers) + index]`` is the canonical ``buffer_id`` of ``rank``'s slice of
+    ``buffers[index]``; each identity is owned by ``owner_instance_id`` at generation 1. A receiving
+    L3 rebuilds the same address-free slice descriptors from it, so a tensor its parent built over a
+    slice compares equal to the one the L3 derives itself.
+    """
+
+    owner_instance_id: bytes
+    buffers: tuple[CommBufferDefinition, ...]
+    buffer_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -213,6 +243,7 @@ class GlobalDomainCommand:
     buffers: tuple[GlobalDomainBuffer, ...]
     descriptors: tuple[GlobalDomainDescriptor, ...] = ()
     attachments: tuple[GlobalDomainAttachment, ...] = ()
+    catalog: GlobalDomainCatalog | None = None
 
     def attachments_for_node(self, node_worker_id: int) -> tuple[GlobalDomainAttachment, ...]:
         """Return the row addressed to one receiving L3 node.
@@ -668,6 +699,22 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
             raise ValueError("global domain IMPORT/COMMIT requires a complete descriptor table")
     elif command.descriptors:
         raise ValueError("global domain PREPARE/ABORT must not carry descriptors")
+    catalog = command.catalog
+    if catalog is not None:
+        if command.phase is not GlobalDomainPhase.PREPARE_EXPORT:
+            raise ValueError("global domain catalog is only carried by PREPARE_EXPORT")
+        if len(catalog.owner_instance_id) != 8:
+            raise ValueError("global domain catalog owner_instance_id must be 8 bytes")
+        if tuple((spec.name, spec.nbytes) for spec in catalog.buffers) != tuple(
+            (buffer.name, buffer.nbytes) for buffer in command.buffers
+        ):
+            raise ValueError("global domain catalog buffers do not match the command buffers")
+        if len(catalog.buffer_ids) != len(command.members) * len(command.buffers):
+            raise ValueError("global domain catalog needs one buffer id per rank slice")
+        if any(buffer_id <= 0 for buffer_id in catalog.buffer_ids) or len(set(catalog.buffer_ids)) != len(
+            catalog.buffer_ids
+        ):
+            raise ValueError("global domain catalog buffer ids must be positive and distinct")
 
     out = bytearray(
         struct.pack(
@@ -693,6 +740,13 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
     out.extend(struct.pack("<I", len(command.descriptors)))
     for descriptor in command.descriptors:
         out.extend(descriptor.encode())
+    out.extend(struct.pack("<I", int(catalog is not None)))
+    if catalog is not None:
+        out.extend(catalog.owner_instance_id)
+        for spec in catalog.buffers:
+            _put_string(out, spec.dtype, "buffer.dtype")
+            out.extend(struct.pack("<QBB", int(spec.count), int(spec.load_from_host), int(spec.store_to_host)))
+        out.extend(struct.pack(f"<{len(catalog.buffer_ids)}Q", *catalog.buffer_ids))
     return bytes(out)
 
 
@@ -726,6 +780,26 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
         GlobalDomainDescriptor.decode(reader.fixed(GLOBAL_DOMAIN_DESCRIPTOR_BYTES, "descriptor"))
         for _ in range(descriptor_count)
     )
+    catalog_present = reader.u32()
+    if catalog_present not in (0, 1):
+        raise ValueError("global domain catalog presence must be 0 or 1")
+    catalog = None
+    if catalog_present:
+        owner_instance_id = reader.fixed(8, "catalog owner")
+        specs = []
+        for buffer in buffers:
+            dtype = reader.string("buffer.dtype")
+            count, load_from_host, store_to_host = struct.unpack("<QBB", reader.fixed(10, "buffer definition"))
+            if load_from_host > 1 or store_to_host > 1:
+                raise ValueError("global domain buffer host flags must be 0 or 1")
+            specs.append(
+                CommBufferDefinition(
+                    buffer.name, dtype, count, buffer.nbytes, bool(load_from_host), bool(store_to_host)
+                )
+            )
+        id_count = member_count * buffer_count
+        buffer_ids = struct.unpack(f"<{id_count}Q", reader.fixed(8 * id_count, "catalog buffer ids"))
+        catalog = GlobalDomainCatalog(bytes(owner_instance_id), tuple(specs), tuple(buffer_ids))
     reader.done("ALLOC_DOMAIN")
     command = GlobalDomainCommand(
         phase=phase,
@@ -738,6 +812,7 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
         buffers=buffers,
         descriptors=descriptors,
         attachments=attachments,
+        catalog=catalog,
     )
     encode_domain_command(command)
     return command

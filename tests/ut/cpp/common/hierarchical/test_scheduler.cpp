@@ -164,6 +164,7 @@ struct MockMailboxWorker {
     std::atomic<bool> should_complete{false};
     std::atomic<bool> drain_mode{false};
     int32_t next_error_code{0};
+    bool next_domain_use_unproven{false};
     std::string next_error_msg;
     std::atomic<bool> is_running{false};
     std::atomic<bool> stop_flag{false};
@@ -223,10 +224,11 @@ struct MockMailboxWorker {
         run_cv.notify_one();
     }
 
-    void complete_with_error(std::string msg) {
+    void complete_with_error(std::string msg, bool domain_use_unproven = false) {
         std::lock_guard<std::mutex> lk(run_mu);
         next_error_code = 1;
         next_error_msg = std::move(msg);
+        next_domain_use_unproven = domain_use_unproven;
         should_complete.store(true, std::memory_order_release);
         run_cv.notify_one();
     }
@@ -389,8 +391,11 @@ private:
     }
 
     /** Publish one run's terminal into its entry: rc and text first, the state last. */
-    void publish_terminal(MailboxRunEntry *entry, int32_t error_code, const std::string &error_msg) {
+    void publish_terminal(
+        MailboxRunEntry *entry, int32_t error_code, const std::string &error_msg, bool domain_use_unproven = false
+    ) {
         entry->error = error_code;
+        entry->domain_use_unproven = domain_use_unproven ? 1 : 0;
         std::memset(entry->error_text, 0, MAILBOX_ERROR_MSG_SIZE);
         if (!error_msg.empty()) {
             const size_t n = std::min(error_msg.size(), static_cast<size_t>(MAILBOX_ERROR_MSG_SIZE - 1));
@@ -494,17 +499,20 @@ private:
         }
         int32_t error_code = 0;
         std::string error_msg;
+        bool domain_use_unproven = false;
         {
             std::lock_guard<std::mutex> lk(run_mu);
             error_code = next_error_code;
             error_msg = std::move(next_error_msg);
+            domain_use_unproven = next_domain_use_unproven;
             next_error_code = 0;
             next_error_msg.clear();
+            next_domain_use_unproven = false;
         }
         is_running.store(false, std::memory_order_release);
 
         // The run's own terminal, into its own entry, and this side's last access to it.
-        publish_terminal(entry, error_code, error_msg);
+        publish_terminal(entry, error_code, error_msg, domain_use_unproven);
     }
 
     /** Hand back one frame the fixture released, and carry on from where the hold stopped. */
@@ -1401,6 +1409,9 @@ struct SchedulerFixture : public ::testing::Test {
         };
         c.on_task_failed_cb = [this](TaskSlot s, const std::string &message) {
             orch.report_task_error(s, message);
+        };
+        c.on_domain_use_unsettled_cb = [this](TaskSlot s) {
+            orch.report_domain_use_unsettled(s);
         };
         c.before_claim_cb = [this](TaskSlot slot) {
             if (before_claim_hook) before_claim_hook(slot);
@@ -4246,6 +4257,40 @@ TEST_F(SchedulerFixture, ComposedKernelArgsBlobFitsMailbox) {
 
     mock_worker.complete();
     wait_consumed(res.task_slot);
+}
+
+TEST_F(SchedulerFixture, AFailureThatProvesItsDeviceWorkDrainedKeepsTheRunSettled) {
+    auto task = orch.submit_next_level(C(23), single_tensor_args(0xD10D, TensorArgType::OUTPUT), cfg, 0);
+    mock_worker.wait_running();
+    mock_worker.complete_with_error("task failed after its device work drained");
+    wait_consumed(task.task_slot);
+    EXPECT_TRUE(orch.run_failed(run_id));
+    EXPECT_TRUE(orch.run_domain_use_settled(run_id));
+}
+
+TEST_F(SchedulerFixture, ACompletionWithoutProofLeavesTheRunUnsettled) {
+    auto task = orch.submit_next_level(C(24), single_tensor_args(0xD20D, TensorArgType::OUTPUT), cfg, 0);
+    mock_worker.wait_running();
+    EXPECT_TRUE(orch.run_domain_use_settled(run_id));
+    mock_worker.complete_with_error("chip run not proven drained", /*domain_use_unproven=*/true);
+    wait_consumed(task.task_slot);
+    EXPECT_FALSE(orch.run_domain_use_settled(run_id));
+}
+
+TEST_F(SchedulerFixture, AnEndpointFailureIsNeverProofOfSettledDeviceWork) {
+    auto task = orch.submit_next_level(C(25), single_tensor_args(0xD30D, TensorArgType::OUTPUT), cfg, 0);
+    mock_worker.wait_running();
+    WorkerCompletion lost;
+    lost.task_slot = task.task_slot;
+    lost.outcome = EndpointOutcome::ENDPOINT_FAILURE;
+    lost.error_message = "endpoint lost";
+    ASSERT_TRUE(lost.domain_use_settled);
+    sched.worker_done(std::move(lost));
+    wait_consumed(task.task_slot);
+    EXPECT_TRUE(orch.run_failed(run_id));
+    EXPECT_FALSE(orch.run_domain_use_settled(run_id));
+    // Let the endpoint's own late terminal arrive so the fixture can stop.
+    mock_worker.complete();
 }
 
 TEST_F(SchedulerFixture, FailedProducerPoisonsDependentTask) {

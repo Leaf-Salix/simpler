@@ -29,6 +29,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import ctypes
+import operator
 import os
 import shutil
 import sys
@@ -36,6 +37,7 @@ import tempfile
 import threading
 import uuid
 import weakref
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import IntEnum
 from math import prod
@@ -77,6 +79,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     ChipCallable,
     ChipStorageTaskArgs,
     ChipTensor,
+    CommDomainRef,
     CoreCallable,
     DataType,
     DeviceMemoryInfo,
@@ -225,7 +228,7 @@ def _assert_bindings_match_source_tree() -> None:
 
 _assert_bindings_match_source_tree()
 
-from .global_comm_domain import GlobalDomainAttachment, GlobalDomainBuffer, GlobalDomainMember  # noqa: E402
+from .global_comm_domain import GlobalDomainAttachment  # noqa: E402
 
 __all__ = [
     "DataType",
@@ -284,6 +287,8 @@ __all__ = [
     "CommBufferSpec",
     "ChipDomainContext",
     "CommDomainHandle",
+    "CommDomainMember",
+    "CommDomainRef",
     "GlobalCommDomainHandle",
     "GlobalCommDomainView",
 ]
@@ -1079,8 +1084,8 @@ class CommBufferSpec:
     """A named slice of the per-rank communicator window.
 
     Buffers are placed sequentially inside the window in declaration order.
-    The ``CommDomainHandle.contexts[chip_idx].buffers`` dict returned by
-    ``Orchestrator.allocate_domain`` is keyed by ``CommBufferSpec.name``.
+    ``CommDomainHandle.member(rank).buffers`` and each local ``ChipDomainContext.buffers``
+    are keyed by ``CommBufferSpec.name``.
     """
 
     name: str
@@ -1108,114 +1113,191 @@ class ChipDomainContext:
     buffers: dict[str, Buffer]
 
 
-class CommDomainHandle:
-    """User-facing handle for one dynamically-allocated CommDomain.
+@dataclass(frozen=True)
+class CommDomainMember:
+    """One dense rank of a communication domain: the chip it targets and its named window slices.
 
-    Returned by ``Orchestrator.allocate_domain(...)``.  Acts as a context
-    manager: ``with`` exit *marks* the handle for release and prevents
-    further use; the actual backend free runs **after** ``Worker.run`` has
-    drained any tasks the orch function submitted using this domain.  This
-    is required because ``submit_*`` only enqueues to the DAG — freeing
-    before drain would create a use-after-free on the chip side.
+    ``node_worker_id`` is ``None`` for an L3 domain. ``buffers`` are address-free ``DOMAIN_WINDOW``
+    Buffers: a tensor built over one resolves only on this rank's chip, and must be submitted
+    toward it.
+    """
+
+    domain_rank: int
+    node_worker_id: int | None
+    local_worker_id: int
+    global_device_rank: int
+    buffers: Mapping[str, Buffer]
+
+
+class CommDomainHandle:
+    """One communication domain, the same type at L3 and at L4.
+
+    ``members`` are in dense-rank order. ``member(rank).buffers[name]`` is the address-free logical
+    slice Buffer; ``local_context(rank)`` is the device mapping this node holds for that rank, and
+    refuses a rank it does not map. ``handle[chip]`` and ``contexts`` keep the chip-id view of those
+    local mappings; a dense rank is only ever addressed through ``member`` / ``local_context``.
+
+    ``ref`` is the immutable cross-node identity. A lower level resolves it with
+    ``orch.get_domain(ref)`` to a borrowed handle of this type; a borrowed handle can neither
+    release the domain nor enter a ``with`` block, and grants access only inside a task that names
+    the domain.
 
     Lifecycle states::
 
-        live           — allocated, indexable, can be passed to submit_*
-        released       — release() called; further indexing raises;
-                          backend memory still alive until Worker.run drain
-        freed          — backend release_domain has executed, memory gone
+        live      — published; lookup, access and submission are accepted
+        released  — ``release()`` or ``with`` exit; new lookup, access and submission are refused,
+                    while tasks already accepted keep resolving the domain
+        freed     — the backend windows are gone, after every run that used the domain finished
 
-    Most users only see ``released``; the ``live → released`` transition
-    happens at ``with`` exit (or explicit ``release()``), and the
-    ``released → freed`` transition is the runtime's job at end-of-run.
+    The ``released -> freed`` transition belongs to the runtime: ``submit_*`` only enqueues, so the
+    backend free waits for each run that used the domain to complete.
     """
 
     __slots__ = (
-        "name",
-        "workers",
-        "contexts",
-        "allocation_id",
-        "_domain_size",
+        "_access",
+        "_committed",
         "_domain_ranks",
+        "_domain_size",
+        "_freed",
         "_release_fn",
         "_released",
-        "_freed",
+        "_users",
+        "allocation_id",
+        "attachments",
+        "borrowed",
+        "buffers",
+        "contexts",
+        "domain_id",
+        "generation",
+        "mapping_size",
+        "members",
+        "name",
+        "ref",
+        "requested_window_size",
+        "retain_after_run",
+        "workers",
     )
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 -- one constructor builds owner, borrowed and L4 handles
         self,
         *,
         name: str,
-        workers: tuple[int, ...],
-        contexts: dict[int, ChipDomainContext],
-        allocation_id: int,
-        _release_fn,
+        _release_fn=None,
+        workers: tuple[int, ...] = (),
+        contexts: dict[int, ChipDomainContext] | None = None,
+        allocation_id: int = 0,
         _domain_size: int | None = None,
         _domain_ranks: dict[int, int] | None = None,
+        members: tuple = (),
+        buffers: tuple = (),
+        domain_id: int | None = None,
+        generation: int = 1,
+        mapping_size: int = 0,
+        retain_after_run: bool = False,
+        attachments: tuple[GlobalDomainAttachment, ...] = (),
+        ref: CommDomainRef | None = None,
+        requested_window_size: int = 0,
+        borrowed: bool = False,
+        committed: bool | None = None,
+        _access=None,
     ) -> None:
-        self.name = name
+        self.name = str(name)
         self.workers = tuple(workers)
-        # Frozen dict-ish — we don't expose mutation
-        self.contexts: dict[int, ChipDomainContext] = dict(contexts)
+        self.contexts: dict[int, ChipDomainContext] = dict(contexts or {})
         self.allocation_id = int(allocation_id)
         self._domain_size = len(self.workers) if _domain_size is None else int(_domain_size)
         self._domain_ranks = (
             {worker: rank for rank, worker in enumerate(self.workers)} if _domain_ranks is None else dict(_domain_ranks)
         )
+        self.members = tuple(members)
+        self.buffers = tuple(buffers)
+        self.attachments = tuple(attachments)
+        self.ref = ref
+        self.domain_id = self.allocation_id if domain_id is None else int(domain_id)
+        self.generation = int(generation)
+        self.mapping_size = int(mapping_size)
+        self.requested_window_size = int(requested_window_size)
+        self.retain_after_run = bool(retain_after_run)
+        self.borrowed = bool(borrowed)
         self._release_fn = _release_fn
         self._released = False
         self._freed = False
+        # A borrowed view becomes usable at its commit; an owner handle is constructed live.
+        self._committed = (_release_fn is not None) if committed is None else bool(committed)
+        self._access = _access
+        # Runs that accepted a use of this domain and have not yet retired it.
+        self._users: set = set()
 
-    def __getitem__(self, chip_idx: int) -> ChipDomainContext:
+    def _require_access(self) -> None:
         if self._released:
             raise RuntimeError(
-                f"CommDomainHandle({self.name!r}) already released; do not pass it to submit_* "
-                "after release(). Submitted tasks that captured device_ctx / buffers before"
-                "release will still see live memory until Worker.run drains."
+                f"CommDomainHandle({self.name!r}) already released; new access and submission are refused. "
+                "Tasks accepted before the release keep resolving it until their runs finish."
             )
-        return self.contexts[chip_idx]
+        if not self._committed:
+            raise RuntimeError(f"CommDomainHandle({self.name!r}) is not committed")
+        if self._access is not None:
+            self._access(self)
+
+    def member(self, domain_rank: int) -> CommDomainMember:
+        self._require_access()
+        rank = operator.index(domain_rank)
+        if rank < 0 or rank >= len(self.members):
+            raise IndexError(f"domain rank {rank} is out of range")
+        member = self.members[rank]
+        if member.domain_rank != rank:
+            raise RuntimeError("domain member table is not rank ordered")
+        return member
+
+    def local_context(self, domain_rank: int) -> ChipDomainContext:
+        """The device mapping this node holds for ``domain_rank``; refuses a rank mapped elsewhere."""
+        member = self.member(domain_rank)
+        context = self.contexts.get(member.local_worker_id)
+        if context is None or context.domain_rank != member.domain_rank:
+            raise ValueError(f"domain rank {member.domain_rank} of {self.name!r} has no mapping on this node")
+        return context
+
+    def buffer_range(self, name: str) -> tuple[int, int]:
+        self._require_access()
+        offset = 0
+        for buffer in self.buffers:
+            if buffer.name == name:
+                return offset, buffer.nbytes
+            offset += buffer.nbytes
+        raise KeyError(f"domain {self.name!r} has no buffer {name!r}")
+
+    def __getitem__(self, chip_idx: int) -> ChipDomainContext:
+        self._require_access()
+        return self.contexts[int(chip_idx)]
 
     @property
     def released(self) -> bool:
-        """True once ``release()`` (or ``with`` exit) has been called.
-
-        Backend memory may still be alive — it is freed by the Worker after
-        DAG drain at end-of-run.  Use this to gate further indexing /
-        submission, not to assert physical teardown (use ``freed`` for that).
-        """
+        """True once ``release()`` (or ``with`` exit) ran; backend memory may still be live."""
         return self._released
 
     @property
     def freed(self) -> bool:
-        """True once the backend ``comm_release_domain_windows`` has executed.
-
-        Only flips after the owning ``Worker.run`` completes and processes the
-        pending-release queue.  An ``orch_fn`` will never observe ``True``
-        for a handle it released within the same ``run`` call.
-        """
+        """True once the backend windows are gone, after every run that used the domain."""
         return self._freed
 
+    @property
+    def committed(self) -> bool:
+        return self._committed
+
     def release(self) -> None:
-        """Mark this handle for collective release.  Idempotent.
-
-        Inside an orch function, this is a non-blocking mark — the actual
-        backend ``comm_release_domain_windows`` runs after
-        the owning run's completion wait so that tasks already submitted with
-        this domain's ``device_ctx`` see live memory through execution.
-
-        After this returns, the handle is treated as released for the
-        user's purposes: ``__getitem__`` raises, repeated ``release()`` is
-        a no-op, and the orch function must not pass it to further
-        ``submit_*`` calls.
-        """
+        """Logically release the domain. Idempotent; the backend free is deferred to the runtime."""
+        if self.borrowed:
+            raise RuntimeError(f"CommDomainHandle({self.name!r}) is borrowed; only its creator releases it")
         if self._released:
             return
         self._released = True
-        # _release_fn is owned by Worker; it queues the actual backend
-        # release and runs it after the owning run completes. Worker also flips _freed.
-        self._release_fn(self)
+        if self._release_fn is not None:
+            self._release_fn(self)
 
     def __enter__(self) -> CommDomainHandle:
+        if self.borrowed:
+            raise RuntimeError(f"CommDomainHandle({self.name!r}) is borrowed and cannot enter a releasing context")
+        self._require_access()
         return self
 
     def __exit__(self, *_):
@@ -1227,141 +1309,13 @@ class CommDomainHandle:
         elif self._released:
             state = "released-pending-free"
         else:
-            state = "live"
-        return f"CommDomainHandle(name={self.name!r}, workers={self.workers}, {state})"
+            state = "live" if self._committed else "uncommitted"
+        return f"CommDomainHandle(name={self.name!r}, ref={self.ref!r}, members={len(self.members)}, {state})"
 
 
-class GlobalCommDomainHandle:
-    """L4-owned handle for one CommDomain spanning local and/or remote L3 nodes.
-
-    The handle contains stable topology, attachment metadata, and buffer
-    offsets only. Device addresses remain in the L3/L2 process that imported
-    the transport handles.
-    """
-
-    __slots__ = (
-        "_freed",
-        "_release_fn",
-        "_released",
-        "attachments",
-        "buffers",
-        "domain_id",
-        "generation",
-        "mapping_size",
-        "members",
-        "name",
-        "retain_after_run",
-    )
-
-    def __init__(
-        self,
-        *,
-        name: str,
-        members: tuple[GlobalDomainMember, ...],
-        buffers: tuple[GlobalDomainBuffer, ...],
-        domain_id: int,
-        generation: int,
-        mapping_size: int,
-        retain_after_run: bool,
-        _release_fn,
-        attachments: tuple[GlobalDomainAttachment, ...] = (),
-    ) -> None:
-        self.name = str(name)
-        self.members = tuple(members)
-        self.buffers = tuple(buffers)
-        self.attachments = tuple(attachments)
-        self.domain_id = int(domain_id)
-        self.generation = int(generation)
-        self.mapping_size = int(mapping_size)
-        self.retain_after_run = bool(retain_after_run)
-        self._release_fn = _release_fn
-        self._released = False
-        self._freed = False
-
-    def member(self, domain_rank: int) -> GlobalDomainMember:
-        if self._released:
-            raise RuntimeError(f"GlobalCommDomainHandle({self.name!r}) is already released")
-        rank = int(domain_rank)
-        if rank < 0 or rank >= len(self.members):
-            raise IndexError(f"global domain rank {rank} is out of range")
-        member = self.members[rank]
-        if member.domain_rank != rank:
-            raise RuntimeError("global domain member table is not rank ordered")
-        return member
-
-    def buffer_range(self, name: str) -> tuple[int, int]:
-        if self._released:
-            raise RuntimeError(f"GlobalCommDomainHandle({self.name!r}) is already released")
-        offset = 0
-        for buffer in self.buffers:
-            if buffer.name == name:
-                return offset, buffer.nbytes
-            offset += buffer.nbytes
-        raise KeyError(f"global domain {self.name!r} has no buffer {name!r}")
-
-    @property
-    def released(self) -> bool:
-        return self._released
-
-    @property
-    def freed(self) -> bool:
-        return self._freed
-
-    def release(self) -> None:
-        if self._released:
-            return
-        self._released = True
-        self._release_fn(self)
-
-    def __enter__(self) -> GlobalCommDomainHandle:
-        return self
-
-    def __exit__(self, *_):
-        self.release()
-
-
-class GlobalCommDomainView:
-    """L3-local imported view and its receiving-node attachment row."""
-
-    __slots__ = (
-        "_committed",
-        "attachments",
-        "contexts",
-        "domain_id",
-        "generation",
-        "mapping_size",
-        "members",
-        "name",
-    )
-
-    def __init__(
-        self,
-        *,
-        name: str,
-        members: tuple[GlobalDomainMember, ...],
-        contexts: dict[int, ChipDomainContext],
-        domain_id: int,
-        generation: int,
-        mapping_size: int,
-        attachments: tuple[GlobalDomainAttachment, ...] = (),
-    ) -> None:
-        self.name = str(name)
-        self.members = tuple(members)
-        self.attachments = tuple(attachments)
-        self.contexts = dict(contexts)
-        self.domain_id = int(domain_id)
-        self.generation = int(generation)
-        self.mapping_size = int(mapping_size)
-        self._committed = False
-
-    def __getitem__(self, local_worker_id: int) -> ChipDomainContext:
-        if not self._committed:
-            raise RuntimeError(f"GlobalCommDomainView({self.name!r}) is not committed")
-        return self.contexts[int(local_worker_id)]
-
-    @property
-    def committed(self) -> bool:
-        return self._committed
+# Compatibility names: both resolve to the one handle type.
+GlobalCommDomainHandle = CommDomainHandle
+GlobalCommDomainView = CommDomainHandle
 
 
 _HOST_LOG_SESSION_OWNER_PID = os.getpid()

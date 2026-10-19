@@ -2263,7 +2263,81 @@ NB_MODULE(_task_interface, m) {
         .value("REMOTE_SIDECAR", BackendKind::REMOTE_SIDECAR)
         .value("DEVICE_MALLOC", BackendKind::DEVICE_MALLOC)
         .value("FORK_COW", BackendKind::FORK_COW)
-        .value("VMM_SHAREABLE", BackendKind::VMM_SHAREABLE);
+        .value("VMM_SHAREABLE", BackendKind::VMM_SHAREABLE)
+        .value("DOMAIN_WINDOW", BackendKind::DOMAIN_WINDOW);
+
+    // --- CommDomainRef ---
+    nb::class_<CommDomainRef>(m, "CommDomainRef")
+        .def(
+            "__init__",
+            [](CommDomainRef *self, nb::bytes owner_instance_id, uint64_t domain_id, uint32_t generation) {
+                if (owner_instance_id.size() != OWNER_INSTANCE_ID_BYTES) {
+                    throw std::invalid_argument(
+                        "owner_instance_id must be " + std::to_string(OWNER_INSTANCE_ID_BYTES) + " bytes, got " +
+                        std::to_string(owner_instance_id.size())
+                    );
+                }
+                CommDomainRef ref{};
+                std::memcpy(ref.owner_instance_id, owner_instance_id.c_str(), OWNER_INSTANCE_ID_BYTES);
+                ref.domain_id = domain_id;
+                ref.generation = generation;
+                validate_comm_domain_ref(ref);
+                new (self) CommDomainRef(ref);
+            },
+            nb::arg("owner_instance_id"), nb::arg("domain_id"), nb::arg("generation") = 1
+        )
+        .def_prop_ro(
+            "owner_instance_id",
+            [](const CommDomainRef &self) {
+                return nb::bytes(reinterpret_cast<const char *>(self.owner_instance_id), OWNER_INSTANCE_ID_BYTES);
+            },
+            "The creator Worker's per-incarnation nonce."
+        )
+        .def_ro("domain_id", &CommDomainRef::domain_id)
+        .def_ro("generation", &CommDomainRef::generation)
+        .def(
+            "__eq__",
+            [](const CommDomainRef &a, const CommDomainRef &b) {
+                return a == b;
+            }
+        )
+        .def(
+            "__ne__",
+            [](const CommDomainRef &a, const CommDomainRef &b) {
+                return a != b;
+            }
+        )
+        .def(
+            "__hash__",
+            [](const CommDomainRef &self) {
+                CanonicalIdentity key{};
+                std::memcpy(key.owner_instance_id, self.owner_instance_id, OWNER_INSTANCE_ID_BYTES);
+                key.buffer_id = self.domain_id;
+                key.generation = self.generation;
+                return CanonicalIdentityHash{}(key);
+            }
+        )
+        .def(
+            "__reduce__",
+            [](const CommDomainRef &self) {
+                return nb::make_tuple(
+                    nb::type<CommDomainRef>(),
+                    nb::make_tuple(
+                        nb::bytes(reinterpret_cast<const char *>(self.owner_instance_id), OWNER_INSTANCE_ID_BYTES),
+                        self.domain_id, self.generation
+                    )
+                );
+            }
+        )
+        .def("__repr__", [](const CommDomainRef &self) -> std::string {
+            std::ostringstream os;
+            os << "CommDomainRef(owner_instance_id=0x" << std::hex;
+            for (uint32_t i = 0; i < OWNER_INSTANCE_ID_BYTES; ++i) {
+                os << std::setw(2) << std::setfill('0') << static_cast<int>(self.owner_instance_id[i]);
+            }
+            os << std::dec << ", domain_id=" << self.domain_id << ", generation=" << self.generation << ")";
+            return os.str();
+        });
 
     // --- CanonicalIdentity ---
     // Equality and hashing fold exactly the three meaningful fields, so a decode with dirty wire
@@ -2937,6 +3011,17 @@ NB_MODULE(_task_interface, m) {
             "Whether any arg names memory behind a chip boundary, which a dispatch must authorize."
         )
 
+        .def(
+            "add_domain_ref", &TaskArgs::add_domain_ref, nb::arg("ref"),
+            "Accept this task's use of a domain it names without a tensor. DOMAIN_WINDOW tensors add their own."
+        )
+        .def(
+            "domain_refs",
+            [](const TaskArgs &self) {
+                return self.domain_refs();
+            },
+            "The distinct domains this task is accepted to use, in first-seen order."
+        )
         .def("clear", &TaskArgs::clear)
 
         .def(
@@ -3562,6 +3647,7 @@ NB_MODULE(_task_interface, m) {
         .def("abandon", &ChipRun::abandon, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("launched", &ChipRun::launched)
         .def_prop_ro("lane_poisoned", &ChipRun::lane_poisoned)
+        .def_prop_ro("domain_use_settled", &ChipRun::domain_use_settled)
         .def_prop_ro("preparation_disposition", &ChipRun::preparation_disposition)
         .def(
             "wait",
@@ -3726,6 +3812,13 @@ NB_MODULE(_task_interface, m) {
                     owner_instance_id, chip_rank, capture_index, task_slot, group_index, group_size
                 );
                 nb::gil_scoped_release release;
+                if (generation == 0) {
+                    if (!activated) throw std::invalid_argument("an unleased chip run is submitted activated");
+                    return self.submit_chip_run(
+                        callable_id, args, config, reinterpret_cast<volatile int32_t *>(accepted_state_addr),
+                        accepted_value
+                    );
+                }
                 return self.submit_chip_run(
                     callable_id, args, config, PipelineSlotLease{slot_id, 0, generation}, run_id, dispatch_id,
                     reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value, activated, provenance
@@ -4086,6 +4179,11 @@ NB_MODULE(_task_interface, m) {
             "(device_ctx, local_window_base) for this rank and publishes the commit flag before result conversion."
         )
         .def(
+            "comm_get_domain_window_size", &ChipWorker::comm_get_domain_window_size, nb::arg("comm_handle"),
+            nb::arg("allocation_id"), nb::call_guard<nb::gil_scoped_release>(),
+            "Bytes the backend actually mapped for a committed domain allocation's local window."
+        )
+        .def(
             "comm_release_domain_windows", &ChipWorker::comm_release_domain_windows, nb::arg("comm_handle"),
             nb::arg("allocation_id"), nb::arg("rank_count"), nb::arg("domain_rank"),
             "Pair to comm_alloc_domain_windows: collectively release the per-rank pool."
@@ -4170,6 +4268,9 @@ NB_MODULE(_task_interface, m) {
         [](uint64_t blob_ptr, size_t capacity) -> TaskArgs {
             TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(blob_ptr), capacity);
             TaskArgs args;
+            for (int32_t i = 0; i < view.domain_ref_count; i++) {
+                args.add_domain_ref(view.domain_ref(i));
+            }
             for (int32_t i = 0; i < view.tensor_count; i++) {
                 args.add_tensor(view.tensors(i), TensorArgType::INPUT, view.transfer(i));
             }

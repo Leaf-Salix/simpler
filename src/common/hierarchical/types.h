@@ -153,6 +153,8 @@ struct RunState {
     std::atomic<RunPhase> phase{RunPhase::RESERVED};
     std::atomic<int32_t> active_tasks{0};
     std::atomic<int32_t> pending_accepts{0};
+    // Cleared when any task of this run completes without proof that its device work drained.
+    std::atomic<bool> domain_use_settled{true};
     mutable std::mutex completion_mu;
     std::condition_variable completion_cv;
     std::exception_ptr first_error;
@@ -341,6 +343,11 @@ struct WorkerCompletion {
      * the word this side's to read at all.
      */
     uint32_t admissible_run_resource_sets{0};
+    /**
+     * False when the endpoint reports the task terminal without proof that its device work, and
+     * that of every task it submitted below, has drained. An ENDPOINT_FAILURE is never proof.
+     */
+    bool domain_use_settled{true};
 };
 
 // =============================================================================

@@ -152,6 +152,10 @@ void Scheduler::worker_done(WorkerCompletion completion) {
     if (completion.admissible_run_resource_sets != 0 && cfg_.note_endpoint_capacity_cb) {
         cfg_.note_endpoint_capacity_cb(completion.worker_id, completion.admissible_run_resource_sets);
     }
+    if ((!completion.domain_use_settled || completion.outcome == EndpointOutcome::ENDPOINT_FAILURE) &&
+        cfg_.on_domain_use_unsettled_cb) {
+        cfg_.on_domain_use_unsettled_cb(completion.task_slot);
+    }
     bool failure_reported = is_failure(completion.outcome);
     if (failure_reported && cfg_.on_task_failed_cb) {
         cfg_.on_task_failed_cb(completion.task_slot, completion.error_message);
