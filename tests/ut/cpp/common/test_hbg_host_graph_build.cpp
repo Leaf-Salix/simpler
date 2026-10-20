@@ -28,6 +28,7 @@
 #include "host_build_graph/graph_recorder_pool.h"
 #include "host_build_graph/host_graph_build.h"
 #include "host_build_graph/kernel_external_tensor.h"
+#include "host_build_graph/kernel_external_tensor_wire.h"
 #include "host_build_graph/kernel_callable_binding.h"
 #include "host_build_graph/kernel_argument_snapshot.h"
 #include "host_build_graph/kernel_graph_template.h"
@@ -386,6 +387,21 @@ TEST(HbgKernelExternalTensor, RejectsHostDeviceArgsAndUnsupportedStrides) {
         reinterpret_cast<void *>(0x44000), shape, transposed_stride, 2, DataType::FLOAT32, AddressSpace::DEVICE
     ));
     EXPECT_EQ(hbg::validate_kernel_external_tensors(args), hbg::KernelExternalTensorStatus::UnsupportedStrideFamily);
+}
+
+TEST(HbgKernelExternalTensor, RejectsFlatTensorRankBeforePacking) {
+    const uint32_t shape[] = {1};
+    const auto boundary =
+        make_tensor_external(reinterpret_cast<void *>(0x22000), shape, 1, DataType::UINT64, AddressSpace::DEVICE);
+    auto tensor = simpler::hbg::Tensor::from_boundary(boundary);
+    ASSERT_TRUE(hbg::valid_kernel_graph_tensor(tensor));
+    ASSERT_TRUE(hbg::valid_restored_kernel_graph_tensor(tensor, 0x100000000ULL, 4096));
+    for (uint32_t ndims : {uint32_t{0}, uint32_t{MAX_TENSOR_DIMS + 1}, uint32_t{256}, UINT32_MAX}) {
+        SCOPED_TRACE(ndims);
+        tensor.ndims = ndims;
+        EXPECT_FALSE(hbg::valid_kernel_graph_tensor(tensor));
+        EXPECT_FALSE(hbg::valid_restored_kernel_graph_tensor(tensor, 0x100000000ULL, 4096));
+    }
 }
 
 class HostGraphBuildTest : public ::testing::Test {
@@ -3256,6 +3272,41 @@ TEST_F(HbgGraphRestoreTest, OrdinaryIntermediateSurvivesBuildPacketAndRestore) {
     const auto before = working_bytes();
     EXPECT_EQ(restore(), hbg::GraphRestoreStatus::InvalidImage);
     EXPECT_EQ(working_bytes(), before);
+}
+
+TEST_F(HbgGraphRestoreTest, ForgedFlatTensorRankRejectsBeforeAnyTargetWrite) {
+    ASSERT_EQ(build(chain_entry), 2);
+    prepare(4096);
+    ASSERT_EQ(hbg::seal_graph_execution_slot(context, 0, 19, 109, seal), 0);
+    registry = reinterpret_cast<hbg::GraphSlotRegistry *>(seal.registry.address);
+    ASSERT_EQ(simpler_aicpu_l1_hbg_register_execution_slot(&seal), 0);
+    ASSERT_EQ(snapshot_graph(), 0);
+    ASSERT_EQ(hbg::make_graph_host_args(snapshot, packet), 0);
+    patch();
+    const auto original = packet.storage;
+    const auto before = working_bytes();
+    const auto offsets = sm_layout::segment_offsets(sm_layout::image_extents(result.bind_usage));
+    Buffer aligned;
+    aligned.reserve(result.image_bytes);
+    for (uint32_t ndims : {uint32_t{0}, uint32_t{MAX_TENSOR_DIMS + 1}, uint32_t{256}, UINT32_MAX}) {
+        SCOPED_TRACE(ndims);
+        packet.storage = original;
+        auto *source = reinterpret_cast<std::byte *>(packet.storage.data()) + packet.data_offset +
+                       packet_header().sm_offset - packet_header().runtime_offset + offsets.storage;
+        auto *sm = source - offsets.storage;
+        std::memcpy(aligned.data(), sm, result.image_bytes);
+        auto *storage = reinterpret_cast<ChipTaskStorage *>(aligned.data() + offsets.storage);
+        ASSERT_GT(storage[0].payload.tensor_count, 0);
+        storage[0].payload.tensor_data()[0].ndims = ndims;
+        std::memcpy(sm, aligned.data(), result.image_bytes);
+        patch();
+        ASSERT_EQ(
+            hbg::validate_graph_packet(packet.storage.data(), packet.bytes, hbg::GraphPacketAddress::DeviceCopy),
+            hbg::GraphPacketStatus::Ok
+        );
+        EXPECT_EQ(restore(), hbg::GraphRestoreStatus::InvalidImage);
+        EXPECT_EQ(working_bytes(), before);
+    }
 }
 
 TEST_F(HbgGraphPacketTest, PacketDoesNotTransmitUnusedFrozenCapacity) {

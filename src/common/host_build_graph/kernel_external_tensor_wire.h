@@ -49,10 +49,12 @@ inline bool valid_restored_kernel_graph_tensor(const GraphTensor &tensor, uint64
 
 inline bool
 valid_restored_kernel_graph_tensor(const simpler::hbg::Tensor &tensor, uint64_t heap, uint64_t bytes) noexcept {
+    if (tensor.ndims == 0 || tensor.ndims > MAX_TENSOR_DIMS) return false;
     return valid_restored_kernel_graph_tensor(graph_tensor_pack(tensor), heap, bytes);
 }
 
 inline bool valid_kernel_graph_tensor(const simpler::hbg::Tensor &tensor) noexcept {
+    if (tensor.ndims == 0 || tensor.ndims > MAX_TENSOR_DIMS) return false;
     return valid_kernel_graph_tensor(graph_tensor_pack(tensor));
 }
 
