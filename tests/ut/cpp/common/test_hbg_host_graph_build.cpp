@@ -2599,6 +2599,7 @@ protected:
     }
     std::vector<std::byte> mutable_bytes() const {
         auto all = working_bytes();
+        all.erase(all.begin(), all.begin() + seal.destinations[0].capacity);
         all.resize(all.size() - sizeof(hbg::GraphSlotRegistry));
         return all;
     }
@@ -2622,7 +2623,12 @@ TEST_F(HbgGraphRestoreTest, OrdinaryIntermediateSurvivesBuildPacketAndRestore) {
     EXPECT_EQ(tasks[0].payload.tensor_data()[0].buffer.addr, tasks[1].payload.tensor_data()[0].buffer.addr);
     EXPECT_EQ(tasks[1].payload.fanin_data()[0], 0);
     const auto *heap = reinterpret_cast<const uint8_t *>(binding.heap.address);
-    EXPECT_TRUE(std::all_of(heap + result.heap_bytes, heap + binding.heap.capacity, [](auto value) {
+    EXPECT_TRUE(std::all_of(heap, heap + binding.heap.capacity, [](auto value) {
+        return value == 0xa5;
+    }));
+    hbg::GraphRestoreResult peer;
+    ASSERT_EQ(hbg::acquire_graph_restore_result(registry, restored.generation, peer), hbg::GraphRestoreStatus::Ok);
+    EXPECT_TRUE(std::all_of(heap, heap + binding.heap.capacity, [](auto value) {
         return value == 0xa5;
     }));
     ASSERT_NO_FATAL_FAILURE(retire());
@@ -2657,7 +2663,48 @@ TEST_F(HbgGraphPacketTest, PacketDoesNotTransmitUnusedFrozenCapacity) {
     );
 }
 
-TEST_F(HbgGraphRestoreTest, RepeatedRestoreRebuildsQueuesPointersAndEveryCapacityByte) {
+TEST_F(HbgGraphRestoreTest, DirtyHeapMaterializesGraphAfterEveryRestore) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    for (uint8_t fill : {0xa5, 0x5a, 0xff}) {
+        dirty_working();
+        std::memset(reinterpret_cast<void *>(binding.heap.address), fill, binding.heap.capacity);
+        ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+        auto &tasks = restored.runtime->sm_handle->header->tasks;
+        int graphs = 0;
+        for (int32_t i = 0; i < tasks.total_tasks; ++i) {
+            auto &outer = tasks.storage_at(i);
+            if (outer.slot.task_kind != TaskKind::GRAPH) continue;
+            ++graphs;
+            auto *execution = graph_execution_localize(outer.slot);
+            ASSERT_NE(execution, nullptr);
+            ASSERT_EQ(execution->task_count, 2);
+            EXPECT_EQ(execution->remaining_tasks.load(), 2);
+            EXPECT_EQ(graph_execution_materialize_slice(outer.slot, *execution, 1), GraphMaterializeResult::PENDING);
+            EXPECT_EQ(graph_execution_materialize_slice(outer.slot, *execution, 1), GraphMaterializeResult::PREPARED);
+            for (int32_t j = 0; j < execution->task_count; ++j) {
+                const auto &task = execution->task_at(j);
+                EXPECT_EQ(execution->task_states[j].load(), CHIP_TASK_PENDING);
+                EXPECT_EQ(task.slot.completed_subtasks.load(), 0);
+                EXPECT_EQ(task.payload.published_block_count.load(), 0);
+                EXPECT_EQ(task.payload.scalar_count, 0);
+                ASSERT_EQ(task.payload.tensor_count, j + 1);
+                for (int32_t k = 0; k < task.payload.tensor_count; ++k) {
+                    const auto &tensor = task.payload.tensor_data()[k];
+                    EXPECT_GE(tensor.buffer.addr, binding.heap.address);
+                    EXPECT_LE(tensor.buffer.addr + tensor.buffer.size, binding.heap.address + result.heap_bytes);
+                }
+            }
+            EXPECT_EQ(
+                execution->task_at(0).payload.tensor_data()[0].buffer.addr,
+                execution->task_at(1).payload.tensor_data()[0].buffer.addr
+            );
+        }
+        EXPECT_EQ(graphs, 1);
+        ASSERT_NO_FATAL_FAILURE(retire());
+    }
+}
+
+TEST_F(HbgGraphRestoreTest, RepeatedRestoreRebuildsQueuesPointersAndWorkingImages) {
     ASSERT_NO_FATAL_FAILURE(prepare_slot());
     const auto source = packet.storage;
     ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
@@ -2750,19 +2797,12 @@ TEST_F(HbgGraphRestoreTest, PartialMemoryFailuresNeverCommitAndFullRetrySucceeds
             std::memcpy(dst, src, size);
             return ++self.step != self.fail_at;
         }
-        static bool zero(void *ctx, void *dst, size_t size) {
-            auto &self = *static_cast<Fault *>(ctx);
-            std::memset(dst, 0, size);
-            return ++self.step != self.fail_at;
-        }
         static bool flush(void *ctx, const void *, size_t) {
             auto &self = *static_cast<Fault *>(ctx);
             return ++self.step != self.fail_at;
         }
     };
-    int regions = 0;
-    for (const auto &dst : seal.destinations)
-        regions += dst.capacity != 0;
+    const int regions = static_cast<int>(packet_header().region_count);
     const auto expected = mutable_bytes();
     for (int fail_at = 1; fail_at <= 2 * regions + 1; ++fail_at) {
         const uint64_t previous = restored.generation;
@@ -2770,7 +2810,7 @@ TEST_F(HbgGraphRestoreTest, PartialMemoryFailuresNeverCommitAndFullRetrySucceeds
         Fault fault{0, fail_at};
         ASSERT_NO_FATAL_FAILURE(retire());
         dirty_working();
-        EXPECT_EQ(restore({&fault, Fault::copy, Fault::zero, Fault::flush}), hbg::GraphRestoreStatus::CopyFailed);
+        EXPECT_EQ(restore({&fault, Fault::copy, Fault::flush}), hbg::GraphRestoreStatus::CopyFailed);
         EXPECT_EQ(restored.generation, output.generation);
         EXPECT_EQ(restored.runtime, output.runtime);
         EXPECT_EQ(registry->restore.committed_generation, previous);
@@ -2815,6 +2855,7 @@ TEST_F(HbgGraphRestoreTest, SmallerAndEmptyGraphsInitializeOnlyLiveWorkingState)
     // A5 reserves its flat scheduler for the empty graph and uses the Graph
     // fallback for the nonempty graph. Prepare accounts for both variants.
     ASSERT_NO_FATAL_FAILURE(prepare_slot(true, empty.scheduler_state_bytes));
+    const auto original_packet = packet;
     ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
     ASSERT_NO_FATAL_FAILURE(retire());
     ASSERT_EQ(build(empty_entry), 0);
@@ -2830,13 +2871,21 @@ TEST_F(HbgGraphRestoreTest, SmallerAndEmptyGraphsInitializeOnlyLiveWorkingState)
         if (!dst.capacity) continue;
         const auto *bytes = reinterpret_cast<const uint8_t *>(dst.address);
         const uint64_t live = i == 0 ? empty.gm_heap_bytes : empty.scheduler_state_bytes;
-        EXPECT_TRUE(std::all_of(bytes, bytes + live, [](auto value) {
-            return value == 0;
+        EXPECT_TRUE(std::all_of(bytes, bytes + live, [i](auto value) {
+            return value == (i == 0 ? 0xa5 : 0);
         }));
         EXPECT_TRUE(std::all_of(bytes + live, bytes + dst.capacity, [](auto value) {
             return value == 0xa5;
         }));
     }
+    ASSERT_NO_FATAL_FAILURE(retire());
+    packet = original_packet;
+    patch();
+    dirty_working();
+    ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+    EXPECT_EQ(restored.total_tasks, packet_header().total_tasks);
+    EXPECT_GT(restored.total_tasks, 0u);
+    EXPECT_EQ(restored.runtime->sm_handle->header->tasks.total_tasks, static_cast<int32_t>(restored.total_tasks));
 }
 
 TEST_F(HbgGraphRestoreTest, BusyAndExhaustedControlCannotWriteWorkingImages) {
@@ -2924,7 +2973,7 @@ TEST_F(HbgGraphRestoreTest, ReadyExecutionCannotBeOverwrittenBeforeRetirement) {
 TEST_F(HbgGraphRestoreTest, FailedRestoreCannotRetryWithoutCleanup) {
     ASSERT_NO_FATAL_FAILURE(prepare_slot());
     hbg::GraphRestoreOps ops;
-    ops.zero = [](void *, void *, size_t) {
+    ops.copy = [](void *, void *, const void *, size_t) {
         return false;
     };
     ASSERT_EQ(restore(ops), hbg::GraphRestoreStatus::CopyFailed);
@@ -3051,7 +3100,7 @@ TEST_F(HbgGraphRestoreTest, PeerValidatesRegistryBeforeInvalidatingWorkingAddres
 TEST_F(HbgGraphRestoreTest, ControlledRestoreFailureCannotHideNativeRuntimeError) {
     ASSERT_NO_FATAL_FAILURE(prepare_slot());
     hbg::GraphRestoreOps ops;
-    ops.zero = [](void *, void *, size_t) {
+    ops.copy = [](void *, void *, const void *, size_t) {
         return false;
     };
     ASSERT_EQ(restore(ops), hbg::GraphRestoreStatus::CopyFailed);
@@ -3067,7 +3116,7 @@ TEST_F(HbgGraphRestoreTest, ControlledRestoreFailureCannotHideNativeRuntimeError
 TEST_F(HbgGraphRestoreTest, ControlledRestoreFailureCannotHideUnexpectedTeardownError) {
     ASSERT_NO_FATAL_FAILURE(prepare_slot());
     hbg::GraphRestoreOps ops;
-    ops.zero = [](void *, void *, size_t) {
+    ops.copy = [](void *, void *, const void *, size_t) {
         return false;
     };
     ASSERT_EQ(restore(ops), hbg::GraphRestoreStatus::CopyFailed);

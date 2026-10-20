@@ -192,9 +192,10 @@ protection; this interface does not register a CANN entry or enqueue streams.
    and Restoring reject with Busy; Failed rejects with Quarantined. Context and
    callable generations are unchanged. Reject an exhausted attempt counter;
    never wrap a generation to zero.
-3. Clear the live internal heap prefix and copy the live runtime/SM, Definition
-   and optional A5 scheduler images. Image descriptors bound all source reads
-   and destination writes; unused frozen capacity remains untouched. Caller-owned
+3. Copy the live runtime/SM, Definition and optional A5 scheduler images. Tensor
+   heap contents are uninitialized; task writers initialize data and Graph
+   materialization initializes execution metadata. Image descriptors bound all
+   source reads and destination writes; unused frozen capacity remains untouched. Caller-owned
    tensor storage and persistent
    platform handshake/KernelArgs allocations are outside these regions.
 4. Wire runtime/SM/scheduler pointers against the registered destinations, attach
@@ -216,7 +217,7 @@ allocation-free Host launch path. Registration remains immutable
 while its separate restore line changes. Old registry/resource schema versions
 fail closed; the public K1 invocation layout is unchanged.
 
-A copy/clear/flush failure may leave partially written working bytes. It publishes
+A copy/flush failure may leave partially written working bytes. It publishes
 Failed, preserves the last committed generation and leaves the output unchanged.
 There is no rollback or dispatch permission. Direct retry is rejected while the
 slot is Failed. `retire_graph_restore(registry, attempt, completion)` checks the exact

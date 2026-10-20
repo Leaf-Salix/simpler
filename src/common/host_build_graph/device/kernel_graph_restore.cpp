@@ -220,11 +220,6 @@ bool copy_region(const GraphRestoreOps &ops, void *dst, const void *src, size_t 
     std::memcpy(dst, src, bytes);
     return true;
 }
-bool zero_region(const GraphRestoreOps &ops, void *dst, size_t bytes) noexcept {
-    if (ops.zero) return ops.zero(ops.context, dst, bytes);
-    std::memset(dst, 0, bytes);
-    return true;
-}
 bool flush_region(const GraphRestoreOps &ops, const void *dst, size_t bytes) noexcept {
     if (ops.flush) return ops.flush(ops.context, dst, bytes);
     cache_flush_range(dst, bytes);
@@ -275,8 +270,6 @@ GraphRestoreStatus restore_graph_packet(
         publish(control, GraphRestorePhase::Failed, GraphRestoreStatus::CopyFailed);
         return GraphRestoreStatus::CopyFailed;
     };
-    const auto &heap = view.slot.destinations[0];
-    if (!zero_region(ops, reinterpret_cast<void *>(heap.address), view.graph.heap_bytes)) return fail();
     for (size_t i = 1; i < 4; ++i) {
         const auto &dst = view.slot.destinations[i];
         const auto &region = view.regions[i];
@@ -297,7 +290,6 @@ GraphRestoreStatus restore_graph_packet(
         return fail();
     runtime->scheduler->seed_queue_slots();
     runtime->aicore_mailbox->init_empty();
-    if (!flush_region(ops, reinterpret_cast<void *>(heap.address), view.graph.heap_bytes)) return fail();
     for (size_t i = 1; i < 4; ++i)
         if (view.regions[i].bytes &&
             !flush_region(ops, reinterpret_cast<void *>(view.slot.destinations[i].address), view.regions[i].bytes))
@@ -372,7 +364,7 @@ acquire_graph_restore_result(const GraphSlotRegistry *registry, uint64_t generat
         return GraphRestoreStatus::NotReady;
     for (size_t i = 0; i < 4; ++i)
         if (control.live_bytes[i] > slot.destinations[i].capacity) return GraphRestoreStatus::NotReady;
-    for (size_t i = 0; i < 4; ++i)
+    for (size_t i = 1; i < 4; ++i)
         if (control.live_bytes[i])
             cache_invalidate_range(reinterpret_cast<const void *>(slot.destinations[i].address), control.live_bytes[i]);
     out = {

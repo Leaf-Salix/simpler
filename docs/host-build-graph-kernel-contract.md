@@ -285,7 +285,9 @@ and retained the function/context leases. The public HBG launch owner and shared
 binder create streams, record events and enqueue cross-stream waits. They do not
 compensate a partial submission or claim that already-running device work has
 stopped.
-Only the live heap prefix is cleared; unused heap capacity is untouched.
+Restore does not clear or flush the tensor heap. Tasks write tensor data and
+Graph localization/materialization initializes execution metadata independently;
+unused heap capacity remains untouched.
 The A5 scheduler image is restored from its zeroed template. The common
 scheduler queues, mailbox and runtime pointers are rebuilt by the leader restore;
 A5 dispatch-specific metadata binding remains with the kernel entry.
