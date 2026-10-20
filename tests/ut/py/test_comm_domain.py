@@ -34,12 +34,12 @@ def domain_worker(request):
     )
     worker = child
     members = [1, 0]
-    if request.param == 4:
-        worker = Worker(level=4, num_sub_workers=0)
-        node = worker.add_worker(child)
-        members = [(node, 1), (node, 0)]
-    worker.init()
     try:
+        if request.param == 4:
+            worker = Worker(level=4, num_sub_workers=0)
+            node = worker.add_worker(child)
+            members = [(node, 1), (node, 0)]
+        worker.init()
         yield worker, members
     finally:
         worker.close()
@@ -348,7 +348,15 @@ def test_metadata_reads_remain_available_before_run_cleanup(domain_worker):
 def test_accepted_callback_can_release_while_close_drains(domain_worker):
     worker, members = domain_worker
     saved = []
-    worker.run(lambda orch, _args, _cfg: saved.append(orch.allocate_domain(**_request(members))))
+
+    def allocate(orch, _args, _cfg):
+        domain = orch.allocate_domain(
+            **_request(members, buffers=[CommBufferSpec(name, "uint8", 4, 4) for name in ("payload", "tail")])
+        )
+        orch.copy_to_domain(domain, 0, b"abcdefgh")
+        saved.append(domain)
+
+    worker.run(allocate)
     entered, resume = threading.Event(), threading.Event()
     errors = []
 
@@ -357,6 +365,11 @@ def test_accepted_callback_can_release_while_close_drains(domain_worker):
         assert resume.wait(10)
         domain = orch.get_domain("tp")
         assert domain.member(0).local_worker_id == 1
+        with pytest.raises(RuntimeError, match="READY"):
+            with worker._operation_lease("fresh operation"):
+                pass
+        orch.copy_to_domain(domain, 0, b"copy", offset=2)
+        assert orch.copy_from_domain(domain, 0, 8) == b"abcopygh"
         domain.release()
         assert domain.released and not domain.freed
 
@@ -372,6 +385,8 @@ def test_accepted_callback_can_release_while_close_drains(domain_worker):
                 assert worker._hierarchical_start_cv.wait_for(
                     lambda: worker._lifecycle is worker_mod._Lifecycle.CLOSED, timeout=10
                 )
+            with pytest.raises(RuntimeError, match="READY"):
+                worker.create_buffer(1)
         except BaseException as exc:
             errors.append(exc)
         finally:
@@ -392,3 +407,64 @@ def test_accepted_callback_can_release_while_close_drains(domain_worker):
     assert not runner.is_alive() and not observer.is_alive()
     assert not errors
     assert saved[0].freed
+
+
+@pytest.mark.parametrize("writing", [True, False])
+def test_accepted_external_copy_finishes_while_close_drains(domain_worker, monkeypatch, writing):
+    worker, members = domain_worker
+    saved = []
+
+    def allocate(orch, _args, _cfg):
+        domain = orch.allocate_domain(**_request(members))
+        orch.copy_to_domain(domain, 0, b"data", buffer="payload")
+        saved.extend((orch, domain))
+
+    worker.run(allocate)
+    orch, domain = saved
+    entered, resume = threading.Event(), threading.Event()
+    errors = []
+    original_range = orch._global_copy_range
+
+    def paused_range(*args, **kwargs):
+        # _copy_domain already owns its outer lease; metadata and staging are still pending.
+        entered.set()
+        assert resume.wait(10)
+        return original_range(*args, **kwargs)
+
+    monkeypatch.setattr(orch, "_global_copy_range", paused_range)
+
+    def copy():
+        try:
+            if writing:
+                orch.copy_to_domain(domain, 0, b"copy", buffer="payload")
+            else:
+                assert orch.copy_from_domain(domain, 0, 4, buffer="payload") == b"data"
+        except BaseException as exc:
+            errors.append(exc)
+
+    def resume_after_close_claim():
+        try:
+            with worker._hierarchical_start_cv:
+                assert worker._hierarchical_start_cv.wait_for(
+                    lambda: worker._lifecycle is worker_mod._Lifecycle.CLOSED, timeout=10
+                )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            resume.set()
+
+    runner = threading.Thread(target=copy)
+    observer = threading.Thread(target=resume_after_close_claim)
+    runner.start()
+    try:
+        assert entered.wait(10)
+        observer.start()
+        worker.close()
+    finally:
+        resume.set()
+        runner.join(10)
+        if observer.ident is not None:
+            observer.join(10)
+    assert not runner.is_alive() and not observer.is_alive()
+    assert not errors
+    assert domain.freed and not worker._buffers

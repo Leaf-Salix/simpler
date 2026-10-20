@@ -7453,13 +7453,15 @@ class Worker:
             self._chip_worker._validate_execution_context()
 
     @contextlib.contextmanager
-    def _operation_lease(self, api: str, *, requires_execution_context: bool = True):
+    def _operation_lease(self, api: str, *, requires_execution_context: bool = True, allow_continuation: bool = False):
         """Admit an operation onto a READY worker and hold a lease for its whole
         duration, so a concurrent close() drains it before teardown.
 
         Fail-fast: admits only a READY worker (a non-READY worker — NEW,
         INITIALIZING, CLOSED, FAILED — is rejected immediately, not waited on,
-        per the state/API matrix for dispatch/buffer). The lease is
+        per the state/API matrix for dispatch/buffer). Selected nested APIs may
+        continue during CLOSED only while this thread already holds this
+        worker's lease, which pins the tree until the outer operation exits. The lease is
         released on exit and wakes a close() that is draining. Use around any API
         that touches the live tree and can run past its admission check (run /
         callable registration / host-buffer / remote-memory).
@@ -7471,7 +7473,10 @@ class Worker:
         tid = threading.get_ident()
         with self._hierarchical_start_cv:
             self._consume_worker_host_mapped_cleanup_error_locked(api)
-            if self._lifecycle is not _Lifecycle.READY:
+            continued = (
+                allow_continuation and self._lifecycle is _Lifecycle.CLOSED and self._lease_depth.get(tid, 0) > 0
+            )
+            if self._lifecycle is not _Lifecycle.READY and not continued:
                 raise RuntimeError(f"Worker.{api}: requires an initialized (READY) worker") from self._startup_error
             if self._ordered_cleanup_error is not None:
                 raise RuntimeError(
@@ -10231,7 +10236,7 @@ class Worker:
     def _domain_guard(self, handle=None, *, releasing=False):
         callback = _callback_frame_for(self) is not None
         # An accepted callback already owns a lease, including while concurrent close drains it.
-        with contextlib.nullcontext() if callback else self._operation_lease("domain access"):
+        with contextlib.nullcontext() if callback else self._operation_lease("domain access", allow_continuation=True):
             with self._control_reservation("domain access") if releasing and not callback else contextlib.nullcontext():
                 with self._domain_mu:
                     if handle is not None and not handle.released:
@@ -12458,7 +12463,7 @@ class Worker:
         if self.level != 2:
             self._check_chip_worker_id(wid)
             host = self._require_buffer_host_side(host, "copy_to")
-        with self._operation_lease("copy_to"), self._device_control_admission("copy_to"):
+        with self._operation_lease("copy_to", allow_continuation=True), self._device_control_admission("copy_to"):
             # This worker's lock spans authorization and the native call. `free` and a CommDomain
             # release both take it before revoking an allocation on this chip, so neither can retire
             # the identity in between; `_clear_child_prov` does not, and needs not -- close drains
@@ -12518,7 +12523,7 @@ class Worker:
         if self.level != 2:
             self._check_chip_worker_id(wid)
             host = self._require_buffer_host_side(host, "copy_from")
-        with self._operation_lease("copy_from"), self._device_control_admission("copy_from"):
+        with self._operation_lease("copy_from", allow_continuation=True), self._device_control_admission("copy_from"):
             # This worker's lock spans authorization and the native call. `free` and a CommDomain
             # release both take it before revoking an allocation on this chip, so neither can retire
             # the identity in between; `_clear_child_prov` does not, and needs not -- close drains
@@ -12570,7 +12575,7 @@ class Worker:
         """
         if self.level < 2:
             raise TypeError("create_buffer requires a level >= 2 Worker")
-        with self._operation_lease("create_buffer"):
+        with self._operation_lease("create_buffer", allow_continuation=True):
             return self._create_buffer_locked(int(nbytes))
 
     def alloc_shared_tensor(self, shapes: tuple[int, ...], dtype) -> Buffer:
