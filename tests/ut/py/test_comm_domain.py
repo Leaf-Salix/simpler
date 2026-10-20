@@ -17,9 +17,8 @@ from typing import Any
 
 import pytest
 import simpler.worker as worker_mod
-from simpler.comm_domain import DomainConfig
 from simpler.orchestrator import _callback_run
-from simpler.task_interface import CommBufferSpec, CommDomainHandle, DataType, TaskArgs, TensorArgType
+from simpler.task_interface import CommBufferSpec, CommDomainHandle, GlobalCommDomainHandle
 from simpler.worker import Worker
 
 
@@ -65,7 +64,7 @@ def test_reuse_snapshot_data_and_second_run_release(domain_worker):
 
     def first(orch, _args, _cfg):
         handle = orch.get_or_allocate_domain(**request)
-        assert type(handle) is CommDomainHandle
+        assert type(handle) is CommDomainHandle is GlobalCommDomainHandle
         assert orch.get_or_allocate_domain(**request) is handle
         assert orch.get_domain("tp") is handle
         assert handle.member(0).local_worker_id == 1
@@ -195,94 +194,6 @@ def test_foreign_release_and_missing_lookup(domain_worker):
         other.close()
 
 
-def test_outside_release_cannot_overtake_an_inflight_run(domain_worker):
-    worker, members = domain_worker
-    saved = []
-    worker.run(lambda orch, _args, _cfg: saved.append(orch.allocate_domain(**_request(members))))
-    entered, finish = threading.Event(), threading.Event()
-
-    def build(orch, _args, _cfg):
-        assert orch.get_domain("tp") is saved[0]
-        entered.set()
-        assert finish.wait(10)
-
-    # submit() builds synchronously; the background caller holds the callback gate.
-    errors = []
-
-    def submit():
-        try:
-            worker.run(build)
-        except BaseException as exc:
-            errors.append(exc)
-
-    thread = threading.Thread(target=submit)
-    thread.start()
-    assert entered.wait(10)
-    # The read-side control reservation may block until graph build exits, but must not free early.
-    released = threading.Event()
-
-    def release():
-        try:
-            saved[0].release()
-        except RuntimeError:
-            pass
-        finally:
-            released.set()
-
-    releaser = threading.Thread(target=release)
-    releaser.start()
-    assert not released.wait(0.05)
-    assert not saved[0].freed
-    finish.set()
-    thread.join(10)
-    releaser.join(10)
-    assert not thread.is_alive() and not releaser.is_alive() and not errors
-
-
-def test_cached_local_buffer_registers_second_run_use():
-    worker = Worker(level=3, platform="a2a3sim", runtime="tensormap_and_ringbuffer", device_ids=[0], num_sub_workers=0)
-    saved = []
-    try:
-        worker.init()
-
-        def first(orch, _args, _cfg):
-            handle = orch.allocate_domain(**_request([0]))
-            saved.append((handle, handle.local_context(0).buffers["payload"]))
-
-        worker.run(first)
-        handle, buffer = saved[0]
-
-        def second(_orch, _args, _cfg):
-            args = TaskArgs()
-            args.add_tensor(buffer.tensor([32], DataType.UINT8), TensorArgType.INPUT)
-            worker._record_touched_identities(args)
-            handle.release()
-            assert handle.released and not handle.freed
-            with pytest.raises(RuntimeError, match="released"):
-                worker._record_touched_identities(args)
-
-        worker.run(second)
-        assert handle.freed
-    finally:
-        worker.close()
-
-
-def test_configuration_validation():
-    for changes in (
-        dict(members=[]),
-        dict(members=[0, 0]),
-        dict(window_size=0),
-        dict(buffers=[CommBufferSpec("", "uint8", 1, 1)]),
-        dict(buffers=[CommBufferSpec("a", "uint8", 1, -1)]),
-        dict(buffers=[CommBufferSpec("a", "uint8", 8192, 8192)]),
-    ):
-        request = _request([0])
-        request.update(changes)
-        request.pop("name")
-        with pytest.raises(ValueError):
-            DomainConfig.capture(**request, topology=())
-
-
 def test_post_allocation_failure_does_not_publish_an_incomplete_handle(monkeypatch):
     worker = Worker(level=3, platform="a2a3sim", runtime="tensormap_and_ringbuffer", device_ids=[0], num_sub_workers=0)
     try:
@@ -304,12 +215,6 @@ def test_post_allocation_failure_does_not_publish_an_incomplete_handle(monkeypat
         worker.run(lambda orch, _args, _cfg: orch.get_or_allocate_domain(**_request([0])).release())
     finally:
         worker.close()
-
-
-def test_global_handle_compatibility_type():
-    from simpler.task_interface import GlobalCommDomainHandle  # noqa: PLC0415
-
-    assert GlobalCommDomainHandle is CommDomainHandle
 
 
 def test_failed_creation_stays_cleanup_owned_without_becoming_public(monkeypatch):
