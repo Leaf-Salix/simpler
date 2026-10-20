@@ -31,7 +31,7 @@
  *      invokes our `DynTileFwkBackendKernelServerInit`.
  *   3. Our Init reads inner_so_bin/inner_so_len/device_id from DeviceArgs,
  *      fingerprints the bytes (ELF Build-ID), and writes them to
- *      `/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<device_id>.so`.
+ *      `/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_v2_<fp>_<device_id>.so`.
  *      The sched thread (HwHiAiUser) owns this dir, so the write succeeds. The
  *      device_id suffix keeps paired dies sharing this filesystem from writing
  *      and executing one shared file (which corrupted the image under
@@ -46,10 +46,10 @@
  *      preinstall file; this dispatcher SO is no longer in the picture.
  *
  * Multi-runtime in one host process: each DeviceRunner bootstraps with the
- * same dispatcher bytes + its own runtime SO bytes. A process-level
- * fingerprint cache in LoadAicpuOp short-circuits repeat invocations for
- * the same runtime SO content, so libaicpu_extend_kernels' one-shot
- * `firstCreatSo_` latch fires at most once per (process, fingerprint).
+ * same dispatcher bytes + its own runtime SO bytes. Each bootstrap acquires
+ * a device-process shared file lease, reusing matching bytes. A subsequent
+ * bootstrap reclaims only v2 files without live leases. Legacy uploaders use
+ * cache_protocol=0 and keep their original, unmanaged filenames.
  */
 
 #ifndef COMMON_AICPU_DISPATCHER_AICPU_DISPATCHER_H_

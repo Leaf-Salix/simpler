@@ -33,6 +33,7 @@
 #include <string>
 
 #include "utils/elf_build_id.h"
+#include "so_cache.h"
 
 // dlog wrapper so error paths show up in device log without depending on
 // our common/unified_log machinery (this SO is loaded standalone by CANN).
@@ -66,11 +67,12 @@ struct KernelArgs {
 };
 struct DeviceArgs {
     uint64_t unused[12] = {0};
-    uint64_t aicpu_so_bin{0};  // 96  — dispatcher bytes (libaicpu_extend_kernels)
-    uint64_t aicpu_so_len{0};  // 104
-    uint64_t device_id{0};     // 112
-    uint64_t inner_so_bin{0};  // 120 — runtime SO bytes (dispatcher)
-    uint64_t inner_so_len{0};  // 128
+    uint64_t aicpu_so_bin{0};    // 96  — dispatcher bytes (libaicpu_extend_kernels)
+    uint64_t aicpu_so_len{0};    // 104
+    uint64_t device_id{0};       // 112
+    uint64_t inner_so_bin{0};    // 120 — runtime SO bytes (dispatcher)
+    uint64_t inner_so_len{0};    // 128
+    uint64_t cache_protocol{0};  // 136 — 1 enables process-leased cache filenames
 };
 static_assert(offsetof(KernelArgs, device_args) == 40, "KernelArgs::device_args offset drift");
 static_assert(offsetof(DeviceArgs, aicpu_so_bin) == 96, "DeviceArgs::aicpu_so_bin offset drift");
@@ -78,6 +80,7 @@ static_assert(offsetof(DeviceArgs, aicpu_so_len) == 104, "DeviceArgs::aicpu_so_l
 static_assert(offsetof(DeviceArgs, device_id) == 112, "DeviceArgs::device_id offset drift");
 static_assert(offsetof(DeviceArgs, inner_so_bin) == 120, "DeviceArgs::inner_so_bin offset drift");
 static_assert(offsetof(DeviceArgs, inner_so_len) == 128, "DeviceArgs::inner_so_len offset drift");
+static_assert(offsetof(DeviceArgs, cache_protocol) == 136, "DeviceArgs::cache_protocol offset drift");
 
 namespace simpler_dispatcher {
 
@@ -97,10 +100,11 @@ uint64_t Fingerprint(const char *data, uint64_t len) {
 
 // Preinstall path — HwHiAiUser owns this dir, the sched thread can write here.
 // device-side /tmp is mounted read-only / restricted in CANN 9.0.
-std::string MakeInnerSoPath(uint64_t fp, uint64_t device_id) {
+std::string MakeInnerSoPath(uint64_t fp, uint64_t device_id, bool managed) {
     char buf[256];
     snprintf(
-        buf, sizeof(buf), "/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_%016lx_%lu.so", fp, device_id
+        buf, sizeof(buf), "/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_%s%016lx_%lu.so",
+        managed ? "v2_" : "", fp, device_id
     );
     return buf;
 }
@@ -192,8 +196,19 @@ __attribute__((visibility("default"))) uint32_t DynTileFwkBackendKernelServerIni
     }
     const char *inner_bytes = reinterpret_cast<const char *>(d->inner_so_bin);
     uint64_t fp = simpler_dispatcher::Fingerprint(inner_bytes, d->inner_so_len);
-    std::string path = simpler_dispatcher::MakeInnerSoPath(fp, d->device_id);
-    if (!simpler_dispatcher::WriteBytes(path, inner_bytes, d->inner_so_len)) {
+    bool managed = d->cache_protocol == 1;
+    std::string path = simpler_dispatcher::MakeInnerSoPath(fp, d->device_id, managed);
+    bool good;
+    if (managed) {
+        size_t start = path.rfind('/') + 1;
+        good = simpler_dispatcher::StageManagedSo(
+            path.substr(0, start - 1), path.substr(start), inner_bytes, d->inner_so_len
+        );
+    } else {
+        good = simpler_dispatcher::WriteBytes(path, inner_bytes, d->inner_so_len);
+    }
+    if (!good) {
+        simpler_dispatcher::DispatcherLog("Init: stage %s failed: %s", path.c_str(), strerror(errno));
         return 1;
     }
     simpler_dispatcher::DispatcherLog("Init: wrote %s (%lu bytes)", path.c_str(), d->inner_so_len);

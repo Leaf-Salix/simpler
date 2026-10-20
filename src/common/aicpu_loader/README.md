@@ -6,7 +6,7 @@ write the bundled runtime SO bytes to the main `aicpu_scheduler`'s preinstall
 path under a content-fingerprint + device-id filename:
 
 ```text
-/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<device_id>.so
+/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_v2_<fp>_<device_id>.so
 ```
 
 The `<device_id>` suffix isolates the paired dies of one a2a3 chip (which share
@@ -26,8 +26,12 @@ preinstall file; the dispatcher is out of the picture once bootstrap returns.
 The source is runtime-agnostic. It is built per-arch under
 `build/lib/<arch>/dispatcher/libsimpler_aicpu_dispatcher.so`, one per arch and
 shared across every runtime. A single process binding multiple runtimes
-therefore shares one dispatcher SO on disk; the host process-level
-fingerprint cache deduplicates bootstrap calls by inner-SO Build-ID.
+therefore shares one dispatcher SO on disk. Each bootstrap acquires a shared
+file lock held until the device process exits, including abnormal exit. A later
+bootstrap reclaims unlocked v2 SOs and incomplete uploads; matching bytes are
+reused. A global file lock serializes publication and reclamation, protecting
+the interval before the first dlopen. Legacy filenames do not participate in
+this protocol and require separate maintenance cleanup if they fill the mount.
 
 ## Argument ABI boundaries
 
@@ -42,6 +46,7 @@ DeviceArgs + 104: aicpu_so_len
 DeviceArgs + 112: device_id
 DeviceArgs + 120: inner_so_bin
 DeviceArgs + 128: inner_so_len
+DeviceArgs + 136: cache_protocol (1 = process-leased v2 cache; 0 = legacy uploader)
 ```
 
 This private bootstrap structure is distinct from the platform runtime
