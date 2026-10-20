@@ -2799,9 +2799,13 @@ TEST_F(HbgGraphRestoreTest, RepeatedRestoreRebuildsQueuesPointersAndWorkingImage
     }
 }
 
-TEST_F(HbgGraphRestoreTest, RuntimeTailCopyPublishesTheCompleteInitializedPrefix) {
-    ASSERT_NO_FATAL_FAILURE(prepare_slot());
-    dirty_working();
+TEST_F(HbgGraphRestoreTest, RuntimeTailFlushKeepsDevicePrefixInitialized) {
+    ASSERT_EQ(build(empty_entry), 0);
+    RuntimeArenaLayout layout{};
+    ASSERT_EQ(hbg::make_kernel_graph_layout(capacity, layout), 0);
+    hbg::GraphResourceRequirements empty{};
+    ASSERT_EQ(hbg::get_graph_resource_requirements(result, layout, empty), 0);
+    ASSERT_NO_FATAL_FAILURE(prepare_slot(true, empty.scheduler_state_bytes));
     struct Trace {
         std::vector<std::pair<const void *, size_t>> copies;
         std::vector<std::pair<const void *, size_t>> flushes;
@@ -2817,17 +2821,38 @@ TEST_F(HbgGraphRestoreTest, RuntimeTailCopyPublishesTheCompleteInitializedPrefix
         static_cast<Trace *>(context)->flushes.emplace_back(dst, bytes);
         return true;
     };
-    ASSERT_EQ(restore(ops), hbg::GraphRestoreStatus::Ok);
-    ASSERT_FALSE(trace.copies.empty());
-    ASSERT_FALSE(trace.flushes.empty());
-    const auto &h = packet_header();
-    const uint64_t live = h.sm_offset + result.image_bytes;
-    EXPECT_EQ(trace.copies[0].first, reinterpret_cast<const void *>(seal.destinations[1].address + h.runtime_offset));
-    EXPECT_EQ(trace.copies[0].second, live - h.runtime_offset);
-    EXPECT_EQ(trace.flushes[0].first, reinterpret_cast<const void *>(seal.destinations[1].address));
-    EXPECT_EQ(trace.flushes[0].second, live);
-    EXPECT_EQ(registry->restore.live_bytes[1], live);
-    ASSERT_NO_FATAL_FAILURE(expect_initialized_prefix());
+    for (bool empty_graph : {false, true}) {
+        if (empty_graph) {
+            ASSERT_EQ(build(empty_entry), 0);
+            ASSERT_EQ(snapshot_graph(), 0);
+            ASSERT_EQ(hbg::make_graph_host_args(snapshot, packet), 0);
+            patch();
+        }
+        dirty_working();
+        trace.copies.clear();
+        trace.flushes.clear();
+        ASSERT_EQ(restore(ops), hbg::GraphRestoreStatus::Ok);
+        ASSERT_FALSE(trace.copies.empty());
+        ASSERT_FALSE(trace.flushes.empty());
+        const auto &h = packet_header();
+        const uint64_t live = h.sm_offset + result.image_bytes;
+        EXPECT_EQ(
+            trace.copies[0].first, reinterpret_cast<const void *>(seal.destinations[1].address + h.runtime_offset)
+        );
+        EXPECT_EQ(trace.copies[0].second, live - h.runtime_offset);
+        EXPECT_EQ(
+            trace.flushes[0].first, reinterpret_cast<const void *>(seal.destinations[1].address + h.runtime_offset)
+        );
+        EXPECT_EQ(trace.flushes[0].second, live - h.runtime_offset);
+        ASSERT_EQ(trace.flushes.size(), trace.copies.size() + 1);
+        for (size_t i = 1; i < trace.copies.size(); ++i)
+            EXPECT_EQ(trace.flushes[i], trace.copies[i]);
+        EXPECT_EQ(trace.flushes.back().first, &registry->restore);
+        EXPECT_EQ(trace.flushes.back().second, sizeof(registry->restore));
+        EXPECT_EQ(registry->restore.live_bytes[1], live);
+        ASSERT_NO_FATAL_FAILURE(expect_initialized_prefix());
+        ASSERT_NO_FATAL_FAILURE(retire());
+    }
 }
 
 TEST_F(HbgGraphRestoreTest, NoncanonicalDestinationOffsetsRejectBeforeAnyTargetWrite) {

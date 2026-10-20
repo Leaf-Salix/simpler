@@ -296,11 +296,13 @@ GraphRestoreStatus restore_graph_packet(
         return fail();
     runtime->scheduler->seed_queue_slots();
     runtime->aicore_mailbox->init_empty();
+    // Device-only queues and mailbox are shared through AICPU coherence and the Ready release/acquire.
     for (size_t i = 1; i < 4; ++i)
-        if (view.regions[i].bytes && !flush_region(
-                                         ops, reinterpret_cast<void *>(view.slot.destinations[i].address),
-                                         view.regions[i].destination_offset + view.regions[i].bytes
-                                     ))
+        if (view.regions[i].bytes &&
+            !flush_region(
+                ops, reinterpret_cast<void *>(view.slot.destinations[i].address + view.regions[i].destination_offset),
+                view.regions[i].bytes
+            ))
             return fail();
     control.runtime_address = reinterpret_cast<uintptr_t>(runtime);
     control.sm_bytes = sm_bytes;

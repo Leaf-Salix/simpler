@@ -289,7 +289,9 @@ Restore does not clear or flush the tensor heap. Tasks write tensor data and
 Graph localization/materialization initializes execution metadata independently;
 unused heap capacity remains untouched.
 The A5 scheduler image is restored from its zeroed template. The common
-scheduler queues, mailbox and runtime pointers are rebuilt by the leader restore;
+scheduler queues, mailbox and runtime pointers are rebuilt by the leader restore.
+The AICPU-only prefix is published by coherence and release/acquire; explicit
+image flushes cover the serialized Runtime tail, Definitions and A5 scheduler.
 A5 dispatch-specific metadata binding remains with the kernel entry.
 Host framing/ownership tests and compilation against the installed CANN header
 are not evidence of on-device capture/restore correctness.

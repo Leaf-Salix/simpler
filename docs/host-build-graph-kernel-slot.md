@@ -208,13 +208,15 @@ protection; this interface does not register a CANN entry or enqueue streams.
    reset the completion mailbox. The separate A5 scheduler image is restored to
    its template; architecture-specific dispatch binding remains the kernel
    entry's responsibility.
-5. Flush every written region and the prepared control metadata before committing
+5. Flush serialized image spans and the prepared control metadata before committing
    the attempt as the successful restore generation and release-publishing Ready.
    The memory backend can fail this pre-publication flush without committing.
    Return the RuntimeContext address,
    capacity-bounded SM span and task count for the dispatch owner.
-   Runtime publication covers its complete live prefix, including device-only
-   initialization before the serialized Runtime tail.
+   The runtime image flush starts at `runtime_offset`. The device-only prefix is
+   published through AICPU coherence and the Ready release/acquire, without a
+   broad prefix flush. `live_bytes` still covers the complete initialized prefix;
+   Definition and optional A5 scheduler images retain their full live flushes.
 
 The 128-byte `GraphRestoreControl` is part of the context registry allocation,
 never part of a graph image. Resource prepare still performs two physical
