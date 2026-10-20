@@ -397,6 +397,54 @@ TEST(HbgKernelExternalTensor, RejectsHostDeviceArgsAndUnsupportedStrides) {
     EXPECT_EQ(hbg::validate_kernel_external_tensors(args), hbg::KernelExternalTensorStatus::UnsupportedStrideFamily);
 }
 
+TEST(HbgKernelExternalTensor, PreservesWideTensorArithmeticBounds) {
+    GraphTensor tensor{};
+    tensor.buffer_addr = 0x44000;
+    tensor.buffer_size = UINT64_MAX;
+    tensor.extent_elem = UINT64_MAX;
+    tensor.ndims = 3;
+    tensor.dtype = static_cast<uint8_t>(DataType::UINT8);
+    tensor.address_space = static_cast<uint8_t>(AddressSpace::DEVICE);
+    tensor.shapes[0] = UINT32_MAX;
+    tensor.shapes[1] = 5;
+    tensor.shapes[2] = 3;
+    tensor.strides[0] = UINT32_MAX - 1;
+    tensor.strides[1] = UINT32_MAX - 1;
+    tensor.strides[2] = 1;
+    EXPECT_TRUE(graph_tensor_wire_valid(tensor));
+    tensor.shapes[2] = 4;
+    tensor.extent_elem = 0;
+    EXPECT_FALSE(graph_tensor_wire_valid(tensor));
+
+    tensor.shapes[1] = UINT32_MAX;
+    tensor.shapes[2] = 2;
+    tensor.strides[0] = tensor.strides[1] = 1;
+    tensor.extent_elem = uint64_t{2} * UINT32_MAX;
+    EXPECT_FALSE(graph_tensor_wire_valid(tensor));
+
+    tensor.ndims = 2;
+    tensor.shapes[0] = tensor.shapes[1] = UINT32_MAX;
+    tensor.strides[0] = UINT32_MAX;
+    tensor.strides[1] = 1;
+    tensor.extent_elem = uint64_t{UINT32_MAX} * UINT32_MAX;
+    tensor.is_contiguous = 1;
+    EXPECT_TRUE(graph_tensor_wire_valid(tensor));
+    EXPECT_TRUE(hbg::supported_kernel_graph_stride_family(tensor));
+    tensor.strides[1] = UINT32_MAX;
+    EXPECT_FALSE(hbg::supported_kernel_graph_stride_family(tensor));
+
+    tensor.ndims = 3;
+    tensor.shapes[1] = 641;
+    tensor.shapes[2] = 6700417;
+    tensor.strides[0] = tensor.strides[1] = 1;
+    tensor.extent_elem = uint64_t{UINT32_MAX} + 641 + 6700417 - 2;
+    tensor.is_contiguous = 0;
+    EXPECT_TRUE(graph_tensor_wire_valid(tensor));
+    ++tensor.shapes[2];
+    ++tensor.extent_elem;
+    EXPECT_FALSE(graph_tensor_wire_valid(tensor));
+}
+
 TEST(HbgKernelExternalTensor, RejectsFlatTensorRankBeforePacking) {
     const uint32_t shape[] = {1};
     const auto boundary =
