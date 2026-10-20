@@ -56,7 +56,8 @@ bool load_callable(int32_t id, uint64_t generation, hbg::HbgCallableRegistration
 bool bind_callable(Runtime *runtime, const hbg::HbgCallableRegistration &registration) noexcept {
     if (runtime == nullptr || registration.callable_bytes < sizeof(ChipCallable)) return false;
     auto *callable = reinterpret_cast<const ChipCallable *>(registration.callable_address);
-    cache_invalidate_range(callable, registration.callable_bytes);
+    // Binding reads metadata headers; uploaded orchestration and kernel code stay immutable.
+    cache_invalidate_range(callable, sizeof(*callable));
     const int32_t children = callable->child_count_;
     if (children < 0 || children > KERNEL_MAX_FUNC_ID) return false;
     runtime->clear_function_bin_addrs();
@@ -70,6 +71,7 @@ bool bind_callable(Runtime *runtime, const hbg::HbgCallableRegistration &registr
         const auto *child = reinterpret_cast<const CoreCallable *>(
             reinterpret_cast<const uint8_t *>(callable) + offsetof(ChipCallable, storage_) + offset
         );
+        cache_invalidate_range(child, sizeof(*child));
         if (child->resolved_addr_ == 0) return false;
         // HBG stores the device-side CoreCallable header in func_id_to_addr_.
         // SchedulerContext::build_payload() dereferences this header to obtain
