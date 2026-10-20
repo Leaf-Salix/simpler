@@ -58,8 +58,9 @@ then returns. The host then issues a normal
 `rtsBinaryLoadFromFile(json, ...)` + `rtsFuncGetByName` +
 `rtsLaunchCpuKernel` sequence pointing at the preinstall basename.
 
-The standalone reference tools retain the legacy `simpler_inner_<fp>_<dev>.so`
-namespace. See [the loader cache protocol](../src/common/aicpu_loader/README.md)
+The standalone reference tools use the same managed cache protocol as the runtime
+and require the dispatcher built from the same checkout. Existing protocol-0
+binaries retain the legacy namespace. See [the loader cache protocol](../src/common/aicpu_loader/README.md)
 for process leases, reclamation, and legacy-cache maintenance.
 
 - **Mechanism**: AICPU OS process has write access to the preinstall

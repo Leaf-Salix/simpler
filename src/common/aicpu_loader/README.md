@@ -32,6 +32,8 @@ bootstrap reclaims unlocked v2 SOs and incomplete uploads; matching bytes are
 reused. A global file lock serializes publication and reclamation, protecting
 the interval before the first dlopen. Legacy filenames do not participate in
 this protocol and require separate maintenance cleanup if they fill the mount.
+Current standalone tools use protocol 1 with the dispatcher built from the same
+checkout. Existing protocol-0 host binaries keep their legacy filenames.
 
 ## Argument ABI boundaries
 
@@ -46,7 +48,7 @@ DeviceArgs + 104: aicpu_so_len
 DeviceArgs + 112: device_id
 DeviceArgs + 120: inner_so_bin
 DeviceArgs + 128: inner_so_len
-DeviceArgs + 136: cache_protocol (1 = process-leased v2 cache; 0 = legacy uploader)
+DeviceArgs + 136: cache_protocol (1 = process-leased v2 cache; 0 = legacy binary)
 ```
 
 This private bootstrap structure is distinct from the platform runtime

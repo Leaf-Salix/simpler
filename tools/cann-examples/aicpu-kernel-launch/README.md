@@ -27,7 +27,7 @@ The full Mode A "Path A" pipeline:
    `rtAicpuKernelLaunchExWithArgs(KERNEL_TYPE_AICPU_KFC)`.
 2. `libaicpu_extend_kernels` dlopens the dispatcher inside the AICPU OS
    process; the dispatcher writes your inner SO bytes to
-   `/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<dev>.so`
+   `/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_v2_<fp>_<dev>.so`
    (writable from the AICPU OS process, no host-side filesystem access
    needed).
 3. Host fingerprints the inner SO by ELF Build-ID, generates a JSON
@@ -112,7 +112,7 @@ struct HelloResult {                 // 32 B GM buffer
 
 The first 96 B of `DeviceArgs` are dispatcher-owned during bootstrap (the
 dispatcher reads `aicpu_so_bin`/`aicpu_so_len`/`device_id`/`inner_so_bin`/
-`inner_so_len` at offsets 96/104/112/120/128). The host reuses the same
+`inner_so_len`/`cache_protocol` at offsets 96/104/112/120/128/136). The host reuses the same
 160 B buffer post-bootstrap by overwriting offsets 96 (`result_addr`) and
 104 (`input_token`) before launching `simpler_aicpu_run`.
 
@@ -164,7 +164,7 @@ task-submit --device auto --device-num 1 \
 Successful output:
 
 ```text
-[bootstrap] inner SO landed at /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<dev>.so
+[bootstrap] inner SO landed at /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_v2_<fp>_<dev>.so
 [bootstrap] fp=<16 hex>  (token=<16 hex>)
 
 === device=<N>  hello_aicpu HelloResult ===

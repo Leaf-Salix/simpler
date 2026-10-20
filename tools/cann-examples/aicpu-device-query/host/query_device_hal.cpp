@@ -23,7 +23,7 @@
 //   4. memcpy bytes H2D
 //   5. rtAicpuKernelLaunchExWithArgs(KERNEL_TYPE_AICPU_KFC, AST_DYN_AICPU, ...) —
 //      libaicpu_extend_kernels dlopens dispatcher, runs DynInit which writes
-//      inner SO bytes to /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<dev>.so
+//      inner SO bytes to /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_v2_<fp>_<dev>.so
 //   6. aclrtSynchronizeStream
 //   7. generate JSON descriptor pointing at preinstall path with two ops
 //      (simpler_aicpu_init + simpler_aicpu_query), fingerprint-suffixed opTypes
@@ -251,6 +251,7 @@ const char *kInfoName(int32_t i) {
 //     112 device_id
 //     120 inner_so_bin
 //     128 inner_so_len
+//     136 cache_protocol
 //   query:
 //     96  q_input_addr  (overwrites aicpu_so_bin slot, but dispatcher is done)
 //     104 q_input_count
@@ -262,6 +263,7 @@ constexpr size_t kBootstrapDispLen = 104;
 constexpr size_t kBootstrapDevId = 112;
 constexpr size_t kBootstrapInnerBin = 120;
 constexpr size_t kBootstrapInnerLen = 128;
+constexpr size_t kBootstrapCacheProtocol = 136;
 constexpr size_t kQInputAddr = 96;
 constexpr size_t kQInputCount = 104;
 constexpr size_t kQOutputAddr = 112;
@@ -271,7 +273,7 @@ void WriteU64(char *buf, size_t off, uint64_t v) { std::memcpy(buf + off, &v, si
 std::string MakePreinstallPath(uint64_t fp, int device_id) {
     char buf[256];
     std::snprintf(
-        buf, sizeof(buf), "/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_%016lx_%d.so", fp, device_id
+        buf, sizeof(buf), "/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_v2_%016lx_%d.so", fp, device_id
     );
     return buf;
 }
@@ -379,6 +381,7 @@ int main(int argc, char **argv) {
     WriteU64(hostargs, kBootstrapDevId, (uint64_t)device_id);
     WriteU64(hostargs, kBootstrapInnerBin, reinterpret_cast<uint64_t>(dev_inner.ptr));
     WriteU64(hostargs, kBootstrapInnerLen, inner_bytes.size());
+    WriteU64(hostargs, kBootstrapCacheProtocol, 1);
     ACL_CHECK(
         aclrtMemcpy(dev_args.ptr, kDeviceArgsBytes, hostargs, kDeviceArgsBytes, ACL_MEMCPY_HOST_TO_DEVICE),
         "H2D DeviceArgs(bootstrap)"
@@ -418,7 +421,7 @@ int main(int argc, char **argv) {
 
     // ---- Fingerprint inner SO + write JSON descriptor ----
     uint64_t fp = fp::Compute(inner_bytes.data(), inner_bytes.size());
-    std::string so_basename = "simpler_inner_" + [&] {
+    std::string so_basename = "simpler_inner_v2_" + [&] {
         char b[24];
         std::snprintf(b, sizeof(b), "%016lx_%d.so", fp, device_id);
         return std::string(b);

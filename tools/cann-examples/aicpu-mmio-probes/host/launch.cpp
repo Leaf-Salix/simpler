@@ -199,6 +199,7 @@ constexpr size_t kBootstrapDispLen = 104;
 constexpr size_t kBootstrapDevId = 112;
 constexpr size_t kBootstrapInnerBin = 120;
 constexpr size_t kBootstrapInnerLen = 128;
+constexpr size_t kBootstrapCacheProtocol = 136;
 
 void WriteU64(char *buf, size_t off, uint64_t v) { std::memcpy(buf + off, &v, sizeof(v)); }
 
@@ -369,6 +370,7 @@ int main(int argc, char **argv) {
     WriteU64(hostargs, kBootstrapDevId, (uint64_t)device_id);
     WriteU64(hostargs, kBootstrapInnerBin, reinterpret_cast<uint64_t>(dev_inner.ptr));
     WriteU64(hostargs, kBootstrapInnerLen, inner_bytes.size());
+    WriteU64(hostargs, kBootstrapCacheProtocol, 1);
     ACL_CHECK(
         aclrtMemcpy(dev_args.ptr, kDeviceArgsBytes, hostargs, kDeviceArgsBytes, ACL_MEMCPY_HOST_TO_DEVICE),
         "H2D DeviceArgs(bootstrap)"
@@ -406,7 +408,7 @@ int main(int argc, char **argv) {
 
     uint64_t fp = fp::Compute(inner_bytes.data(), inner_bytes.size());
     char base[64];
-    std::snprintf(base, sizeof(base), "simpler_inner_%016lx_%d.so", fp, device_id);
+    std::snprintf(base, sizeof(base), "simpler_inner_v2_%016lx_%d.so", fp, device_id);
     std::string so_basename = base;
     std::printf(
         "[bootstrap] inner landed at /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/%s (fp=%016lx)\n", base, fp

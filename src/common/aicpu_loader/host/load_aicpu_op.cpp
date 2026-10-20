@@ -125,7 +125,7 @@ int LoadAicpuOp::BootstrapDispatcher(
     write_qword(112, static_cast<uint64_t>(device_id_));
     write_qword(120, reinterpret_cast<uint64_t>(dev_inner.ptr));
     write_qword(128, static_cast<uint64_t>(inner_len));
-    write_qword(136, 1);  // Device-process lease protocol; legacy standalone uploaders leave this zero.
+    write_qword(136, 1);  // Device-process lease protocol; legacy host binaries leave this zero.
 
     DeviceBuf dev_args;
     rc = dev_args.alloc(kDeviceArgsBytes);
