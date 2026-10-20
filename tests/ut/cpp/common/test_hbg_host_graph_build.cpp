@@ -3429,14 +3429,17 @@ TEST_F(HbgGraphRestoreTest, OrdinaryIntermediateSurvivesBuildPacketAndRestore) {
         return value == 0xa5;
     }));
     ASSERT_NO_FATAL_FAILURE(retire());
-    auto *source = reinterpret_cast<ChipTaskStorage *>(
-        reinterpret_cast<std::byte *>(packet.storage.data()) + packet.data_offset + packet_header().sm_offset -
-        packet_header().runtime_offset + offsets.storage
-    );
+    auto *source_sm = reinterpret_cast<std::byte *>(packet.storage.data()) + packet.data_offset +
+                      packet_header().sm_offset - packet_header().runtime_offset;
+    Buffer aligned;
+    aligned.reserve(restored.sm_bytes);
+    std::memcpy(aligned.data(), source_sm, restored.sm_bytes);
+    auto *source = reinterpret_cast<ChipTaskStorage *>(aligned.data() + offsets.storage);
     auto &tensor = source[0].payload.tensor_data()[0];
     const auto original = tensor;
     for (uint64_t address : {binding.heap.address - 64, binding.heap.address + result.heap_bytes, HEAP_VIRTUAL_BASE}) {
         tensor.buffer.addr = address;
+        std::memcpy(source_sm, aligned.data(), restored.sm_bytes);
         patch();
         const auto before = working_bytes();
         EXPECT_EQ(restore(), hbg::GraphRestoreStatus::InvalidImage);
@@ -3444,6 +3447,7 @@ TEST_F(HbgGraphRestoreTest, OrdinaryIntermediateSurvivesBuildPacketAndRestore) {
     }
     tensor = original;
     tensor.buffer.size = result.heap_bytes + 1;
+    std::memcpy(source_sm, aligned.data(), restored.sm_bytes);
     patch();
     const auto before = working_bytes();
     EXPECT_EQ(restore(), hbg::GraphRestoreStatus::InvalidImage);
