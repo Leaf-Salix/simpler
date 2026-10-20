@@ -247,6 +247,8 @@ int make_graph_launch_template(
     GraphResourceRequirements required{};
     rc = get_graph_resource_requirements(build, layout, required);
     if (rc != 0) return rc;
+    layout.sched.capacities =
+        kernel_graph_queue_capacities(build.total_tasks, layout.task_capacity, required.graph_definition_bytes != 0);
     KernelWorkingBinding binding{};
     rc = bind_kernel_resources_for_launch(context, device_id, slot_generation, required, binding);
     if (rc != 0) return rc;

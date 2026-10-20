@@ -385,7 +385,7 @@ TEST(HbgKernelExternalTensor, RejectsHostDeviceArgsAndUnsupportedStrides) {
 
 class HostGraphBuildTest : public ::testing::Test {
 protected:
-    static constexpr uint64_t capacity = 64;
+    uint64_t capacity{64};
     Runtime runtime;
     DeviceArena host_arena;
     RuntimeArenaLayout layout{};
@@ -2027,9 +2027,9 @@ protected:
         if (registry != nullptr) hbg::detach_graph_slot_registry(registry);
         HbgGraphPacketTest::TearDown();
     }
-    void prepare_slot(bool publish = true, uint64_t scheduler_capacity = 0) {
+    void prepare_slot(bool publish = true, uint64_t scheduler_capacity = 0, uint64_t spare = 0) {
         ASSERT_GE(build(graph_entry), 0);
-        prepare(0, scheduler_capacity);
+        prepare(spare, scheduler_capacity);
         ASSERT_EQ(hbg::seal_graph_execution_slot(context, 0, 19, 109, seal), 0);
         registry = reinterpret_cast<hbg::GraphSlotRegistry *>(seal.registry.address);
         if (publish) {
@@ -2671,6 +2671,137 @@ protected:
             EXPECT_EQ(entry.seq.load(), 0u);
     }
 };
+
+class HbgLargeGraphRestoreTest : public HbgGraphRestoreTest {
+protected:
+    void SetUp() override {
+        capacity = 512;
+        HostGraphBuildTest::SetUp();
+    }
+    void prepare_large_slot() {
+        packet_task_count = capacity - 1;
+        ASSERT_EQ(build(packet_window_entry), capacity - 1);
+        RuntimeArenaLayout physical{};
+        ASSERT_EQ(hbg::make_kernel_graph_layout(capacity, physical), 0);
+        hbg::GraphResourceRequirements largest{};
+        ASSERT_EQ(hbg::get_graph_resource_requirements(result, physical, largest), 0);
+        ASSERT_NO_FATAL_FAILURE(prepare_slot(true, largest.scheduler_state_bytes, 2 * 1024 * 1024));
+    }
+};
+
+TEST_F(HbgLargeGraphRestoreTest, FlatQueuesFollowTaskCountWithoutMovingFrozenStorage) {
+    ASSERT_NO_FATAL_FAILURE(prepare_large_slot());
+    RuntimeArenaLayout physical{};
+    ASSERT_EQ(hbg::make_kernel_graph_layout(capacity, physical), 0);
+    for (int count : {0, 1, 63, 64, 65, 127, 128, 129, 511}) {
+        SCOPED_TRACE(count);
+        packet_task_count = count;
+        ASSERT_EQ(build(packet_window_entry), count);
+        ASSERT_EQ(snapshot_graph(), 0);
+        ASSERT_EQ(hbg::make_graph_host_args(snapshot, packet), 0);
+        patch();
+        dirty_working();
+        ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+        ASSERT_NO_FATAL_FAILURE(expect_initialized_prefix());
+        const auto &logical = restored.runtime->prebuilt_layout;
+        uint64_t expected = 64;
+        while (expected < static_cast<uint64_t>(count))
+            expected <<= 1;
+        EXPECT_EQ(logical.task_capacity, physical.task_capacity);
+        EXPECT_EQ(logical.arena_size, physical.arena_size);
+        EXPECT_EQ(logical.off_runtime, physical.off_runtime);
+        EXPECT_EQ(logical.off_copied_begin, physical.off_copied_begin);
+        EXPECT_EQ(logical.off_copied_end, physical.off_copied_end);
+        EXPECT_EQ(logical.off_scheduler, physical.off_scheduler);
+        EXPECT_EQ(logical.off_sm_handle, physical.off_sm_handle);
+        EXPECT_EQ(logical.off_mailbox, physical.off_mailbox);
+        EXPECT_EQ(packet_header().runtime_offset, physical.off_runtime);
+        EXPECT_EQ(packet_header().sm_offset, physical.off_copied_end);
+        auto &sched = *restored.runtime->scheduler;
+        std::vector<ChipReadyQueue *> queues;
+        for (int i = 0; i < NUM_RESOURCE_SHAPES; ++i) {
+            EXPECT_EQ(logical.sched.off_ready_queue_slots[i], physical.sched.off_ready_queue_slots[i]);
+            EXPECT_EQ(logical.sched.off_ready_sync_queue_slots[i], physical.sched.off_ready_sync_queue_slots[i]);
+            EXPECT_EQ(
+                logical.sched.off_early_dispatch_queue_slots[i], physical.sched.off_early_dispatch_queue_slots[i]
+            );
+            queues.push_back(&sched.ready_queues[i]);
+            queues.push_back(&sched.ready_sync_queues[i]);
+        }
+        EXPECT_EQ(logical.sched.off_dummy_ready_queue_slots, physical.sched.off_dummy_ready_queue_slots);
+        EXPECT_EQ(logical.sched.off_graph_ready_queue_slots, physical.sched.off_graph_ready_queue_slots);
+        EXPECT_EQ(logical.sched.off_graph_prepare_queue_slots, physical.sched.off_graph_prepare_queue_slots);
+        queues.push_back(&sched.dummy_ready_queue);
+        queues.push_back(&sched.graph_ready_queue);
+        queues.push_back(&sched.graph_prepare_queue);
+        auto &tasks = restored.runtime->sm_handle->header->tasks;
+        for (auto *queue : queues) {
+            ASSERT_EQ(queue->capacity, expected);
+            const auto *unused = reinterpret_cast<const uint8_t *>(queue->slots + expected);
+            EXPECT_TRUE(std::all_of(unused, unused + (capacity - expected) * sizeof(ChipReadyQueueSlot), [](auto b) {
+                return b == 0xa5;
+            }));
+            for (int lap = 0; lap < 3; ++lap) {
+                for (int i = 0; i < count; ++i)
+                    ASSERT_TRUE(queue->push(&tasks.storage_at(i).slot));
+                for (int i = 0; i < count; ++i) {
+                    auto *slot = queue->pop();
+                    ASSERT_EQ(slot, &tasks.storage_at(i).slot);
+                    ASSERT_TRUE(queue->push(slot));
+                }
+                for (int i = 0; i < count; ++i)
+                    EXPECT_EQ(queue->pop(), &tasks.storage_at(i).slot);
+                EXPECT_EQ(queue->pop(), nullptr);
+            }
+        }
+        ASSERT_NO_FATAL_FAILURE(retire());
+    }
+    ASSERT_EQ(build(graph_entry), 1);
+    ASSERT_EQ(snapshot_graph(), 0);
+    ASSERT_EQ(hbg::make_graph_host_args(snapshot, packet), 0);
+    patch();
+    dirty_working();
+    ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+    ASSERT_NO_FATAL_FAILURE(expect_initialized_prefix());
+    EXPECT_EQ(restored.runtime->scheduler->dummy_ready_queue.capacity, capacity);
+    ASSERT_NO_FATAL_FAILURE(retire());
+    ASSERT_EQ(build(chain_entry), 2);
+    ASSERT_EQ(snapshot_graph(), 0);
+    ASSERT_EQ(hbg::make_graph_host_args(snapshot, packet), 0);
+    patch();
+    dirty_working();
+    ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+    ASSERT_NO_FATAL_FAILURE(expect_initialized_prefix());
+    EXPECT_EQ(restored.runtime->scheduler->dummy_ready_queue.capacity, 64u);
+}
+
+TEST_F(HbgLargeGraphRestoreTest, ForgedFlatQueueCapacitiesRejectBeforeAnyTargetWrite) {
+    ASSERT_NO_FATAL_FAILURE(prepare_large_slot());
+    packet_task_count = 65;
+    ASSERT_EQ(build(packet_window_entry), 65);
+    ASSERT_EQ(snapshot_graph(), 0);
+    ASSERT_EQ(hbg::make_graph_host_args(snapshot, packet), 0);
+    patch();
+    const auto original = packet.storage;
+    const auto before = working_bytes();
+    for (int queue = 0; queue < 9; ++queue) {
+        for (uint64_t forged : {uint64_t{0}, uint64_t{64}, uint64_t{127}, uint64_t{256}, UINT64_MAX}) {
+            packet.storage = original;
+            auto *source = reinterpret_cast<RuntimeContext *>(
+                reinterpret_cast<std::byte *>(packet.storage.data()) + packet.data_offset
+            );
+            auto &caps = source->prebuilt_layout.sched.capacities;
+            if (queue < 3) caps.ready[queue] = forged;
+            else if (queue < 6) caps.ready_sync[queue - 3] = forged;
+            else if (queue == 6) caps.dummy = forged;
+            else if (queue == 7) caps.graph_ready = forged;
+            else caps.graph_prepare = forged;
+            patch();
+            EXPECT_EQ(restore(), hbg::GraphRestoreStatus::InvalidImage);
+            EXPECT_EQ(working_bytes(), before);
+        }
+    }
+}
 
 TEST_F(HbgGraphRestoreTest, OrdinaryIntermediateSurvivesBuildPacketAndRestore) {
     ASSERT_EQ(build(chain_entry), 2);

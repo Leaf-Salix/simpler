@@ -46,6 +46,15 @@ allocation, address binding or H2D. H1 has already validated and measured the
 Definition plan, so the query reads the immutable measurement and does not scan
 or mutate the borrowed Definition staging.
 
+Kernel packets retain these window-based physical reservations and offsets.
+Without a live Definitions region, their nine logical ready/sync/dummy/Graph
+queue capacities are `next_power_of_two(max(64, total_tasks))`. A flat task has
+at most one pending entry per queue, including SPMD requeue. Packets containing
+Definitions retain the window-based capacities because inner tasks are not
+included in the outer task count. Device validation independently derives these
+capacities before accepting the pristine layout; fixed early-dispatch queues
+and the AICore mailbox keep their existing sizes.
+
 `GraphResourceRequirements` is an independent value snapshot for one graph:
 
 | Field | Meaning |

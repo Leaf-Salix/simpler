@@ -128,6 +128,7 @@ bool validate_images(const GraphRestoreView &view, RuntimeArenaLayout &layout, u
     while (ready_capacity < h.task_window)
         ready_capacity <<= 1;
     layout = runtime_reserve_layout(reservations, h.task_window, ready_capacity);
+    layout.sched.capacities = kernel_graph_queue_capacities(h.total_tasks, h.task_window, view.regions[2].bytes != 0);
     const auto &image = view.regions[1];
     if (h.runtime_offset != layout.off_runtime || h.sm_offset != layout.off_copied_end ||
         image.destination_offset != layout.off_runtime || h.sm_offset < image.destination_offset ||
