@@ -1486,6 +1486,58 @@ protected:
     }
 };
 
+TEST(HbgGraphPacket, ChecksumMatchesByteReferenceAcrossAlignmentsAndTails) {
+    constexpr size_t skip =
+        sizeof(SimplerKernelInvocationHeader) + offsetof(hbg::GraphPacketHeader, inline_payload_addr);
+    EXPECT_EQ(hbg::graph_packet_checksum(nullptr, 0), 0u);
+    EXPECT_EQ(hbg::graph_packet_checksum(nullptr, 512), 0u);
+    uint64_t random = 0x3c6ef372fe94f82bULL;
+    for (int pattern = 0; pattern < 5; ++pattern) {
+        for (size_t alignment = 0; alignment < sizeof(uint64_t); ++alignment) {
+            for (size_t bytes = 0; bytes <= 1024; ++bytes) {
+                auto storage = std::make_unique<uint8_t[]>(alignment + std::max(bytes, size_t{1}));
+                auto *packet = storage.get() + alignment;
+                for (size_t i = 0; i < bytes; ++i) {
+                    random ^= random << 13;
+                    random ^= random >> 7;
+                    random ^= random << 17;
+                    packet[i] = pattern == 0 ? 0 :
+                                pattern == 1 ? 0xff :
+                                pattern == 2 ? static_cast<uint8_t>(i % 8 == 0) :
+                                pattern == 3 ? static_cast<uint8_t>((i / 8) % 2 ? 0xff : 0) :
+                                               static_cast<uint8_t>(random);
+                }
+                uint64_t expected = 0;
+                if (bytes >= skip + 16) {
+                    expected = simpler::common::utils::fnv1a_64(packet, skip);
+                    expected = simpler::common::utils::fnv1a_64_append(expected, packet + skip + 16, bytes - skip - 16);
+                }
+                ASSERT_EQ(hbg::graph_packet_checksum(packet, bytes), expected)
+                    << "pattern=" << pattern << " alignment=" << alignment << " bytes=" << bytes;
+            }
+        }
+    }
+}
+
+TEST(HbgGraphPacket, ChecksumExcludesOnlyPatchedAddressAndChecksumBytes) {
+    constexpr size_t skip =
+        sizeof(SimplerKernelInvocationHeader) + offsetof(hbg::GraphPacketHeader, inline_payload_addr);
+    std::vector<uint8_t> packet(513, 0);
+    const uint64_t baseline = hbg::graph_packet_checksum(packet.data(), packet.size());
+    for (size_t offset = 0; offset < packet.size(); ++offset) {
+        for (unsigned bit = 0; bit < 8; ++bit) {
+            packet[offset] = static_cast<uint8_t>(1u << bit);
+            const uint64_t checksum = hbg::graph_packet_checksum(packet.data(), packet.size());
+            if (offset >= skip && offset < skip + 16) {
+                EXPECT_EQ(checksum, baseline) << "offset=" << offset << " bit=" << bit;
+            } else {
+                EXPECT_NE(checksum, baseline) << "offset=" << offset << " bit=" << bit;
+            }
+            packet[offset] = 0;
+        }
+    }
+}
+
 TEST(HbgGraphPacket, CompactLayoutFollowsWindowAndPreservesProgramSizing) {
     for (uint64_t window : {1, 2, 63, 64, 65, 128, 32768}) {
         RuntimeArenaLayout layout{};

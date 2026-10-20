@@ -102,7 +102,23 @@ inline uint64_t graph_packet_checksum(const void *packet, size_t size) noexcept 
     if (packet == nullptr || size < skip + 16) return 0;
     const auto *bytes = static_cast<const uint8_t *>(packet);
     auto hash = simpler::common::utils::fnv1a_64(bytes, skip);
-    return simpler::common::utils::fnv1a_64_append(hash, bytes + skip + 16, size - skip - 16);
+    const auto *tail = bytes + skip + 16;
+    size_t remaining = size - skip - 16;
+    constexpr uint64_t zero_word_factor = [] {
+        uint64_t value = 1;
+        for (size_t i = 0; i < sizeof(uint64_t); ++i)
+            value *= 0x100000001b3ULL;
+        return value;
+    }();
+    while (remaining >= sizeof(uint64_t)) {
+        uint64_t word;
+        std::memcpy(&word, tail, sizeof(word));
+        // Eight zero bytes leave only the eight FNV prime multiplications.
+        hash = word == 0 ? hash * zero_word_factor : simpler::common::utils::fnv1a_64_append(hash, tail, sizeof(word));
+        tail += sizeof(word);
+        remaining -= sizeof(word);
+    }
+    return simpler::common::utils::fnv1a_64_append(hash, tail, remaining);
 }
 
 // Allocation-free framing validation. No device destination is read or written.
