@@ -1701,6 +1701,7 @@ add_device_phase_capture_test(test_device_phase_capture_compile_off 0 1 0)
 add_executable(test_onboard_device_log_level
     common/test_onboard_device_log_level.cpp
     ${COMMON_PLATFORM_DIR}/onboard/aicpu/device_log.cpp
+    ${COMMON_PLATFORM_DIR}/shared/aicpu/unified_log_device.cpp
 )
 target_include_directories(test_onboard_device_log_level PRIVATE
     ${GTEST_INCLUDE_DIRS}
