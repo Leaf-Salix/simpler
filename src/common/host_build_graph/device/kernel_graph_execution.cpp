@@ -11,6 +11,7 @@
 #if defined(SIMPLER_HBG_KERNEL_MODE)
 
 #include "host_build_graph/kernel_callable_registration.h"
+#include "host_build_graph/kernel_callable_binding.h"
 
 #include <atomic>
 #include <cstring>
@@ -53,35 +54,7 @@ bool load_callable(int32_t id, uint64_t generation, hbg::HbgCallableRegistration
            hbg::valid_hbg_callable_registration(out);
 }
 
-bool bind_callable(Runtime *runtime, const hbg::HbgCallableRegistration &registration) noexcept {
-    if (runtime == nullptr || registration.callable_bytes < sizeof(ChipCallable)) return false;
-    auto *callable = reinterpret_cast<const ChipCallable *>(registration.callable_address);
-    // Binding reads metadata headers; uploaded orchestration and kernel code stay immutable.
-    cache_invalidate_range(callable, sizeof(*callable));
-    const int32_t children = callable->child_count_;
-    if (children < 0 || children > KERNEL_MAX_FUNC_ID) return false;
-    runtime->clear_function_bin_addrs();
-    for (int32_t i = 0; i < children; ++i) {
-        const int32_t func_id = callable->child_func_ids_[i];
-        const uint32_t offset = callable->child_offsets_[i];
-        constexpr size_t header = offsetof(ChipCallable, storage_);
-        if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID || offset > registration.callable_bytes - header ||
-            sizeof(CoreCallable) > registration.callable_bytes - header - offset)
-            return false;
-        const auto *child = reinterpret_cast<const CoreCallable *>(
-            reinterpret_cast<const uint8_t *>(callable) + offsetof(ChipCallable, storage_) + offset
-        );
-        cache_invalidate_range(child, sizeof(*child));
-        if (child->resolved_addr_ == 0) return false;
-        // HBG stores the device-side CoreCallable header in func_id_to_addr_.
-        // SchedulerContext::build_payload() dereferences this header to obtain
-        // resolved_addr(); storing the code address here would make it interpret
-        // AICore instructions as a CoreCallable object.
-        runtime->replay_function_bin_addr(func_id, reinterpret_cast<uint64_t>(child));
-    }
-    runtime->set_active_callable_id(registration.callable_id);
-    return true;
-}
+hbg::KernelCallableBinding g_callable_binding;
 
 }  // namespace
 
@@ -178,7 +151,8 @@ int consume_kernel_task(void *arg) {
             arg, packet_bytes, registration.device_id, registration.runtime_binary_id,
             {registration.callable_id, registration.tensor_count, registration.scalar_count}, restored
         );
-        const bool callable_bound = status == hbg::GraphRestoreStatus::Ok && bind_callable(runtime, registration);
+        const bool callable_bound =
+            status == hbg::GraphRestoreStatus::Ok && g_callable_binding.bind(runtime, registration);
         int rc = callable_bound ? 0 : -1;
         if (rc != 0) {
             LOG_ERROR(

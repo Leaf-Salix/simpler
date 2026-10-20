@@ -28,6 +28,7 @@
 #include "host_build_graph/graph_recorder_pool.h"
 #include "host_build_graph/host_graph_build.h"
 #include "host_build_graph/kernel_external_tensor.h"
+#include "host_build_graph/kernel_callable_binding.h"
 #include "host_build_graph/kernel_argument_snapshot.h"
 #include "host_build_graph/kernel_graph_template.h"
 #include "host_build_graph/kernel_graph_slot.h"
@@ -3555,3 +3556,132 @@ TEST_F(HbgGraphRestoreTest, ControlledRestoreFailureCannotHideUnexpectedTeardown
     );
     EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Poisoned);
 }
+
+namespace {
+
+class HbgCallableBindingTest : public ::testing::Test {
+protected:
+    Runtime runtime;
+    hbg::KernelCallableBinding binding;
+    std::vector<uint8_t> image_a;
+    std::vector<uint8_t> image_b;
+    hbg::HbgCallableRegistration a;
+    hbg::HbgCallableRegistration b;
+
+    static std::vector<uint8_t> image(int children, uint8_t code_byte) {
+        const int32_t ids[] = {3, 8};
+        std::vector<uint8_t> child_images[2];
+        for (int i = 0; i < children; ++i) {
+            child_images[i] = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, &code_byte, 1);
+            reinterpret_cast<CoreCallable *>(child_images[i].data())->resolved_addr_ = 0x1000 + code_byte + i;
+        }
+        return make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
+            nullptr, 0, "orch", &code_byte, 1, ids, child_images, children, ""
+        );
+    }
+
+    static CoreCallable *child(std::vector<uint8_t> &storage, int index) {
+        auto *parent = reinterpret_cast<ChipCallable *>(storage.data());
+        return reinterpret_cast<CoreCallable *>(parent->storage_ + parent->child_offsets_[index]);
+    }
+
+    hbg::HbgCallableRegistration registration(std::vector<uint8_t> &storage, int id) {
+        hbg::HbgCallableRegistration value;
+        value.context_generation = 1;
+        value.runtime_address = reinterpret_cast<uintptr_t>(&runtime);
+        value.register_table_address = 0x1000;
+        value.callable_address = reinterpret_cast<uintptr_t>(storage.data());
+        value.callable_bytes = storage.size();
+        value.callable_hash = id + 1;
+        value.function_hash = id + 2;
+        value.callable_id = id;
+        value.device_id = 0;
+        value.runtime_binary_id = 1;
+        return value;
+    }
+
+    void SetUp() override {
+        image_a = image(2, 1);
+        image_b = image(1, 2);
+        a = registration(image_a, 0);
+        b = registration(image_b, 1);
+        ASSERT_TRUE(hbg::valid_hbg_callable_registration(a));
+        ASSERT_TRUE(hbg::valid_hbg_callable_registration(b));
+    }
+
+    void expect_a() {
+        EXPECT_EQ(runtime.get_active_callable_id(), a.callable_id);
+        EXPECT_EQ(runtime.get_function_bin_addr(3), reinterpret_cast<uintptr_t>(child(image_a, 0)));
+        EXPECT_EQ(runtime.get_function_bin_addr(8), reinterpret_cast<uintptr_t>(child(image_a, 1)));
+    }
+};
+
+TEST_F(HbgCallableBindingTest, RepeatedBindingPreservesEveryChildHeader) {
+    ASSERT_TRUE(binding.bind(&runtime, a));
+    expect_a();
+    ASSERT_TRUE(binding.bind(&runtime, a));
+    expect_a();
+}
+
+TEST_F(HbgCallableBindingTest, DifferentCodeWithSharedFunctionIdSupportsAba) {
+    ASSERT_TRUE(binding.bind(&runtime, a));
+    ASSERT_TRUE(binding.bind(&runtime, b));
+    EXPECT_EQ(runtime.get_function_bin_addr(3), reinterpret_cast<uintptr_t>(child(image_b, 0)));
+    EXPECT_EQ(runtime.get_function_bin_addr(8), 0u);
+    ASSERT_TRUE(binding.bind(&runtime, a));
+    expect_a();
+}
+
+TEST_F(HbgCallableBindingTest, PartialFailureRevokesPriorBindingBeforeRetry) {
+    for (bool bad_offset : {false, true}) {
+        ASSERT_TRUE(binding.bind(&runtime, a));
+        auto failing_image = image(2, 3);
+        auto failing = registration(failing_image, 2);
+        if (bad_offset) {
+            reinterpret_cast<ChipCallable *>(failing_image.data())->child_offsets_[1] = UINT32_MAX;
+        } else {
+            child(failing_image, 1)->resolved_addr_ = 0;
+        }
+        ASSERT_FALSE(binding.bind(&runtime, failing));
+        EXPECT_EQ(runtime.get_active_callable_id(), -1);
+        EXPECT_EQ(runtime.get_function_bin_addr(3), reinterpret_cast<uintptr_t>(child(failing_image, 0)));
+        ASSERT_TRUE(binding.bind(&runtime, a));
+        expect_a();
+    }
+}
+
+TEST_F(HbgCallableBindingTest, ActiveResetRebuildsTheSameRegistration) {
+    ASSERT_TRUE(binding.bind(&runtime, a));
+    runtime.clear_function_bin_addrs();
+    runtime.set_active_callable_id(-1);
+    ASSERT_TRUE(binding.bind(&runtime, a));
+    expect_a();
+}
+
+TEST_F(HbgCallableBindingTest, NewGenerationCannotReuseOldSuccessfulBinding) {
+    ASSERT_TRUE(binding.bind(&runtime, a));
+    auto next = a;
+    ++next.context_generation;
+    child(image_a, 1)->resolved_addr_ = 0;
+    ASSERT_FALSE(binding.bind(&runtime, next));
+    EXPECT_EQ(runtime.get_active_callable_id(), -1);
+    child(image_a, 1)->resolved_addr_ = 0x2000;
+    ASSERT_TRUE(binding.bind(&runtime, next));
+    expect_a();
+}
+
+TEST_F(HbgCallableBindingTest, RuntimeIdentityMustMatchEvenWithTheSameActiveId) {
+    ASSERT_TRUE(binding.bind(&runtime, a));
+    Runtime another;
+    another.set_active_callable_id(a.callable_id);
+    ASSERT_FALSE(binding.bind(&another, a));
+    EXPECT_EQ(another.get_active_callable_id(), -1);
+    auto next = a;
+    next.runtime_address = reinterpret_cast<uintptr_t>(&another);
+    ASSERT_TRUE(binding.bind(&another, next));
+    EXPECT_EQ(another.get_function_bin_addr(3), reinterpret_cast<uintptr_t>(child(image_a, 0)));
+    ASSERT_TRUE(binding.bind(&runtime, a));
+    expect_a();
+}
+
+}  // namespace
