@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -1609,9 +1610,10 @@ TEST_F(HbgGraphPacketTest, SmallerGraphKeepsFrozenCapacityAndTransmitsOnlyLiveIm
         &image, static_cast<const std::byte *>(snapshot.data()) + sizeof(SimplerKernelInvocationHeader) + sizeof(h),
         sizeof(image)
     );
-    EXPECT_EQ(image.bytes, h.sm_offset + result.image_bytes);
+    EXPECT_EQ(image.destination_offset, h.runtime_offset);
+    EXPECT_EQ(image.bytes, h.sm_offset + result.image_bytes - h.runtime_offset);
     RuntimeContext pristine{};
-    std::memcpy(&pristine, payload + h.runtime_offset, sizeof(pristine));
+    std::memcpy(&pristine, payload, sizeof(pristine));
     EXPECT_EQ(pristine.ops, nullptr);
     EXPECT_EQ(pristine.orchestrator, nullptr);
     EXPECT_EQ(pristine.tensor_access, nullptr);
@@ -1624,6 +1626,22 @@ TEST_F(HbgGraphPacketTest, SmallerGraphKeepsFrozenCapacityAndTransmitsOnlyLiveIm
         hbg::validate_graph_packet(larger.data(), larger.size(), hbg::GraphPacketAddress::HostTemplate),
         hbg::GraphPacketStatus::Ok
     );
+}
+
+TEST_F(HbgGraphPacketTest, RuntimeImageExcludesDeviceInitializedPrefix) {
+    ASSERT_EQ(build(chain_entry), 2);
+    prepare();
+    ASSERT_EQ(snapshot_graph(), 0);
+    const auto h = header();
+    hbg::GraphImageRegion image{};
+    std::memcpy(
+        &image, static_cast<const std::byte *>(snapshot.data()) + sizeof(SimplerKernelInvocationHeader) + sizeof(h),
+        sizeof(image)
+    );
+    EXPECT_EQ(image.destination_offset, h.runtime_offset);
+    EXPECT_EQ(image.bytes, h.sm_offset + result.image_bytes - h.runtime_offset);
+    EXPECT_EQ(required.runtime_arena_bytes, h.sm_offset + result.image_bytes);
+    EXPECT_GE(h.destinations[1].capacity, required.runtime_arena_bytes);
 }
 
 TEST_F(HbgGraphPacketTest, HeapAndDependencyReferencesSurviveCopyingThePacket) {
@@ -1639,9 +1657,9 @@ TEST_F(HbgGraphPacketTest, HeapAndDependencyReferencesSurviveCopyingThePacket) {
     Buffer relocated;
     relocated.reserve(binding.runtime_image.capacity);
     std::memcpy(
-        relocated.data(),
+        relocated.data() + h.runtime_offset,
         static_cast<const std::byte *>(snapshot.data()) + sizeof(SimplerKernelInvocationHeader) + h.payload_offset,
-        h.sm_offset + result.image_bytes
+        h.sm_offset + result.image_bytes - h.runtime_offset
     );
     const auto to = sm_layout::segment_offsets(sm_layout::image_extents(result.bind_usage));
     const auto *tasks = reinterpret_cast<const ChipTaskStorage *>(relocated.data() + h.sm_offset + to.storage);
@@ -1740,6 +1758,9 @@ TEST_F(HbgGraphPacketTest, RejectsMalformedEnvelopeHeaderRegionsAndContents) {
         },
         [](auto &, auto &h, auto &) {
             h.version++;
+        },
+        [](auto &, auto &h, auto &) {
+            h.version = 3;
         },
         [](auto &, auto &h, auto &) {
             h.region_count = UINT32_MAX;
@@ -1923,8 +1944,9 @@ TEST_F(HbgGraphPacketTest, TensorAddressesAndScalarsSurviveRelocation) {
         Buffer aligned;
         aligned.reserve(binding.runtime_image.capacity);
         std::memcpy(
-            aligned.data(), packets[i].data() + sizeof(SimplerKernelInvocationHeader) + first_header.payload_offset,
-            first_header.sm_offset + result.image_bytes
+            aligned.data() + first_header.runtime_offset,
+            packets[i].data() + sizeof(SimplerKernelInvocationHeader) + first_header.payload_offset,
+            first_header.sm_offset + result.image_bytes - first_header.runtime_offset
         );
         const auto *sm = aligned.data() + first_header.sm_offset;
         const auto offsets = sm_layout::segment_offsets(sm_layout::image_extents(result.bind_usage));
@@ -2091,7 +2113,7 @@ TEST_F(HbgGraphSlotTest, SealsFrozenContextBeforeReadyAndUsesDedicatedPrepareStr
     ASSERT_EQ(admit(view), hbg::GraphSlotStatus::Ok);
     EXPECT_EQ(view.slot.slot_generation, 19u);
     EXPECT_EQ(view.graph.runtime_binary_id, 109u);
-    EXPECT_EQ(view.slot.max_packet_bytes, packet.bytes);
+    EXPECT_EQ(view.slot.max_packet_bytes, packet.bytes + packet_header().runtime_offset);
     EXPECT_EQ(provider.allocation_calls, allocations);
     EXPECT_TRUE(platform.copies.empty());
 }
@@ -2597,11 +2619,56 @@ protected:
         for (const auto &dst : seal.destinations)
             if (dst.capacity) std::memset(reinterpret_cast<void *>(dst.address), 0xa5, dst.capacity);
     }
-    std::vector<std::byte> mutable_bytes() const {
+    std::vector<std::byte> target_bytes() const {
         auto all = working_bytes();
-        all.erase(all.begin(), all.begin() + seal.destinations[0].capacity);
         all.resize(all.size() - sizeof(hbg::GraphSlotRegistry));
         return all;
+    }
+    std::vector<std::byte> restored_image_bytes() {
+        auto all = target_bytes();
+        all.erase(all.begin(), all.begin() + seal.destinations[0].capacity + packet_header().runtime_offset);
+        return all;
+    }
+    void expect_initialized_prefix() {
+        const auto base = seal.destinations[1].address;
+        const auto &layout = restored.runtime->prebuilt_layout;
+        auto &scheduler = *restored.runtime->scheduler;
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(&scheduler), base + layout.off_scheduler);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(restored.runtime->sm_handle), base + layout.off_sm_handle);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(restored.runtime->aicore_mailbox), base + layout.off_mailbox);
+        EXPECT_EQ(scheduler.sm_header, restored.runtime->sm_handle->header);
+        const auto check_queue = [&](const ChipReadyQueue &queue, uint64_t capacity) {
+            EXPECT_EQ(queue.capacity, capacity);
+            EXPECT_EQ(queue.mask, capacity - 1);
+            EXPECT_EQ(queue.enqueue_pos.load(), 0u);
+            EXPECT_EQ(queue.dequeue_pos.load(), 0u);
+            EXPECT_EQ(queue.max_occupancy.load(), 0u);
+            ASSERT_NE(queue.slots, nullptr);
+            ASSERT_GE(reinterpret_cast<uintptr_t>(queue.slots), base);
+            ASSERT_LE(reinterpret_cast<uintptr_t>(queue.slots + capacity), base + packet_header().runtime_offset);
+            for (uint64_t i = 0; i < capacity; ++i) {
+                EXPECT_EQ(queue.slots[i].sequence.load(), static_cast<int64_t>(i));
+                EXPECT_EQ(queue.slots[i].slot_state, nullptr);
+            }
+        };
+        for (int i = 0; i < NUM_RESOURCE_SHAPES; ++i) {
+            check_queue(scheduler.ready_queues[i], layout.sched.capacities.ready[i]);
+            check_queue(scheduler.ready_sync_queues[i], layout.sched.capacities.ready_sync[i]);
+            check_queue(scheduler.early_dispatch_queues[i], CHIP_EARLY_DISPATCH_QUEUE_SIZE);
+        }
+        check_queue(scheduler.dummy_ready_queue, layout.sched.capacities.dummy);
+        check_queue(scheduler.graph_ready_queue, layout.sched.capacities.graph_ready);
+        check_queue(scheduler.graph_prepare_queue, layout.sched.capacities.graph_prepare);
+        check_queue(scheduler.early_sync_start_queue, CHIP_EARLY_DISPATCH_QUEUE_SIZE);
+        check_queue(scheduler.ed_publish_drain_queue, CHIP_EARLY_DISPATCH_QUEUE_SIZE);
+        EXPECT_EQ(scheduler.async_wait_list.count, 0);
+        EXPECT_EQ(scheduler.async_wait_list.busy.load(), 0);
+        EXPECT_EQ(scheduler.async_wait_list.mpsc_skipped_count.load(), 0u);
+        const auto &mailbox = *restored.runtime->aicore_mailbox;
+        EXPECT_EQ(mailbox.head.load(), 0u);
+        EXPECT_EQ(mailbox.tail.load(), 0u);
+        for (const auto &entry : mailbox.entries)
+            EXPECT_EQ(entry.seq.load(), 0u);
     }
 };
 
@@ -2633,8 +2700,8 @@ TEST_F(HbgGraphRestoreTest, OrdinaryIntermediateSurvivesBuildPacketAndRestore) {
     }));
     ASSERT_NO_FATAL_FAILURE(retire());
     auto *source = reinterpret_cast<ChipTaskStorage *>(
-        reinterpret_cast<std::byte *>(packet.storage.data()) + packet.data_offset + packet_header().sm_offset +
-        offsets.storage
+        reinterpret_cast<std::byte *>(packet.storage.data()) + packet.data_offset + packet_header().sm_offset -
+        packet_header().runtime_offset + offsets.storage
     );
     auto &tensor = source[0].payload.tensor_data()[0];
     const auto original = tensor;
@@ -2714,20 +2781,97 @@ TEST_F(HbgGraphRestoreTest, RepeatedRestoreRebuildsQueuesPointersAndWorkingImage
     EXPECT_EQ(runtime->scheduler->sm_header, runtime->sm_handle->header);
     auto &queue = runtime->scheduler->graph_ready_queue;
     EXPECT_EQ(queue.slots[queue.capacity - 1].sequence.load(), queue.capacity - 1);
-    const auto expected = mutable_bytes();
+    ASSERT_NO_FATAL_FAILURE(expect_initialized_prefix());
+    const auto expected = restored_image_bytes();
     for (uint64_t iteration = 2; iteration <= 16; ++iteration) {
         ASSERT_NO_FATAL_FAILURE(retire());
         dirty_working();
         ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
         EXPECT_EQ(restored.runtime, runtime);
         EXPECT_EQ(restored.generation, iteration);
-        EXPECT_EQ(mutable_bytes(), expected);
+        ASSERT_NO_FATAL_FAILURE(expect_initialized_prefix());
+        EXPECT_EQ(restored_image_bytes(), expected);
         EXPECT_EQ(packet.storage, source);
         hbg::GraphRestoreResult peer;
         EXPECT_EQ(hbg::acquire_graph_restore_result(registry, iteration - 1, peer), hbg::GraphRestoreStatus::NotReady);
         EXPECT_EQ(hbg::acquire_graph_restore_result(registry, iteration, peer), hbg::GraphRestoreStatus::Ok);
         EXPECT_EQ(peer.runtime, runtime);
     }
+}
+
+TEST_F(HbgGraphRestoreTest, RuntimeTailCopyPublishesTheCompleteInitializedPrefix) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    dirty_working();
+    struct Trace {
+        std::vector<std::pair<const void *, size_t>> copies;
+        std::vector<std::pair<const void *, size_t>> flushes;
+    } trace;
+    hbg::GraphRestoreOps ops;
+    ops.context = &trace;
+    ops.copy = [](void *context, void *dst, const void *src, size_t bytes) {
+        static_cast<Trace *>(context)->copies.emplace_back(dst, bytes);
+        std::memcpy(dst, src, bytes);
+        return true;
+    };
+    ops.flush = [](void *context, const void *dst, size_t bytes) {
+        static_cast<Trace *>(context)->flushes.emplace_back(dst, bytes);
+        return true;
+    };
+    ASSERT_EQ(restore(ops), hbg::GraphRestoreStatus::Ok);
+    ASSERT_FALSE(trace.copies.empty());
+    ASSERT_FALSE(trace.flushes.empty());
+    const auto &h = packet_header();
+    const uint64_t live = h.sm_offset + result.image_bytes;
+    EXPECT_EQ(trace.copies[0].first, reinterpret_cast<const void *>(seal.destinations[1].address + h.runtime_offset));
+    EXPECT_EQ(trace.copies[0].second, live - h.runtime_offset);
+    EXPECT_EQ(trace.flushes[0].first, reinterpret_cast<const void *>(seal.destinations[1].address));
+    EXPECT_EQ(trace.flushes[0].second, live);
+    EXPECT_EQ(registry->restore.live_bytes[1], live);
+    ASSERT_NO_FATAL_FAILURE(expect_initialized_prefix());
+}
+
+TEST_F(HbgGraphRestoreTest, NoncanonicalDestinationOffsetsRejectBeforeAnyTargetWrite) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    const auto original = packet.storage;
+    const auto before = working_bytes();
+    const auto offset = packet_header().runtime_offset;
+    const auto capacity = seal.destinations[1].capacity;
+    for (uint64_t invalid :
+         {uint64_t{0}, offset - 1, offset + 1, packet_header().sm_offset, capacity - 1, UINT64_MAX}) {
+        packet.storage = original;
+        auto *region = reinterpret_cast<hbg::GraphImageRegion *>(
+            reinterpret_cast<std::byte *>(packet.storage.data()) + sizeof(SimplerKernelInvocationHeader) +
+            sizeof(hbg::GraphPacketHeader)
+        );
+        region->destination_offset = invalid;
+        patch();
+        EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Rejected);
+        EXPECT_EQ(working_bytes(), before);
+    }
+    packet.storage = original;
+    auto *regions = reinterpret_cast<hbg::GraphImageRegion *>(
+        reinterpret_cast<std::byte *>(packet.storage.data()) + sizeof(SimplerKernelInvocationHeader) +
+        sizeof(hbg::GraphPacketHeader)
+    );
+    ASSERT_GT(packet_header().region_count, 1u);
+    regions[1].destination_offset = 64;
+    patch();
+    EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Rejected);
+    EXPECT_EQ(working_bytes(), before);
+    packet.storage = original;
+    packet_header().runtime_offset -= 64;
+    regions = reinterpret_cast<hbg::GraphImageRegion *>(
+        reinterpret_cast<std::byte *>(packet.storage.data()) + sizeof(SimplerKernelInvocationHeader) +
+        sizeof(hbg::GraphPacketHeader)
+    );
+    regions[0].destination_offset = packet_header().runtime_offset;
+    patch();
+    ASSERT_EQ(
+        hbg::validate_graph_packet(packet.storage.data(), packet.bytes, hbg::GraphPacketAddress::DeviceCopy),
+        hbg::GraphPacketStatus::Ok
+    );
+    EXPECT_EQ(restore(), hbg::GraphRestoreStatus::InvalidImage);
+    EXPECT_EQ(working_bytes(), before);
 }
 
 TEST_F(HbgGraphRestoreTest, SourceCorruptionOnFirstMiddleAndLastLineCannotWriteDestinations) {
@@ -2756,12 +2900,12 @@ TEST_F(HbgGraphRestoreTest, ForgedRuntimeLayoutAndRelativePoolsRejectBeforeCopy)
         EXPECT_EQ(restore(), hbg::GraphRestoreStatus::InvalidImage);
         EXPECT_EQ(working_bytes(), before);
     };
-    const size_t runtime = packet.data_offset + packet_header().runtime_offset;
+    const size_t runtime = packet.data_offset;
     corrupt(
         runtime + offsetof(RuntimeContext, prebuilt_layout) + offsetof(RuntimeArenaLayout, off_scheduler), UINT64_MAX, 8
     );
     corrupt(runtime + offsetof(RuntimeContext, ops), 0x1234, sizeof(void *));
-    const size_t sm = packet.data_offset + packet_header().sm_offset;
+    const size_t sm = packet.data_offset + packet_header().sm_offset - packet_header().runtime_offset;
     corrupt(sm + offsetof(SharedMemoryTaskHeader, total_tasks), 999, 4);
     const auto offsets = sm_layout::segment_offsets(sm_layout::image_extents({packet_header().total_tasks, 0, 0, 0}));
     corrupt(sm + offsets.storage + offsetof(ChipTaskStorage, payload) + offsetof(TaskPayload, tensors), INT32_MAX, 4);
@@ -2771,7 +2915,7 @@ TEST_F(HbgGraphRestoreTest, HostOnlyCopyCannotBeSmuggledIntoTheDeviceGraphImage)
     ASSERT_NO_FATAL_FAILURE(prepare_slot());
     const auto before = working_bytes();
     auto *base = reinterpret_cast<std::byte *>(packet.storage.data());
-    const size_t sm = packet.data_offset + packet_header().sm_offset;
+    const size_t sm = packet.data_offset + packet_header().sm_offset - packet_header().runtime_offset;
     const auto offsets = sm_layout::segment_offsets(sm_layout::image_extents({packet_header().total_tasks, 0, 0, 0}));
     const size_t payload = sm + offsets.storage + offsetof(ChipTaskStorage, payload);
     const size_t tensor_field = payload + offsetof(TaskPayload, tensors);
@@ -2803,7 +2947,7 @@ TEST_F(HbgGraphRestoreTest, PartialMemoryFailuresNeverCommitAndFullRetrySucceeds
         }
     };
     const int regions = static_cast<int>(packet_header().region_count);
-    const auto expected = mutable_bytes();
+    const auto expected = restored_image_bytes();
     for (int fail_at = 1; fail_at <= 2 * regions + 1; ++fail_at) {
         const uint64_t previous = restored.generation;
         const auto output = restored;
@@ -2821,7 +2965,7 @@ TEST_F(HbgGraphRestoreTest, PartialMemoryFailuresNeverCommitAndFullRetrySucceeds
         ASSERT_NO_FATAL_FAILURE(retire(hbg::GraphRestoreRetirement::ControlledFailure));
         EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
         EXPECT_EQ(restored.generation, previous + 2);
-        EXPECT_EQ(mutable_bytes(), expected);
+        EXPECT_EQ(restored_image_bytes(), expected);
     }
 }
 
@@ -3057,7 +3201,7 @@ TEST_F(HbgGraphRestoreTest, PublishFailureIsQuarantinedAndFatalCleanupCannotRetr
         hbg::GraphRestoreStatus::Rejected
     );
     EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Quarantined);
-    const auto before = mutable_bytes();
+    const auto before = target_bytes();
     EXPECT_EQ(
         hbg::retire_graph_restore(registry, registry->restore.attempt, {hbg::GraphRestoreRetirement::FatalFailure}),
         hbg::GraphRestoreStatus::Poisoned
@@ -3069,7 +3213,7 @@ TEST_F(HbgGraphRestoreTest, PublishFailureIsQuarantinedAndFatalCleanupCannotRetr
         ),
         hbg::GraphRestoreStatus::Poisoned
     );
-    EXPECT_EQ(mutable_bytes(), before);
+    EXPECT_EQ(target_bytes(), before);
 }
 
 TEST_F(HbgGraphRestoreTest, FatalExecutionAfterSuccessfulRestoreRevokesPeerAccess) {

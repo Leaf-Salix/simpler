@@ -22,7 +22,7 @@
 namespace hbg {
 
 inline constexpr uint32_t GRAPH_PACKET_MAGIC = 0x50474248;  // HBGP
-inline constexpr uint16_t GRAPH_PACKET_VERSION = 3;
+inline constexpr uint16_t GRAPH_PACKET_VERSION = 4;
 
 enum class GraphImageKind : uint32_t { Runtime = 1, Definitions = 2, Scheduler = 3 };
 enum class GraphPacketAddress : uint32_t { HostTemplate, DeviceCopy };
@@ -169,9 +169,11 @@ validate_graph_packet(const void *packet, size_t size, GraphPacketAddress addres
         if (kind <= previous_kind || kind > 3 || (index == 0 && kind != 1)) return GraphPacketStatus::InvalidRegion;
         const uint64_t capacity = header.destinations[kind].capacity;
         const uint64_t aligned = (cursor + 63) & ~uint64_t{63};
-        if (region.reserved != 0 || region.source_offset != aligned || region.destination_offset != 0 ||
-            region.bytes == 0 || region.bytes > capacity ||
-            (kind == 1 && (region.bytes <= header.sm_offset || region.bytes % 64 != 0)) ||
+        const uint64_t destination_offset = kind == 1 ? header.runtime_offset : 0;
+        if (region.reserved != 0 || region.source_offset != aligned ||
+            region.destination_offset != destination_offset || region.bytes == 0 ||
+            !graph_span_fits(region.destination_offset, region.bytes, capacity) ||
+            (kind == 1 && (region.bytes <= header.sm_offset - header.runtime_offset || region.bytes % 64 != 0)) ||
             !graph_span_fits(region.source_offset, region.bytes, header.payload_bytes))
             return GraphPacketStatus::InvalidRegion;
         for (; cursor < aligned; ++cursor)

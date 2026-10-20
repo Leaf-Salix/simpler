@@ -79,9 +79,9 @@ struct RuntimeArenaLayout {
     //                function of the layout, not of the run, so the device writes
     //                it at boot instead of receiving an initialization pattern
     //                over PCIe.
-    //   copied       [off_copied_begin, off_copied_end). Every byte carries this
-    //                run's own content, so bind ships the whole zone as one
-    //                contiguous range.
+    //   copied       [off_copied_begin, off_copied_end): alignment padding and
+    //                RuntimeContext. Program bind ships this contiguous zone;
+    //                kernel packets start at off_runtime, omitting leading padding.
     //
     // Past off_copied_end the device carries one further tail the host arena does
     // not: the shared-memory image, whose size is the submitted task count and

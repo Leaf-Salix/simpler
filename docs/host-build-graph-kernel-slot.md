@@ -121,10 +121,10 @@ Poisoning neither drains device work nor frees resources or resets the device.
 
 ## Invocation admission
 
-HBG packet version 3 has a 200-byte header containing device ID, runtime
+HBG packet version 4 has a 200-byte header containing device ID, runtime
 binary identity and live heap length. The common K1 header keeps the integrated
 ABI; offsets use `sizeof(SimplerKernelInvocationHeader)` and no common-header
-version fields are added. HBG version 1 and 2 packets fail closed.
+version fields are added. HBG version 1, 2 and 3 packets fail closed.
 Callable generation, callable/argument/function
 hashes remain per-invocation fields, so different callables and arguments can
 share a slot. The common callable admission checks ID, effective argument counts and residency
@@ -198,6 +198,11 @@ protection; this interface does not register a CANN entry or enqueue streams.
    source reads and destination writes; unused frozen capacity remains untouched. Caller-owned
    tensor storage and persistent
    platform handshake/KernelArgs allocations are outside these regions.
+   The Runtime region starts at the canonical `runtime_offset` destination and
+   carries RuntimeContext plus the compact SM image. Device-only scheduler,
+   queue and mailbox storage is initialized in place, rather than transmitted.
+   Definition and A5 scheduler regions keep destination offset zero. Frozen
+   allocation sizes, layout keys and target runtime/SM offsets are unchanged.
 4. Wire runtime/SM/scheduler pointers against the registered destinations, attach
    the populated SM, initialize scheduler queue headers and sequence ramps, and
    reset the completion mailbox. The separate A5 scheduler image is restored to
@@ -208,6 +213,8 @@ protection; this interface does not register a CANN entry or enqueue streams.
    The memory backend can fail this pre-publication flush without committing.
    Return the RuntimeContext address,
    capacity-bounded SM span and task count for the dispatch owner.
+   Runtime publication covers its complete live prefix, including device-only
+   initialization before the serialized Runtime tail.
 
 The 128-byte `GraphRestoreControl` is part of the context registry allocation,
 never part of a graph image. Resource prepare still performs two physical

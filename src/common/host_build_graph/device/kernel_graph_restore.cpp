@@ -128,22 +128,25 @@ bool validate_images(const GraphRestoreView &view, RuntimeArenaLayout &layout, u
     while (ready_capacity < h.task_window)
         ready_capacity <<= 1;
     layout = runtime_reserve_layout(reservations, h.task_window, ready_capacity);
-    const uint64_t capacity = view.regions[1].bytes;
+    const auto &image = view.regions[1];
     if (h.runtime_offset != layout.off_runtime || h.sm_offset != layout.off_copied_end ||
-        !graph_span_fits(h.runtime_offset, sizeof(RuntimeContext), capacity) ||
-        !graph_span_fits(h.sm_offset, sizeof(SharedMemoryHeader), capacity))
+        image.destination_offset != layout.off_runtime || h.sm_offset < image.destination_offset ||
+        !graph_span_fits(0, sizeof(RuntimeContext), image.bytes) ||
+        !graph_span_fits(h.sm_offset - image.destination_offset, sizeof(SharedMemoryHeader), image.bytes))
         return false;
-    const auto pristine = read_value<RuntimeContext>(view.payload + h.runtime_offset);
+    const auto *runtime_source = view.payload + image.source_offset;
+    const auto pristine = read_value<RuntimeContext>(runtime_source);
     if (!same_layout(pristine.prebuilt_layout, layout) || pristine.mode != MODE_EXECUTE || pristine.ops != nullptr ||
         pristine.orchestrator != nullptr || pristine.tensor_access != nullptr || pristine.sm_handle != nullptr ||
         pristine.scheduler != nullptr || pristine.aicore_mailbox != nullptr || pristine.total_cycles != 0 ||
         pristine.inline_completed_tasks < 0 || pristine.inline_completed_tasks > h.total_tasks ||
         pristine.active_callable_hash != h.callable_hash)
         return false;
-    sm_bytes = capacity - h.sm_offset;
+    const uint64_t sm_offset = h.sm_offset - image.destination_offset;
+    sm_bytes = image.bytes - sm_offset;
     const auto offsets = sm_layout::segment_offsets(sm_layout::image_extents({h.total_tasks, 0, 0, 0}));
     if (sm_bytes > INT32_MAX || offsets.fanin_pool > sm_bytes) return false;
-    const auto *sm = view.payload + h.sm_offset;
+    const auto *sm = runtime_source + sm_offset;
     if (read_value<uint64_t>(sm + offsetof(SharedMemoryTaskHeader, task_storage)) != 0 ||
         read_value<uint64_t>(sm + offsetof(SharedMemoryTaskHeader, task_states)) != 0 ||
         read_value<int32_t>(sm + offsetof(SharedMemoryTaskHeader, total_tasks)) != static_cast<int32_t>(h.total_tasks))
@@ -274,7 +277,10 @@ GraphRestoreStatus restore_graph_packet(
         const auto &dst = view.slot.destinations[i];
         const auto &region = view.regions[i];
         if (region.bytes == 0) continue;
-        if (!copy_region(ops, reinterpret_cast<void *>(dst.address), view.payload + region.source_offset, region.bytes))
+        if (!copy_region(
+                ops, reinterpret_cast<void *>(dst.address + region.destination_offset),
+                view.payload + region.source_offset, region.bytes
+            ))
             return fail();
     }
     const auto &working = view.slot.destinations[1];
@@ -291,15 +297,17 @@ GraphRestoreStatus restore_graph_packet(
     runtime->scheduler->seed_queue_slots();
     runtime->aicore_mailbox->init_empty();
     for (size_t i = 1; i < 4; ++i)
-        if (view.regions[i].bytes &&
-            !flush_region(ops, reinterpret_cast<void *>(view.slot.destinations[i].address), view.regions[i].bytes))
+        if (view.regions[i].bytes && !flush_region(
+                                         ops, reinterpret_cast<void *>(view.slot.destinations[i].address),
+                                         view.regions[i].destination_offset + view.regions[i].bytes
+                                     ))
             return fail();
     control.runtime_address = reinterpret_cast<uintptr_t>(runtime);
     control.sm_bytes = sm_bytes;
     control.total_tasks = view.graph.total_tasks;
     control.live_bytes[0] = view.graph.heap_bytes;
     for (size_t i = 1; i < 4; ++i)
-        control.live_bytes[i] = view.regions[i].bytes;
+        control.live_bytes[i] = view.regions[i].destination_offset + view.regions[i].bytes;
     if (!flush_region(ops, &control, sizeof(control))) return fail();
     control.committed_generation = control.attempt;
     publish(control, GraphRestorePhase::Ready, GraphRestoreStatus::Ok);

@@ -273,14 +273,15 @@ int make_graph_launch_template(
     header.destinations[3] = {binding.scheduler.address, binding.scheduler.capacity};
     std::vector<GraphImageRegion> regions;
     const uint64_t image_bytes[] = {
-        0, required.runtime_arena_bytes, required.graph_definition_bytes, required.scheduler_state_bytes
+        0, required.runtime_arena_bytes - layout.off_runtime, required.graph_definition_bytes,
+        required.scheduler_state_bytes
     };
     for (uint32_t i = 1; i <= 3; ++i) {
         if (image_bytes[i] == 0) continue;
         const uint64_t offset = (header.payload_bytes + 63) & ~uint64_t{63};
         header.payload_bytes = offset;
         if (!add_size(image_bytes[i], header.payload_bytes)) return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
-        regions.push_back({static_cast<GraphImageKind>(i), 0, offset, image_bytes[i], 0});
+        regions.push_back({static_cast<GraphImageKind>(i), 0, offset, image_bytes[i], i == 1 ? layout.off_runtime : 0});
     }
     header.region_count = regions.size();
     header.payload_offset = (sizeof(header) + regions.size() * sizeof(GraphImageRegion) + 63) & ~uint64_t{63};
@@ -316,7 +317,7 @@ int make_graph_launch_template(
         build, image + layout.off_copied_end, binding.definitions.address, definitions, layout.sched.capacities.dummy
     );
     if (rc != 0) return rc;
-    std::memcpy(payload, image, required.runtime_arena_bytes);
+    std::memcpy(payload, image + layout.off_runtime, image_bytes[1]);
     SimplerKernelInvocationHeader invocation{};
     invocation.mode = SIMPLER_MODE_KERNEL;
     invocation.callable_id = identity.callable_id;

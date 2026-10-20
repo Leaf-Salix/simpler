@@ -228,11 +228,11 @@ The canonical packet layout is:
 
 ```text
 SimplerKernelInvocationHeader (sizeof the shared K1 header)
-GraphPacketHeader            (200 bytes, HBG format version 3)
+GraphPacketHeader            (200 bytes, HBG format version 4)
 GraphImageRegion[]           (32 bytes each)
 zero padding to a 64-byte relative offset
 inline payload:
-  live runtime/SM image
+  RuntimeContext and compact SM image (destination starts at runtime_offset)
   live Definition image, if nonzero
   live A5 scheduler image, if nonzero
 ```
@@ -262,7 +262,7 @@ the leader image validation and restore described in
 [Execution-slot registration and admission](host-build-graph-kernel-slot.md)
 defines the prepare-time seal, context-owned AICPU registry and read-only
 `admit_graph_packet_for_restore` gate. The registry is not a graph/callable cache
-and no launch payload can choose its address. HBG version 1 and 2 packets are
+and no launch payload can choose its address. HBG version 1, 2 and 3 packets are
 rejected;
 the outer K1 invocation ABI remains unchanged.
 
