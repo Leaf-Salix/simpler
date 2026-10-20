@@ -237,7 +237,7 @@ The canonical packet layout is:
 
 ```text
 SimplerKernelInvocationHeader (sizeof the shared K1 header)
-GraphPacketHeader            (200 bytes, HBG format version 4)
+GraphPacketHeader            (200 bytes, HBG format version 5)
 GraphImageRegion[]           (32 bytes each)
 zero padding to a 64-byte relative offset
 inline payload:
@@ -268,10 +268,16 @@ corruption; it cannot replace H3's independent device registry trust check or
 the leader image validation and restore described in
 [execution-slot registration and restoration](host-build-graph-kernel-slot.md).
 
+Version 5 uses standard XXH64 with seed zero over the logical concatenation
+of the covered spans, merging and finalizing only once. It reads little-endian
+lanes and keeps the numeric digest field, 200-byte header, registry and resource
+layout. Version 4 FNV digests are rejected. Host and device must use the same
+runtime revision; existing captures must be recreated.
+
 [Execution-slot registration and admission](host-build-graph-kernel-slot.md)
 defines the prepare-time seal, context-owned AICPU registry and read-only
 `admit_graph_packet_for_restore` gate. The registry is not a graph/callable cache
-and no launch payload can choose its address. HBG version 1, 2 and 3 packets are
+and no launch payload can choose its address. HBG version 1, 2, 3 and 4 packets are
 rejected;
 the outer K1 invocation ABI remains unchanged.
 

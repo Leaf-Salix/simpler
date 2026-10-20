@@ -121,10 +121,10 @@ Poisoning neither drains device work nor frees resources or resets the device.
 
 ## Invocation admission
 
-HBG packet version 4 has a 200-byte header containing device ID, runtime
+HBG packet version 5 has a 200-byte header containing device ID, runtime
 binary identity and live heap length. The common K1 header keeps the integrated
 ABI; offsets use `sizeof(SimplerKernelInvocationHeader)` and no common-header
-version fields are added. HBG version 1, 2 and 3 packets fail closed.
+version fields are added. HBG version 1, 2, 3 and 4 packets fail closed.
 Callable generation, callable/argument/function
 hashes remain per-invocation fields, so different callables and arguments can
 share a slot. The common callable admission checks ID, effective argument counts and residency
