@@ -97,7 +97,7 @@ struct AicpuExecutor {
 
     // ===== Methods =====
     int32_t init(Runtime *runtime);
-    int32_t run(Runtime *runtime);
+    int32_t run(Runtime *runtime, bool restored_graph);
     void deinit(Runtime *runtime);
 };
 
@@ -192,7 +192,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
 /**
  * Shutdown AICore - Send exit signal via registers to all AICore kernels
  */
-int32_t AicpuExecutor::run(Runtime *runtime) {
+int32_t AicpuExecutor::run(Runtime *runtime, bool restored_graph) {
     int32_t affinity_exec_idx = platform_aicpu_affinity_thread_idx();
     int32_t thread_idx = (affinity_exec_idx >= 0) ? affinity_exec_idx : (thread_idx_++);
     if (thread_idx < 0 || thread_idx >= aicpu_thread_num_ || thread_idx >= MAX_AICPU_THREADS) {
@@ -238,49 +238,52 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         if (boot_ok) {
             runtime_arena_.attach(prebuilt_arena, DeviceArena::kDefaultBaseAlign);
             rt = reinterpret_cast<RuntimeContext *>(static_cast<char *>(prebuilt_arena) + off_runtime);
-            runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
+            if (!restored_graph) {
+                runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
 
-            void *sm_ptr = runtime->get_gm_sm_ptr();
-            // The image the host shipped is pitched to the submitted task count,
-            // not to the count the table was dimensioned for, and the device region
-            // holds exactly that image — so its size comes from the same pitch.
-            // attach_populated rejects a pitch outside (0, task_capacity] and a
-            // region too small for it.
-            const uint64_t live_slots = sm_layout::live_slot_pitch(static_cast<uint64_t>(runtime->host_total_tasks));
-            const uint64_t sm_size = runtime->sm_image_bytes;
-            // sm_handle and the scheduler state are the device-only zone: their
-            // bytes never travel, so they start as whatever the pooled arena last
-            // held. Zeroing the handle first is what makes attach_populated's
-            // assignment of every field checkable here rather than by inspecting
-            // attach_populated.
-            memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
-            if (!rt->sm_handle->attach_populated(
-                    sm_ptr, sm_size, rt->prebuilt_layout.task_capacity, live_slots, runtime->sm_image_bytes
-                )) {
-                LOG_ERROR("Thread %d: host-orch: sm_handle->attach_populated failed", thread_idx);
-                rt = nullptr;
-                run_rc = -1;
-                boot_ok = false;
-            } else if (!rt->scheduler->init_data_from_layout(rt->prebuilt_layout.sched, runtime_arena_, sm_ptr)) {
-                LOG_ERROR("Thread %d: host-orch: scheduler init_data_from_layout failed", thread_idx);
-                rt = nullptr;
-                run_rc = -1;
-                boot_ok = false;
-            } else {
-                // Queue headers are set, so the slot arrays can take their ramp,
-                // and the mailbox ring gets its cursors and publication gates.
-                // All of it precedes runtime_init_ready_, which is what releases
-                // the peer threads into the dispatch loop, so neither a push nor a
-                // completion message sees an uninitialized region.
-                //
-                // Both regions sit in the device-only zone, so their bytes are
-                // whatever the pooled arena last held, and each one's empty state is
-                // whatever its own initializer writes — a ready queue's is a
-                // sequence ramp (slot i holds i), the mailbox's is zeroed cursors
-                // and publication gates. Zeroing the region is a substitute for
-                // neither call.
-                rt->scheduler->seed_queue_slots();
-                rt->aicore_mailbox->init_empty();
+                void *sm_ptr = runtime->get_gm_sm_ptr();
+                // The image the host shipped is pitched to the submitted task count,
+                // not to the count the table was dimensioned for, and the device region
+                // holds exactly that image — so its size comes from the same pitch.
+                // attach_populated rejects a pitch outside (0, task_capacity] and a
+                // region too small for it.
+                const uint64_t live_slots =
+                    sm_layout::live_slot_pitch(static_cast<uint64_t>(runtime->host_total_tasks));
+                const uint64_t sm_size = runtime->sm_image_bytes;
+                // sm_handle and the scheduler state are the device-only zone: their
+                // bytes never travel, so they start as whatever the pooled arena last
+                // held. Zeroing the handle first is what makes attach_populated's
+                // assignment of every field checkable here rather than by inspecting
+                // attach_populated.
+                memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
+                if (!rt->sm_handle->attach_populated(
+                        sm_ptr, sm_size, rt->prebuilt_layout.task_capacity, live_slots, runtime->sm_image_bytes
+                    )) {
+                    LOG_ERROR("Thread %d: host-orch: sm_handle->attach_populated failed", thread_idx);
+                    rt = nullptr;
+                    run_rc = -1;
+                    boot_ok = false;
+                } else if (!rt->scheduler->init_data_from_layout(rt->prebuilt_layout.sched, runtime_arena_, sm_ptr)) {
+                    LOG_ERROR("Thread %d: host-orch: scheduler init_data_from_layout failed", thread_idx);
+                    rt = nullptr;
+                    run_rc = -1;
+                    boot_ok = false;
+                } else {
+                    // Queue headers are set, so the slot arrays can take their ramp,
+                    // and the mailbox ring gets its cursors and publication gates.
+                    // All of it precedes runtime_init_ready_, which is what releases
+                    // the peer threads into the dispatch loop, so neither a push nor a
+                    // completion message sees an uninitialized region.
+                    //
+                    // Both regions sit in the device-only zone, so their bytes are
+                    // whatever the pooled arena last held, and each one's empty state is
+                    // whatever its own initializer writes — a ready queue's is a
+                    // sequence ramp (slot i holds i), the mailbox's is zeroed cursors
+                    // and publication gates. Zeroing the region is a substitute for
+                    // neither call.
+                    rt->scheduler->seed_queue_slots();
+                    rt->aicore_mailbox->init_empty();
+                }
             }
         }
 
@@ -443,7 +446,7 @@ extern "C" int32_t aicpu_prewarm_callable(Runtime *runtime) {
  * @param runtime Pointer to Runtime structure
  * @return 0 on success, non-zero on error
  */
-extern "C" int32_t aicpu_execute(Runtime *runtime) {
+static int32_t execute_graph_runtime(Runtime *runtime, bool restored_graph) {
     if (runtime == nullptr) {
         LOG_ERROR("%s", "Invalid argument: null Runtime pointer");
         return -1;
@@ -459,7 +462,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         return -1;
     }
 
-    int32_t rc = g_aicpu_executor.run(runtime);
+    int32_t rc = g_aicpu_executor.run(runtime, restored_graph);
     if (rc != 0) {
         LOG_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
     }
@@ -484,3 +487,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     LOG_INFO("%s", "aicpu_execute: Kernel execution completed successfully");
     return 0;
 }
+
+extern "C" int32_t aicpu_execute(Runtime *runtime) { return execute_graph_runtime(runtime, false); }
+
+int32_t aicpu_execute_restored_graph(Runtime *runtime) { return execute_graph_runtime(runtime, true); }

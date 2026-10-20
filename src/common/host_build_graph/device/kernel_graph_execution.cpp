@@ -27,7 +27,7 @@
 #include "host_build_graph/kernel_graph_wire.h"
 #include "runtime.h"
 
-extern "C" int32_t aicpu_execute(Runtime *runtime);
+int32_t aicpu_execute_restored_graph(Runtime *runtime);
 
 namespace {
 
@@ -151,8 +151,9 @@ int consume_kernel_task(void *arg) {
             arg, packet_bytes, registration.device_id, registration.runtime_binary_id,
             {registration.callable_id, registration.tensor_count, registration.scalar_count}, restored
         );
-        const bool callable_bound =
-            status == hbg::GraphRestoreStatus::Ok && g_callable_binding.bind(runtime, registration);
+        const auto binding = status == hbg::GraphRestoreStatus::Ok ? g_callable_binding.bind(runtime, registration) :
+                                                                     hbg::CallableBindingResult::Rejected;
+        const bool callable_bound = binding != hbg::CallableBindingResult::Rejected;
         int rc = callable_bound ? 0 : -1;
         if (rc != 0) {
             LOG_ERROR(
@@ -166,14 +167,9 @@ int consume_kernel_task(void *arg) {
             runtime->host_total_tasks = static_cast<int32_t>(restored.total_tasks);
             runtime->sm_image_bytes = restored.sm_bytes;
 
-            // Publish only AICPU-owned runtime control. AICore has already
-            // written workers[] by this point; flushing the whole Runtime would
-            // write stale cached handshake lines back over those reports and
-            // strand AICPU initialization. teardown_gates[] is AICore-owned as
-            // well, so start at the first field after both device-owned arrays.
-            auto *runtime_bytes = reinterpret_cast<uint8_t *>(runtime);
-            auto *control_begin = reinterpret_cast<uint8_t *>(&runtime->worker_count);
-            cache_flush_range(control_begin, sizeof(*runtime) - static_cast<size_t>(control_begin - runtime_bytes));
+            for (const auto &span :
+                 runtime->kernel_graph_publication_spans(binding == hbg::CallableBindingResult::Rebound))
+                cache_flush_range(span.address, span.bytes);
 
             // READY is the release publication for the AICore prelaunch gate.
             // Flush it last so every control field above is visible first.
@@ -190,7 +186,7 @@ int consume_kernel_task(void *arg) {
         while (g_restore_epoch.load(std::memory_order_acquire) == epoch) {}
     }
     int rc = g_restore_status.load(std::memory_order_acquire);
-    if (rc == 0) rc = aicpu_execute(runtime);
+    if (rc == 0) rc = aicpu_execute_restored_graph(runtime);
     if (rc != 0) LOG_ERROR("HBG graph execution failed on thread %d: rc=%d", thread, rc);
     if (rc != 0) {
         int32_t expected = 0;

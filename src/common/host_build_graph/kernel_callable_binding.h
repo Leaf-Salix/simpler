@@ -23,24 +23,26 @@ namespace hbg {
 // The serialized kernel leader is the persistent Runtime table's sole writer.
 // Registered callable images remain immutable for their context generation.
 // Registration identity and packet restoration succeed before binding.
+enum class CallableBindingResult { Rejected, Rebound, Reused };
+
 class KernelCallableBinding {
 public:
-    bool bind(Runtime *runtime, const HbgCallableRegistration &registration) noexcept {
+    CallableBindingResult bind(Runtime *runtime, const HbgCallableRegistration &registration) noexcept {
         if (runtime != nullptr && valid_ && registration.runtime_address == reinterpret_cast<uintptr_t>(runtime) &&
             runtime->get_active_callable_id() == registration.callable_id &&
             std::memcmp(&registration_, &registration, sizeof(registration)) == 0)
-            return true;
+            return CallableBindingResult::Reused;
         valid_ = false;
-        if (runtime == nullptr) return false;
+        if (runtime == nullptr) return CallableBindingResult::Rejected;
         runtime->set_active_callable_id(-1);
         if (registration.runtime_address != reinterpret_cast<uintptr_t>(runtime) ||
             registration.callable_bytes < sizeof(ChipCallable))
-            return false;
+            return CallableBindingResult::Rejected;
         auto *callable = reinterpret_cast<const ChipCallable *>(registration.callable_address);
         // Binding reads metadata headers; uploaded orchestration and kernel code stay immutable.
         cache_invalidate_range(callable, sizeof(*callable));
         const int32_t children = callable->child_count_;
-        if (children < 0 || children > KERNEL_MAX_FUNC_ID) return false;
+        if (children < 0 || children > KERNEL_MAX_FUNC_ID) return CallableBindingResult::Rejected;
         runtime->clear_function_bin_addrs();
         for (int32_t i = 0; i < children; ++i) {
             const int32_t func_id = callable->child_func_ids_[i];
@@ -48,12 +50,12 @@ public:
             constexpr size_t header = offsetof(ChipCallable, storage_);
             if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID || offset > registration.callable_bytes - header ||
                 sizeof(CoreCallable) > registration.callable_bytes - header - offset)
-                return false;
+                return CallableBindingResult::Rejected;
             const auto *child = reinterpret_cast<const CoreCallable *>(
                 reinterpret_cast<const uint8_t *>(callable) + offsetof(ChipCallable, storage_) + offset
             );
             cache_invalidate_range(child, sizeof(*child));
-            if (child->resolved_addr_ == 0) return false;
+            if (child->resolved_addr_ == 0) return CallableBindingResult::Rejected;
             // HBG stores the device-side CoreCallable header in func_id_to_addr_.
             // SchedulerContext::build_payload() dereferences this header to obtain
             // resolved_addr(); storing the code address here would make it interpret
@@ -63,7 +65,7 @@ public:
         runtime->set_active_callable_id(registration.callable_id);
         registration_ = registration;
         valid_ = true;
-        return true;
+        return CallableBindingResult::Rebound;
     }
 
 private:

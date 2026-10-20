@@ -2730,6 +2730,17 @@ protected:
         EXPECT_EQ(reinterpret_cast<uintptr_t>(restored.runtime->sm_handle), base + layout.off_sm_handle);
         EXPECT_EQ(reinterpret_cast<uintptr_t>(restored.runtime->aicore_mailbox), base + layout.off_mailbox);
         EXPECT_EQ(scheduler.sm_header, restored.runtime->sm_handle->header);
+        const auto &handle = *restored.runtime->sm_handle;
+        const auto sm = base + packet_header().sm_offset;
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(handle.sm_base), sm);
+        EXPECT_EQ(handle.sm_size, restored.sm_bytes);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(handle.header), sm);
+        EXPECT_FALSE(handle.is_owner);
+        const auto segments = sm_layout::segment_offsets(
+            sm_layout::image_extents({sm_layout::live_slot_pitch(restored.total_tasks), 0, 0, 0})
+        );
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(handle.header->tasks.task_storage), sm + segments.storage);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(handle.header->tasks.task_states), sm + segments.task_states);
         const auto check_queue = [&](const ChipReadyQueue &queue, uint64_t capacity) {
             EXPECT_EQ(queue.capacity, capacity);
             EXPECT_EQ(queue.mask, capacity - 1);
@@ -3617,24 +3628,24 @@ protected:
 };
 
 TEST_F(HbgCallableBindingTest, RepeatedBindingPreservesEveryChildHeader) {
-    ASSERT_TRUE(binding.bind(&runtime, a));
+    ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Rebound);
     expect_a();
-    ASSERT_TRUE(binding.bind(&runtime, a));
+    ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Reused);
     expect_a();
 }
 
 TEST_F(HbgCallableBindingTest, DifferentCodeWithSharedFunctionIdSupportsAba) {
-    ASSERT_TRUE(binding.bind(&runtime, a));
-    ASSERT_TRUE(binding.bind(&runtime, b));
+    ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Rebound);
+    ASSERT_EQ(binding.bind(&runtime, b), hbg::CallableBindingResult::Rebound);
     EXPECT_EQ(runtime.get_function_bin_addr(3), reinterpret_cast<uintptr_t>(child(image_b, 0)));
     EXPECT_EQ(runtime.get_function_bin_addr(8), 0u);
-    ASSERT_TRUE(binding.bind(&runtime, a));
+    ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Rebound);
     expect_a();
 }
 
 TEST_F(HbgCallableBindingTest, PartialFailureRevokesPriorBindingBeforeRetry) {
     for (bool bad_offset : {false, true}) {
-        ASSERT_TRUE(binding.bind(&runtime, a));
+        ASSERT_NE(binding.bind(&runtime, a), hbg::CallableBindingResult::Rejected);
         auto failing_image = image(2, 3);
         auto failing = registration(failing_image, 2);
         if (bad_offset) {
@@ -3642,46 +3653,97 @@ TEST_F(HbgCallableBindingTest, PartialFailureRevokesPriorBindingBeforeRetry) {
         } else {
             child(failing_image, 1)->resolved_addr_ = 0;
         }
-        ASSERT_FALSE(binding.bind(&runtime, failing));
+        ASSERT_EQ(binding.bind(&runtime, failing), hbg::CallableBindingResult::Rejected);
         EXPECT_EQ(runtime.get_active_callable_id(), -1);
         EXPECT_EQ(runtime.get_function_bin_addr(3), reinterpret_cast<uintptr_t>(child(failing_image, 0)));
-        ASSERT_TRUE(binding.bind(&runtime, a));
+        ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Rebound);
         expect_a();
     }
 }
 
 TEST_F(HbgCallableBindingTest, ActiveResetRebuildsTheSameRegistration) {
-    ASSERT_TRUE(binding.bind(&runtime, a));
+    ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Rebound);
     runtime.clear_function_bin_addrs();
     runtime.set_active_callable_id(-1);
-    ASSERT_TRUE(binding.bind(&runtime, a));
+    ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Rebound);
     expect_a();
 }
 
 TEST_F(HbgCallableBindingTest, NewGenerationCannotReuseOldSuccessfulBinding) {
-    ASSERT_TRUE(binding.bind(&runtime, a));
+    ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Rebound);
     auto next = a;
     ++next.context_generation;
     child(image_a, 1)->resolved_addr_ = 0;
-    ASSERT_FALSE(binding.bind(&runtime, next));
+    ASSERT_EQ(binding.bind(&runtime, next), hbg::CallableBindingResult::Rejected);
     EXPECT_EQ(runtime.get_active_callable_id(), -1);
     child(image_a, 1)->resolved_addr_ = 0x2000;
-    ASSERT_TRUE(binding.bind(&runtime, next));
+    ASSERT_EQ(binding.bind(&runtime, next), hbg::CallableBindingResult::Rebound);
     expect_a();
 }
 
 TEST_F(HbgCallableBindingTest, RuntimeIdentityMustMatchEvenWithTheSameActiveId) {
-    ASSERT_TRUE(binding.bind(&runtime, a));
+    ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Rebound);
     Runtime another;
     another.set_active_callable_id(a.callable_id);
-    ASSERT_FALSE(binding.bind(&another, a));
+    ASSERT_EQ(binding.bind(&another, a), hbg::CallableBindingResult::Rejected);
     EXPECT_EQ(another.get_active_callable_id(), -1);
     auto next = a;
     next.runtime_address = reinterpret_cast<uintptr_t>(&another);
-    ASSERT_TRUE(binding.bind(&another, next));
+    ASSERT_EQ(binding.bind(&another, next), hbg::CallableBindingResult::Rebound);
     EXPECT_EQ(another.get_function_bin_addr(3), reinterpret_cast<uintptr_t>(child(image_a, 0)));
-    ASSERT_TRUE(binding.bind(&runtime, a));
+    ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Rebound);
     expect_a();
 }
 
 }  // namespace
+
+TEST(HbgRuntimePublication, SpansCoverChangedFieldsWithoutPublishingWorkerLines) {
+    for (bool functions_changed : {false, true}) {
+        SCOPED_TRACE(functions_changed);
+        Runtime runtime;
+        const auto *base = reinterpret_cast<const uint8_t *>(&runtime);
+        const std::vector<uint8_t> before(base, base + sizeof(runtime));
+        constexpr uintptr_t pattern = UINTPTR_MAX / 0xff * 0x5a;
+        runtime.set_gm_sm_ptr(reinterpret_cast<void *>(pattern));
+        runtime.set_prebuilt_arena(reinterpret_cast<void *>(pattern), pattern);
+        runtime.host_total_tasks = 0x35353535;
+        runtime.sm_image_bytes = pattern;
+        runtime.set_active_callable_id(0x35353535);
+        if (functions_changed)
+            for (int i = 0; i < RUNTIME_MAX_FUNC_ID; ++i)
+                runtime.replay_function_bin_addr(i, pattern);
+        const auto spans = runtime.kernel_graph_publication_spans(functions_changed);
+        EXPECT_EQ(spans[0].address, runtime.func_id_to_addr_);
+        EXPECT_EQ(spans[0].bytes, functions_changed ? sizeof(runtime.func_id_to_addr_) : 0u);
+        const auto object_begin = reinterpret_cast<uintptr_t>(&runtime);
+        const auto owned_end = reinterpret_cast<uintptr_t>(runtime.teardown_gates) + sizeof(runtime.teardown_gates);
+        size_t published_bytes = 0;
+        for (const auto &span : spans) {
+            if (span.bytes == 0) continue;
+            const auto begin = reinterpret_cast<uintptr_t>(span.address);
+            ASSERT_GE(begin, object_begin);
+            ASSERT_LE(begin + span.bytes, object_begin + sizeof(runtime));
+            // cache_ops.cpp rounds both ends to 64-byte AICPU cache lines.
+            const auto rounded_begin = begin & ~uintptr_t{63};
+            const auto rounded_end = (begin + span.bytes + 63) & ~uintptr_t{63};
+            EXPECT_GE(rounded_begin, owned_end);
+            EXPECT_GT(rounded_end, rounded_begin);
+            published_bytes += span.bytes;
+        }
+        EXPECT_LT(published_bytes, (functions_changed ? sizeof(runtime.func_id_to_addr_) : 0u) + 1024u);
+        for (size_t offset = 0; offset < sizeof(runtime); ++offset) {
+            if (before[offset] == base[offset]) continue;
+            const auto address = object_begin + offset;
+            EXPECT_TRUE(
+                std::any_of(
+                    spans.begin(), spans.end(),
+                    [&](const auto &span) {
+                        const auto begin = reinterpret_cast<uintptr_t>(span.address);
+                        return address >= begin && address - begin < span.bytes;
+                    }
+                )
+            ) << "unpublished changed byte "
+              << offset;
+        }
+    }
+}
