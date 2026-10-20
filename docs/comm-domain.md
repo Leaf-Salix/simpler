@@ -33,6 +33,61 @@ with orch.allocate_domain(
 allocation: if `sum(b.nbytes) > window_size`, `allocate_domain` raises
 `ValueError` immediately and no backend allocation is registered.
 
+### Unified creation and reuse
+
+L3 and L4 use `allocate_domain(members=...)`, `get_or_allocate_domain(...)`,
+`get_domain(name)` and `release_domain(handle)`, returning the same
+`CommDomainHandle`. L3 members are logical chip worker ids, such as `[1, 0]`;
+L4 members are `(node_worker_id, chip_worker_id)` pairs. Order defines domain
+rank. `member(rank)` returns topology metadata; `local_context(rank)` returns
+an L3 creator's local mapping. Legacy `handle[chip_id]` keeps chip-id semantics.
+For L3 member metadata, `node_worker_id=-1` denotes the creator's own node.
+
+```python
+# In each run that uses the retained domain:
+domain = orch.get_or_allocate_domain(
+    name="tp", members=members, window_size=4096,
+    buffers=[CommBufferSpec("payload", "float32", 1024, 4096)],
+    retain_after_run=True,
+)
+# L3 only: keep the existing node-local Buffer/Tensor access path.
+payload = domain.local_context(0).buffers["payload"]
+```
+
+`allocate_domain` rejects a live name. `get_or_allocate_domain` returns the
+same handle only if ordered members and target identities, requested window
+size, every ordered buffer definition field, retention, and communication
+topology match an immutable snapshot. A conflict reports the differing field
+before device effects. A hit does not allocate, initialize or clear memory.
+`get_domain(name)` performs creator-local lookup and raises `KeyError` when
+missing. `allocate_global_domain` and `release_global_domain` are compatibility
+wrappers; `workers=` remains the legacy L3 allocation spelling.
+
+Creation and reuse run before the callback's first task submission, using the
+existing control admission gate. A successful run preserves domains created
+with `retain_after_run=True`; subsequent runs must look up or reuse a domain
+before using it. Local cached VMM Tensor submissions also register their run.
+Use `with` only when the scope should release the shared handle: context exit
+releases a reused handle too. An out-of-run release requires all accepted runs
+to have completed their cleanup. `Worker.close()` frees remaining owned domains.
+`Worker.live_domains` includes both backends.
+
+`copy_to_domain` and `copy_from_domain` use domain rank and the same named-buffer
+bounds checks. They synchronously stage data before task submission; they do
+not wait for already queued DAG work. L3 staging reuses ordinary VMM Buffer
+copies and must stay inside the declared slices, including when `buffer=None`.
+L4 retains the existing bounded whole-window copy path. `buffer_range(name)`
+returns the slice's window offset and byte size. `mapping_size` is the requested
+extent on the local L3 backend and the returned mapping extent on L4.
+
+This interface does not add transparent L4-created Tensor forwarding or a
+cross-session domain reference. L4 handles expose layout and topology, while
+receiving L3 code continues to call `get_global_domain(domain_id)` and obtains
+its existing local Buffer objects there. No device pointer from another node
+is exposed. Completion/error handling and native teardown keep the existing
+backend protocols; this interface adds no new proof of device quiescence for
+an ambiguous native failure.
+
 ### `ChipDomainContext` (one per participating chip, via `handle[chip_idx]`)
 
 | Field | Meaning |
@@ -56,7 +111,7 @@ forked local L3 workers (`add_worker`) and TCP-connected L3 workers
 (`add_remote_worker`) without `mpirun`:
 
 ```python
-with orch.allocate_global_domain(
+with orch.allocate_domain(
     name="tp",
     members=[(node0_worker_id, 0), (node1_worker_id, 0)],
     window_size=4096,
@@ -137,9 +192,9 @@ contexts.
 control-plane staging and smoke checks. Normal communication still runs in
 L2 kernels through the imported `CommContext`.
 
-By default a live Global CommDomain is swept after the current `Worker.run`
+By default a live CommDomain at either level is swept after the current `Worker.run`
 drains. Set `retain_after_run=True` when a communication kernel writes results
-into the window and a second L4 run must inspect them. The later run should
+into the window and a second run must inspect them. The later run should
 call `domain.release()` after copying the results; `Worker.close()` is the
 final safety net.
 

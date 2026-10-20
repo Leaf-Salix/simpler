@@ -150,6 +150,7 @@ from .callable_identity import (
     parse_python_callable_payload,
     parse_python_import_target,
 )
+from .comm_domain import DomainConfig
 from .comm_endpoints import (
     DEVICE_AICORE,
     DEVICE_AICPU,
@@ -5757,6 +5758,8 @@ class Worker:
         # Dynamic CommDomain allocations.  Keyed by user-facing name (unique
         # among live handles).  ``orch.allocate_domain`` adds entries here;
         # ``release()`` removes them and queues a deferred backend free.
+        self._domain_mu = threading.RLock()
+        self._domain_by_buffer: dict[CanonicalIdentity, CommDomainHandle] = {}
         self._live_domains: dict[str, CommDomainHandle] = {}
         self._live_global_domains: dict[str, GlobalCommDomainHandle] = {}
         self._failed_global_domain_releases: dict[int, GlobalCommDomainHandle] = {}
@@ -9681,7 +9684,12 @@ class Worker:
         Useful for debugging.  Mutating the returned dict has no effect; use
         ``handle.release()`` or ``orch.release_domain(handle)`` to free.
         """
-        return dict(self._live_domains)
+        with self._domain_mu:
+            return {
+                name: handle
+                for name, handle in {**self._live_domains, **self._live_global_domains}.items()
+                if handle._config is not None and not handle.released
+            }
 
     def _validate_worker_chip_id(self, worker_id: int) -> None:
         if self.level < 3:
@@ -10129,6 +10137,129 @@ class Worker:
             after_success=lambda: setattr(self, "_comm_base_ready", True),
         )
 
+    def _domain_config(self, members, window_size, buffers, retain_after_run) -> DomainConfig:
+        if self.level == 3:
+            ids = tuple(self._config.get("device_ids", ()))
+            members = tuple(operator.index(member) for member in members)
+            if any(member < 0 or member >= len(ids) for member in members):
+                raise ValueError("domain members must name registered chip worker ids")
+            topology = (self._config.get("platform"), ids)
+        elif self.level >= 4:
+            members = tuple((operator.index(node), operator.index(chip)) for node, chip in members)
+            nodes = self._resolved_global_nodes()
+            targets = []
+            for node_id, chip in members:
+                node = nodes.get(node_id)
+                if node is None or chip < 0 or chip >= len(node.device_ids):
+                    raise ValueError("domain members must name registered (node, chip) worker ids")
+                targets.append(
+                    (
+                        node_id,
+                        chip,
+                        node.device_ids[chip],
+                        node.global_device_ranks[chip],
+                        node.platform,
+                        node.comm_profile,
+                    )
+                )
+            topology = (self._global_cluster_id, tuple(targets))
+        else:
+            raise RuntimeError("communication domains require an L3+ Worker")
+        return DomainConfig.capture(members, window_size, buffers, retain_after_run, topology)
+
+    def _comm_domain(self, *, name, members, window_size, buffers, retain_after_run, reuse):
+        # The callback/control gate serializes publication with submission and out-of-run release.
+        with self._control_admission("allocate_domain"), self._domain_mu:
+            if not name:
+                raise ValueError("domain name must be non-empty")
+            config = self._domain_config(members, window_size, buffers, retain_after_run)
+            table = self._live_domains if self.level == 3 else self._live_global_domains
+            handle = table.get(name)
+            if handle is not None:
+                if not reuse:
+                    raise ValueError(f"domain {name!r} is already live")
+                if handle._config is None:
+                    raise RuntimeError(f"domain {name!r} has an unfinished allocation")
+                difference = handle._config.difference(config)
+                if difference:
+                    raise ValueError(f"domain {name!r} configuration differs: {difference}")
+                self._use_domain(handle)
+                return handle
+            resources = self._building_run_resources
+            if resources is None:
+                raise RuntimeError("domain allocation is only valid while a run's graph is being built")
+            try:
+                if self.level == 3:
+                    handle = self._allocate_domain(
+                        name=name, workers=config.members, window_size=config.window_size, buffers=config.specs()
+                    )
+                    handle.retain_after_run = config.retain_after_run
+                    handle.members = tuple(
+                        GlobalDomainMember(-1, chip, chip, rank) for rank, chip in enumerate(config.members)
+                    )
+                    handle.buffers = tuple(GlobalDomainBuffer(b[0], b[3]) for b in config.buffers)
+                    handle.mapping_size = config.window_size
+                else:
+                    handle = self._allocate_global_domain(
+                        name=name,
+                        members=config.members,
+                        window_size=config.window_size,
+                        buffers=config.specs(),
+                        retain_after_run=config.retain_after_run,
+                    )
+                handle._guard = self._domain_guard
+                for context in handle.contexts.values():
+                    for buffer in context.buffers.values():
+                        self._domain_by_buffer[buffer.identity] = handle
+                self._use_domain(handle)
+                handle._config = config
+                return handle
+            except BaseException as creation_error:
+                # The backend live table also owns partially committed allocations. Close the
+                # failed transaction without publishing it, keeping its existing fence debt.
+                failed = table.get(name)
+                if failed is not None:
+                    failed._released = True
+                    release = self._release_domain_handle if self.level == 3 else self._release_global_domain_handle
+                    try:
+                        release(failed, resources)
+                    except BaseException as cleanup_error:
+                        raise creation_error from cleanup_error
+                raise
+
+    @contextlib.contextmanager
+    def _domain_guard(self, handle=None, *, releasing=False):
+        callback = _callback_frame_for(self) is not None
+        # An accepted callback already owns a lease, including while concurrent close drains it.
+        with contextlib.nullcontext() if callback else self._operation_lease("domain access"):
+            with self._control_reservation("domain access") if releasing and not callback else contextlib.nullcontext():
+                with self._domain_mu:
+                    if handle is not None and not handle.released:
+                        self._use_domain(handle)
+                    yield
+
+    def _use_domain(self, handle) -> None:
+        resources = self._building_run_resources if _callback_frame_for(self) is not None else None
+        if resources is None:
+            return
+        if handle.released:
+            raise RuntimeError(f"domain {handle.name!r} is already released")
+        local = bool(handle.workers)
+        with resources.domain_lock:
+            table = resources.live_domains if local else resources.live_global_domains
+            table[handle.name] = handle
+            resources.requires_ordered_cleanup = True
+        release = self._release_domain_handle if local else self._release_global_domain_handle
+        handle._release_fn = lambda released, owner=resources: release(released, owner)
+
+    def _get_domain(self, name: str) -> CommDomainHandle:
+        with self._domain_guard():
+            handle = self.live_domains.get(name)
+            if handle is None:
+                raise KeyError(f"no live communication domain {name!r}")
+            self._use_domain(handle)
+            return handle
+
     def _allocate_domain(  # noqa: PLR0912 -- linear input-validation + per-chip shm staging + dispatch + reply unpack; splitting obscures the fail-fast ordering
         self,
         *,
@@ -10331,7 +10462,8 @@ class Worker:
                 # registry. If append is interrupted, those registries still
                 # make the allocation reachable by the end-of-run/close sweep.
                 resources.pending_release_domains.append(handle)
-                resources.live_domains.pop(handle.name, None)
+                if resources.live_domains.get(handle.name) is handle:
+                    resources.live_domains.pop(handle.name)
                 # Pop from _live_domains so a subsequent allocation in this
                 # run can reuse the name. The pending claim keeps the old
                 # allocation alive until the fence drains it.
@@ -10362,6 +10494,7 @@ class Worker:
             stragglers = list(resources.pending_release_domains)
             global_stragglers = list(resources.pending_release_global_domains)
             resources.live_global_domains.clear()
+            resources.live_domains.clear()
         self._drain_pending_domain_snapshot(resources, stragglers)
         self._drain_pending_global_domain_snapshot(resources, global_stragglers)
 
@@ -11307,7 +11440,7 @@ class Worker:
                         )
             raise
 
-        handle = GlobalCommDomainHandle(
+        handle = CommDomainHandle(
             name=name,
             members=domain_members_tuple,
             buffers=global_buffers,
@@ -11414,7 +11547,7 @@ class Worker:
         live_domains = self._live_global_domains if resources is None else resources.live_global_domains
 
         def _release(handle: GlobalCommDomainHandle) -> None:
-            if handle.retain_after_run and not include_retained:
+            if handle.retain_after_run and not handle.released and not include_retained:
                 return
             handle._released = True  # noqa: SLF001 -- runtime owns this transition
             self._free_global_domain_after_fence(handle)
@@ -11464,7 +11597,9 @@ class Worker:
         )
         return decode_copy_result(reply)
 
-    def _release_all_live_domains(self, resources: _RunResources | None = None) -> None:
+    def _release_all_live_domains(
+        self, resources: _RunResources | None = None, *, include_retained: bool = True
+    ) -> None:
         """Best-effort release of every still-live domain handle (LIFO).
 
         Called from the end-of-run sweep (after the owning run's pending
@@ -11480,6 +11615,8 @@ class Worker:
         live_domains = self._live_domains if resources is None else resources.live_domains
 
         def _release(handle: CommDomainHandle) -> None:
+            if handle.retain_after_run and not handle.released and not include_retained:
+                return
             # Mark released first (flips handle._released so further indexing
             # raises), then synchronously free.  The handle is not in the
             # deferred-release queue, so we use the direct path.
@@ -11681,6 +11818,7 @@ class Worker:
                             self._drop_device_alloc(identity)
         with self._child_prov_lock:
             for identity in self._domain_members.pop(allocation_id, set()):
+                self._domain_by_buffer.pop(identity, None)
                 self._drop_device_alloc(identity)
 
     def _require_freeable(self, handle: Buffer, *, api: str) -> Buffer:
@@ -11846,7 +11984,13 @@ class Worker:
         resources = self._building_run_resources
         if resources is None:
             return
-        resources.touched_identities.update(self._identities_in_args(args))
+        identities = self._identities_in_args(args)
+        with self._domain_mu:
+            for identity in identities:
+                handle = self._domain_by_buffer.get(identity)
+                if handle is not None:
+                    self._use_domain(handle)
+        resources.touched_identities.update(identities)
 
     def _child_prov_check_dispatch_locked(self, args: Any, target_worker_id: int, *, api: str) -> None:
         """Validate device args against the worker they are dispatched to.
@@ -13387,11 +13531,14 @@ class Worker:
                         "live_global_domains",
                         lambda: self._release_all_live_global_domains(
                             resources,
-                            include_retained=False,
+                            include_retained=native_error is not None,
                         ),
                     ),
                     ("pending_domains", lambda: self._execute_pending_domain_releases(resources)),
-                    ("live_domains", lambda: self._release_all_live_domains(resources)),
+                    (
+                        "live_domains",
+                        lambda: self._release_all_live_domains(resources, include_retained=native_error is not None),
+                    ),
                     ("retire_domains", lambda: self._retire_run_domains(resources)),
                     ("native_run", _release_native_run),
                 )

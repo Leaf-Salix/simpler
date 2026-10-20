@@ -5353,10 +5353,10 @@ class TestRunHandle:
         release_done = threading.Event()
         real_sweep = worker._release_all_live_domains
 
-        def parked_sweep(res=None):
+        def parked_sweep(res=None, **kwargs):
             in_sweep.set()
             assert release_done.wait(5.0), "releasing thread did not finish"
-            real_sweep(res)
+            real_sweep(res, **kwargs)
 
         worker._release_all_live_domains = cast(Any, parked_sweep)
 
@@ -5635,7 +5635,7 @@ class TestOrderedCleanupDegradation:
         worker._orch = cast(Any, _StubOrch())
         boom = RuntimeError("domain release failed")
 
-        def failing_release(res):
+        def failing_release(res, **_kwargs):
             raise boom
 
         worker._release_all_live_domains = cast(Any, failing_release)

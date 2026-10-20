@@ -1111,7 +1111,7 @@ class ChipDomainContext:
 class CommDomainHandle:
     """User-facing handle for one dynamically-allocated CommDomain.
 
-    Returned by ``Orchestrator.allocate_domain(...)``.  Acts as a context
+    Returned by the L3/L4 ``Orchestrator.allocate_domain(...)`` API.  Acts as a context
     manager: ``with`` exit *marks* the handle for release and prevents
     further use; the actual backend free runs **after** ``Worker.run`` has
     drained any tasks the orch function submitted using this domain.  This
@@ -1140,40 +1140,89 @@ class CommDomainHandle:
         "_release_fn",
         "_released",
         "_freed",
+        "members",
+        "buffers",
+        "domain_id",
+        "generation",
+        "mapping_size",
+        "retain_after_run",
+        "attachments",
+        "_config",
+        "_guard",
     )
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 -- preserve the L3 and legacy L4 constructor keywords
         self,
         *,
         name: str,
-        workers: tuple[int, ...],
-        contexts: dict[int, ChipDomainContext],
-        allocation_id: int,
+        workers: tuple[int, ...] = (),
+        contexts: dict[int, ChipDomainContext] | None = None,
+        allocation_id: int = 0,
         _release_fn,
+        members: tuple[GlobalDomainMember, ...] = (),
+        buffers: tuple[GlobalDomainBuffer, ...] = (),
+        domain_id: int | None = None,
+        generation: int = 1,
+        mapping_size: int = 0,
+        retain_after_run: bool = False,
+        attachments: tuple[GlobalDomainAttachment, ...] = (),
         _domain_size: int | None = None,
         _domain_ranks: dict[int, int] | None = None,
     ) -> None:
         self.name = name
         self.workers = tuple(workers)
         # Frozen dict-ish — we don't expose mutation
-        self.contexts: dict[int, ChipDomainContext] = dict(contexts)
+        self.contexts: dict[int, ChipDomainContext] = dict(contexts or {})
         self.allocation_id = int(allocation_id)
         self._domain_size = len(self.workers) if _domain_size is None else int(_domain_size)
         self._domain_ranks = (
             {worker: rank for rank, worker in enumerate(self.workers)} if _domain_ranks is None else dict(_domain_ranks)
         )
         self._release_fn = _release_fn
+        self.members = tuple(members)
+        self.buffers = tuple(buffers)
+        self.domain_id = self.allocation_id if domain_id is None else int(domain_id)
+        self.generation = int(generation)
+        self.mapping_size = int(mapping_size)
+        self.retain_after_run = bool(retain_after_run)
+        self.attachments = tuple(attachments)
+        self._config = None
+        self._guard = lambda _handle, **_kwargs: contextlib.nullcontext()
         self._released = False
         self._freed = False
 
     def __getitem__(self, chip_idx: int) -> ChipDomainContext:
+        with self._guard(self):
+            self._require_live()
+            return self.contexts[chip_idx]
+
+    def _require_live(self) -> None:
         if self._released:
-            raise RuntimeError(
-                f"CommDomainHandle({self.name!r}) already released; do not pass it to submit_* "
-                "after release(). Submitted tasks that captured device_ctx / buffers before"
-                "release will still see live memory until Worker.run drains."
-            )
-        return self.contexts[chip_idx]
+            raise RuntimeError(f"CommDomainHandle({self.name!r}) is already released")
+
+    def member(self, domain_rank: int) -> GlobalDomainMember:
+        """Return rank-ordered topology metadata, without a remote device address."""
+        with self._guard(self):
+            self._require_live()
+            rank = int(domain_rank)
+            if rank < 0 or rank >= len(self.members):
+                raise IndexError(f"domain rank {rank} is out of range")
+            return self.members[rank]
+
+    def local_context(self, domain_rank: int) -> ChipDomainContext:
+        """Return this creator's local chip mapping; L4 creators hold no such mappings."""
+        member = self.member(domain_rank)
+        return self[member.local_worker_id]
+
+    def buffer_range(self, name: str) -> tuple[int, int]:
+        with self._guard(self):
+            self._require_live()
+            offset = 0
+            for buffer in self.buffers:
+                if buffer.name == name:
+                    return offset, buffer.nbytes
+                offset += buffer.nbytes
+            raise KeyError(f"domain {self.name!r} has no buffer {name!r}")
 
     @property
     def released(self) -> bool:
@@ -1210,13 +1259,16 @@ class CommDomainHandle:
         """
         if self._released:
             return
-        self._released = True
-        # _release_fn is owned by Worker; it queues the actual backend
-        # release and runs it after the owning run completes. Worker also flips _freed.
-        self._release_fn(self)
+        with self._guard(self, releasing=True):
+            if self._released:
+                return
+            self._released = True
+            self._release_fn(self)
 
     def __enter__(self) -> CommDomainHandle:
-        return self
+        with self._guard(self):
+            self._require_live()
+            return self
 
     def __exit__(self, *_):
         self.release()
@@ -1231,93 +1283,8 @@ class CommDomainHandle:
         return f"CommDomainHandle(name={self.name!r}, workers={self.workers}, {state})"
 
 
-class GlobalCommDomainHandle:
-    """L4-owned handle for one CommDomain spanning local and/or remote L3 nodes.
-
-    The handle contains stable topology, attachment metadata, and buffer
-    offsets only. Device addresses remain in the L3/L2 process that imported
-    the transport handles.
-    """
-
-    __slots__ = (
-        "_freed",
-        "_release_fn",
-        "_released",
-        "attachments",
-        "buffers",
-        "domain_id",
-        "generation",
-        "mapping_size",
-        "members",
-        "name",
-        "retain_after_run",
-    )
-
-    def __init__(
-        self,
-        *,
-        name: str,
-        members: tuple[GlobalDomainMember, ...],
-        buffers: tuple[GlobalDomainBuffer, ...],
-        domain_id: int,
-        generation: int,
-        mapping_size: int,
-        retain_after_run: bool,
-        _release_fn,
-        attachments: tuple[GlobalDomainAttachment, ...] = (),
-    ) -> None:
-        self.name = str(name)
-        self.members = tuple(members)
-        self.buffers = tuple(buffers)
-        self.attachments = tuple(attachments)
-        self.domain_id = int(domain_id)
-        self.generation = int(generation)
-        self.mapping_size = int(mapping_size)
-        self.retain_after_run = bool(retain_after_run)
-        self._release_fn = _release_fn
-        self._released = False
-        self._freed = False
-
-    def member(self, domain_rank: int) -> GlobalDomainMember:
-        if self._released:
-            raise RuntimeError(f"GlobalCommDomainHandle({self.name!r}) is already released")
-        rank = int(domain_rank)
-        if rank < 0 or rank >= len(self.members):
-            raise IndexError(f"global domain rank {rank} is out of range")
-        member = self.members[rank]
-        if member.domain_rank != rank:
-            raise RuntimeError("global domain member table is not rank ordered")
-        return member
-
-    def buffer_range(self, name: str) -> tuple[int, int]:
-        if self._released:
-            raise RuntimeError(f"GlobalCommDomainHandle({self.name!r}) is already released")
-        offset = 0
-        for buffer in self.buffers:
-            if buffer.name == name:
-                return offset, buffer.nbytes
-            offset += buffer.nbytes
-        raise KeyError(f"global domain {self.name!r} has no buffer {name!r}")
-
-    @property
-    def released(self) -> bool:
-        return self._released
-
-    @property
-    def freed(self) -> bool:
-        return self._freed
-
-    def release(self) -> None:
-        if self._released:
-            return
-        self._released = True
-        self._release_fn(self)
-
-    def __enter__(self) -> GlobalCommDomainHandle:
-        return self
-
-    def __exit__(self, *_):
-        self.release()
+# The legacy L4 spelling denotes the same owning handle type.
+GlobalCommDomainHandle = CommDomainHandle
 
 
 class GlobalCommDomainView:

@@ -167,7 +167,10 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | `submit_next_level(callable_handle, args, config=None, *, worker: int) -> TaskHandle` | Hands a callable to one exact NEXT_LEVEL child and returns an opaque handle for explicit task dependencies |
 | `submit_next_level_group(callable_handle, args_list, config=None, *, workers: list[int]) -> TaskHandle` | Submits one group DAG node and returns its opaque handle |
 | `submit_sub(callable_handle, args=None)` | Schedules a registered host-side Python callable |
-| `allocate_domain(*, name, workers, window_size, buffers=())` | Context manager returning a handle indexed by domain-local rank |
+| `allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | L3/L4 creation returning `CommDomainHandle`; legacy L3 `workers=` and chip-id indexing remain supported |
+| `get_or_allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | Reuse the same live handle after full configuration validation, or create it |
+| `get_domain(name)` / `release_domain(handle)` | Creator-local lookup / deferred owning release |
+| `copy_to_domain(handle, rank, data, ...)` / `copy_from_domain(handle, rank, nbytes, ...)` | Synchronous bounded staging before task submission; L3 requires declared slices |
 | `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Delegates allocation to the owning Worker; target chip memory is named by the returned handle |
 
 ## Callables and task args
