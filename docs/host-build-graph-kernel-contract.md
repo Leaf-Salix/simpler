@@ -145,11 +145,19 @@ prepare/freeze and slot registration. Callable prepare uploads context-owned
 images and stores immutable registration metadata without enqueuing a registration
 kernel or synchronizing a stream/event/device. It may run inside capture, including
 after an earlier launch has joined the internal streams to that capture.
-Each launch enqueues an idempotent callable registration immediately before graph
-execution on the same AICPU stream. Both operations are captured and replayed in
-order. An eager launch or another captured graph carries its own registration,
-so neither depends on the original capture having executed. A registration enqueue
-failure returns through the binder and poisons the context.
+Each launch carries that prepare-owned registration in a fixed version-1 HBG
+dispatch prefix, followed by the unchanged canonical version-5 graph packet.
+CANN deep-copies both into one task. The prefix has its own fixed-size checksum
+and length/identity checks; it is Host authority, not a registration synthesized
+from graph claims. Both placeholder offsets include the prefix. Before reading
+Runtime, the consumer checks the prefix, its context/slot identity, the entire
+source range against all destinations and the registry, and any existing
+registration for the same generation. The participant leader publishes the
+idempotent registration before restore/execution and releases all peers through
+the existing epoch gate. An eager launch or another captured graph carries its
+own registration, so neither depends on the original capture having executed.
+Enqueue failures return through the binder and poison the context. The canonical
+packet still receives its full per-invocation checksum, slot and image checks.
 Launch receives only frozen bindings. It performs Host build, constructs or
 reuses an immutable graph template, makes a fresh HostArgs copy, and enters the
 shared three-stream binder. The TMR public launch keeps its independent packet
@@ -281,13 +289,18 @@ and no launch payload can choose its address. HBG version 1, 2, 3 and 4 packets 
 rejected;
 the outer K1 invocation ABI remains unchanged.
 
-`make_graph_host_args` validates the template and produces a fresh writable copy
-with one placeholder. Both offsets include the outer common header:
+`make_graph_host_args` is the canonical-packet helper. It validates the template
+and produces a fresh writable copy with one placeholder. Its offsets include
+the canonical common header:
 `address_offset = sizeof(SimplerKernelInvocationHeader) + offsetof(GraphPacketHeader, inline_payload_addr)` and
 `data_offset = sizeof(SimplerKernelInvocationHeader) + payload_offset`.
-`submit_graph_template` passes that copy to
-a synchronous HostArgs consumer; only task execution is asynchronous.
-`aicpu_loader/host/kernel_graph_launch.h::launch_graph_template` adapts this to
+`submit_graph_template` passes the canonical copy to a synchronous HostArgs
+consumer. The production path uses `make_graph_dispatch_args` and
+`submit_graph_dispatch` instead: the canonical bytes follow the 144-byte
+`GraphDispatchHeader`, and both offsets above increase by 144. Its prefix
+checksum covers the complete fixed prefix except the checksum itself;
+the inner packet retains its own unchanged v5 checksum coverage.
+`aicpu_loader/host/kernel_graph_launch.h::launch_graph_template` adapts this dispatch copy to
 `aclrtLaunchKernelWithHostArgs`, forwarding the supplied dedicated AICPU stream,
 function, block count and config, with exactly one `aclrtPlaceHolderInfo`.
 The adapter submits exactly once and returns the RTS status unchanged. It does

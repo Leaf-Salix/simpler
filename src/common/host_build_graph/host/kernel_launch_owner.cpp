@@ -156,15 +156,10 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
     };
     ops.launch_aicpu = [](void *context, void *stream) noexcept {
         const auto &s = *static_cast<Submission *>(context);
-        // Registration and execution share the AICPU stream and capture. Each
-        // invocation is self-contained even if another graph has never replayed.
-        auto registration = *s.registration;
-        const int registered = s.runner->launch_aicpu_payload(
-            stream, &registration, sizeof(registration), "simpler_aicpu_l1_hbg_register_callable", 1
-        );
-        if (registered != 0) return registered;
+        // One task-owned copy carries both prepare-owned authority and the
+        // canonical packet, including when no earlier graph has replayed.
         return hbg::launch_graph_template(
-            *s.graph, s.runner->kernel_aicpu_handle_,
+            *s.graph, *s.registration, s.runner->kernel_aicpu_handle_,
             static_cast<uint32_t>(s.runner->kernel_runtime_.get_aicpu_launch_count()), static_cast<aclrtStream>(stream)
         );
     };

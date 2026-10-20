@@ -130,6 +130,24 @@ def _run(platform, device):
             io.write(output, [-999.0] * len(values))
             return [value + (scalar if index == 0 else -scalar) for value in values]
 
+        # Neither graph has executed when B first replays. Use each capture mode
+        # in a fresh context so no earlier eager call can publish its authority.
+        cold_graphs = []
+        for index in range(2):
+            graph = ctypes.c_void_p()
+            _check(lib.aclmdlRICaptureBegin(caller.stream, context), "cold capture begin")
+            launch(index, 3.0)
+            _check(lib.aclmdlRICaptureEnd(caller.stream, ctypes.byref(graph)), "cold capture end")
+            assert graph.value
+            cold_graphs.append(graph)
+        for iteration, index in enumerate((1, 0, 1)):
+            expected = seed_inputs(index, 3.0, context + iteration)
+            _check(lib.aclmdlRIExecuteAsync(cold_graphs[index], caller.stream), "cold graph replay")
+            _check(lib.aclrtSynchronizeStreamWithTimeout(caller.stream, 10000), "cold graph sync")
+            io.verify(output, expected)
+        for graph in cold_graphs:
+            _check(lib.aclmdlRIDestroy(graph), "destroy cold graph")
+
         for index, scalar in ((0, 3.0), (1, 3.0), (0, 3.0), (0, 7.0)):
             expected = seed_inputs(index, scalar, context)
             launch(index, scalar)

@@ -23,6 +23,7 @@
 #include "callable.h"
 #include "common/unified_log.h"
 #include "host_build_graph/kernel_graph_restore.h"
+#include "host_build_graph/kernel_graph_dispatch.h"
 #include "host_build_graph/kernel_graph_slot_registry.h"
 #include "host_build_graph/kernel_graph_wire.h"
 #include "runtime.h"
@@ -69,8 +70,8 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_l1_hbg_regis
         return std::memcmp(&slot.value, &registration, sizeof(registration)) == 0 ? 0 : -1;
     std::memcpy(&slot.value, &registration, sizeof(registration));
     cache_flush_range(&slot.value, sizeof(slot.value));
-    // The context owns this table. The same-stream registration node publishes
-    // it before graph execution; identical replays retain the published binding.
+    // The context owns this table. The invocation leader publishes it before
+    // graph execution; identical replays retain the published binding.
     set_platform_regs(registration.register_table_address);
     slot.generation.store(registration.context_generation, std::memory_order_release);
     return 0;
@@ -83,46 +84,39 @@ int consume_kernel_task(void *arg) {
         LOG_ERROR("%s", "HBG kernel invocation has null HostArgs");
         return -1;
     }
+    // The independently bound context owns these fields; the canonical inner
+    // packet cannot choose a registry or provide callable authority.
+    const auto *registry = hbg::current_graph_slot_registry();
+    if (registry == nullptr) return -1;
+    cache_invalidate_range(registry, offsetof(hbg::GraphSlotRegistry, registration));
+    hbg::GraphSlotRegistration slot{};
+    if (hbg::acquire_graph_execution_slot(registry, registry->device_id, registry->runtime_binary_id, slot) !=
+            hbg::GraphSlotStatus::Ok ||
+        !hbg::graph_dispatch_source_fits(arg, sizeof(hbg::GraphDispatchHeader), slot))
+        return -1;
+    cache_invalidate_range(arg, sizeof(hbg::GraphDispatchHeader));
+    hbg::GraphDispatchHeader dispatch{};
+    if (!hbg::read_graph_dispatch_header(arg, sizeof(dispatch), dispatch) ||
+        !hbg::graph_dispatch_matches_slot(arg, dispatch, slot))
+        return -1;
+    const auto registration = dispatch.registration;
+    // A generation's existing authority is immutable. Do this comparison before
+    // reading Runtime, including when the same callable ID has already replayed.
+    if (g_callables[registration.callable_id].generation.load(std::memory_order_acquire) ==
+        registration.context_generation) {
+        hbg::HbgCallableRegistration existing{};
+        if (!load_callable(registration.callable_id, registration.context_generation, existing) ||
+            std::memcmp(&existing, &registration, sizeof(existing)) != 0)
+            return -1;
+    }
+    auto *packet = static_cast<uint8_t *>(arg) + sizeof(dispatch);
+    cache_invalidate_range(packet, sizeof(SimplerKernelInvocationHeader) + sizeof(hbg::GraphPacketHeader));
     SimplerKernelInvocationHeader invocation{};
     hbg::GraphPacketHeader graph{};
-    std::memcpy(&invocation, arg, sizeof(invocation));
-    std::memcpy(&graph, static_cast<const uint8_t *>(arg) + sizeof(invocation), sizeof(graph));
-    if (graph.total_bytes > UINT32_MAX - sizeof(invocation)) {
-        LOG_ERROR("HBG graph packet size is invalid: %llu", static_cast<unsigned long long>(graph.total_bytes));
-        return -1;
-    }
-    const size_t packet_bytes = sizeof(invocation) + static_cast<size_t>(graph.total_bytes);
-
-    hbg::HbgCallableRegistration registration{};
-    if (!load_callable(invocation.callable_id, graph.slot_generation, registration)) {
-        LOG_ERROR(
-            "HBG callable lookup failed: id=%d generation=%llu", invocation.callable_id,
-            static_cast<unsigned long long>(graph.slot_generation)
-        );
-        return -1;
-    }
-    if (get_platform_regs() != registration.register_table_address) {
-        LOG_ERROR(
-            "HBG register table mismatch: prepared=%llu resident=%llu",
-            static_cast<unsigned long long>(registration.register_table_address),
-            static_cast<unsigned long long>(get_platform_regs())
-        );
-        return -1;
-    }
-    if (registration.callable_hash != graph.callable_hash || registration.function_hash != graph.function_hash ||
-        invocation.scalar_count != registration.scalar_count || invocation.tensor_count != registration.tensor_count ||
-        invocation.host_copy_tensor_count != 0) {
-        LOG_ERROR(
-            "HBG invocation identity mismatch: callable=%llu/%llu function=%llu/%llu tensors=%d/%d host_copies=%d "
-            "scalars=%d/%d",
-            static_cast<unsigned long long>(registration.callable_hash),
-            static_cast<unsigned long long>(graph.callable_hash),
-            static_cast<unsigned long long>(registration.function_hash),
-            static_cast<unsigned long long>(graph.function_hash), invocation.tensor_count, registration.tensor_count,
-            invocation.host_copy_tensor_count, invocation.scalar_count, registration.scalar_count
-        );
-        return -1;
-    }
+    std::memcpy(&invocation, packet, sizeof(invocation));
+    std::memcpy(&graph, packet + sizeof(invocation), sizeof(graph));
+    if (!hbg::graph_dispatch_matches_packet(dispatch, invocation, graph)) return -1;
+    const size_t packet_bytes = static_cast<size_t>(dispatch.packet_bytes);
     auto *runtime = reinterpret_cast<Runtime *>(registration.runtime_address);
     if (runtime == nullptr) {
         LOG_ERROR("%s", "HBG callable registration has null Runtime address");
@@ -147,10 +141,15 @@ int consume_kernel_task(void *arg) {
     if (thread == 0) {
         while (g_entered.load(std::memory_order_acquire) != threads) {}
         hbg::GraphRestoreResult restored{};
-        const auto status = hbg::restore_graph_packet(
-            arg, packet_bytes, registration.device_id, registration.runtime_binary_id,
-            {registration.callable_id, registration.tensor_count, registration.scalar_count}, restored
-        );
+        auto published = registration;
+        const int registered = simpler_aicpu_l1_hbg_register_callable(&published);
+        const auto status =
+            registered == 0 && get_platform_regs() == registration.register_table_address ?
+                hbg::restore_graph_packet(
+                    packet, packet_bytes, registration.device_id, registration.runtime_binary_id,
+                    {registration.callable_id, registration.tensor_count, registration.scalar_count}, restored
+                ) :
+                hbg::GraphRestoreStatus::Rejected;
         const auto binding = status == hbg::GraphRestoreStatus::Ok ? g_callable_binding.bind(runtime, registration) :
                                                                      hbg::CallableBindingResult::Rejected;
         const bool callable_bound = binding != hbg::CallableBindingResult::Rejected;
