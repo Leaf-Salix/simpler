@@ -10173,6 +10173,9 @@ class Worker:
         return DomainConfig.capture(members, window_size, buffers, retain_after_run, topology)
 
     def _comm_domain(self, *, name, members, window_size, buffers, retain_after_run, reuse):
+        resources = self._building_run_resources
+        if _callback_frame_for(self) is None or resources is None:
+            raise RuntimeError("domain creation and reuse require this Worker's orchestration callback")
         # The callback/control gate serializes publication with submission and out-of-run release.
         with self._control_admission("allocate_domain"), self._domain_mu:
             if not name:
@@ -10190,9 +10193,6 @@ class Worker:
                     raise ValueError(f"domain {name!r} configuration differs: {difference}")
                 self._use_domain(handle)
                 return handle
-            resources = self._building_run_resources
-            if resources is None:
-                raise RuntimeError("domain allocation is only valid while a run's graph is being built")
             try:
                 if self.level == 3:
                     handle = self._allocate_domain(

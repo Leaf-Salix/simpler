@@ -1128,6 +1128,10 @@ class CommDomainHandle:
     Most users only see ``released``; the ``live → released`` transition
     happens at ``with`` exit (or explicit ``release()``), and the
     ``released → freed`` transition is the runtime's job at end-of-run.
+
+    Callers must treat handle attributes and context/buffer mappings as read-only
+    metadata. Reassignment is unsupported; configure through allocation arguments
+    and end ownership through ``release()``. Buffer contents remain writable.
     """
 
     __slots__ = (
@@ -1171,7 +1175,6 @@ class CommDomainHandle:
     ) -> None:
         self.name = name
         self.workers = tuple(workers)
-        # Frozen dict-ish — we don't expose mutation
         self.contexts: dict[int, ChipDomainContext] = dict(contexts or {})
         self.allocation_id = int(allocation_id)
         self._domain_size = len(self.workers) if _domain_size is None else int(_domain_size)

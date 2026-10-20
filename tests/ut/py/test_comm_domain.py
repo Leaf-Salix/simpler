@@ -69,13 +69,16 @@ def test_reuse_snapshot_data_and_second_run_release(domain_worker):
         assert orch.get_domain("tp") is handle
         assert handle.member(0).local_worker_id == 1
         orch.copy_to_domain(handle, 0, b"retained", buffer="payload", offset=3)
-        saved.append(handle)
+        saved.append((handle, orch))
 
     worker.run(first)
-    handle = saved[0]
+    handle, orch = saved[0]
     allocation_count = worker._next_alloc_id
     assert not handle.released and not handle.freed
     assert worker.live_domains == {"tp": handle}
+    for name in ("tp", "missing"):
+        with pytest.raises(RuntimeError, match="callback"):
+            orch.get_or_allocate_domain(**dict(request, name=name))
     # Mutating a caller-owned spec cannot rewrite the captured configuration.
     request["buffers"][0].dtype = "int8"
 
@@ -348,11 +351,10 @@ def test_metadata_reads_remain_available_before_run_cleanup(domain_worker):
 def test_accepted_callback_can_release_while_close_drains(domain_worker):
     worker, members = domain_worker
     saved = []
+    request = _request(members, buffers=[CommBufferSpec(name, "uint8", 4, 4) for name in ("payload", "tail")])
 
     def allocate(orch, _args, _cfg):
-        domain = orch.allocate_domain(
-            **_request(members, buffers=[CommBufferSpec(name, "uint8", 4, 4) for name in ("payload", "tail")])
-        )
+        domain = orch.allocate_domain(**request)
         orch.copy_to_domain(domain, 0, b"abcdefgh")
         saved.append(domain)
 
@@ -363,7 +365,8 @@ def test_accepted_callback_can_release_while_close_drains(domain_worker):
     def build(orch, _args, _cfg):
         entered.set()
         assert resume.wait(10)
-        domain = orch.get_domain("tp")
+        domain = orch.get_or_allocate_domain(**request)
+        assert orch.get_domain("tp") is domain
         assert domain.member(0).local_worker_id == 1
         with pytest.raises(RuntimeError, match="READY"):
             with worker._operation_lease("fresh operation"):
@@ -387,6 +390,9 @@ def test_accepted_callback_can_release_while_close_drains(domain_worker):
                 )
             with pytest.raises(RuntimeError, match="READY"):
                 worker.create_buffer(1)
+            assert worker._orch is not None
+            with _callback_run(0, object()), pytest.raises(RuntimeError, match="callback"):
+                worker._orch.get_or_allocate_domain(**request)
         except BaseException as exc:
             errors.append(exc)
         finally:

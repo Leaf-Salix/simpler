@@ -43,6 +43,10 @@ rank. `member(rank)` returns topology metadata; `local_context(rank)` returns
 an L3 creator's local mapping. Legacy `handle[chip_id]` keeps chip-id semantics.
 For L3 member metadata, `node_worker_id=-1` denotes the creator's own node.
 
+Handle attributes and context/buffer mappings are read-only metadata by contract;
+reassigning them is unsupported. Configure domains through allocation arguments
+and end ownership through `release()`. Buffer contents remain writable.
+
 ```python
 # In each run that uses the retained domain:
 domain = orch.get_or_allocate_domain(
@@ -63,8 +67,9 @@ before device effects. A hit does not allocate, initialize or clear memory.
 missing. `allocate_global_domain` and `release_global_domain` are compatibility
 wrappers; `workers=` remains the legacy L3 allocation spelling.
 
-Creation and reuse run before the callback's first task submission, using the
-existing control admission gate. A successful run preserves domains created
+Creation and reuse require the owning Worker's orchestration callback, before
+its first task submission; calls outside it are rejected even on a reuse hit.
+They use the existing control admission gate. A successful run preserves domains created
 with `retain_after_run=True`; subsequent runs must look up or reuse a domain
 before using it. Local cached VMM Tensor submissions also register their run.
 Use `with` only when the scope should release the shared handle: context exit
