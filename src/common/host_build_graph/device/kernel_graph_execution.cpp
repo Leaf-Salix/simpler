@@ -144,7 +144,8 @@ int consume_kernel_task(void *arg) {
         auto published = registration;
         const int registered = simpler_aicpu_l1_hbg_register_callable(&published);
         const auto status =
-            registered == 0 && get_platform_regs() == registration.register_table_address ?
+            registered == 0 && get_platform_regs() == registration.register_table_address &&
+                    hbg::refresh_graph_kernel_dfx(registry, runtime, registration) ?
                 hbg::restore_graph_packet(
                     packet, packet_bytes, registration.device_id, registration.runtime_binary_id,
                     {registration.callable_id, registration.tensor_count, registration.scalar_count}, restored

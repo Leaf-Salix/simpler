@@ -79,6 +79,7 @@ extern "C" __attribute__((weak)) uint32_t runtime_hbg_kernel_architecture_impl(v
 int __attribute__((weak)) DeviceRunnerBase::prepare_hbg_kernel_runtime(const HostApi *) {
     return PTO_RUNTIME_ERR_UNSUPPORTED;
 }
+int __attribute__((weak)) DeviceRunnerBase::prepare_hbg_kernel_dfx_context() { return PTO_RUNTIME_ERR_UNSUPPORTED; }
 int __attribute__((weak)) DeviceRunnerBase::prepare_hbg_kernel_callable_registration(
     int32_t, size_t, const simpler::kernel::PreparedInvocationView &, void *
 ) {
@@ -753,6 +754,9 @@ int DeviceRunnerBase::init_kernel_context(
     if (rc != 0) return rc;
     if (!hbg_kernel) {
         rc = prepare_kernel_coordination();
+        if (rc != 0) return rc;
+    } else {
+        rc = prepare_hbg_kernel_dfx_context();
         if (rc != 0) return rc;
     }
     rc = persistent_args_.set_dfx_enabled(false);

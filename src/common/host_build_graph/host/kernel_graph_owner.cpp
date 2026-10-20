@@ -155,6 +155,17 @@ int DeviceRunnerBase::prepare_hbg_kernel_runtime(const HostApi *) {
     return aclrtSynchronizeStreamWithTimeout(control_stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
 }
 
+int DeviceRunnerBase::prepare_hbg_kernel_dfx_context() {
+    if (!persistent_args_.is_prepared() || persistent_args_.device_k_args() == nullptr ||
+        persistent_args_.args().runtime_args == nullptr)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    *kernel_runtime_.kernel_dfx_args_slot() = reinterpret_cast<uint64_t>(persistent_args_.device_k_args());
+    return copy_to_device(
+        persistent_args_.args().runtime_args->kernel_dfx_args_slot(), kernel_runtime_.kernel_dfx_args_slot(),
+        sizeof(uint64_t)
+    );
+}
+
 int DeviceRunnerBase::prepare_hbg_kernel_callable_registration(
     int32_t callable_id, size_t callable_bytes, const simpler::kernel::PreparedInvocationView &callable,
     void *control_stream_raw

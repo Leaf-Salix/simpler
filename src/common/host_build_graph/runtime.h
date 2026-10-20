@@ -364,6 +364,14 @@ public:
     // device code must not inspect. No fixed cap — grows with the chip-level
     // entry-tensor count.
     std::vector<TensorPair> tensor_pairs_;
+
+    // Context initialization publishes the resident KernelArgs address here.
+    // Program runtimes keep zero; invocation restoration never rewrites it.
+    uint64_t *kernel_dfx_args_slot() { return &kernel_dfx_args_; }
+    const uint64_t *kernel_dfx_args_slot() const { return &kernel_dfx_args_; }
+
+private:
+    uint64_t kernel_dfx_args_{0};
 };
 
 // Number of bytes of the Runtime image that must be copied to the device.

@@ -1471,6 +1471,7 @@ protected:
     void abandon_kernel_coordination();
     int finalize_hbg_kernel_registration();
     int prepare_hbg_kernel_runtime(const HostApi *api);
+    int prepare_hbg_kernel_dfx_context();
     int prepare_hbg_kernel_callable_registration(
         int32_t callable_id, size_t callable_bytes, const simpler::kernel::PreparedInvocationView &callable,
         void *control_stream

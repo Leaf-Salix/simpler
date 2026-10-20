@@ -47,10 +47,18 @@
 #include "call_config.h"
 #include "utils/fnv1a_64.h"
 #include "aicpu/platform_regs.h"
+#include "aicpu/args_dump_aicpu.h"
+#include "aicpu/chip_swimlane_collector_aicpu.h"
+#include "aicpu/dep_gen_collector_aicpu.h"
+#include "aicpu/device_phase_aicpu.h"
+#include "aicpu/pmu_collector_aicpu.h"
+#include "aicpu/scope_stats_collector_aicpu.h"
+#include "common/kernel_args.h"
 
 extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count);
 extern "C" const char *const *runtime_l1_extra_aicpu_symbols(size_t *count);
 int consume_kernel_task(void *arg);
+uint64_t get_test_kernel_phase_base();
 
 namespace {
 
@@ -2457,6 +2465,126 @@ TEST_F(HbgGraphSlotTest, DispatchPublicationFailureCancelsAndReleasesAllParticip
         _exit(0);
     };
     EXPECT_EXIT(isolated(), ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(HbgGraphSlotTest, KernelDfxRefreshTracksWindowsAndReplacesProgramGlobals) {
+    prepare_slot();
+    Runtime runtime;
+    auto registration = dispatch_registration();
+    registration.runtime_address = reinterpret_cast<uintptr_t>(&runtime);
+    KernelArgs args{};
+    args.runtime_args = &runtime;
+    args.regs = registration.register_table_address;
+    args.chip_swimlane_data_base = 0x10000;
+    args.chip_swimlane_aicore_rotation_table = 0x20000;
+    args.dep_gen_data_base = 0x30000;
+    *runtime.kernel_dfx_args_slot() = reinterpret_cast<uintptr_t>(&args);
+    const uint32_t swimlane = SIMPLER_DFX_FLAG_CHIP_SWIMLANE;
+    const uint32_t dependencies = SIMPLER_DFX_FLAG_DEP_GEN;
+    for (uint32_t flags : {0u, swimlane, 0u, dependencies, swimlane | dependencies, 0u, swimlane}) {
+        SCOPED_TRACE(flags);
+        set_chip_swimlane_enabled(false);
+        set_platform_chip_swimlane_base(0x40000);
+        set_platform_chip_swimlane_aicore_rotation_table(0x50000);
+        set_dep_gen_enabled(true);
+        set_platform_dep_gen_base(0x60000);
+        set_dump_args_enabled(true);
+        set_platform_dump_base(0x61000);
+        set_scope_stats_enabled(true);
+        set_pmu_enabled(true);
+        set_platform_pmu_base(0x70000);
+        set_platform_phase_base(0x80000);
+        args.enable_profiling_flag = flags;
+        ASSERT_TRUE(hbg::refresh_graph_kernel_dfx(registry, &runtime, registration));
+        EXPECT_EQ(is_chip_swimlane_enabled(), (flags & swimlane) != 0);
+        EXPECT_EQ(get_platform_chip_swimlane_base(), args.chip_swimlane_data_base);
+        EXPECT_EQ(get_platform_chip_swimlane_aicore_rotation_table(), args.chip_swimlane_aicore_rotation_table);
+        EXPECT_EQ(is_dep_gen_enabled(), (flags & dependencies) != 0);
+        EXPECT_EQ(get_platform_dep_gen_base(), args.dep_gen_data_base);
+        EXPECT_FALSE(is_dump_args_enabled());
+        EXPECT_FALSE(is_pmu_enabled());
+        EXPECT_FALSE(is_scope_stats_enabled());
+        EXPECT_EQ(get_platform_dump_base(), 0u);
+        EXPECT_EQ(get_platform_pmu_base(), 0u);
+        EXPECT_EQ(get_test_kernel_phase_base(), 0u);
+    }
+    auto conflict = registration;
+    ++conflict.context_generation;
+    EXPECT_FALSE(hbg::refresh_graph_kernel_dfx(registry, &runtime, conflict));
+    conflict = registration;
+    conflict.register_table_address += 8;
+    EXPECT_FALSE(hbg::refresh_graph_kernel_dfx(registry, &runtime, conflict));
+    *runtime.kernel_dfx_args_slot() = 1;
+    EXPECT_FALSE(hbg::refresh_graph_kernel_dfx(registry, &runtime, registration));
+    *runtime.kernel_dfx_args_slot() = reinterpret_cast<uintptr_t>(&args);
+    args.enable_profiling_flag = SIMPLER_DFX_FLAG_PMU;
+    EXPECT_FALSE(hbg::refresh_graph_kernel_dfx(registry, &runtime, registration));
+    EXPECT_TRUE(is_chip_swimlane_enabled());
+    EXPECT_EQ(get_platform_chip_swimlane_base(), 0x10000u);
+    alignas(1024) hbg::GraphSlotRegistry other{};
+    EXPECT_FALSE(hbg::detach_graph_slot_registry(&other));
+    EXPECT_TRUE(is_chip_swimlane_enabled());
+    ASSERT_TRUE(hbg::detach_graph_slot_registry(registry));
+    EXPECT_FALSE(is_chip_swimlane_enabled());
+    EXPECT_FALSE(is_dep_gen_enabled());
+    EXPECT_EQ(get_platform_chip_swimlane_base(), 0u);
+    EXPECT_EQ(get_platform_chip_swimlane_aicore_rotation_table(), 0u);
+    EXPECT_EQ(get_platform_dep_gen_base(), 0u);
+    EXPECT_FALSE(hbg::refresh_graph_kernel_dfx(registry, &runtime, registration));
+    ASSERT_EQ(hbg::bind_graph_slot_registry(registry, 0, 109), hbg::GraphSlotStatus::Ok);
+    args.chip_swimlane_data_base = 0x90000;
+    args.enable_profiling_flag = swimlane;
+    ASSERT_TRUE(hbg::refresh_graph_kernel_dfx(registry, &runtime, registration));
+    EXPECT_EQ(get_platform_chip_swimlane_base(), 0x90000u);
+}
+
+TEST_F(HbgGraphSlotTest, KernelDfxRejectsInvalidResidentArgsBeforeBinding) {
+    prepare_slot();
+    Runtime runtime;
+    auto registration = dispatch_registration();
+    registration.runtime_address = reinterpret_cast<uintptr_t>(&runtime);
+    KernelArgs args{};
+    args.runtime_args = &runtime;
+    args.regs = registration.register_table_address;
+    *runtime.kernel_dfx_args_slot() = reinterpret_cast<uintptr_t>(&args);
+    const auto valid = args;
+    for (int invalid = 0; invalid < 8; ++invalid) {
+        SCOPED_TRACE(invalid);
+        args = valid;
+        switch (invalid) {
+        case 0:
+            args.runtime_args = nullptr;
+            break;
+        case 1:
+            args.regs += 8;
+            break;
+        case 2:
+            args.chip_swimlane_data_base = 0x10000;
+            break;
+        case 3:
+            args.chip_swimlane_aicore_rotation_table = 0x20000;
+            break;
+        case 4:
+            args.dep_gen_data_base = 1;
+            break;
+        case 5:
+            args.enable_profiling_flag = SIMPLER_DFX_FLAG_DEP_GEN;
+            break;
+        case 6:
+            args.dump_data_base = 0x30000;
+            break;
+        case 7:
+            args.device_wall_data_base = 0x40000;
+            break;
+        }
+        EXPECT_FALSE(hbg::refresh_graph_kernel_dfx(registry, &runtime, registration));
+    }
+    args = valid;
+    ASSERT_TRUE(hbg::refresh_graph_kernel_dfx(registry, &runtime, registration));
+    EXPECT_FALSE(is_chip_swimlane_enabled());
+    EXPECT_FALSE(is_dep_gen_enabled());
+    EXPECT_EQ(get_platform_chip_swimlane_base(), 0u);
+    EXPECT_EQ(get_platform_dep_gen_base(), 0u);
 }
 
 TEST_F(HbgGraphSlotTest, SealsFrozenContextBeforeReadyAndUsesDedicatedPrepareStream) {
