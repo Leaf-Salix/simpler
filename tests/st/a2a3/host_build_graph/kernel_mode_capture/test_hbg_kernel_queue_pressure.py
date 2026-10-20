@@ -89,7 +89,7 @@ def _build_callable(platform):
     )
 
 
-def _run(platform, device):
+def _run(platform, device, aicpu_threads=3, scenarios=None):
     from simpler.task_interface import CallConfig, ChipStorageTaskArgs, ChipTensor, DataType  # noqa: PLC0415
     from simpler.worker import Worker  # noqa: PLC0415
 
@@ -101,7 +101,7 @@ def _run(platform, device):
     worker = Worker(level=2, execution_mode="kernel", device_id=device, platform=platform, runtime=RUNTIME)
     config = CallConfig()
     config.runtime_env.ring_task_window = 512
-    config.aicpu_thread_num = 3
+    config.aicpu_thread_num = aicpu_threads
     worker.init(config=config)
     pin = worker._kernel_pin_finalizer
     callable_id = worker.kernel_prepare_callable(chip)
@@ -109,7 +109,8 @@ def _run(platform, device):
     output = caller.device_buffer([-2.0] * elements)
     committed = worker.committed_device_memory()
     graphs = []
-    scenarios = ((64, 129, 0), (128, 129, 0), (65, 129, 0), (64, 2, 1), (1, 129, 0), (0, 129, 0))
+    if scenarios is None:
+        scenarios = ((64, 129, 0), (128, 129, 0), (65, 129, 0), (64, 2, 1), (1, 129, 0), (0, 129, 0))
 
     def launch(marker, scenario):
         args = ChipStorageTaskArgs()
@@ -136,6 +137,7 @@ def _run(platform, device):
         assert list(actual) == expected, (marker, scenario)
 
     for scenario in scenarios:
+        print(f"PRESSURE_EAGER threads={aicpu_threads} scenario={scenario}", flush=True)
         clear()
         launch(11, scenario)
         verify(11, scenario)
@@ -159,12 +161,12 @@ def _run(platform, device):
     worker.close()
     _assert_closed_cleanly(worker, pin)
     assert not caller.close()
-    print("PASS queue pressure eager/replay window=512 threads=3 tasks=0,1,64,65,128 blocks=129", flush=True)
+    print(f"PASS queue pressure eager/replay window=512 threads={aicpu_threads} scenarios={scenarios}", flush=True)
 
 
 if __name__ == "__main__":
     try:
-        _run(sys.argv[1], int(sys.argv[2]))
+        _run(sys.argv[1], int(sys.argv[2]), int(sys.argv[3]) if len(sys.argv) > 3 else 3)
     except BaseException:
         traceback.print_exc()
         sys.stdout.flush()
