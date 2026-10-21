@@ -89,6 +89,8 @@ inline void ReclaimUnusedSos(const std::string &dir, const std::string &target) 
     closedir(entries);
 }
 
+bool WriteBytes(const std::string &path, const char *data, uint64_t len);
+
 // The global lock serializes publication, reclamation and the lease table.
 // Each call opens a separate lock FD: flock on one shared FD does not serialize
 // threads. Shared SO locks live until the scheduler process exits (even _exit
@@ -111,30 +113,11 @@ inline bool StageManagedSo(const std::string &dir, const std::string &name, cons
     }
     ReclaimUnusedSos(dir, path);
     if (same == 0) {
-        std::string temp = path + ".tmp." + std::to_string(getpid());
-        CacheFd output(OpenCacheFile(temp, O_CREAT | O_EXCL | O_WRONLY));
-        if (output.fd < 0) return false;
-        bool good = true;
-        size_t offset = 0;
-        while (offset < len) {
-            ssize_t n = write(output.fd, data + offset, len - offset);
-            if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) {
-                good = false;
-                break;
-            }
-            offset += n;
+        {
+            CacheFd output(OpenCacheFile(path + ".tmp." + std::to_string(getpid()), O_CREAT | O_EXCL | O_WRONLY));
+            if (output.fd < 0) return false;
         }
-        if (good && fchmod(output.fd, 0755) != 0) good = false;
-        // close can report a buffered filesystem write failure too.
-        if (close(output.fd) != 0) good = false;
-        output.fd = -1;
-        if (!good || rename(temp.c_str(), path.c_str()) != 0) {
-            int error = errno;
-            unlink(temp.c_str());
-            errno = error;
-            return false;
-        }
+        if (!WriteBytes(path, data, len)) return false;
         if (target.fd >= 0) close(target.fd);
         target.fd = OpenCacheFile(path, O_RDONLY);
         if (target.fd < 0 || flock(target.fd, LOCK_SH | LOCK_NB) != 0) return false;

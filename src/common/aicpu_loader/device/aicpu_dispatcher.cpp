@@ -130,15 +130,18 @@ bool WriteBytes(const std::string &path, const char *data, uint64_t len) {
             return false;
         }
         f.write(data, static_cast<std::streamsize>(len));
-        bool good = f.good();
         f.close();
+        bool good = f.good();
         if (!good) {
             DispatcherLog("write %s failed", tmp_path);
             unlink(tmp_path);
             return false;
         }
     }
-    (void)chmod(tmp_path, 0755);
+    if (chmod(tmp_path, 0755) != 0) {
+        unlink(tmp_path);
+        return false;
+    }
     if (rename(tmp_path, path.c_str()) != 0) {
         DispatcherLog("rename %s -> %s failed: %s", tmp_path, path.c_str(), strerror(errno));
         unlink(tmp_path);

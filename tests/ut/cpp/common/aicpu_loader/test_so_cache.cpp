@@ -24,6 +24,8 @@
 
 #include "aicpu_loader/device/so_cache.h"
 
+extern "C" void DlogRecord(int, int, const char *, ...) {}
+
 namespace {
 namespace fs = std::filesystem;
 using simpler_dispatcher::StageManagedSo;

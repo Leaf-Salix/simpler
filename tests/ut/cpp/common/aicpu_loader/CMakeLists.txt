@@ -9,6 +9,8 @@
 #
 # The dispatcher cache uses only POSIX filesystem primitives, without CANN.
 macro(aicpu_loader_case src)
-    simpler_ut_plain_case(${src} INCLUDES ${SIMPLER_SRC}/common LABEL no_hardware)
+    simpler_ut_plain_case(${src}
+        SOURCES ${SIMPLER_SRC}/common/aicpu_loader/device/aicpu_dispatcher.cpp
+        INCLUDES ${SIMPLER_SRC}/common LABEL no_hardware)
 endmacro()
 simpler_ut_glob_cases(aicpu_loader_case)
