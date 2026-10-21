@@ -74,36 +74,17 @@ inline int SameBytes(int fd, const char *data, size_t len) {
     return 1;
 }
 
-void AuditCacheSnapshot(
-    const std::string &dir, const char *phase, const std::string &target, int fd, size_t len, int same
-);
-void AuditCacheRemoved(const std::string &path, int fd, int result);
-void AuditCacheGc(uint64_t matched, uint64_t removed, uint64_t busy, uint64_t errors);
-
 inline void ReclaimUnusedSos(const std::string &dir, const std::string &target) {
     DIR *entries = opendir(dir.c_str());
     if (entries == nullptr) return;
-    uint64_t matched = 0, removed = 0, busy = 0, errors = 0;
     while (auto *entry = readdir(entries)) {
         if (!IsManagedSo(entry->d_name)) continue;
         std::string path = dir + "/" + entry->d_name;
         if (path == target) continue;
-        ++matched;
         CacheFd candidate(OpenCacheFile(path, O_RDONLY));
-        if (candidate.fd < 0) {
-            ++errors;
-        } else if (flock(candidate.fd, LOCK_EX | LOCK_NB) != 0) {
-            if (errno == EWOULDBLOCK || errno == EAGAIN) ++busy;
-            else ++errors;
-        } else {
-            int result = unlink(path.c_str());
-            if (result == 0) ++removed;
-            else ++errors;
-            if (removed + errors <= 8) AuditCacheRemoved(path, candidate.fd, result);
-        }
+        if (candidate.fd >= 0 && flock(candidate.fd, LOCK_EX | LOCK_NB) == 0) unlink(path.c_str());
     }
     closedir(entries);
-    AuditCacheGc(matched, removed, busy, errors);
 }
 
 bool WriteBytes(const std::string &path, const char *data, uint64_t len);
@@ -128,7 +109,6 @@ inline bool StageManagedSo(const std::string &dir, const std::string &name, cons
     } else if (errno != ENOENT) {
         return false;
     }
-    AuditCacheSnapshot(dir, "before_gc", path, target.fd, len, same);
     ReclaimUnusedSos(dir, path);
     if (same == 0) {
         {
@@ -146,7 +126,6 @@ inline bool StageManagedSo(const std::string &dir, const std::string &name, cons
     auto found = leases.find(path);
     if (found != leases.end()) close(found->second);
     leases[path] = target.fd;
-    AuditCacheSnapshot(dir, "leased", path, target.fd, len, same);
     target.fd = -1;
     return true;
 }
