@@ -10,6 +10,7 @@
  */
 #include "host_build_graph/kernel_graph_template.h"
 #include "host_build_graph/kernel_graph_dispatch.h"
+#include "host_build_graph/kernel_graph_prepared.h"
 
 #include <algorithm>
 #include <new>
@@ -17,6 +18,7 @@
 
 #include "host_build_graph/host_graph_build.h"
 #include "host_build_graph/kernel_external_tensor_wire.h"
+#include "host_build_graph/kernel_graph_image_validation.h"
 #include "host_build_graph/runtime_core.h"
 
 namespace hbg {
@@ -341,6 +343,40 @@ int make_graph_launch_template(
     return 0;
 } catch (const std::bad_alloc &) {
     return PTO_RUNTIME_ERR_INTERNAL;
+}
+
+int make_graph_prepared_dispatch(
+    const GraphLaunchTemplate &source, const HbgCallableRegistration &registration, GraphPreparedDispatch &out
+) {
+    if (validate_graph_packet(source.data(), source.size(), GraphPacketAddress::HostTemplate) != GraphPacketStatus::Ok)
+        return PTO_RUNTIME_ERR_INTERNAL;
+    GraphRestoreView view{};
+    const auto *packet = static_cast<const std::byte *>(source.data());
+    std::memcpy(&view.invocation, packet, sizeof(view.invocation));
+    std::memcpy(&view.graph, packet + sizeof(view.invocation), sizeof(view.graph));
+    view.payload = packet + sizeof(view.invocation) + view.graph.payload_offset;
+    for (size_t n = 0; n < 4; ++n)
+        view.slot.destinations[n] = view.graph.destinations[n];
+    GraphPreparedDispatch next{};
+    next.invocation = view.invocation;
+    next.invocation.payload_bytes = sizeof(next) - sizeof(next.invocation);
+    next.registration = registration;
+    next.graph = view.graph;
+    next.graph.checksum = 0;
+    for (uint32_t n = 0; n < view.graph.region_count; ++n) {
+        std::memcpy(
+            &next.regions[n], packet + sizeof(view.invocation) + sizeof(view.graph) + n * sizeof(GraphImageRegion),
+            sizeof(GraphImageRegion)
+        );
+        view.regions[static_cast<uint32_t>(next.regions[n].kind)] = next.regions[n];
+    }
+    next.checksum = graph_prepared_dispatch_checksum(next);
+    RuntimeArenaLayout layout{};
+    uint64_t sm_bytes = 0;
+    if (!valid_graph_prepared_dispatch(next) || !detail::validate_graph_images(view, layout, sm_bytes))
+        return PTO_RUNTIME_ERR_INTERNAL;
+    out = next;
+    return 0;
 }
 
 int make_graph_host_args(const GraphLaunchTemplate &source, GraphHostArgs &out) {

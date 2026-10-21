@@ -16,6 +16,8 @@ struct RuntimeContext;
 
 namespace hbg {
 
+struct GraphPreparedDispatch;
+
 enum class GraphRestoreStatus : uint32_t {
     Ok,
     Rejected,
@@ -65,6 +67,15 @@ GraphRestoreStatus restore_graph_packet(
     const void *packet, size_t bytes, int device_id, uint64_t runtime_binary_id,
     const simpler::kernel::PreparedInvocationView &trusted_callable, GraphRestoreResult &out,
     const GraphRestoreOps &ops = {}
+) noexcept;
+
+// The Host validates the complete image before enqueueing DMA. Every participant
+// has invalidated its copied spans after DMA and joined before this leader call.
+// slot comes from the independently acquired live context registry. The owner
+// excludes previous execution and retains the immutable prepared image/metadata.
+// This attaches published bytes without copying or flushing their image spans.
+GraphRestoreStatus attach_prepared_graph_image(
+    const GraphPreparedDispatch &prepared, const GraphSlotRegistration &slot, GraphRestoreResult &out
 ) noexcept;
 
 // Called after all participants have skipped dispatch on failure, shut down,

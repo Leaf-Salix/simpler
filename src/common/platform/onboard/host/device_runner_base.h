@@ -1470,6 +1470,7 @@ protected:
     int finalize_kernel_coordination();
     void abandon_kernel_coordination();
     int finalize_hbg_kernel_registration();
+    void abandon_hbg_kernel_sources();
     int prepare_hbg_kernel_runtime(const HostApi *api);
     int prepare_hbg_kernel_dfx_context();
     int prepare_hbg_kernel_callable_registration(

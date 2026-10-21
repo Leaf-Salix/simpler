@@ -1886,6 +1886,7 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
     )
     target_include_directories(test_kernel_launch_native PRIVATE
         ${PROJECT_ROOT}/src/common
+        ${PROJECT_ROOT}/src/common/task_interface
         ${PROJECT_ROOT}/src/common/platform/include
         ${PROJECT_ROOT}/src/common/platform/onboard/host
         ${ASCEND_HOME_PATH}/include

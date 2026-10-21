@@ -13,9 +13,17 @@
 #include <acl/acl_rt.h>
 
 #include "host_build_graph/kernel_graph_template.h"
+#include "host_build_graph/kernel_graph_prepared.h"
 #include "worker/runtime_c_api.h"
 
 namespace hbg {
+
+inline int launch_graph_prepared(
+    const GraphPreparedDispatch &source, aclrtFuncHandle function, uint32_t blocks, aclrtStream stream
+) {
+    GraphPreparedDispatch args = source;
+    return aclrtLaunchKernelWithHostArgs(function, blocks, stream, nullptr, &args, sizeof(args), nullptr, 0);
+}
 
 inline int launch_graph_host_args(
     GraphHostArgs &args, aclrtFuncHandle function, uint32_t blocks, aclrtStream stream, aclrtLaunchKernelCfg *config

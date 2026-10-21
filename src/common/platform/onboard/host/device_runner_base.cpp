@@ -1852,6 +1852,7 @@ int DeviceRunnerBase::finalize_common() { return finalize_common_impl(false); }
 int DeviceRunnerBase::abandon_common_after_device_failure() { return finalize_common_impl(true); }
 
 int __attribute__((weak)) DeviceRunnerBase::finalize_hbg_kernel_registration() { return 0; }
+void __attribute__((weak)) DeviceRunnerBase::abandon_hbg_kernel_sources() {}
 
 int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     if (!abandon_device_resources && execution_mode_latch_.is_kernel()) {
@@ -2034,6 +2035,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     // exists. Both are no-ops on a program-mode context.
     if (abandon_device_resources) {
         abandon_kernel_coordination();
+        abandon_hbg_kernel_sources();
         hbg_kernel_state_.reset();
         persistent_args_.abandon();
     } else {

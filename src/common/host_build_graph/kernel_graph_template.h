@@ -23,6 +23,7 @@ namespace hbg {
 
 struct GraphBuild;
 struct HbgCallableRegistration;
+struct GraphPreparedDispatch;
 
 struct GraphInvocationIdentity {
     int32_t callable_id{-1};
@@ -87,6 +88,12 @@ struct GraphHostArgs {
 int make_graph_host_args(const GraphLaunchTemplate &source, GraphHostArgs &out);
 int make_graph_dispatch_args(
     const GraphLaunchTemplate &source, const HbgCallableRegistration &registration, GraphHostArgs &out
+);
+
+// Validates canonical image contents once on the Host. The context retains a
+// private immutable DMA snapshot for every capture that uses this metadata.
+int make_graph_prepared_dispatch(
+    const GraphLaunchTemplate &source, const HbgCallableRegistration &registration, GraphPreparedDispatch &out
 );
 
 struct GraphHostLaunchOps {
