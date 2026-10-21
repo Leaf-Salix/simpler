@@ -250,6 +250,12 @@ public:
         size_t bytes;
     };
 
+    GraphPublicationSpan kernel_graph_handshake_span() const {
+        const auto *begin = reinterpret_cast<const uint8_t *>(&kernel_prelaunch);
+        const auto *end = reinterpret_cast<const uint8_t *>(workers + RUNTIME_MAX_WORKER);
+        return {begin, static_cast<size_t>(end - begin)};
+    }
+
     // These fields are AICPU-owned; worker reports and teardown gates occupy
     // separate cache lines. Function bindings remain visible across replays.
     std::array<GraphPublicationSpan, 4> kernel_graph_publication_spans(bool functions_changed) const {

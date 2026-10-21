@@ -4694,3 +4694,21 @@ TEST(HbgRuntimePublication, SpansCoverChangedFieldsWithoutPublishingWorkerLines)
         }
     }
 }
+
+TEST(HbgRuntimePublication, HandshakeSpanStaysWithinHostResetLinesWithoutReadingConfiguration) {
+    Runtime runtime;
+    for (int32_t workers : {-1, 0, 1, RUNTIME_MAX_WORKER, INT32_MAX}) {
+        SCOPED_TRACE(workers);
+        runtime.worker_count = workers;
+        const auto span = runtime.kernel_graph_handshake_span();
+        const auto begin = reinterpret_cast<uintptr_t>(span.address);
+        const auto end = begin + span.bytes;
+        EXPECT_EQ(begin, reinterpret_cast<uintptr_t>(&runtime.kernel_prelaunch));
+        EXPECT_EQ(end, reinterpret_cast<uintptr_t>(runtime.workers + RUNTIME_MAX_WORKER));
+        EXPECT_EQ(begin % 64, 0u);
+        EXPECT_EQ(end % 64, 0u);
+        EXPECT_LE(end, reinterpret_cast<uintptr_t>(runtime.teardown_gates));
+        EXPECT_LE(end, reinterpret_cast<uintptr_t>(&runtime.worker_count));
+        EXPECT_LE(end, reinterpret_cast<uintptr_t>(runtime.func_id_to_addr_));
+    }
+}

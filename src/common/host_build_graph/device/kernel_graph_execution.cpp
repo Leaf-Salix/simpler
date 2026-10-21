@@ -367,7 +367,8 @@ static int consume_prepared_graph_task(void *arg) {
     const int32_t thread = platform_aicpu_affinity_thread_idx();
     const int32_t threads = context.threads;
     if (thread < 0 || thread >= threads) return -1;
-    cache_invalidate_range(runtime, sizeof(*runtime));
+    const auto handshake = runtime->kernel_graph_handshake_span();
+    cache_invalidate_range(handshake.address, handshake.bytes);
     const uint64_t epoch = g_restore_epoch.load(std::memory_order_acquire);
     if (thread == 0) {
         g_prepared_metadata_status.store(0, std::memory_order_relaxed);
