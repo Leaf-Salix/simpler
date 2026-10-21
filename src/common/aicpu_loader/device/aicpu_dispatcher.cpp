@@ -22,6 +22,7 @@
 #include "aicpu_dispatcher.h"
 
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -53,6 +54,111 @@ void DispatcherLog(const char *fmt, ...) {
     // would not have dlopen'd in the first place, so an address-vs-nullptr
     // guard here is dead code (and is folded to `true` by most compilers).
     DlogRecord(kDlogModuleCcecpu, kDlogLevelError, "[simpler-dispatcher] %s", buf);
+}
+
+void AuditCacheSnapshot(
+    const std::string &dir, const char *phase, const std::string &target, int fd, size_t len, int same
+) {
+    const int saved_errno = errno;
+    struct statvfs space{};
+    const int space_result = statvfs(dir.c_str(), &space);
+    const int space_errno = space_result == 0 ? 0 : errno;
+    DispatcherLog(
+        "SO_CACHE_AUDIT_2651 phase=%s pid=%d root=%s space_rc=%d space_errno=%d blocks=%llu free=%llu "
+        "available=%llu frsize=%llu inodes=%llu ifree=%llu",
+        phase, static_cast<int>(getpid()), dir.c_str(), space_result, space_errno,
+        static_cast<unsigned long long>(space.f_blocks), static_cast<unsigned long long>(space.f_bfree),
+        static_cast<unsigned long long>(space.f_bavail), static_cast<unsigned long long>(space.f_frsize),
+        static_cast<unsigned long long>(space.f_files), static_cast<unsigned long long>(space.f_ffree)
+    );
+    uint64_t scanned = 0, originals = 0, trials = 0, temps = 0, unknown = 0, special = 0;
+    uint64_t bytes = 0, allocated = 0, original_allocated = 0, trial_allocated = 0;
+    uint64_t errors = 0;
+    DIR *entries = opendir(dir.c_str());
+    if (entries == nullptr) ++errors;
+    else {
+        while (true) {
+            errno = 0;
+            auto *entry = readdir(entries);
+            if (entry == nullptr) {
+                if (errno != 0) ++errors;
+                break;
+            }
+            const std::string name = entry->d_name;
+            if (name == "." || name == "..") continue;
+            ++scanned;
+            if (name.rfind("simpler_inner_", 0) != 0) continue;
+            struct stat st{};
+            if (lstat((dir + "/" + name).c_str(), &st) != 0) {
+                ++errors;
+                continue;
+            }
+            if (!S_ISREG(st.st_mode)) {
+                ++special;
+                continue;
+            }
+            const bool original = IsManagedSo(name.c_str());
+            const bool trial =
+                name.rfind("simpler_inner_v2_", 0) == 0 && IsManagedSo(("simpler_inner_" + name.substr(17)).c_str());
+            if (original) ++originals;
+            else if (trial) ++trials;
+            else ++unknown;
+            if ((original || trial) && name.find(".tmp.") != std::string::npos) ++temps;
+            const uint64_t used = static_cast<uint64_t>(st.st_blocks) * 512;
+            bytes += st.st_size;
+            allocated += used;
+            if (original) original_allocated += used;
+            if (trial) trial_allocated += used;
+        }
+        if (closedir(entries) != 0) ++errors;
+    }
+    DispatcherLog(
+        "SO_CACHE_AUDIT_2651 phase=%s pid=%d scanned=%llu original=%llu v2=%llu temps=%llu unknown=%llu "
+        "special=%llu size=%llu allocated=%llu original_allocated=%llu v2_allocated=%llu errors=%llu complete=%d",
+        phase, static_cast<int>(getpid()), static_cast<unsigned long long>(scanned),
+        static_cast<unsigned long long>(originals), static_cast<unsigned long long>(trials),
+        static_cast<unsigned long long>(temps), static_cast<unsigned long long>(unknown),
+        static_cast<unsigned long long>(special), static_cast<unsigned long long>(bytes),
+        static_cast<unsigned long long>(allocated), static_cast<unsigned long long>(original_allocated),
+        static_cast<unsigned long long>(trial_allocated), static_cast<unsigned long long>(errors), errors == 0
+    );
+    struct stat held{}, current{};
+    const int held_result = fd < 0 ? -1 : fstat(fd, &held);
+    const int path_result = lstat(target.c_str(), &current);
+    DispatcherLog(
+        "SO_CACHE_AUDIT_2651 phase=%s pid=%d target=%s fd=%d fstat_rc=%d inode=%llu nlink=%llu size=%llu "
+        "expected=%llu same=%d path_rc=%d path_inode=%llu path_matches=%d",
+        phase, static_cast<int>(getpid()), target.c_str(), fd, held_result,
+        static_cast<unsigned long long>(held.st_ino), static_cast<unsigned long long>(held.st_nlink),
+        static_cast<unsigned long long>(held.st_size), static_cast<unsigned long long>(len), same, path_result,
+        static_cast<unsigned long long>(current.st_ino),
+        held_result == 0 && path_result == 0 && held.st_dev == current.st_dev && held.st_ino == current.st_ino
+    );
+    errno = saved_errno;
+}
+
+void AuditCacheRemoved(const std::string &path, int fd, int result) {
+    const int saved_errno = errno;
+    struct stat held{};
+    int status = fstat(fd, &held);
+    DispatcherLog(
+        "SO_CACHE_AUDIT_2651 phase=unlink pid=%d target=%s rc=%d errno=%d fstat_rc=%d inode=%llu nlink=%llu "
+        "size=%llu allocated=%llu",
+        static_cast<int>(getpid()), path.c_str(), result, result == 0 ? 0 : saved_errno, status,
+        static_cast<unsigned long long>(held.st_ino), static_cast<unsigned long long>(held.st_nlink),
+        static_cast<unsigned long long>(held.st_size), static_cast<unsigned long long>(held.st_blocks) * 512
+    );
+    errno = saved_errno;
+}
+
+void AuditCacheGc(uint64_t matched, uint64_t removed, uint64_t busy, uint64_t errors) {
+    const int saved_errno = errno;
+    DispatcherLog(
+        "SO_CACHE_AUDIT_2651 phase=gc pid=%d matched=%llu removed=%llu busy=%llu errors=%llu",
+        static_cast<int>(getpid()), static_cast<unsigned long long>(matched), static_cast<unsigned long long>(removed),
+        static_cast<unsigned long long>(busy), static_cast<unsigned long long>(errors)
+    );
+    errno = saved_errno;
 }
 }  // namespace simpler_dispatcher
 
