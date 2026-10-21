@@ -59,6 +59,7 @@
 
 extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count);
 extern "C" const char *const *runtime_l1_extra_aicpu_symbols(size_t *count);
+extern "C" int simpler_aicpu_l1_hbg_prepare_execution_context(void *arg);
 int consume_kernel_task(void *arg);
 uint64_t get_test_kernel_phase_base();
 
@@ -3544,6 +3545,75 @@ TEST_F(HbgPreparedGraphTest, MetadataRequiresTheIndependentSlotAndSupportsUnalig
     }
     hbg::GraphPreparedDispatch output{};
     EXPECT_FALSE(hbg::read_graph_prepared_dispatch(nullptr, sizeof(prepared), output));
+}
+
+TEST_F(HbgPreparedGraphTest, SingleParticipantMetadataFailureCollectivelyCancelsBeforeAttach) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    for (int variant = 0; variant < 3; ++variant) {
+        SCOPED_TRACE(variant);
+        for (size_t bad_copy = 0; bad_copy < 4; ++bad_copy) {
+            SCOPED_TRACE(bad_copy);
+            auto isolated = [&]() {
+                alarm(5);
+                Runtime execution_runtime;
+                execution_runtime.set_aicpu_thread_num(4);
+                execution_runtime.set_aicpu_allowed_cpu_count(4);
+                execution_runtime.set_aicpu_launch_count(4);
+                for (int32_t i = 0; i < 4; ++i)
+                    execution_runtime.get_aicpu_allowed_cpus()[i] = i;
+                auto callable = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
+                    nullptr, 0, "prepared", nullptr, 0, nullptr, nullptr, 0, ""
+                );
+                auto registration = dispatch_registration();
+                registration.runtime_address = reinterpret_cast<uintptr_t>(&execution_runtime);
+                registration.callable_address = reinterpret_cast<uintptr_t>(callable.data());
+                registration.callable_bytes = callable.size();
+                KernelArgs dfx_args{};
+                dfx_args.runtime_args = &execution_runtime;
+                dfx_args.regs = registration.register_table_address;
+                *execution_runtime.kernel_dfx_args_slot() = reinterpret_cast<uintptr_t>(&dfx_args);
+                if (simpler_aicpu_l1_hbg_register_callable(&registration) != 0 ||
+                    !hbg::refresh_graph_kernel_dfx(registry, &execution_runtime, registration))
+                    _exit(2);
+                hbg::GraphPreparedContext prepared_context{seal, reinterpret_cast<uintptr_t>(&execution_runtime)};
+                if (simpler_aicpu_l1_hbg_prepare_execution_context(&prepared_context) != 0 ||
+                    hbg::make_graph_prepared_dispatch(snapshot, registration, prepared) != 0 ||
+                    !hbg::graph_prepared_dispatch_matches_slot(prepared, seal))
+                    _exit(3);
+                publish_image();
+                const auto before = target_bytes();
+                std::array<hbg::GraphPreparedDispatch, 4> copies;
+                copies.fill(prepared);
+                if (variant == 0) ++copies[bad_copy].magic;
+                else if (variant == 2) ++copies[bad_copy].graph.argument_hash;
+                copies[bad_copy].checksum = hbg::graph_prepared_dispatch_checksum(copies[bad_copy]);
+                if (variant == 2 && !hbg::graph_prepared_dispatch_matches_slot(copies[bad_copy], seal)) _exit(4);
+                execution_runtime.kernel_prelaunch.state = HBG_KERNEL_PRELAUNCH_WAIT;
+                std::array<int, 4> results{};
+                std::vector<std::thread> threads;
+                for (size_t participant = 0; participant < copies.size(); ++participant)
+                    threads.emplace_back([&, participant] {
+                        void *arg = variant == 1 && participant == bad_copy ? nullptr : &copies[participant];
+                        results[participant] = consume_kernel_task(arg);
+                    });
+                for (auto &thread : threads)
+                    thread.join();
+                if (std::any_of(
+                        results.begin(), results.end(),
+                        [](int rc) {
+                            return rc != -1;
+                        }
+                    ) ||
+                    execution_runtime.kernel_prelaunch.state != HBG_KERNEL_PRELAUNCH_CANCEL ||
+                    registry->restore.attempt != 0 || registry->restore.committed_generation != 0 ||
+                    registry->restore.phase != static_cast<uint32_t>(hbg::GraphRestorePhase::Idle) ||
+                    registry->phase != static_cast<uint32_t>(hbg::GraphSlotPhase::Poisoned) || target_bytes() != before)
+                    _exit(1);
+                _exit(0);
+            };
+            EXPECT_EXIT(isolated(), ::testing::ExitedWithCode(0), "");
+        }
+    }
 }
 
 TEST_F(HbgPreparedGraphTest, OrderedDmaAndAttachReinitializeDirtyPrefixOnEveryReplay) {
