@@ -23,7 +23,7 @@
 //   5. Bootstrap via rtAicpuKernelLaunchExWithArgs(KERNEL_TYPE_AICPU_KFC,
 //      libaicpu_extend_kernels.so) — this dlopens the dispatcher inside the
 //      AICPU OS process, which writes our inner SO bytes to
-//      /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_v2_<fp>_<dev>.so.
+//      /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<dev>.so.
 //   6. Fingerprint inner SO + write a JSON descriptor pointing at the
 //      preinstall basename, register via rtsBinaryLoadFromFile.
 //   7. rtsFuncGetByName for init + run handles.
@@ -255,8 +255,8 @@ struct HelloResult {
 static_assert(sizeof(HelloResult) == kHelloResultBytes, "HelloResult size drift");
 
 // DeviceArgs offsets. The first 96 B are dispatcher-owned during bootstrap
-// (so_bin / so_len / device_id / inner_so_bin / inner_so_len / cache_protocol
-// at 96/104/112/120/128/136). After bootstrap completes the dispatcher is done with the
+// (so_bin / so_len / device_id / inner_so_bin / inner_so_len at 96/104/112/
+// 120/128). After bootstrap completes the dispatcher is done with the
 // struct, so we reuse the buffer by rewriting offsets 96 (result_addr) and
 // 104 (input_token) before the run() launch.
 constexpr size_t kBootstrapDispBin = 96;
@@ -264,7 +264,6 @@ constexpr size_t kBootstrapDispLen = 104;
 constexpr size_t kBootstrapDevId = 112;
 constexpr size_t kBootstrapInnerBin = 120;
 constexpr size_t kBootstrapInnerLen = 128;
-constexpr size_t kBootstrapCacheProtocol = 136;
 constexpr size_t kRunResultAddr = 96;
 constexpr size_t kRunInputToken = 104;
 
@@ -388,7 +387,6 @@ int main(int argc, char **argv) {
     WriteU64(hostargs, kBootstrapDevId, (uint64_t)device_id);
     WriteU64(hostargs, kBootstrapInnerBin, reinterpret_cast<uint64_t>(dev_inner.ptr));
     WriteU64(hostargs, kBootstrapInnerLen, inner_bytes.size());
-    WriteU64(hostargs, kBootstrapCacheProtocol, 1);
     ACL_CHECK(
         aclrtMemcpy(dev_args.ptr, kDeviceArgsBytes, hostargs, kDeviceArgsBytes, ACL_MEMCPY_HOST_TO_DEVICE),
         "H2D DeviceArgs(bootstrap)"
@@ -433,7 +431,7 @@ int main(int argc, char **argv) {
     // ---- Fingerprint inner SO + register via JSON descriptor ----
     uint64_t fp = fp::Compute(inner_bytes.data(), inner_bytes.size());
     char base[64];
-    std::snprintf(base, sizeof(base), "simpler_inner_v2_%016lx_%d.so", fp, device_id);
+    std::snprintf(base, sizeof(base), "simpler_inner_%016lx_%d.so", fp, device_id);
     std::string so_basename = base;
     std::printf("[bootstrap] inner SO landed at /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/%s\n", base);
     std::printf("[bootstrap] fp=%016lx (token=%016lx)\n", fp, input_token);

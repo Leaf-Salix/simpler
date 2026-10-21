@@ -37,12 +37,10 @@ struct CacheFd {
     CacheFd &operator=(const CacheFd &) = delete;
 };
 
-// Only this namespace participates in the lease protocol. Legacy SOs may have
-// untracked readers, including a bootstrap that has not reached dlopen yet.
 inline bool IsManagedSo(const char *name) {
     char fp[17] = {}, device[21] = {};
     int end = 0;
-    sscanf(name, "simpler_inner_v2_%16[0123456789abcdef]_%20[0123456789].so%n", fp, device, &end);
+    sscanf(name, "simpler_inner_%16[0123456789abcdef]_%20[0123456789].so%n", fp, device, &end);
     if (strlen(fp) != 16 || end == 0) return false;
     if (name[end] == '\0') return true;
     if (strncmp(name + end, ".tmp.", 5) != 0) return false;

@@ -32,7 +32,7 @@ using simpler_dispatcher::StageManagedSo;
 
 std::string Name(int id) {
     char name[80];
-    snprintf(name, sizeof(name), "simpler_inner_v2_%016x_0.so", id);
+    snprintf(name, sizeof(name), "simpler_inner_%016x_0.so", id);
     return name;
 }
 std::string Read(const std::string &path) {
@@ -110,7 +110,6 @@ protected:
 };
 
 TEST_F(SoCache, ReclaimsHistoricalBuildsAndTempsButPreservesForeignFiles) {
-    Write(dir + "/simpler_inner_0000000000000001_0.so", "legacy");
     Write(dir + "/libother.so", "foreign");
     Write(dir + "/" + Name(99) + ".tmp.123", "partial");
     ASSERT_EQ(symlink("libother.so", (dir + "/" + Name(98)).c_str()), 0);
@@ -123,7 +122,6 @@ TEST_F(SoCache, ReclaimsHistoricalBuildsAndTempsButPreservesForeignFiles) {
         EXPECT_EQ(Read(dir + "/" + Name(id)), "runtime");
     }
     EXPECT_FALSE(fs::exists(dir + "/" + Name(99) + ".tmp.123"));
-    EXPECT_EQ(Read(dir + "/simpler_inner_0000000000000001_0.so"), "legacy");
     EXPECT_EQ(Read(dir + "/libother.so"), "foreign");
     EXPECT_TRUE(fs::is_symlink(dir + "/" + Name(98)));
     EXPECT_TRUE(fs::is_fifo(dir + "/" + Name(97)));

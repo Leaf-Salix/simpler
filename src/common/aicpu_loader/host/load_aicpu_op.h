@@ -20,7 +20,7 @@
  *      `rtAicpuKernelLaunchExWithArgs` (kernel_type =
  *      `KERNEL_TYPE_AICPU_KFC`) targeting libaicpu_extend_kernels. Our
  *      dispatcher then writes the runtime SO to
- *      `/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_v2_<fp>_<device_id>.so`
+ *      `/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<device_id>.so`
  *      using sched-thread (HwHiAiUser) write permission. The dispatcher SO
  *      itself is never persisted to disk.
  *
@@ -96,7 +96,7 @@ public:
      * @param inner_so_len        Runtime SO size
      * @param stream              Stream on which to enqueue the bootstrap
      * @param device_id           ACL device ordinal; suffixed onto the preinstall
-     *                            basename (simpler_inner_v2_<fp>_<device_id>.so) so
+     *                            basename (simpler_inner_<fp>_<device_id>.so) so
      *                            paired dies sharing the filesystem do not write
      *                            and execute the same on-disk SO.
      * @return 0 on success, error code on failure
