@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Retained local VMM Buffer use across runs through the existing vector-add callable."""
+"""Explicit retained-domain lookup across runs through the existing vector-add callable."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ _NBYTES = _NUMEL * 4
 @pytest.mark.platforms(["a2a3sim", "a5sim", "a2a3", "a5"])
 @pytest.mark.runtime(_RUNTIME)
 @pytest.mark.device_count(1)
-def test_retained_cached_buffer_reaches_chip_in_second_run(st_platform, st_device_ids):
+def test_retained_domain_reaches_chip_in_second_run(st_platform, st_device_ids):
     worker = Worker(
         level=3, platform=st_platform, runtime=_RUNTIME, device_ids=[int(st_device_ids[0])], num_sub_workers=0
     )
@@ -46,13 +46,15 @@ def test_retained_cached_buffer_reaches_chip_in_second_run(st_platform, st_devic
         def first(orch, _args, _cfg):
             domain = orch.get_or_allocate_domain(**request)
             orch.copy_to_domain(domain, 0, struct.pack(f"<{_NUMEL}f", *([35.0] * _NUMEL)), buffer="payload")
-            saved.append((domain, domain.local_context(0).buffers["payload"]))
+            saved.append(domain)
 
         worker.run(first)
-        domain, payload = saved[0]
+        domain = saved[0]
 
         def second(orch, _args, cfg):
-            # A cached VMM Buffer must enroll this run even without a domain lookup.
+            domain = orch.get_domain("tp")
+            assert domain is saved[0]
+            payload = domain.local_context(0).buffers["payload"]
             args = TaskArgs()
             args.add_tensor(payload.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.INPUT)
             args.add_tensor(payload.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.INPUT)
@@ -63,8 +65,6 @@ def test_retained_cached_buffer_reaches_chip_in_second_run(st_platform, st_devic
             assert resources.requires_ordered_cleanup
             domain.release()
             assert domain.released and not domain.freed
-            with pytest.raises(RuntimeError, match="released"):
-                orch.submit_next_level(chip, args, cfg, worker=0)
 
         worker.run(second)
         assert domain.freed

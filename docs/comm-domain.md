@@ -67,14 +67,20 @@ before device effects. A hit does not allocate, initialize or clear memory.
 missing. `allocate_global_domain` and `release_global_domain` are compatibility
 wrappers; `workers=` remains the legacy L3 allocation spelling.
 
-Creation and reuse require the owning Worker's orchestration callback, before
-its first task submission; calls outside it are rejected even on a reuse hit.
-They use the existing control admission gate. A successful run preserves domains created
-with `retain_after_run=True`; subsequent runs must look up or reuse a domain
-before using it. Local cached VMM Tensor submissions also register their run.
+Domain creation, lookup, handle access, staging and explicit release require
+the owning Worker's orchestration callback. Creation, reuse and staging must
+precede its first task submission and use the existing control admission gate.
+A successful run preserves domains created with `retain_after_run=True`.
+Each subsequent run must call `get_domain` or `get_or_allocate_domain`, then
+obtain its local Buffers again. Passing a previous run's domain Buffers as
+arguments or submitting them directly from a closure is unsupported.
 Use `with` only when the scope should release the shared handle: context exit
-releases a reused handle too. An out-of-run release requires all accepted runs
-to have completed their cleanup. `Worker.close()` frees remaining owned domains.
+releases a reused handle too. After release, callers must not submit new uses
+of previously obtained Buffers; no additional per-submit domain check is made.
+Physical release still waits for accepted tasks and their children to complete.
+Domain management uses the existing callback serialization and run cleanup;
+arbitrary-thread concurrent lookup, copy and release are not supported.
+`Worker.close()` frees remaining owned domains after its existing lease/fence drain.
 `Worker.live_domains` includes both backends.
 
 `copy_to_domain` and `copy_from_domain` use domain rank and the same named-buffer

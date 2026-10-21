@@ -5758,8 +5758,6 @@ class Worker:
         # Dynamic CommDomain allocations.  Keyed by user-facing name (unique
         # among live handles).  ``orch.allocate_domain`` adds entries here;
         # ``release()`` removes them and queues a deferred backend free.
-        self._domain_mu = threading.RLock()
-        self._domain_by_buffer: dict[CanonicalIdentity, CommDomainHandle] = {}
         self._live_domains: dict[str, CommDomainHandle] = {}
         self._live_global_domains: dict[str, GlobalCommDomainHandle] = {}
         self._failed_global_domain_releases: dict[int, GlobalCommDomainHandle] = {}
@@ -9689,12 +9687,11 @@ class Worker:
         Useful for debugging.  Mutating the returned dict has no effect; use
         ``handle.release()`` or ``orch.release_domain(handle)`` to free.
         """
-        with self._domain_mu:
-            return {
-                name: handle
-                for name, handle in {**self._live_domains, **self._live_global_domains}.items()
-                if handle._config is not None and not handle.released
-            }
+        return {
+            name: handle
+            for name, handle in {**self._live_domains, **self._live_global_domains}.items()
+            if handle._config is not None and not handle.released
+        }
 
     def _validate_worker_chip_id(self, worker_id: int) -> None:
         if self.level < 3:
@@ -10148,7 +10145,9 @@ class Worker:
             members = tuple(operator.index(member) for member in members)
             if any(member < 0 or member >= len(ids) for member in members):
                 raise ValueError("domain members must name registered chip worker ids")
-            topology = (self._config.get("platform"), ids)
+            ranks = tuple(int(rank) for rank in self._config.get("global_device_ranks", ()))
+            _validate_global_device_ranks("Worker.global_device_ranks", ranks, len(ids))
+            topology = (self._config.get("platform"), ids, ranks or tuple(range(len(ids))))
         elif self.level >= 4:
             members = tuple((operator.index(node), operator.index(chip)) for node, chip in members)
             nodes = self._resolved_global_nodes()
@@ -10176,8 +10175,8 @@ class Worker:
         resources = self._building_run_resources
         if _callback_frame_for(self) is None or resources is None:
             raise RuntimeError("domain creation and reuse require this Worker's orchestration callback")
-        # The callback/control gate serializes publication with submission and out-of-run release.
-        with self._control_admission("allocate_domain"), self._domain_mu:
+        # The callback/control gate serializes domain creation with task submission.
+        with self._control_admission("allocate_domain"):
             if not name:
                 raise ValueError("domain name must be non-empty")
             config = self._domain_config(members, window_size, buffers, retain_after_run)
@@ -10200,7 +10199,8 @@ class Worker:
                     )
                     handle.retain_after_run = config.retain_after_run
                     handle.members = tuple(
-                        GlobalDomainMember(-1, chip, chip, rank) for rank, chip in enumerate(config.members)
+                        GlobalDomainMember(-1, chip, config.topology[2][chip], rank)
+                        for rank, chip in enumerate(config.members)
                     )
                     handle.buffers = tuple(GlobalDomainBuffer(b[0], b[3]) for b in config.buffers)
                     handle.mapping_size = config.window_size
@@ -10213,9 +10213,6 @@ class Worker:
                         retain_after_run=config.retain_after_run,
                     )
                 handle._guard = self._domain_guard
-                for context in handle.contexts.values():
-                    for buffer in context.buffers.values():
-                        self._domain_by_buffer[buffer.identity] = handle
                 self._use_domain(handle)
                 handle._config = config
                 return handle
@@ -10233,15 +10230,10 @@ class Worker:
                 raise
 
     @contextlib.contextmanager
-    def _domain_guard(self, handle=None, *, releasing=False):
-        callback = _callback_frame_for(self) is not None
-        # An accepted callback already owns a lease, including while concurrent close drains it.
-        with contextlib.nullcontext() if callback else self._operation_lease("domain access", allow_continuation=True):
-            with self._control_reservation("domain access") if releasing and not callback else contextlib.nullcontext():
-                with self._domain_mu:
-                    if handle is not None and not handle.released:
-                        self._use_domain(handle)
-                    yield
+    def _domain_guard(self, _handle=None, **_kwargs):
+        if _callback_frame_for(self) is None or self._building_run_resources is None:
+            raise RuntimeError("domain access requires this Worker's orchestration callback")
+        yield
 
     def _use_domain(self, handle) -> None:
         resources = self._building_run_resources if _callback_frame_for(self) is not None else None
@@ -11823,7 +11815,6 @@ class Worker:
                             self._drop_device_alloc(identity)
         with self._child_prov_lock:
             for identity in self._domain_members.pop(allocation_id, set()):
-                self._domain_by_buffer.pop(identity, None)
                 self._drop_device_alloc(identity)
 
     def _require_freeable(self, handle: Buffer, *, api: str) -> Buffer:
@@ -11989,13 +11980,7 @@ class Worker:
         resources = self._building_run_resources
         if resources is None:
             return
-        identities = self._identities_in_args(args)
-        with self._domain_mu:
-            for identity in identities:
-                handle = self._domain_by_buffer.get(identity)
-                if handle is not None:
-                    self._use_domain(handle)
-        resources.touched_identities.update(identities)
+        resources.touched_identities.update(self._identities_in_args(args))
 
     def _child_prov_check_dispatch_locked(self, args: Any, target_worker_id: int, *, api: str) -> None:
         """Validate device args against the worker they are dispatched to.

@@ -1344,7 +1344,7 @@ def test_two_remote_daemons_build_and_copy_global_domain_without_mpirun():
         assert not captured["handle"].freed
 
         def read_orch(orch, _args, _cfg):
-            domain = captured["handle"]
+            domain = orch.get_domain("tcp-global")
             try:
                 captured["rank0"] = orch.copy_from_global_domain(domain, 0, len(b"node-zero"), buffer="payload")
                 captured["rank1"] = orch.copy_from_global_domain(domain, 1, len(b"node-one"), buffer="payload")
@@ -1430,6 +1430,7 @@ def test_local_and_remote_l3_build_and_copy_global_domain_without_mpirun():
         assert not domain.freed
 
         def read_orch(orch, _args, _cfg):
+            domain = orch.get_domain("mixed-global")
             try:
                 captured["local"] = orch.copy_from_global_domain(
                     domain,

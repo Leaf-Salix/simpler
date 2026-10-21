@@ -1132,6 +1132,8 @@ class CommDomainHandle:
     Callers must treat handle attributes and context/buffer mappings as read-only
     metadata. Reassignment is unsupported; configure through allocation arguments
     and end ownership through ``release()``. Buffer contents remain writable.
+    Each orchestration callback must obtain the domain through allocation or lookup
+    before accessing its Buffers; carrying Buffers directly across runs is unsupported.
     """
 
     __slots__ = (

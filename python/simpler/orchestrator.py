@@ -655,7 +655,7 @@ class Orchestrator:
         if self._worker is None or handle._guard != self._worker._domain_guard:
             raise ValueError("domain belongs to another Worker")
         size = len(data) if writing else data
-        with self._control_admission("domain copy"), handle._guard(handle):
+        with handle._guard(handle), self._control_admission("domain copy"):
             handle._require_live()
             absolute = self._global_copy_range(handle, buffer=buffer, offset=offset, nbytes=size)
             handle.member(rank)

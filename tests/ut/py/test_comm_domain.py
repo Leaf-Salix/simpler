@@ -31,6 +31,7 @@ def domain_worker(request):
         device_ids=[0, 1],
         num_sub_workers=0,
         comm_profile="sim",
+        global_device_ranks=[10, 20],
     )
     worker = child
     members = [1, 0]
@@ -68,6 +69,7 @@ def test_reuse_snapshot_data_and_second_run_release(domain_worker):
         assert orch.get_or_allocate_domain(**request) is handle
         assert orch.get_domain("tp") is handle
         assert handle.member(0).local_worker_id == 1
+        assert [handle.member(rank).global_device_rank for rank in range(2)] == [20, 10]
         orch.copy_to_domain(handle, 0, b"retained", buffer="payload", offset=3)
         saved.append((handle, orch))
 
@@ -100,7 +102,7 @@ def test_reuse_snapshot_data_and_second_run_release(domain_worker):
     handle.release()
 
 
-def test_configuration_conflicts_have_no_device_effect(domain_worker):
+def test_configuration_conflicts_have_no_device_effect(domain_worker, monkeypatch):
     worker, members = domain_worker
     request = _request(members)
     mutations = [dict(members=list(reversed(members))), dict(window_size=8192), dict(retain_after_run=False)]
@@ -124,6 +126,11 @@ def test_configuration_conflicts_have_no_device_effect(domain_worker):
         for mutation in mutations:
             with pytest.raises(ValueError, match="configuration differs"):
                 orch.get_or_allocate_domain(**dict(request, **mutation))
+        child = worker if worker.level == 3 else worker._next_level_workers[0]
+        with monkeypatch.context() as patch:
+            patch.setitem(child._config, "global_device_ranks", [30, 40])
+            with pytest.raises(ValueError, match="topology"):
+                orch.get_or_allocate_domain(**request)
         assert worker._next_alloc_id == allocated
         assert orch.get_domain("tp") is handle
         handle.release()
@@ -147,7 +154,7 @@ def test_release_rebuild_does_not_remove_replacement(domain_worker):
     old, new = saved
     assert old.freed and not new.freed
     assert worker.live_domains == {"tp": new}
-    new.release()
+    worker.run(lambda orch, _args, _cfg: orch.release_domain(orch.get_domain("tp")))
     assert new.freed
 
 
@@ -270,6 +277,7 @@ def test_failed_creation_stays_cleanup_owned_without_becoming_public(monkeypatch
             assert old in resources.pending_release_domains
             new = worker._comm_domain(**request, reuse=True)
             assert new is not old and new._config is not None
+            assert new.member(0).global_device_rank == 0
             assert new.allocation_id != old.allocation_id
             worker._execute_pending_domain_releases(resources)
             assert old.freed and released == [old.allocation_id]
@@ -280,7 +288,6 @@ def test_failed_creation_stays_cleanup_owned_without_becoming_public(monkeypatch
         worker._worker = None
         worker._building_run_resources = None
         worker._live_domains.clear()
-        worker._domain_by_buffer.clear()
         worker.close()
 
 
@@ -326,25 +333,41 @@ def test_legacy_entrypoints_share_reuse_and_release(domain_worker):
     worker.run(build)
 
 
-def test_metadata_reads_remain_available_before_run_cleanup(domain_worker):
+def test_domain_access_requires_owner_callback(domain_worker):
     worker, members = domain_worker
     saved = []
     worker.run(lambda orch, _args, _cfg: saved.append(orch.allocate_domain(**_request(members))))
     domain = saved[0]
-    run = worker.submit(lambda orch, _args, _cfg: orch.get_domain("tp"))
-    try:
-        assert not run._cleanup_published
-        assert domain.member(0).local_worker_id == 1
-        assert domain.buffer_range("payload") == (0, 32)
-        assert worker._get_domain("tp") is domain
-        if worker.level == 3:
-            assert domain.local_context(0).domain_rank == 0
-        with pytest.raises(RuntimeError, match="in flight"):
-            domain.release()
-        assert not domain.released
-    finally:
-        run.wait()
-    domain.release()
+    orch = worker._orch
+    assert orch is not None
+    accesses = [
+        lambda: orch.get_domain("tp"),
+        lambda: domain.member(0),
+        lambda: domain.buffer_range("payload"),
+        lambda: domain.local_context(0),
+        lambda: orch.copy_to_domain(domain, 0, b"x"),
+        lambda: orch.copy_from_domain(domain, 0, 1),
+        domain.__enter__,
+        domain.release,
+    ]
+    for access in accesses:
+        with pytest.raises(RuntimeError, match="callback"):
+            access()
+    with _callback_run(0, object()), pytest.raises(RuntimeError, match="callback"):
+        orch.get_domain("tp")
+    assert not domain.released and not domain.freed
+
+    def release(orch, _args, _cfg):
+        current = orch.get_domain("tp")
+        assert current is domain
+        assert current.buffer_range("payload") == (0, 32)
+        resources = worker._building_run_resources
+        assert resources is not None and resources.requires_ordered_cleanup
+        table = resources.live_domains if worker.level == 3 else resources.live_global_domains
+        assert table.get("tp") is current
+        current.release()
+
+    worker.run(release)
     assert domain.freed
 
 
@@ -393,6 +416,8 @@ def test_accepted_callback_can_release_while_close_drains(domain_worker):
             assert worker._orch is not None
             with _callback_run(0, object()), pytest.raises(RuntimeError, match="callback"):
                 worker._orch.get_or_allocate_domain(**request)
+            with pytest.raises(RuntimeError, match="callback"):
+                worker._orch.copy_from_domain(saved[0], 0, 1)
         except BaseException as exc:
             errors.append(exc)
         finally:
@@ -413,64 +438,3 @@ def test_accepted_callback_can_release_while_close_drains(domain_worker):
     assert not runner.is_alive() and not observer.is_alive()
     assert not errors
     assert saved[0].freed
-
-
-@pytest.mark.parametrize("writing", [True, False])
-def test_accepted_external_copy_finishes_while_close_drains(domain_worker, monkeypatch, writing):
-    worker, members = domain_worker
-    saved = []
-
-    def allocate(orch, _args, _cfg):
-        domain = orch.allocate_domain(**_request(members))
-        orch.copy_to_domain(domain, 0, b"data", buffer="payload")
-        saved.extend((orch, domain))
-
-    worker.run(allocate)
-    orch, domain = saved
-    entered, resume = threading.Event(), threading.Event()
-    errors = []
-    original_range = orch._global_copy_range
-
-    def paused_range(*args, **kwargs):
-        # _copy_domain already owns its outer lease; metadata and staging are still pending.
-        entered.set()
-        assert resume.wait(10)
-        return original_range(*args, **kwargs)
-
-    monkeypatch.setattr(orch, "_global_copy_range", paused_range)
-
-    def copy():
-        try:
-            if writing:
-                orch.copy_to_domain(domain, 0, b"copy", buffer="payload")
-            else:
-                assert orch.copy_from_domain(domain, 0, 4, buffer="payload") == b"data"
-        except BaseException as exc:
-            errors.append(exc)
-
-    def resume_after_close_claim():
-        try:
-            with worker._hierarchical_start_cv:
-                assert worker._hierarchical_start_cv.wait_for(
-                    lambda: worker._lifecycle is worker_mod._Lifecycle.CLOSED, timeout=10
-                )
-        except BaseException as exc:
-            errors.append(exc)
-        finally:
-            resume.set()
-
-    runner = threading.Thread(target=copy)
-    observer = threading.Thread(target=resume_after_close_claim)
-    runner.start()
-    try:
-        assert entered.wait(10)
-        observer.start()
-        worker.close()
-    finally:
-        resume.set()
-        runner.join(10)
-        if observer.ident is not None:
-            observer.join(10)
-    assert not runner.is_alive() and not observer.is_alive()
-    assert not errors
-    assert domain.freed and not worker._buffers
