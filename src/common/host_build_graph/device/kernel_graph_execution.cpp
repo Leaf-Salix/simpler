@@ -385,8 +385,8 @@ static int consume_prepared_graph_task(void *arg) {
     hbg::GraphPreparedDispatch local{};
     if (metadata_ok) {
         cache_invalidate_range(arg, sizeof(local));
-        metadata_ok = hbg::read_graph_prepared_dispatch(arg, sizeof(local), local) &&
-                      hbg::graph_prepared_dispatch_matches_slot(local, slot) &&
+        std::memcpy(&local, arg, sizeof(local));
+        metadata_ok = hbg::graph_prepared_dispatch_matches_slot(local, slot) &&
                       local.registration.runtime_address == reinterpret_cast<uintptr_t>(runtime);
     }
     if (metadata_ok) {
