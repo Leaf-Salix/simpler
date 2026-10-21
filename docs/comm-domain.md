@@ -67,9 +67,10 @@ before device effects. A hit does not allocate, initialize or clear memory.
 missing. `allocate_global_domain` and `release_global_domain` are compatibility
 wrappers; `workers=` remains the legacy L3 allocation spelling.
 
-Domain creation, lookup, handle access, staging and explicit release require
-the owning Worker's orchestration callback. Creation, reuse and staging must
-precede its first task submission and use the existing control admission gate.
+Domain creation and configuration reuse occur in an orchestration callback.
+L3 creation, reuse and staging precede its first task submission and use the
+existing control admission gate. L4 retains its existing control-plane paths
+without adding a first-task restriction.
 A successful run preserves domains created with `retain_after_run=True`.
 Each subsequent run must call `get_domain` or `get_or_allocate_domain`, then
 obtain its local Buffers again. Passing a previous run's domain Buffers as
@@ -78,14 +79,19 @@ Use `with` only when the scope should release the shared handle: context exit
 releases a reused handle too. After release, callers must not submit new uses
 of previously obtained Buffers; no additional per-submit domain check is made.
 Physical release still waits for accepted tasks and their children to complete.
-Domain management uses the existing callback serialization and run cleanup;
-arbitrary-thread concurrent lookup, copy and release are not supported.
+After run completion, retained handles can be inspected, copied through a
+matching Orchestrator and released serially outside a callback; release then
+reclaims the backend resources synchronously and repeated release is a no-op.
+Release follows the handle's existing callback to its creating Worker; callers
+must pair copy operations with the matching Orchestrator and handle.
+Concurrency follows the existing backend contracts; no additional
+concurrent-access or cross-Worker misuse checks are added.
 `Worker.close()` frees remaining owned domains after its existing lease/fence drain.
 `Worker.live_domains` includes both backends.
 
 `copy_to_domain` and `copy_from_domain` use domain rank and the same named-buffer
-bounds checks. They synchronously stage data before task submission; they do
-not wait for already queued DAG work. L3 staging reuses ordinary VMM Buffer
+bounds checks. They synchronously stage data and do not wait for already queued
+DAG work. L3 staging precedes task submission and reuses ordinary VMM Buffer
 copies and must stay inside the declared slices, including when `buffer=None`.
 L4 retains the existing bounded whole-window copy path. `buffer_range(name)`
 returns the slice's window offset and byte size. `mapping_size` is the requested

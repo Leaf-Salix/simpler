@@ -1132,8 +1132,9 @@ class CommDomainHandle:
     Callers must treat handle attributes and context/buffer mappings as read-only
     metadata. Reassignment is unsupported; configure through allocation arguments
     and end ownership through ``release()``. Buffer contents remain writable.
-    Each orchestration callback must obtain the domain through allocation or lookup
-    before accessing its Buffers; carrying Buffers directly across runs is unsupported.
+    Each run consuming domain Buffers must obtain the domain through allocation or
+    lookup; carrying Buffers directly across runs is unsupported. Retained handles
+    may be inspected and released serially after run completion.
     """
 
     __slots__ = (
@@ -1154,7 +1155,6 @@ class CommDomainHandle:
         "retain_after_run",
         "attachments",
         "_config",
-        "_guard",
     )
 
     def __init__(  # noqa: PLR0913 -- preserve the L3 and legacy L4 constructor keywords
@@ -1192,14 +1192,12 @@ class CommDomainHandle:
         self.retain_after_run = bool(retain_after_run)
         self.attachments = tuple(attachments)
         self._config = None
-        self._guard = lambda _handle, **_kwargs: contextlib.nullcontext()
         self._released = False
         self._freed = False
 
     def __getitem__(self, chip_idx: int) -> ChipDomainContext:
-        with self._guard(self):
-            self._require_live()
-            return self.contexts[chip_idx]
+        self._require_live()
+        return self.contexts[chip_idx]
 
     def _require_live(self) -> None:
         if self._released:
@@ -1207,12 +1205,11 @@ class CommDomainHandle:
 
     def member(self, domain_rank: int) -> GlobalDomainMember:
         """Return rank-ordered topology metadata, without a remote device address."""
-        with self._guard(self):
-            self._require_live()
-            rank = int(domain_rank)
-            if rank < 0 or rank >= len(self.members):
-                raise IndexError(f"domain rank {rank} is out of range")
-            return self.members[rank]
+        self._require_live()
+        rank = int(domain_rank)
+        if rank < 0 or rank >= len(self.members):
+            raise IndexError(f"domain rank {rank} is out of range")
+        return self.members[rank]
 
     def local_context(self, domain_rank: int) -> ChipDomainContext:
         """Return this creator's local chip mapping; L4 creators hold no such mappings."""
@@ -1220,14 +1217,13 @@ class CommDomainHandle:
         return self[member.local_worker_id]
 
     def buffer_range(self, name: str) -> tuple[int, int]:
-        with self._guard(self):
-            self._require_live()
-            offset = 0
-            for buffer in self.buffers:
-                if buffer.name == name:
-                    return offset, buffer.nbytes
-                offset += buffer.nbytes
-            raise KeyError(f"domain {self.name!r} has no buffer {name!r}")
+        self._require_live()
+        offset = 0
+        for buffer in self.buffers:
+            if buffer.name == name:
+                return offset, buffer.nbytes
+            offset += buffer.nbytes
+        raise KeyError(f"domain {self.name!r} has no buffer {name!r}")
 
     @property
     def released(self) -> bool:
@@ -1243,9 +1239,9 @@ class CommDomainHandle:
     def freed(self) -> bool:
         """True once the backend ``comm_release_domain_windows`` has executed.
 
-        Only flips after the owning ``Worker.run`` completes and processes the
-        pending-release queue.  An ``orch_fn`` will never observe ``True``
-        for a handle it released within the same ``run`` call.
+        Flips after the owning run's fence and physical release. Releasing a
+        retained handle after run completion frees it synchronously. An ``orch_fn``
+        will never observe ``True`` for a handle it released within the same run.
         """
         return self._freed
 
@@ -1256,6 +1252,7 @@ class CommDomainHandle:
         backend ``comm_release_domain_windows`` runs after
         the owning run's completion wait so that tasks already submitted with
         this domain's ``device_ctx`` see live memory through execution.
+        Serial release after run completion frees a retained domain immediately.
 
         After this returns, the handle is treated as released for the
         user's purposes: ``__getitem__`` raises, repeated ``release()`` is
@@ -1264,16 +1261,12 @@ class CommDomainHandle:
         """
         if self._released:
             return
-        with self._guard(self, releasing=True):
-            if self._released:
-                return
-            self._released = True
-            self._release_fn(self)
+        self._released = True
+        self._release_fn(self)
 
     def __enter__(self) -> CommDomainHandle:
-        with self._guard(self):
-            self._require_live()
-            return self
+        self._require_live()
+        return self
 
     def __exit__(self, *_):
         self.release()

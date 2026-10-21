@@ -10175,8 +10175,8 @@ class Worker:
         resources = self._building_run_resources
         if _callback_frame_for(self) is None or resources is None:
             raise RuntimeError("domain creation and reuse require this Worker's orchestration callback")
-        # The callback/control gate serializes domain creation with task submission.
-        with self._control_admission("allocate_domain"):
+        control = self._control_admission("allocate_domain") if self.level == 3 else contextlib.nullcontext()
+        with control:
             if not name:
                 raise ValueError("domain name must be non-empty")
             config = self._domain_config(members, window_size, buffers, retain_after_run)
@@ -10212,7 +10212,6 @@ class Worker:
                         buffers=config.specs(),
                         retain_after_run=config.retain_after_run,
                     )
-                handle._guard = self._domain_guard
                 self._use_domain(handle)
                 handle._config = config
                 return handle
@@ -10229,12 +10228,6 @@ class Worker:
                         raise creation_error from cleanup_error
                 raise
 
-    @contextlib.contextmanager
-    def _domain_guard(self, _handle=None, **_kwargs):
-        if _callback_frame_for(self) is None or self._building_run_resources is None:
-            raise RuntimeError("domain access requires this Worker's orchestration callback")
-        yield
-
     def _use_domain(self, handle) -> None:
         resources = self._building_run_resources if _callback_frame_for(self) is not None else None
         if resources is None:
@@ -10250,12 +10243,11 @@ class Worker:
         handle._release_fn = lambda released, owner=resources: release(released, owner)
 
     def _get_domain(self, name: str) -> CommDomainHandle:
-        with self._domain_guard():
-            handle = self.live_domains.get(name)
-            if handle is None:
-                raise KeyError(f"no live communication domain {name!r}")
-            self._use_domain(handle)
-            return handle
+        handle = self.live_domains.get(name)
+        if handle is None:
+            raise KeyError(f"no live communication domain {name!r}")
+        self._use_domain(handle)
+        return handle
 
     def _allocate_domain(  # noqa: PLR0912 -- linear input-validation + per-chip shm staging + dispatch + reply unpack; splitting obscures the fail-fast ordering
         self,

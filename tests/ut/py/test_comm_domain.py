@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 import simpler.worker as worker_mod
 from simpler.orchestrator import _callback_run
-from simpler.task_interface import CommBufferSpec, CommDomainHandle, GlobalCommDomainHandle
+from simpler.task_interface import CommBufferSpec, CommDomainHandle, GlobalCommDomainHandle, TaskArgs
 from simpler.worker import Worker
 
 
@@ -178,30 +178,15 @@ def test_context_exit_and_worker_close(domain_worker):
     assert saved[1].released and saved[1].freed
 
 
-def test_foreign_release_and_missing_lookup(domain_worker):
+def test_missing_lookup(domain_worker):
     worker, members = domain_worker
-    other = Worker(level=3, platform="a2a3sim", runtime="tensormap_and_ringbuffer", device_ids=[0], num_sub_workers=0)
-    try:
 
-        def build(orch, _args, _cfg):
-            with pytest.raises(KeyError):
-                orch.get_domain("missing")
-            handle = orch.allocate_domain(**_request(members))
-            assert other._orch is not None
-            with pytest.raises(ValueError, match="another Worker"):
-                other._orch.release_domain(handle)
-            copies = [(other._orch.copy_to_domain, b"x"), (other._orch.copy_from_domain, 1)]
-            if worker.level >= 4:
-                copies.extend(((other._orch.copy_to_global_domain, b"x"), (other._orch.copy_from_global_domain, 1)))
-            for copy_domain, data in copies:
-                with pytest.raises(ValueError, match="another Worker"):
-                    copy_domain(handle, 0, data, buffer="payload")
-            handle.release()
+    def build(orch, _args, _cfg):
+        with pytest.raises(KeyError):
+            orch.get_domain("missing")
+        orch.allocate_domain(**_request(members)).release()
 
-        other.init()
-        worker.run(build)
-    finally:
-        other.close()
+    worker.run(build)
 
 
 def test_post_allocation_failure_does_not_publish_an_incomplete_handle(monkeypatch):
@@ -312,6 +297,11 @@ def test_nonretained_and_failed_retained_runs_are_closed(domain_worker):
 def test_legacy_entrypoints_share_reuse_and_release(domain_worker):
     worker, members = domain_worker
 
+    def noop(_orch, _args, _cfg):
+        pass
+
+    task = worker.register(noop) if worker.level >= 4 else None
+
     def build(orch, _args, _cfg):
         request = _request(members)
         if worker.level == 3:
@@ -320,6 +310,8 @@ def test_legacy_entrypoints_share_reuse_and_release(domain_worker):
             request["workers"] = request.pop("members")
             domain = orch.allocate_domain(**request)
         else:
+            assert task is not None
+            orch.submit_next_level(task, TaskArgs(), worker=members[0][0])
             with pytest.raises(TypeError, match="L3"):
                 orch.allocate_domain(**dict(request, workers=request["members"], members=None))
             domain = orch.allocate_global_domain(**request)
@@ -333,31 +325,52 @@ def test_legacy_entrypoints_share_reuse_and_release(domain_worker):
     worker.run(build)
 
 
-def test_domain_access_requires_owner_callback(domain_worker):
+@pytest.mark.parametrize("release_api", ["handle", "orchestrator"])
+def test_retained_domain_release_after_run(domain_worker, release_api, monkeypatch):
+    worker, members = domain_worker
+    saved = []
+    worker.run(lambda orch, _args, _cfg: saved.append(orch.allocate_domain(**_request(members))))
+    domain = saved[0]
+    release_calls = []
+    backend_name = "_release_domain_claimed" if worker.level == 3 else "_release_global_domain_claimed"
+    backend = getattr(worker, backend_name)
+
+    def release_backend(handle):
+        release_calls.append(handle)
+        backend(handle)
+
+    monkeypatch.setattr(worker, backend_name, release_backend)
+    orch = worker._orch
+    assert orch is not None
+    release = domain.release if release_api == "handle" else lambda: orch.release_domain(domain)
+    release()
+    assert domain.released and domain.freed and worker.live_domains == {}
+    domain.release()
+    orch.release_domain(domain)
+    orch.release_global_domain(domain)
+    assert release_calls == [domain]
+
+
+def test_retained_domain_serial_access_and_run_registration(domain_worker):
     worker, members = domain_worker
     saved = []
     worker.run(lambda orch, _args, _cfg: saved.append(orch.allocate_domain(**_request(members))))
     domain = saved[0]
     orch = worker._orch
     assert orch is not None
-    accesses = [
-        lambda: orch.get_domain("tp"),
-        lambda: domain.member(0),
-        lambda: domain.buffer_range("payload"),
-        lambda: domain.local_context(0),
-        lambda: orch.copy_to_domain(domain, 0, b"x"),
-        lambda: orch.copy_from_domain(domain, 0, 1),
-        domain.__enter__,
-        domain.release,
-    ]
-    for access in accesses:
-        with pytest.raises(RuntimeError, match="callback"):
-            access()
-    with _callback_run(0, object()), pytest.raises(RuntimeError, match="callback"):
-        orch.get_domain("tp")
+    assert orch.get_domain("tp") is domain
+    assert domain.member(0).local_worker_id == 1
+    assert domain.buffer_range("payload") == (0, 32)
+    if worker.level == 3:
+        assert domain.local_context(0) is domain[1]
+    orch.copy_to_domain(domain, 0, b"serial", buffer="payload")
+    assert orch.copy_from_domain(domain, 0, 6, buffer="payload") == b"serial"
+    if worker.level >= 4:
+        orch.copy_to_global_domain(domain, 0, b"legacy", buffer="payload")
+        assert orch.copy_from_global_domain(domain, 0, 6, buffer="payload") == b"legacy"
     assert not domain.released and not domain.freed
 
-    def release(orch, _args, _cfg):
+    def lookup(orch, _args, _cfg):
         current = orch.get_domain("tp")
         assert current is domain
         assert current.buffer_range("payload") == (0, 32)
@@ -365,9 +378,10 @@ def test_domain_access_requires_owner_callback(domain_worker):
         assert resources is not None and resources.requires_ordered_cleanup
         table = resources.live_domains if worker.level == 3 else resources.live_global_domains
         assert table.get("tp") is current
-        current.release()
 
-    worker.run(release)
+    worker.run(lookup)
+    with domain as current:
+        assert current is domain
     assert domain.freed
 
 
@@ -416,8 +430,6 @@ def test_accepted_callback_can_release_while_close_drains(domain_worker):
             assert worker._orch is not None
             with _callback_run(0, object()), pytest.raises(RuntimeError, match="callback"):
                 worker._orch.get_or_allocate_domain(**request)
-            with pytest.raises(RuntimeError, match="callback"):
-                worker._orch.copy_from_domain(saved[0], 0, 1)
         except BaseException as exc:
             errors.append(exc)
         finally:

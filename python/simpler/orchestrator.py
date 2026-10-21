@@ -530,7 +530,7 @@ class Orchestrator:
     ) -> CommDomainHandle:
         """Create a domain using L3 chip ids or L4 ``(node, chip)`` members.
 
-        Creation is a synchronous control operation before the first task submission.
+        Creation is synchronous; L3 control must precede the first task submission.
         ``workers`` is the legacy L3 spelling; it cannot be combined with ``members``.
         Retained domains survive successful runs until explicit release or Worker.close().
         """
@@ -577,9 +577,7 @@ class Orchestrator:
         return self._worker._get_domain(name)
 
     def release_domain(self, handle: CommDomainHandle) -> None:
-        """Release an owned domain after this Worker's accepted tasks drain."""
-        if self._worker is None or handle._guard != self._worker._domain_guard:
-            raise ValueError("domain belongs to another Worker")
+        """Release a domain through its creating Worker's completion fence."""
         handle.release()
 
     def allocate_global_domain(
@@ -630,9 +628,10 @@ class Orchestrator:
         buffer: str | None = None,
         offset: int = 0,
     ) -> None:
-        """Synchronously stage bytes before DAG submission; does not wait for queued tasks.
+        """Synchronously stage bytes; does not wait for queued tasks.
 
-        L3 staging is limited to declared buffer slices; L4 keeps its existing window copy path.
+        L3 staging precedes task submission and stays within declared buffer slices.
+        L4 keeps its existing window copy path.
         """
         self._copy_domain(handle, domain_rank, bytes(data), buffer, offset, writing=True)
 
@@ -652,18 +651,18 @@ class Orchestrator:
     copy_from_global_domain = copy_from_domain
 
     def _copy_domain(self, handle, rank, data, buffer, offset, *, writing):
-        if self._worker is None or handle._guard != self._worker._domain_guard:
-            raise ValueError("domain belongs to another Worker")
+        if self._worker is None:
+            raise RuntimeError("domain copy requires an Orchestrator bound to a Worker")
         size = len(data) if writing else data
-        with handle._guard(handle), self._control_admission("domain copy"):
-            handle._require_live()
-            absolute = self._global_copy_range(handle, buffer=buffer, offset=offset, nbytes=size)
-            handle.member(rank)
-            if not handle.workers:
-                if writing:
-                    self._worker._copy_to_global_domain(handle, rank, data, absolute)
-                    return None
-                return self._worker._copy_from_global_domain(handle, rank, size, absolute)
+        handle._require_live()
+        absolute = self._global_copy_range(handle, buffer=buffer, offset=offset, nbytes=size)
+        handle.member(rank)
+        if not handle.workers:
+            if writing:
+                self._worker._copy_to_global_domain(handle, rank, data, absolute)
+                return None
+            return self._worker._copy_from_global_domain(handle, rank, size, absolute)
+        with self._control_admission("domain copy"):
             # Reuse the ordinary VMM Buffer copy/provenance path rather than add a local domain RPC.
             context = handle.local_context(rank)
             ranges = []
