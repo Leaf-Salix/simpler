@@ -27,6 +27,7 @@
 #include "host_build_graph/kernel_graph_prepared.h"
 #include "host_build_graph/kernel_graph_slot_registry.h"
 #include "host_build_graph/kernel_graph_wire.h"
+#include "host_build_graph/shared_memory.h"
 #include "runtime.h"
 
 int32_t aicpu_execute_restored_graph(Runtime *runtime);
@@ -90,13 +91,17 @@ bool prepared_context_is_current() {
     return generation == registry->context_generation && generation == g_prepared_context.generation;
 }
 
-void maintain_prepared_image(const hbg::GraphPreparedDispatch &dispatch) {
+void maintain_prepared_image(const hbg::GraphPreparedDispatch &dispatch, uint64_t runtime_state_bytes = UINT64_MAX) {
     for (uint32_t i = 0; i < dispatch.graph.region_count; ++i) {
         const auto &region = dispatch.regions[i];
         const auto kind = static_cast<uint32_t>(region.kind);
         cache_invalidate_range(
             reinterpret_cast<const void *>(dispatch.graph.destinations[kind].address + region.destination_offset),
-            static_cast<size_t>(region.bytes)
+            static_cast<size_t>(
+                region.kind == hbg::GraphImageKind::Runtime && runtime_state_bytes < region.bytes ?
+                    runtime_state_bytes :
+                    region.bytes
+            )
         );
     }
 }
@@ -459,7 +464,12 @@ static int consume_prepared_graph_task(void *arg) {
     // All status reads, destruction and executor cleanup have returned. No
     // execution role touches the image again before the next ordered DMA.
     // A failed execution poisons the slot rather than assuming quiescence.
-    if (g_execution_status.load(std::memory_order_acquire) == 0) maintain_prepared_image(g_prepared_dispatch);
+    if (g_execution_status.load(std::memory_order_acquire) == 0) {
+        const auto &graph = g_prepared_dispatch.graph;
+        // Live task state precedes the immutable fanin and argument pools.
+        const auto offsets = sm_layout::segment_offsets(sm_layout::image_extents({graph.total_tasks, 0, 0, 0}));
+        maintain_prepared_image(g_prepared_dispatch, graph.sm_offset - graph.runtime_offset + offsets.fanin_pool);
+    }
     const int32_t cleaned = g_prepared_cleaned.fetch_add(1, std::memory_order_acq_rel) + 1;
     if (cleaned == threads) {
         rc = g_execution_status.load(std::memory_order_acquire);
