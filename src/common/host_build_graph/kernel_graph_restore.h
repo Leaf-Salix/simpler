@@ -74,6 +74,8 @@ GraphRestoreStatus restore_graph_packet(
 // slot comes from the independently acquired live context registry. The owner
 // excludes previous execution and retains the immutable prepared image/metadata.
 // This attaches published bytes without copying or flushing their image spans.
+// A successfully retired mailbox retains its ticket sequence storage; a new
+// slot, intervening restore failure or changed Runtime address initializes it.
 GraphRestoreStatus attach_prepared_graph_image(
     const GraphPreparedDispatch &prepared, const GraphSlotRegistration &slot, GraphRestoreResult &out
 ) noexcept;

@@ -3184,7 +3184,7 @@ protected:
         all.erase(all.begin(), all.begin() + seal.destinations[0].capacity + packet_header().runtime_offset);
         return all;
     }
-    void expect_initialized_prefix() {
+    void expect_initialized_scheduler() {
         const auto base = seal.destinations[1].address;
         const auto &layout = restored.runtime->prebuilt_layout;
         auto &scheduler = *restored.runtime->scheduler;
@@ -3230,6 +3230,9 @@ protected:
         EXPECT_EQ(scheduler.async_wait_list.count, 0);
         EXPECT_EQ(scheduler.async_wait_list.busy.load(), 0);
         EXPECT_EQ(scheduler.async_wait_list.mpsc_skipped_count.load(), 0u);
+    }
+    void expect_initialized_prefix() {
+        ASSERT_NO_FATAL_FAILURE(expect_initialized_scheduler());
         const auto &mailbox = *restored.runtime->aicore_mailbox;
         EXPECT_EQ(mailbox.head.load(), 0u);
         EXPECT_EQ(mailbox.tail.load(), 0u);
@@ -3321,6 +3324,13 @@ class HbgPreparedGraphTest : public HbgGraphRestoreTest {
 protected:
     hbg::GraphPreparedDispatch prepared{};
 
+    void dirty_working_preserving_mailbox() {
+        auto &mailbox = *restored.runtime->aicore_mailbox;
+        std::array<std::byte, sizeof(mailbox)> saved;
+        std::memcpy(saved.data(), &mailbox, saved.size());
+        dirty_working();
+        std::memcpy(&mailbox, saved.data(), saved.size());
+    }
     void prepare_dispatch() {
         ASSERT_EQ(hbg::make_graph_prepared_dispatch(snapshot, dispatch_registration(), prepared), 0);
         ASSERT_TRUE(hbg::graph_prepared_dispatch_matches_slot(prepared, seal));
@@ -3616,17 +3626,27 @@ TEST_F(HbgPreparedGraphTest, SingleParticipantMetadataFailureCollectivelyCancels
     }
 }
 
-TEST_F(HbgPreparedGraphTest, OrderedDmaAndAttachReinitializeDirtyPrefixOnEveryReplay) {
+TEST_F(HbgPreparedGraphTest, OrderedDmaResetsExecutionStateAndRetainsQuiescentMailboxStorage) {
     ASSERT_NO_FATAL_FAILURE(prepare_slot());
     ASSERT_NO_FATAL_FAILURE(prepare_dispatch());
     std::vector<std::byte> expected;
     for (uint64_t round = 1; round <= 4; ++round) {
-        dirty_working();
+        if (round == 1) dirty_working();
+        else dirty_working_preserving_mailbox();
         publish_image();
         ASSERT_EQ(hbg::attach_prepared_graph_image(prepared, seal, restored), hbg::GraphRestoreStatus::Ok);
         EXPECT_EQ(restored.generation, round);
         EXPECT_EQ(restored.total_tasks, prepared.graph.total_tasks);
-        ASSERT_NO_FATAL_FAILURE(expect_initialized_prefix());
+        ASSERT_NO_FATAL_FAILURE(expect_initialized_scheduler());
+        auto &mailbox = *restored.runtime->aicore_mailbox;
+        EXPECT_EQ(mailbox.head.load(), round - 1);
+        EXPECT_EQ(mailbox.tail.load(), round - 1);
+        AICoreCompletionMsgView message{};
+        EXPECT_FALSE(mailbox.try_pop(message));
+        if (round == 1) {
+            for (const auto &entry : mailbox.entries)
+                EXPECT_EQ(entry.seq.load(), 0u);
+        }
         if (round == 1) expected = restored_image_bytes();
         else EXPECT_EQ(restored_image_bytes(), expected);
         auto &tasks = restored.runtime->sm_handle->header->tasks;
@@ -3634,9 +3654,7 @@ TEST_F(HbgPreparedGraphTest, OrderedDmaAndAttachReinitializeDirtyPrefixOnEveryRe
         auto &queue = restored.runtime->scheduler->graph_ready_queue;
         ASSERT_TRUE(queue.push(&tasks.storage_at(0).slot));
         EXPECT_EQ(queue.pop(), &tasks.storage_at(0).slot);
-        restored.runtime->aicore_mailbox->head.store(7);
-        restored.runtime->aicore_mailbox->tail.store(3);
-        restored.runtime->aicore_mailbox->entries[0].seq.store(9);
+        ASSERT_TRUE(mailbox.try_push_normal_done(TaskId{1}, 0x4000 + round));
         ASSERT_NO_FATAL_FAILURE(retire());
     }
 }
@@ -3649,7 +3667,8 @@ TEST_F(HbgPreparedGraphTest, AlternatingTemplatesRestoreTheirOwnImagesIntoTheSam
     for (int round = 0; round < 3; ++round) {
         SCOPED_TRACE(round);
         ASSERT_NO_FATAL_FAILURE(select_template(templates[round == 1 ? 1 : 0]));
-        dirty_working();
+        if (round == 0) dirty_working();
+        else dirty_working_preserving_mailbox();
         publish_image();
         ASSERT_EQ(hbg::attach_prepared_graph_image(prepared, seal, restored), hbg::GraphRestoreStatus::Ok);
         EXPECT_EQ(restored.generation, static_cast<uint64_t>(round + 1));
@@ -3662,6 +3681,58 @@ TEST_F(HbgPreparedGraphTest, AlternatingTemplatesRestoreTheirOwnImagesIntoTheSam
         task.payload.published_block_count.store(5);
         ASSERT_NO_FATAL_FAILURE(retire());
     }
+}
+
+TEST_F(HbgPreparedGraphTest, MailboxReuseSurvivesWrapAndDiscardsOnlyPreviouslyPublishedMessages) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    ASSERT_NO_FATAL_FAILURE(prepare_dispatch());
+    publish_image();
+    ASSERT_EQ(hbg::attach_prepared_graph_image(prepared, seal, restored), hbg::GraphRestoreStatus::Ok);
+    auto &mailbox = *restored.runtime->aicore_mailbox;
+    AICoreCompletionMsgView message{};
+    for (uint64_t i = 0; i < AICORE_COMPLETION_MAILBOX_CAPACITY + 17; ++i) {
+        ASSERT_TRUE(mailbox.try_push_normal_done(TaskId{1}, 0x4000 + i));
+        ASSERT_TRUE(mailbox.try_pop(message));
+        EXPECT_EQ(message.addr, 0x4000 + i);
+    }
+    for (uint64_t i = 0; i < 5; ++i)
+        ASSERT_TRUE(mailbox.try_push_normal_done(TaskId{1}, 0x8000 + i));
+    const uint64_t ticket = mailbox.head.load();
+    ASSERT_NO_FATAL_FAILURE(retire());
+    publish_image();
+    ASSERT_EQ(hbg::attach_prepared_graph_image(prepared, seal, restored), hbg::GraphRestoreStatus::Ok);
+    EXPECT_EQ(restored.runtime->aicore_mailbox, &mailbox);
+    EXPECT_EQ(mailbox.head.load(), ticket);
+    EXPECT_EQ(mailbox.tail.load(), ticket);
+    EXPECT_FALSE(mailbox.try_pop(message));
+    mailbox.head.store(ticket + 1);
+    EXPECT_FALSE(mailbox.try_pop(message));
+    mailbox.head.store(ticket);
+    ASSERT_TRUE(mailbox.try_push_normal_done(TaskId{2}, 0x9000));
+    ASSERT_TRUE(mailbox.try_pop(message));
+    EXPECT_EQ(message.task_token.raw, 2u);
+    EXPECT_EQ(message.addr, 0x9000u);
+    ASSERT_NO_FATAL_FAILURE(retire());
+}
+
+TEST_F(HbgPreparedGraphTest, ControlledRestoreFailureRequiresFullMailboxInitialization) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    ASSERT_NO_FATAL_FAILURE(prepare_dispatch());
+    publish_image();
+    ASSERT_EQ(hbg::attach_prepared_graph_image(prepared, seal, restored), hbg::GraphRestoreStatus::Ok);
+    ASSERT_TRUE(restored.runtime->aicore_mailbox->try_push_normal_done(TaskId{1}, 0x4000));
+    ASSERT_NO_FATAL_FAILURE(retire());
+    hbg::GraphRestoreOps failure;
+    failure.copy = [](void *, void *, const void *, size_t) {
+        return false;
+    };
+    ASSERT_EQ(restore(failure), hbg::GraphRestoreStatus::CopyFailed);
+    ASSERT_NO_FATAL_FAILURE(retire(hbg::GraphRestoreRetirement::ControlledFailure));
+    dirty_working();
+    publish_image();
+    ASSERT_EQ(hbg::attach_prepared_graph_image(prepared, seal, restored), hbg::GraphRestoreStatus::Ok);
+    ASSERT_NO_FATAL_FAILURE(expect_initialized_prefix());
+    ASSERT_NO_FATAL_FAILURE(retire());
 }
 
 TEST_F(HbgPreparedGraphTest, AttachRejectsForeignMetadataAndBusyStateWithoutChangingImages) {

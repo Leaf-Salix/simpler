@@ -66,7 +66,7 @@ GraphRestoreStatus fail_restore(GraphRestoreControl &control) noexcept {
 }
 
 RuntimeContext *initialize_restored_runtime(
-    const GraphRestoreView &view, const RuntimeArenaLayout &layout, uint64_t sm_bytes
+    const GraphRestoreView &view, const RuntimeArenaLayout &layout, uint64_t sm_bytes, bool reuse_mailbox = false
 ) noexcept {
     const auto &working = view.slot.destinations[1];
     DeviceArena arena;
@@ -80,7 +80,12 @@ RuntimeContext *initialize_restored_runtime(
         !runtime->scheduler->init_data_from_layout(layout.sched, arena, sm))
         return nullptr;
     runtime->scheduler->seed_queue_slots();
-    runtime->aicore_mailbox->init_empty();
+    if (reuse_mailbox) {
+        auto &mailbox = *runtime->aicore_mailbox;
+        mailbox.tail.store(mailbox.head.load(std::memory_order_acquire), std::memory_order_release);
+    } else {
+        runtime->aicore_mailbox->init_empty();
+    }
     return runtime;
 }
 
@@ -173,7 +178,10 @@ GraphRestoreStatus attach_prepared_graph_image(
     auto &control = registry->restore;
     const auto claimed = claim_restore(control);
     if (claimed != GraphRestoreStatus::Ok) return claimed;
-    auto *runtime = initialize_restored_runtime(view, layout, sm_bytes);
+    const bool reuse_mailbox = control.committed_generation != 0 &&
+                               control.committed_generation == control.attempt - 1 &&
+                               control.runtime_address == slot.destinations[1].address + layout.off_runtime;
+    auto *runtime = initialize_restored_runtime(view, layout, sm_bytes, reuse_mailbox);
     if (runtime == nullptr) return fail_restore(control);
     return finish_restore(view, runtime, sm_bytes, control, out, {});
 }
