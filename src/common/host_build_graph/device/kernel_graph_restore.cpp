@@ -64,7 +64,8 @@ bool relative_span(
 }
 
 bool validate_definition(
-    const std::byte *source, uint64_t capacity, uint64_t offset, const ChipTaskStorage &task
+    const std::byte *source, uint64_t capacity, uint64_t offset, int32_t boundary_count, int32_t boundary_scalar_count,
+    uint64_t begin, uint64_t end
 ) noexcept {
     if (offset < sizeof(GraphDefinitionHeader) || offset % GRAPH_DEFINITION_OBJECT_ALIGN != 0 ||
         !graph_span_fits(offset, sizeof(GraphDefinition), capacity))
@@ -74,8 +75,8 @@ bool validate_definition(
     if (framing.magic != GRAPH_DEFINITION_OBJECT_MAGIC || framing.definition_bytes != d.total_bytes ||
         framing.full_key != d.full_key || !graph_span_fits(offset, d.total_bytes, capacity) ||
         d.total_bytes < sizeof(d) || d.task_count <= 0 || d.task_count > MAX_IN_GRAPH_TASKS || d.edge_count < 0 ||
-        d.root_count <= 0 || d.root_count > d.task_count || d.boundary_count != task.payload.tensor_count ||
-        d.boundary_scalar_count != task.payload.scalar_count)
+        d.root_count <= 0 || d.root_count > d.task_count || d.boundary_count != boundary_count ||
+        d.boundary_scalar_count != boundary_scalar_count)
         return false;
     const auto section = [&](uint64_t off, int32_t count, uint64_t stride, uint64_t align) {
         return count >= 0 &&
@@ -113,8 +114,6 @@ bool validate_definition(
         if (!valid_kernel_graph_tensor(predicate.operand)) return false;
     }
     GraphExecutionStorageLayout storage{};
-    const auto begin = reinterpret_cast<uintptr_t>(task.task.packed_buffer_base);
-    const auto end = reinterpret_cast<uintptr_t>(task.task.packed_buffer_end);
     return graph_execution_storage_layout(d.task_count, d.tensor_arg_count, d.scalar_arg_count, &storage) &&
            storage.total_bytes == d.execution_storage_bytes && end >= begin &&
            graph_span_fits(d.required_heap, storage.total_bytes, end - begin) &&
@@ -157,35 +156,39 @@ bool validate_images(const GraphRestoreView &view, RuntimeArenaLayout &layout, u
     const uint64_t definition_source = view.regions[2].source_offset;
     for (uint32_t i = 0; i < h.total_tasks; ++i) {
         const uint64_t storage_offset = offsets.storage + i * sizeof(ChipTaskStorage);
-        ChipTaskStorage task{};
-        std::memcpy(static_cast<void *>(&task), sm + storage_offset, sizeof(task));
-        if (task.task.task_id.raw != TaskId::make_global(i).raw ||
-            (task.slot.task_kind != TaskKind::GRAPH && task.slot.task_kind != TaskKind::DUMMY &&
-             task.slot.task_kind != TaskKind::KERNEL))
+        const auto *descriptor = sm + storage_offset + offsetof(ChipTaskStorage, task);
+        const auto *slot = sm + storage_offset + offsetof(ChipTaskStorage, slot);
+        const auto task_id = read_value<TaskId>(descriptor + offsetof(TaskDescriptor, task_id));
+        const auto task_kind = read_value<TaskKind>(slot + offsetof(ChipTaskSlotState, task_kind));
+        if (task_id.raw != TaskId::make_global(i).raw ||
+            (task_kind != TaskKind::GRAPH && task_kind != TaskKind::DUMMY && task_kind != TaskKind::KERNEL))
             return false;
-        const bool graph = task.slot.task_kind == TaskKind::GRAPH;
-        const auto &p = task.payload;
-        if (p.tensor_count < 0 || p.tensor_count > (graph ? GRAPH_MAX_TENSOR_ARGS : MAX_TENSOR_ARGS) ||
-            p.scalar_count < 0 || p.scalar_count > (graph ? GRAPH_MAX_SCALAR_ARGS : MAX_SCALAR_ARGS) ||
-            p.fanin_count < 0 || p.fanin_count > CHIP_MAX_FANIN)
-            return false;
+        const bool graph = task_kind == TaskKind::GRAPH;
         const uint64_t payload_offset = storage_offset + offsetof(ChipTaskStorage, payload);
+        const auto *payload = sm + payload_offset;
+        const auto tensor_count = read_value<int32_t>(payload + offsetof(TaskPayload, tensor_count));
+        const auto scalar_count = read_value<int32_t>(payload + offsetof(TaskPayload, scalar_count));
+        const auto fanin_count = read_value<int32_t>(payload + offsetof(TaskPayload, fanin_count));
+        if (tensor_count < 0 || tensor_count > (graph ? GRAPH_MAX_TENSOR_ARGS : MAX_TENSOR_ARGS) || scalar_count < 0 ||
+            scalar_count > (graph ? GRAPH_MAX_SCALAR_ARGS : MAX_SCALAR_ARGS) || fanin_count < 0 ||
+            fanin_count > CHIP_MAX_FANIN)
+            return false;
         uint64_t tensors = 0, scalars = 0, fanin = 0;
         if (!relative_span(
-                sm, payload_offset + offsetof(TaskPayload, tensors), p.tensor_count,
+                sm, payload_offset + offsetof(TaskPayload, tensors), tensor_count,
                 graph ? sizeof(GraphTensor) : sizeof(simpler::hbg::Tensor),
                 graph ? alignof(GraphTensor) : alignof(simpler::hbg::Tensor), offsets.fanin_pool, sm_bytes, tensors
             ) ||
             !relative_span(
-                sm, payload_offset + offsetof(TaskPayload, scalars), p.scalar_count, sizeof(uint64_t),
-                alignof(uint64_t), offsets.fanin_pool, sm_bytes, scalars
+                sm, payload_offset + offsetof(TaskPayload, scalars), scalar_count, sizeof(uint64_t), alignof(uint64_t),
+                offsets.fanin_pool, sm_bytes, scalars
             ) ||
             !relative_span(
-                sm, payload_offset + offsetof(TaskPayload, fanin), p.fanin_count, sizeof(int32_t), alignof(int32_t),
+                sm, payload_offset + offsetof(TaskPayload, fanin), fanin_count, sizeof(int32_t), alignof(int32_t),
                 offsets.fanin_pool, sm_bytes, fanin
             ))
             return false;
-        for (int32_t j = 0; j < p.tensor_count; ++j) {
+        for (int32_t j = 0; j < tensor_count; ++j) {
             if (graph) {
                 if (!valid_restored_kernel_graph_tensor(
                         read_value<GraphTensor>(sm + tensors + j * sizeof(GraphTensor)), heap.address, h.heap_bytes
@@ -198,20 +201,24 @@ bool validate_images(const GraphRestoreView &view, RuntimeArenaLayout &layout, u
                 return false;
             }
         }
-        for (int32_t j = 0; j < p.fanin_count; ++j) {
+        for (int32_t j = 0; j < fanin_count; ++j) {
             const int32_t dep = read_value<int32_t>(sm + fanin + j * sizeof(int32_t));
             if (dep < 0 || static_cast<uint32_t>(dep) >= i) return false;
         }
-        const uint64_t begin = reinterpret_cast<uintptr_t>(task.task.packed_buffer_base);
-        const uint64_t end = reinterpret_cast<uintptr_t>(task.task.packed_buffer_end);
+        const uint64_t begin =
+            reinterpret_cast<uintptr_t>(read_value<void *>(descriptor + offsetof(TaskDescriptor, packed_buffer_base)));
+        const uint64_t end =
+            reinterpret_cast<uintptr_t>(read_value<void *>(descriptor + offsetof(TaskDescriptor, packed_buffer_end)));
         if ((begin != 0 || end != 0) &&
             (begin < heap.address || end < begin || !graph_span_fits(begin - heap.address, end - begin, h.heap_bytes)))
             return false;
-        const uint64_t definition = reinterpret_cast<uintptr_t>(task.slot.graph_context);
+        const uint64_t definition =
+            reinterpret_cast<uintptr_t>(read_value<void *>(slot + offsetof(ChipTaskSlotState, graph_context)));
         if (graph) {
             if (definition < definitions.address ||
                 !validate_definition(
-                    view.payload + definition_source, view.regions[2].bytes, definition - definitions.address, task
+                    view.payload + definition_source, view.regions[2].bytes, definition - definitions.address,
+                    tensor_count, scalar_count, begin, end
                 ))
                 return false;
         } else if (definition != 0) return false;
