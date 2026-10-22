@@ -5,7 +5,7 @@ deferred completion under the `tensormap_and_ringbuffer` runtime.
 
 | Test | Platforms | Contract under test |
 | ---- | --------- | ------------------- |
-| [`test_unified_domain.py`](test_unified_domain.py) | a2a3sim, a5sim, a2a3, a5 | Explicit domain lookup in each run and deferred release after submitted work completes. |
+| [`test_unified_domain.py`](test_unified_domain.py) | L3: a2a3sim, a5sim, a2a3, a5; L4: a2a3sim, a5sim | Explicit L3 lookup and exact L4 reuse across runs, with deferred release until the submitted chip kernel completes. |
 | [`async_notify/`](async_notify/) | a2a3, a5 | A notification-counter producer releases its dependent consumers only after deferred completion. |
 | [`deferred_notify/`](deferred_notify/) | a2a3, a2a3sim, a5sim | A peer notification publishes the remote rank's mailbox contents before the consumer reads them. |
 

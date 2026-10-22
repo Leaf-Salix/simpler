@@ -71,3 +71,68 @@ def test_retained_domain_reaches_chip_in_second_run(st_platform, st_device_ids):
         assert struct.unpack_from(f"<{_NUMEL}f", output.shm.buf) == (70.0,) * _NUMEL
     finally:
         worker.close()
+
+
+@pytest.mark.platforms(["a2a3sim", "a5sim"])
+@pytest.mark.runtime(_RUNTIME)
+@pytest.mark.device_count(1)
+def test_l4_reuse_keeps_domain_until_child_kernel_completes(st_platform, st_device_ids):
+    worker = Worker(level=4, num_sub_workers=0)
+    try:
+        child = Worker(
+            level=3,
+            platform=st_platform,
+            runtime=_RUNTIME,
+            device_ids=[int(st_device_ids[0])],
+            num_sub_workers=0,
+            comm_profile="sim",
+        )
+        callable_obj = build_chip_callable(st_platform)
+        chip = child.register(callable_obj)
+        node = worker.add_worker(child)
+        worker.register(callable_obj)
+
+        def forward(orch, args, cfg):
+            payload = orch.get_global_domain(int(args.scalar(0)))[0].buffers["payload"]
+            chip_args = TaskArgs()
+            chip_args.add_tensor(payload.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.INPUT)
+            chip_args.add_tensor(payload.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.INPUT)
+            chip_args.add_tensor(args.tensor(0), TensorArgType.OUTPUT_EXISTING)
+            orch.submit_next_level(chip, chip_args, cfg, worker=0)
+
+        forward_handle = worker.register(forward)
+        request = dict(
+            name="tp",
+            members=[(node, 0)],
+            window_size=_NBYTES,
+            buffers=[CommBufferSpec("payload", "float32", _NUMEL, _NBYTES)],
+            retain_after_run=True,
+        )
+        saved = []
+        worker.init()
+        output = worker.create_buffer(_NBYTES)
+
+        def first(orch, _args, _cfg):
+            domain = orch.get_or_allocate_domain(**request)
+            orch.copy_to_domain(domain, 0, struct.pack(f"<{_NUMEL}f", *([35.0] * _NUMEL)), buffer="payload")
+            saved.append(domain)
+
+        worker.run(first)
+        allocation_count = worker._next_alloc_id
+        assert not saved[0].released and not saved[0].freed
+
+        def second(orch, _args, cfg):
+            domain = orch.get_or_allocate_domain(**request)
+            assert domain is saved[0] and worker._next_alloc_id == allocation_count
+            args = TaskArgs()
+            args.add_tensor(output.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+            args.add_scalar(domain.domain_id)
+            orch.submit_next_level(forward_handle, args, cfg, worker=node)
+            domain.release()
+            assert domain.released and not domain.freed
+
+        worker.run(second)
+        assert saved[0].freed and worker.live_domains == {}
+        assert struct.unpack_from(f"<{_NUMEL}f", output.shm.buf) == (70.0,) * _NUMEL
+    finally:
+        worker.close()
