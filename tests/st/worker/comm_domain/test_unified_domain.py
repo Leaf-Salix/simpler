@@ -13,7 +13,7 @@ from __future__ import annotations
 import struct
 
 import pytest
-from simpler.task_interface import CommBufferSpec, DataType, TaskArgs, TensorArgType
+from simpler.task_interface import CommBufferSpec, CommDomainRef, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
 from examples.workers.l3.multi_chip_dispatch.main import N_COLS, N_ROWS, build_chip_callable
@@ -54,7 +54,7 @@ def test_retained_domain_reaches_chip_in_second_run(st_platform, st_device_ids):
         def second(orch, _args, cfg):
             domain = orch.get_domain("tp")
             assert domain is saved[0]
-            payload = domain.local_context(0).buffers["payload"]
+            payload = domain.member(0).buffers["payload"]
             args = TaskArgs()
             args.add_tensor(payload.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.INPUT)
             args.add_tensor(payload.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.INPUT)
@@ -93,11 +93,19 @@ def test_l4_reuse_keeps_domain_until_child_kernel_completes(st_platform, st_devi
         worker.register(callable_obj)
 
         def forward(orch, args, cfg):
-            payload = orch.get_global_domain(int(args.scalar(0)))[0].buffers["payload"]
+            domain = orch.get_domain(CommDomainRef.from_tensor(args.tensor(0)))
+            assert domain.borrowed
+            payload = domain.member(0).buffers["payload"]
+            assert payload.identity == args.tensor(0).buffer.identity
+            assert orch.copy_from_domain(domain, 0, 4, buffer="payload") == struct.pack("<f", 35.0)
+            with pytest.raises(RuntimeError, match="borrowed"):
+                domain.release()
+            with pytest.raises(RuntimeError, match="borrowed"):
+                domain.__enter__()
             chip_args = TaskArgs()
+            chip_args.add_tensor(args.tensor(0), TensorArgType.INPUT)
             chip_args.add_tensor(payload.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.INPUT)
-            chip_args.add_tensor(payload.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.INPUT)
-            chip_args.add_tensor(args.tensor(0), TensorArgType.OUTPUT_EXISTING)
+            chip_args.add_tensor(args.tensor(1), TensorArgType.OUTPUT_EXISTING)
             orch.submit_next_level(chip, chip_args, cfg, worker=0)
 
         forward_handle = worker.register(forward)
@@ -125,8 +133,8 @@ def test_l4_reuse_keeps_domain_until_child_kernel_completes(st_platform, st_devi
             domain = orch.get_or_allocate_domain(**request)
             assert domain is saved[0] and worker._next_alloc_id == allocation_count
             args = TaskArgs()
+            args.add_tensor(domain.member(0).buffers["payload"].tensor([_NUMEL], DataType.FLOAT32), TensorArgType.INPUT)
             args.add_tensor(output.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
-            args.add_scalar(domain.domain_id)
             orch.submit_next_level(forward_handle, args, cfg, worker=node)
             domain.release()
             assert domain.released and not domain.freed

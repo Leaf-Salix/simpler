@@ -169,7 +169,9 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | `submit_sub(callable_handle, args=None)` | Schedules a registered host-side Python callable |
 | `allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | L3/L4 creation returning `CommDomainHandle`; legacy L3 `workers=` and chip-id indexing remain supported |
 | `get_or_allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | Reuse the same live handle after full configuration validation, or create it |
-| `get_domain(name)` / `release_domain(handle)` | Creator-local lookup / deferred owning release |
+| `get_domain(name_or_ref)` / `release_domain(handle)` | Creator-local lookup or an already-granted L3 borrowed handle / deferred owning release |
+| `domain.member(rank).buffers[name].tensor(...)` | Common L3/L4 Buffer view; L4 descriptors forward to their exact L3/chip through ordinary TaskArgs |
+| `domain.ref` / `CommDomainRef.from_tensor(tensor)` | Immutable domain identity; does not authorize access or own the domain |
 | `copy_to_domain(handle, rank, data, ...)` / `copy_from_domain(handle, rank, nbytes, ...)` | Synchronous bounded staging before task submission; L3 requires declared slices |
 | `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Delegates allocation to the owning Worker; target chip memory is named by the returned handle |
 

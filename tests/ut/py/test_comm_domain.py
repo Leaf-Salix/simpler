@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 import simpler.worker as worker_mod
 from simpler.orchestrator import _callback_run
-from simpler.task_interface import CommBufferSpec, CommDomainHandle, GlobalCommDomainHandle, TaskArgs
+from simpler.task_interface import CommBufferSpec, CommDomainHandle, DataType, GlobalCommDomainHandle, TaskArgs
 from simpler.worker import Worker
 
 
@@ -68,6 +68,18 @@ def test_reuse_snapshot_data_and_second_run_release(domain_worker):
         assert type(handle) is CommDomainHandle is GlobalCommDomainHandle
         assert orch.get_or_allocate_domain(**request) is handle
         assert orch.get_domain("tp") is handle
+        assert orch.get_domain(handle.ref) is handle and not handle.borrowed
+        payload = handle.member(0).buffers["payload"]
+        assert payload.tensor([8], DataType.UINT8).buffer.identity == payload.identity
+        assert handle.buffers[0].dtype == "uint8" and handle.buffers[0].count == 32
+        assert handle.requested_window_size == 4096
+        args = TaskArgs()
+        args.add_tensor(payload.tensor([8], DataType.UINT8))
+        target = members[0] if worker.level == 3 else members[0][0]
+        with worker._child_prov_lock:
+            worker._child_prov_check_dispatch_locked(args, target, api="test")
+            with pytest.raises(ValueError, match="wrong worker|stale"):
+                worker._child_prov_check_dispatch_locked(args, 999, api="test")
         assert handle.member(0).local_worker_id == 1
         assert [handle.member(rank).global_device_rank for rank in range(2)] == [20, 10]
         orch.copy_to_domain(handle, 0, b"retained", buffer="payload", offset=3)
@@ -450,3 +462,164 @@ def test_accepted_callback_can_release_while_close_drains(domain_worker):
     assert not runner.is_alive() and not observer.is_alive()
     assert not errors
     assert saved[0].freed
+
+
+def test_domain_slice_grant_preserves_identity_views_and_rejects_stale_materialization(monkeypatch):
+    from dataclasses import replace  # noqa: PLC0415
+    from multiprocessing.shared_memory import SharedMemory  # noqa: PLC0415
+
+    from simpler.buffer import ImportContext, ImportRegistry, re_export  # noqa: PLC0415
+    from simpler.comm_domain import CommDomainRef, domain_buffers  # noqa: PLC0415
+    from simpler.comm_endpoints import DEVICE_AICPU  # noqa: PLC0415
+    from simpler.global_comm_domain import (  # noqa: PLC0415
+        GlobalDomainBuffer,
+        GlobalDomainCommand,
+        GlobalDomainMember,
+        GlobalDomainPhase,
+        decode_domain_command,
+        encode_domain_command,
+    )
+    from simpler.task_interface import _materialize_chip_task_args  # noqa: PLC0415
+
+    command = GlobalDomainCommand(
+        phase=GlobalDomainPhase.PREPARE_EXPORT,
+        domain_id=7,
+        generation=3,
+        name="tp",
+        profile="sim",
+        window_size=4096,
+        members=(GlobalDomainMember(2, 0, 10, 0),),
+        buffers=(GlobalDomainBuffer("prefix", 16, "uint8", 16), GlobalDomainBuffer("payload", 32, "float32", 8)),
+        owner_instance_id=b"creator1",
+        buffer_ids=(40, 41),
+    )
+    received = decode_domain_command(encode_domain_command(command))
+    assert received == command
+    logical = domain_buffers(command, 0)["payload"]
+    granted = domain_buffers(received, 0, base=4096)["payload"]
+    assert logical.to_descriptor() == granted.to_descriptor()
+    first = logical.tensor([2], DataType.FLOAT32, byte_offset=4)
+    second = logical.tensor([2], DataType.FLOAT32, byte_offset=12)
+    assert first.buffer.identity == second.buffer.identity == granted.identity
+    assert CommDomainRef.from_tensor(first) == CommDomainRef(b"creator1", 7, 3)
+    entry = worker_mod._L2GlobalDomain(
+        domain_id=7,
+        generation=3,
+        domain_rank=0,
+        rank_count=1,
+        descriptor=worker_mod.GlobalDomainDescriptor(worker_mod.GLOBAL_DOMAIN_VERSION, 1, 0, 1, 4096, b"test"),
+        local_window_base=4096,
+        mapping_size=4096,
+        requested_window_size=4096,
+        device_ctx=1,
+        buffers={granted.identity: granted},
+    )
+    store = worker_mod._L2GlobalDomainStore({7: entry})
+    registry = ImportRegistry(ImportContext(deployment=DEVICE_AICPU))
+    args = TaskArgs()
+    args.add_tensor(first)
+    args.add_tensor(second)
+    native = _materialize_chip_task_args(args, registry, store.resolve)
+    assert native.tensor(0).data == 4096 + 16 + 4
+    assert native.tensor(1).data == 4096 + 16 + 12
+    with pytest.raises(ValueError, match="grant"):
+        _materialize_chip_task_args(args, registry)
+    changed = re_export(first.buffer)
+    changed.nbytes += 1
+    with pytest.raises(ValueError, match="granted slice"):
+        store.resolve(changed.to_descriptor())
+    for field, value in (("generation", 4), ("domain_rank", 1), ("revoked", True)):
+        previous = getattr(entry, field)
+        setattr(entry, field, value)
+        with pytest.raises(ValueError, match="stale|another chip"):
+            _materialize_chip_task_args(args, registry, store.resolve)
+        setattr(entry, field, previous)
+    assert _materialize_chip_task_args(args, registry, store.resolve).tensor(0).data == 4116
+    for bad in (replace(command, owner_instance_id=b""), replace(command, buffer_ids=(40, 40))):
+        with pytest.raises(ValueError):
+            encode_domain_command(bad)
+
+    class Chip:
+        fail = True
+
+        def comm_global_domain_release(self, _domain_id):
+            if self.fail:
+                raise RuntimeError("release failed")
+
+    def release_payload(_buf):
+        size = worker_mod.LOCAL_RELEASE_REQUEST.size
+        shm = SharedMemory(create=True, size=size)
+        shm.unlink()
+        payload = shm.buf
+        assert payload is not None
+        worker_mod.LOCAL_RELEASE_REQUEST.pack_into(
+            payload, 0, worker_mod.LOCAL_DOMAIN_MAGIC, worker_mod.GLOBAL_DOMAIN_VERSION, 7, 3
+        )
+        return shm, payload, size
+
+    monkeypatch.setattr(worker_mod, "_open_global_domain_payload", release_payload)
+    chip = Chip()
+    with pytest.raises(RuntimeError, match="release failed"):
+        worker_mod._handle_ctrl_global_domain_release(chip, memoryview(bytearray()), store)
+    assert store.domains[7] is entry and entry.revoked
+    with pytest.raises(ValueError, match="stale"):
+        _materialize_chip_task_args(args, registry, store.resolve)
+    chip.fail = False
+    worker_mod._handle_ctrl_global_domain_release(chip, memoryview(bytearray()), store)
+    assert store.domains == {}
+    with pytest.raises(ValueError, match="stale"):
+        _materialize_chip_task_args(args, registry, store.resolve)
+
+
+@pytest.mark.parametrize("domain_worker", [4], indirect=True)
+def test_l4_release_and_rebuild_revoke_old_tensor_and_reference(domain_worker):
+    worker, members = domain_worker
+    saved = []
+
+    def build(orch, _args, _cfg):
+        old = orch.allocate_domain(**_request(members))
+        ref = old.ref
+        payload = old.member(0).buffers["payload"]
+        args = TaskArgs()
+        args.add_tensor(payload.tensor([8], DataType.UINT8))
+        old.release()
+        with worker._child_prov_lock, pytest.raises(ValueError, match="stale"):
+            worker._child_prov_check_dispatch_locked(args, members[0][0], api="test")
+        new = orch.allocate_domain(**_request(members))
+        assert new.ref != ref and new.member(0).buffers["payload"].identity != payload.identity
+        with pytest.raises(KeyError):
+            orch.get_domain(ref)
+        with worker._child_prov_lock, pytest.raises(ValueError, match="stale"):
+            worker._child_prov_check_dispatch_locked(args, members[0][0], api="test")
+        saved.extend((old, new))
+
+    worker.run(build)
+    assert saved[0].freed and not saved[1].freed
+
+    def finish(orch, _args, _cfg):
+        current = orch.get_domain("tp")
+        args = TaskArgs()
+        args.add_tensor(current.member(0).buffers["payload"].tensor([8], DataType.UINT8))
+        with worker._child_prov_lock:
+            worker._child_prov_check_dispatch_locked(args, members[0][0], api="test")
+        current.release()
+
+    worker.run(finish)
+    assert saved[1].freed
+
+
+def test_borrowed_local_context_does_not_alias_another_nodes_chip_id():
+    from simpler.global_comm_domain import GlobalDomainMember  # noqa: PLC0415
+    from simpler.task_interface import ChipDomainContext  # noqa: PLC0415
+
+    local = ChipDomainContext("tp", 0, 2, 1, 4096, 4096, {})
+    borrowed = CommDomainHandle(
+        name="tp",
+        members=(GlobalDomainMember(0, 0, 10, 0), GlobalDomainMember(1, 0, 20, 1)),
+        contexts={0: local},
+        borrowed=True,
+        _release_fn=None,
+    )
+    assert borrowed.local_context(0) is local
+    with pytest.raises(KeyError, match="not mapped"):
+        borrowed.local_context(1)

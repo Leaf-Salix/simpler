@@ -127,6 +127,7 @@ from _task_interface import (
 )
 
 from .buffer import AccessMode, AddressSpace, Buffer, ImportContext, ImportRegistry, Tensor, TensorTransfer
+from .comm_domain import CommDomainRef
 from .comm_endpoints import DEVICE_AICPU
 
 
@@ -148,7 +149,7 @@ def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -
             raise ValueError(f"argument {i}: HOST/NONE Buffer grant does not cover callable direction {direction}")
 
 
-def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry) -> ChipStorageTaskArgs:
+def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry, domain_resolver=None) -> ChipStorageTaskArgs:
     """Resolve accepted argument descriptors into this process's chip-only POD.
 
     The caller owns submission/callable checks, backing retention and the registry's
@@ -157,7 +158,18 @@ def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry) -> Chi
     """
     if not isinstance(args, TaskArgs):
         raise TypeError("chip argument materialization requires address-free TaskArgs")
-    resolved = registry.materialize_args(args)
+    from .buffer import BackendKind  # noqa: PLC0415
+
+    resolved = {}
+    for i in range(args.tensor_count()):
+        desc = args.tensor(i).buffer
+        if desc.backend_kind == BackendKind.DOMAIN_WINDOW:
+            if domain_resolver is None:
+                raise ValueError("communication domain has no grant at this endpoint")
+            resolved[desc.identity] = (domain_resolver(desc), int(AddressSpace.DEVICE))
+        else:
+            imported = registry.materialize(desc)
+            resolved[desc.identity] = (imported.base, int(imported.address_space))
     return _ti_module.materialize_task_args(args, resolved)
 
 
@@ -284,6 +296,8 @@ __all__ = [
     "CommBufferSpec",
     "ChipDomainContext",
     "CommDomainHandle",
+    "CommDomainRef",
+    "CommDomainMember",
     "GlobalCommDomainHandle",
     "GlobalCommDomainView",
 ]
@@ -1108,6 +1122,11 @@ class ChipDomainContext:
     buffers: dict[str, Buffer]
 
 
+@dataclass(frozen=True)
+class CommDomainMember(GlobalDomainMember):
+    buffers: dict[str, Buffer]
+
+
 class CommDomainHandle:
     """User-facing handle for one dynamically-allocated CommDomain.
 
@@ -1155,6 +1174,10 @@ class CommDomainHandle:
         "retain_after_run",
         "attachments",
         "_config",
+        "_ref",
+        "_borrowed",
+        "_member_buffers",
+        "_requested_window_size",
     )
 
     def __init__(  # noqa: PLR0913 -- preserve the L3 and legacy L4 constructor keywords
@@ -1174,6 +1197,10 @@ class CommDomainHandle:
         attachments: tuple[GlobalDomainAttachment, ...] = (),
         _domain_size: int | None = None,
         _domain_ranks: dict[int, int] | None = None,
+        ref: CommDomainRef | None = None,
+        borrowed: bool = False,
+        member_buffers: dict[int, dict[str, Buffer]] | None = None,
+        requested_window_size: int | None = None,
     ) -> None:
         self.name = name
         self.workers = tuple(workers)
@@ -1194,6 +1221,10 @@ class CommDomainHandle:
         self._config = None
         self._released = False
         self._freed = False
+        self._ref = ref
+        self._borrowed = bool(borrowed)
+        self._member_buffers = dict(member_buffers or {})
+        self._requested_window_size = self.mapping_size if requested_window_size is None else int(requested_window_size)
 
     def __getitem__(self, chip_idx: int) -> ChipDomainContext:
         self._require_live()
@@ -1203,18 +1234,43 @@ class CommDomainHandle:
         if self._released:
             raise RuntimeError(f"CommDomainHandle({self.name!r}) is already released")
 
-    def member(self, domain_rank: int) -> GlobalDomainMember:
-        """Return rank-ordered topology metadata, without a remote device address."""
+    def member(self, domain_rank: int) -> CommDomainMember:
+        """Return a member's topology and ordinary Buffers, indexed by domain rank."""
         self._require_live()
         rank = int(domain_rank)
         if rank < 0 or rank >= len(self.members):
             raise IndexError(f"domain rank {rank} is out of range")
-        return self.members[rank]
+        member = self.members[rank]
+        buffers = self._member_buffers.get(rank)
+        if buffers is None:
+            context = self.contexts.get(member.local_worker_id)
+            buffers = context.buffers if context is not None and context.domain_rank == rank else {}
+        return CommDomainMember(
+            member.node_worker_id, member.local_worker_id, member.global_device_rank, member.domain_rank, buffers
+        )
 
     def local_context(self, domain_rank: int) -> ChipDomainContext:
         """Return this creator's local chip mapping; L4 creators hold no such mappings."""
         member = self.member(domain_rank)
-        return self[member.local_worker_id]
+        context = self[member.local_worker_id]
+        if context.domain_rank != member.domain_rank:
+            raise KeyError(f"domain rank {domain_rank} is not mapped on this node")
+        return context
+
+    @property
+    def ref(self) -> CommDomainRef:
+        self._require_live()
+        if self._ref is None:
+            raise RuntimeError("domain has no exported reference")
+        return self._ref
+
+    @property
+    def borrowed(self) -> bool:
+        return self._borrowed
+
+    @property
+    def requested_window_size(self) -> int:
+        return self._config.window_size if self._config is not None else self._requested_window_size
 
     def buffer_range(self, name: str) -> tuple[int, int]:
         self._require_live()
@@ -1259,12 +1315,16 @@ class CommDomainHandle:
         a no-op, and the orch function must not pass it to further
         ``submit_*`` calls.
         """
+        if self._borrowed:
+            raise RuntimeError("borrowed communication domain cannot be released")
         if self._released:
             return
         self._released = True
         self._release_fn(self)
 
     def __enter__(self) -> CommDomainHandle:
+        if self._borrowed:
+            raise RuntimeError("borrowed communication domain cannot enter a releasing context")
         self._require_live()
         return self
 
@@ -1281,7 +1341,7 @@ class CommDomainHandle:
         return f"CommDomainHandle(name={self.name!r}, workers={self.workers}, {state})"
 
 
-# The legacy L4 spelling denotes the same owning handle type.
+# The legacy L4 spelling denotes the same public handle type.
 GlobalCommDomainHandle = CommDomainHandle
 
 

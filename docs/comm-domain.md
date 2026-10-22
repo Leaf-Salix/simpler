@@ -54,8 +54,9 @@ domain = orch.get_or_allocate_domain(
     buffers=[CommBufferSpec("payload", "float32", 1024, 4096)],
     retain_after_run=True,
 )
-# L3 only: keep the existing node-local Buffer/Tensor access path.
-payload = domain.local_context(0).buffers["payload"]
+# The same Buffer/Tensor access works in L3 and L4.
+payload = domain.member(0).buffers["payload"]
+tensor = payload.tensor([1024], DataType.FLOAT32)
 ```
 
 `allocate_domain` rejects a live name. `get_or_allocate_domain` returns the
@@ -98,13 +99,40 @@ L4 retains the existing bounded whole-window copy path. `buffer_range(name)`
 returns the slice's window offset and byte size. `mapping_size` is the requested
 extent on the local L3 backend and the returned mapping extent on L4.
 
-This interface does not add transparent L4-created Tensor forwarding or a
-cross-session domain reference. L4 handles expose layout and topology, while
-receiving L3 code continues to call `get_global_domain(domain_id)` and obtains
-its existing local Buffer objects there. No device pointer from another node
-is exposed. Completion/error handling and native teardown keep the existing
-backend protocols; this interface adds no new proof of device quiescence for
-an ambiguous native failure.
+`member(rank).buffers[name]` returns an ordinary public `Buffer` in both layers.
+L4 Buffers carry an address-free `DOMAIN_WINDOW` descriptor: creator incarnation,
+domain id/generation, rank and declared slice. Pass their Tensors through the
+existing `TaskArgs` to the member's L3, then to its exact chip. Local and TCP/MPI
+forwarding preserve the creator's canonical identity, view offset and geometry;
+the receiving node and chip resolve only an existing committed slice grant.
+Wrong targets, stale identities and modified descriptors are refused. Ordinary
+Tensor arguments name their own chip's storage; peer-window access still uses
+`CommContext`. Tensor construction performs no network copy or implicit H2D.
+
+`domain.ref` is an immutable `CommDomainRef`, not a release callback or an access
+grant. A receiving L3 can use `orch.get_domain(ref)` to obtain the same public
+handle type in borrowed mode; `CommDomainRef.from_tensor(tensor)` extracts the
+reference from an incoming L4 domain Tensor. Borrowed `release()` and `with`
+are refused. `local_context(rank)` is available only for ranks actually mapped
+on this node. Legacy `get_global_domain(domain_id)` remains session-local.
+`handle.buffers` contains complete buffer definitions, and
+`requested_window_size` distinguishes the request from `mapping_size`.
+The L3 backend does not report a rounded physical extent; its `mapping_size`
+continues to record the requested size.
+
+The creator must still explicitly obtain the domain in every consuming run.
+The existing root run fence protects its accepted descendants; holding a
+descriptor or borrowed handle alone adds no retention. Logical release revokes
+new owning L4 Tensor submissions while previously accepted descendants keep
+their node grants until the fence. Pure references passed as scalars or closure
+values remain subject to the caller's no-new-use-after-release convention;
+they do not introduce arbitrary independent child runs or a global close
+notification protocol. L3's legacy cached-Buffer convention is unchanged.
+Graph/replay retention, general Remote COPY/lease and mapping semantics remain
+separate work under #2460. No new proof of device quiescence is added for an
+ambiguous native failure. #2120 remains a follow-up compatibility integration:
+its detach API must share the same Worker retention, use enrollment and cleanup
+authority rather than create a second persistent-domain registry.
 
 ### `ChipDomainContext` (one per participating chip, via `handle[chip_idx]`)
 
@@ -115,8 +143,8 @@ an ambiguous native failure.
 | `domain_size` | number of ranks in the subset |
 | `device_ctx` | pointer to the device-side `CommContext` (pass as a kernel scalar) |
 | `local_window_base` | base device address of this rank's window |
-| `actual_window_size` | window size actually allocated |
-| `buffers` | `{buffer_name: Buffer}` for each `CommBufferSpec` (device `VMM_WINDOW`, owned by this chip) |
+| `actual_window_size` | imported backend extent; the L3-local backend records the requested extent |
+| `buffers` | `{buffer_name: Buffer}` for each `CommBufferSpec`, resolved on this chip; L3-local VMM or imported logical domain slice |
 
 Kernels read peer windows through `device_ctx` (which holds every rank's
 window base, local + imported peer); `buffers[name]` is the local slice —
