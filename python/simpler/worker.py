@@ -434,6 +434,8 @@ _SHUTDOWN_REQUESTED = 1
 # `schema` sits at offset 0 of the record and is released last, so a reader
 # that acquire-loads _TEARDOWN_REPORT_SCHEMA has the whole record.
 _OFF_TEARDOWN_REPORT = _OFF_SHUTDOWN - SIMPLER_TEARDOWN_REPORT_BYTES - 8
+# Success-only receipt in the reserved gap, independent of optional diagnostics.
+_OFF_CHIP_FINALIZED = _OFF_SHUTDOWN - 4
 _MAILBOX_ARGS_CAPACITY = _OFF_TEARDOWN_REPORT - _OFF_TASK_ARGS_BLOB
 _OFF_CONTROL_CALLABLE_HASH = _OFF_ARGS + 32
 # MAILBOX_OFF_ERROR_MSG / MAILBOX_ERROR_MSG_SIZE come from the C++
@@ -3314,6 +3316,13 @@ def _provider_sweep_debt_errors(results: tuple[ProviderReleaseResult, ...]) -> l
     return errors
 
 
+def _record_chip_teardown_completion(shm: SharedMemory, child_pid: int, finalized: set[int] | None) -> None:
+    if finalized is not None:
+        buf = shm.buf
+        if buf is not None and _mailbox_load_i32(_buffer_field_addr(buf, _OFF_CHIP_FINALIZED)) == 1:
+            finalized.add(child_pid)
+
+
 def _read_teardown_report(shm: SharedMemory, child_pid: int) -> TeardownReport:
     """Copy one reaped child's teardown record out of its mailbox.
 
@@ -3345,6 +3354,7 @@ def _finalize_chip_worker_and_publish(buf: memoryview, cw: _ChipWorker) -> None:
     """
     try:
         cw.finalize()
+        _mailbox_store_i32(_buffer_field_addr(buf, _OFF_CHIP_FINALIZED), 1)
     finally:
         _flush_host_log_or_warn("chip_process finalize")
         _publish_teardown_report(buf, cw)
@@ -4643,7 +4653,7 @@ def _child_worker_loop(
 
 
 def _journal_child_survivors(  # noqa: PLR0913 -- one (shms, pids) pair per child kind, plus the report sink
-    journal, sub_shms, sub_pids, chip_shms, chip_pids, next_shms, next_pids, reaped, reports=None
+    journal, sub_shms, sub_pids, chip_shms, chip_pids, next_shms, next_pids, reaped, reports=None, finalized=None
 ):
     """Register unreaped child processes and their paired shms in the cleanup
     journal so a subsequent close() can retry.
@@ -4679,6 +4689,8 @@ def _journal_child_survivors(  # noqa: PLR0913 -- one (shms, pids) pair per chil
                         wpid = 0
                     if wpid == 0:
                         raise RuntimeError(f"child {_kind} pid {_pid} still alive; shm not freed")
+                    if _kind == "chip":
+                        _record_chip_teardown_completion(_shm, _pid, finalized)
                     # Reaped, so nothing can still be writing the record, and
                     # the shm is about to go. Read once: a journal retry after
                     # a close failure must not replace what the first read
@@ -5781,6 +5793,7 @@ class Worker:
         # keyed by that child's pid. Absent means the child never reaped, which
         # is a different answer from an uncommitted record.
         self._teardown_reports: dict[int, TeardownReport] = {}
+        self._finalized_chip_pids: set[int] = set()
         self._sub_shms: list[SharedMemory] = []
         self._sub_pids: list[int] = []
 
@@ -10786,9 +10799,16 @@ class Worker:
             try:
                 self._free_domain_after_fence(handle)
             except BaseException:
-                self._cleanup_journal.add_once(
-                    "domain-release", str(handle.allocation_id), lambda: self._free_domain_after_fence(handle)
-                )
+                # A fatal run may have already closed the chip's control lane.
+                # Keep ownership until whole-tree teardown reclaims its windows.
+                chip_pids = tuple(self._chip_pids[chip] for chip in handle.workers)
+
+                def retire() -> None:
+                    if not chip_pids or not all(pid in self._finalized_chip_pids for pid in chip_pids):
+                        raise RuntimeError(f"domain {handle.name!r}: window reclamation is unconfirmed")
+                    handle._freed = True
+
+                self._cleanup_journal.add_once("domain-retirement", str(handle.allocation_id), retire)
                 raise
             # Retire only after exact-once backend success. An interruption
             # before this deletion leaves a replayable claim; an interruption
@@ -14379,6 +14399,7 @@ class Worker:
         deadline: float,
         report_pids: set[int] | None = None,
         reports: dict[int, TeardownReport] | None = None,
+        finalized: set[int] | None = None,
     ) -> None:
         """Reap + free every child across ALL groups within one shared deadline.
 
@@ -14445,8 +14466,10 @@ class Worker:
                     keep_shms.append(shms[i])
                     continue
                 try:
-                    if report_pids is not None and reports is not None and pids[i] in report_pids:
-                        reports[pids[i]] = _read_teardown_report(shms[i], pids[i])
+                    if report_pids is not None and pids[i] in report_pids:
+                        _record_chip_teardown_completion(shms[i], pids[i], finalized)
+                        if reports is not None:
+                            reports[pids[i]] = _read_teardown_report(shms[i], pids[i])
                     shms[i].close()
                     try:
                         shms[i].unlink()
@@ -14454,6 +14477,9 @@ class Worker:
                         pass
                 except BaseException as exc:  # noqa: BLE001
                     errors.append(exc)
+                    if finalized is not None and report_pids is not None and pids[i] in report_pids:
+                        # ECHILD permits retrying a reaped pid when receipt capture was interrupted.
+                        keep_pids.append(pids[i])
                     keep_shms.append(shms[i])  # shm survives; its pid is already gone
             pids[:] = keep_pids + pids[n:]
             shms[:] = keep_shms + shms[n:]
@@ -14534,7 +14560,9 @@ class Worker:
         try:
             # Only chip children run a device teardown, so only their mailboxes
             # carry a record to collect.
-            self._reap_child_groups(groups, deadline, set(self._chip_pids), self._teardown_reports)
+            self._reap_child_groups(
+                groups, deadline, set(self._chip_pids), self._teardown_reports, self._finalized_chip_pids
+            )
         except BaseException as exc:  # noqa: BLE001
             reap_error = exc
 
@@ -14551,6 +14579,7 @@ class Worker:
             self._next_level_pids,
             set(),
             self._teardown_reports,
+            self._finalized_chip_pids,
         )
         self._sub_pids.clear()
         self._chip_pids.clear()
@@ -14612,9 +14641,6 @@ class Worker:
         # Register the whole pre-transport ownership set before driving it. The
         # journal attempts every independent action and removes only successful
         # entries. Any survivor fences the transport teardown below.
-        domain_error = self._cleanup_journal.drive_kinds({"domain-release"})
-        if domain_error is not None:
-            errors.append(domain_error)
         pre_transport_keys: set[tuple[str, str]] = set()
         for kind, identity, cleanup in (
             ("region", "all region instances", self._sweep_region_instances),
@@ -14749,6 +14775,12 @@ class Worker:
 
         if errors:
             raise errors[0]
+
+        # Each chip's comm_destroy reclaims windows left by a failed release.
+        # Retire their ownership only after native teardown and all child/shm cleanup.
+        retirement_error = self._cleanup_journal.drive_kinds({"domain-retirement"})
+        if retirement_error is not None:
+            raise retirement_error
 
     def _teardown_ready_tree(self) -> None:
         self._teardown_worker_tree(startup_abort=False)
