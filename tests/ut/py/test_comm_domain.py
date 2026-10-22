@@ -860,6 +860,80 @@ def test_failed_pending_local_release_remains_worker_owned(domain_worker, monkey
     assert saved[0].freed
 
 
+@pytest.mark.parametrize("domain_worker", [3], indirect=True)
+@pytest.mark.parametrize(
+    "teardown_failure", [None, "_reclaim_child_groups", "_close_worker_chip_orch_comm", "journal", "proof"]
+)
+def test_cached_release_failure_waits_for_tree_teardown(domain_worker, monkeypatch, teardown_failure):
+    worker, members = domain_worker
+    saved, calls = [], []
+
+    def build(orch, _args, _cfg):
+        domain = orch.allocate_domain(**_request(members))
+        saved.append(domain)
+        domain.release()
+
+    def fail_release(domain):
+        calls.append(domain)
+        raise RuntimeError("backend release failed")
+
+    teardown = getattr(worker, teardown_failure) if teardown_failure not in (None, "journal", "proof") else lambda: None
+    interrupted = []
+    withheld_proofs = set()
+    record_completion = worker_mod._record_chip_teardown_completion
+
+    def withhold_completion(shm, pid, _finalized):
+        record_completion(shm, pid, withheld_proofs)
+
+    def fail_teardown(*args):
+        assert not domain.freed
+        if not interrupted:
+            interrupted.append(True)
+            raise RuntimeError("tree teardown failed")
+        return teardown(*args)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(worker, "_release_domain_claimed", fail_release)
+            with pytest.raises(RuntimeError, match="backend release failed"):
+                worker.run(build)
+            domain = saved[0]
+            assert domain.released and not domain.freed
+            assert isinstance(worker._domain_free_results[domain.allocation_id], RuntimeError)
+            if teardown_failure == "proof":
+                with monkeypatch.context() as teardown_patch:
+                    teardown_patch.setattr(worker_mod, "_record_chip_teardown_completion", withhold_completion)
+                    for _ in range(2):
+                        with pytest.raises(RuntimeError, match="reclamation is unconfirmed"):
+                            worker.close()
+                        assert not domain.freed and not worker._cleanup_journal.empty
+                assert not worker._chip_pids and not worker._chip_shms
+                worker._finalized_chip_pids.update(withheld_proofs)
+            elif teardown_failure is not None:
+                with monkeypatch.context() as teardown_patch:
+                    if teardown_failure == "journal":
+                        worker._cleanup_journal.add_once("shm", "interrupted mailbox", fail_teardown)
+                    else:
+                        teardown_patch.setattr(worker, teardown_failure, fail_teardown)
+                    with pytest.raises(RuntimeError, match="tree teardown failed"):
+                        worker.close()
+                assert not domain.freed and not worker._cleanup_journal.empty
+                if teardown_failure == "journal":
+                    assert not worker._chip_pids and not worker._chip_shms
+            worker.close()
+            assert domain.freed and worker._cleanup_journal.empty
+            assert worker._worker is None and not worker._chip_pids and not worker._chip_shms
+            domain.release()
+            assert calls == [domain]
+    finally:
+        # The injected release never reached a device. Allow test cleanup even
+        # when an assertion fails against an implementation without fallback.
+        if saved and not saved[0].freed:
+            worker._finalized_chip_pids.update(withheld_proofs)
+            worker._domain_free_results.pop(saved[0].allocation_id, None)
+            worker.close()
+
+
 @pytest.mark.parametrize("domain_worker", [4], indirect=True)
 def test_freed_global_domain_retires_duplicate_cleanup_debt(domain_worker, monkeypatch):
     worker, members = domain_worker
