@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import enum
 import struct
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
 
 from _task_interface import AddressSpace  # pyright: ignore[reportMissingImports]
 
@@ -41,6 +42,9 @@ from .comm_endpoints import (
 from .comm_endpoints import (
     _adapter_profile_id as _neutral_adapter_profile_id,
 )
+
+if TYPE_CHECKING:
+    from .buffer import Buffer
 
 #: Descriptor layout. Paired with ``COMM_GLOBAL_DOMAIN_VERSION`` in
 #: ``src/common/platform_comm/comm.h``: the platform backend stamps this number into every
@@ -93,6 +97,7 @@ class GlobalDomainMember:
     local_worker_id: int
     global_device_rank: int
     domain_rank: int
+    buffers: dict[str, Buffer] = field(default_factory=dict, compare=False, repr=False)
 
 
 @dataclass(frozen=True)

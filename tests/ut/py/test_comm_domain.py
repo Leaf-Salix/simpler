@@ -307,6 +307,26 @@ def test_nonretained_and_failed_retained_runs_are_closed(domain_worker):
     assert worker.live_domains == {}
 
 
+def test_reuse_after_submission_has_no_device_control(domain_worker):
+    from simpler.orchestrator import _admit_task_submission  # noqa: PLC0415
+
+    worker, members = domain_worker
+
+    def build(orch, _args, _cfg):
+        domain = orch.allocate_domain(**_request(members))
+        allocation_count = worker._next_alloc_id
+        _admit_task_submission(worker)
+        assert orch.get_or_allocate_domain(**_request(members)) is domain
+        assert worker._next_alloc_id == allocation_count
+        with pytest.raises(ValueError, match="configuration differs"):
+            orch.get_or_allocate_domain(**_request(members, window_size=8192))
+        if worker.level == 3:
+            with pytest.raises(RuntimeError, match="direct device control"):
+                orch.allocate_domain(**_request(members, name="new"))
+
+    worker.run(build)
+
+
 def test_legacy_entrypoints_share_reuse_and_release(domain_worker):
     worker, members = domain_worker
 
@@ -523,6 +543,8 @@ def test_domain_slice_grant_preserves_identity_views_and_rejects_stale_materiali
     native = _materialize_chip_task_args(args, registry, store.resolve)
     assert native.tensor(0).data == 4096 + 16 + 4
     assert native.tensor(1).data == 4096 + 16 + 12
+    with pytest.raises(ValueError, match="live grant"):
+        registry.require(granted.identity)
     with pytest.raises(ValueError, match="grant"):
         _materialize_chip_task_args(args, registry)
     changed = re_export(first.buffer)
@@ -570,6 +592,49 @@ def test_domain_slice_grant_preserves_identity_views_and_rejects_stale_materiali
     assert store.domains == {}
     with pytest.raises(ValueError, match="stale"):
         _materialize_chip_task_args(args, registry, store.resolve)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("separate", [False, True])
+@pytest.mark.parametrize("host_nbytes", [16, 32])
+def test_domain_and_host_descriptors_cannot_alias_identity(reverse, separate, host_nbytes):
+    from simpler.buffer import ImportContext, ImportRegistry, wrap_fork_inherited  # noqa: PLC0415
+    from simpler.comm_domain import domain_buffers  # noqa: PLC0415
+    from simpler.comm_endpoints import DEVICE_AICPU  # noqa: PLC0415
+    from simpler.task_interface import _materialize_chip_task_args  # noqa: PLC0415
+
+    command = worker_mod.GlobalDomainCommand(
+        phase=worker_mod.GlobalDomainPhase.PREPARE_EXPORT,
+        domain_id=7,
+        generation=1,
+        name="tp",
+        profile="sim",
+        window_size=4096,
+        members=(worker_mod.GlobalDomainMember(0, 0, 0, 0),),
+        buffers=(worker_mod.GlobalDomainBuffer("payload", 32),),
+        owner_instance_id=b"creator1",
+        buffer_ids=(1,),
+    )
+    domain = domain_buffers(command, 0)["payload"]
+    host = wrap_fork_inherited(8192, host_nbytes, b"creator1", 1)
+    ordered = (host, domain) if reverse else (domain, host)
+    registry = ImportRegistry(ImportContext(deployment=DEVICE_AICPU))
+
+    def materialize(buffers):
+        args = TaskArgs()
+        for buffer in buffers:
+            args.add_tensor(buffer.tensor([8], DataType.UINT8))
+        return _materialize_chip_task_args(args, registry, lambda _desc: 4096)
+
+    try:
+        if separate:
+            first = materialize(ordered[:1])
+            assert first.tensor(0).data == (8192 if reverse else 4096)
+        with pytest.raises(ValueError, match="different descriptor"):
+            materialize(ordered[1:] if separate else ordered)
+        assert materialize(ordered[:1]).tensor(0).data == (8192 if reverse else 4096)
+    finally:
+        registry.close()
 
 
 def test_release_and_rebuild_revoke_old_tensor_and_reference(domain_worker):
@@ -628,21 +693,19 @@ def test_borrowed_local_context_does_not_alias_another_nodes_chip_id():
 
 
 def test_interrupted_release_before_admission_preserves_live_handle():
+    import contextlib  # noqa: PLC0415
+
     calls = []
 
     def reject(_handle):
         raise KeyboardInterrupt("release not admitted")
 
-    domain = CommDomainHandle(name="not-admitted", _release_fn=reject, _release_fn_manages_state=True)
+    domain = CommDomainHandle(name="not-admitted", _release_fn=calls.append, _release_scope=reject)
     with pytest.raises(KeyboardInterrupt, match="not admitted"):
         domain.release()
     assert not domain.released and not domain.freed
 
-    def accept(handle):
-        handle._released = True
-        calls.append(handle)
-
-    domain._release_fn = accept
+    domain._release_scope = contextlib.nullcontext
     domain.release()
     domain.release()
     assert domain.released and calls == [domain]
@@ -706,7 +769,8 @@ def test_cached_tensor_release_inside_callback_orders_cleanup(domain_worker):
     assert domain.freed
 
 
-def test_interrupted_pending_publication_keeps_cleanup_owner(domain_worker, monkeypatch):
+@pytest.mark.parametrize("retained", [False, True])
+def test_interrupted_pending_publication_keeps_cleanup_owner(domain_worker, monkeypatch, retained):
     worker, members = domain_worker
     saved, freed = [], []
     backend = "_release_domain_claimed" if worker.level == 3 else "_release_global_domain_claimed"
@@ -722,9 +786,18 @@ def test_interrupted_pending_publication_keeps_cleanup_owner(domain_worker, monk
         def append(self, _handle):
             raise KeyboardInterrupt("pending publication")
 
+    if retained:
+        worker.run(lambda orch, _args, _cfg: saved.append(orch.allocate_domain(**_request(members))))
+
     def build(orch, _args, _cfg):
-        domain = orch.allocate_domain(**_request(members))
-        saved.append(domain)
+        if retained:
+            domain = saved[0]
+            args = TaskArgs()
+            args.add_tensor(domain.member(0).buffers["payload"].tensor([8], DataType.UINT8))
+            worker._record_touched_identities(args)
+        else:
+            domain = orch.allocate_domain(**_request(members))
+            saved.append(domain)
         resources = worker._building_run_resources
         queue = "pending_release_domains" if worker.level == 3 else "pending_release_global_domains"
         setattr(resources, queue, InterruptedQueue())
@@ -763,6 +836,28 @@ def test_interrupted_global_free_remains_close_owned(domain_worker, monkeypatch,
         assert worker._failed_global_domain_releases.get(domain.domain_id) is domain
     worker.close()
     assert domain.freed and worker._failed_global_domain_releases == {}
+
+
+@pytest.mark.parametrize("domain_worker", [3], indirect=True)
+def test_failed_pending_local_release_remains_worker_owned(domain_worker, monkeypatch):
+    worker, members = domain_worker
+    saved = []
+
+    def build(orch, _args, _cfg):
+        domain = orch.allocate_domain(**_request(members))
+        saved.append(domain)
+        domain.release()
+
+    def interrupt(_handle):
+        raise RuntimeError("pending free failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(worker, "_free_domain_after_fence", interrupt)
+        with pytest.raises(RuntimeError, match="pending free failed"):
+            worker.run(build)
+    assert saved[0].released and not saved[0].freed
+    worker.close()
+    assert saved[0].freed
 
 
 @pytest.mark.parametrize("domain_worker", [4], indirect=True)

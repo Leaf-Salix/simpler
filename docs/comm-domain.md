@@ -69,9 +69,9 @@ missing. `allocate_global_domain` and `release_global_domain` are compatibility
 wrappers; `workers=` remains the legacy L3 allocation spelling.
 
 Domain creation and configuration reuse occur in an orchestration callback.
-L3 creation, reuse and staging precede its first task submission and use the
-existing control admission gate. L4 retains its existing control-plane paths
-without adding a first-task restriction.
+L3 creation and staging precede its first task submission and use the existing
+control admission gate. Registry-only reuse performs no device control and remains
+available after task submission. L4 retains its existing control-plane paths.
 A successful run preserves domains created with `retain_after_run=True`.
 Ordinary Tensor submissions and synchronous Buffer copies register domain use
 in the current run, including cached Tensors from a previous run. Explicit lookup
