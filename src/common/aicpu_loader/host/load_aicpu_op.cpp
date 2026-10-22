@@ -18,7 +18,6 @@
 
 #include <cstddef>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -277,18 +276,14 @@ int LoadAicpuOp::Init(const std::vector<std::string> &extra_symbols) {
     kernel_symbols_ = {KernelNames::RunName, KernelNames::InitName};
     kernel_symbols_.insert(kernel_symbols_.end(), extra_symbols.begin(), extra_symbols.end());
 
-    // Each loader owns its descriptor; CANN requires the .json suffix.
-    char json_name_buf[] = "/tmp/simpler_inner_XXXXXX.json";
-    int fd = mkstemps(json_name_buf, 5);
-    if (fd < 0) {
-        LOG_ERROR("LoadAicpuOp::Init: cannot create temporary JSON");
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    close(fd);
+    // Per-process JSON path. /tmp is always writable.
+    char json_name_buf[128];
+    snprintf(
+        json_name_buf, sizeof(json_name_buf), "/tmp/simpler_inner_%016lx_%d.json", inner_fp_, static_cast<int>(getpid())
+    );
     json_file_path_ = json_name_buf;
 
     if (!GenerateAicpuOpJson(json_file_path_, inner_so_basename_)) {
-        std::remove(json_file_path_.c_str());
         json_file_path_.clear();
         return PTO_RUNTIME_ERR_INTERNAL;
     }

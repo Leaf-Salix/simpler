@@ -12,7 +12,6 @@
 #include <cstdint>
 #include <array>
 #include <cstdio>
-#include <string>
 #include <dlfcn.h>
 #include <unistd.h>
 
@@ -55,7 +54,6 @@ int watched_free_hits = 0;
 int unload_failures_left = 0;
 int unload_calls = 0;
 int func_lookup_failures_left = 0;
-thread_local std::string last_loader_json;
 // Independent of `guard_acl`, which refuses all six ACL/rt symbols at once and
 // exists to assert that kernel mode calls none of them. This one fails a
 // bounded number of resets and then lets the real call through, so a second
@@ -300,15 +298,6 @@ extern "C" void arm_unload_failures(int count) {
     unload_calls = 0;
 }
 extern "C" int unload_call_count() { return unload_calls; }
-
-extern "C" const char *last_loader_json_path() { return last_loader_json.c_str(); }
-
-extern "C" int rtsBinaryLoadFromFile(const char *path, const void *config, void **handle) {
-    last_loader_json = path;
-    return reinterpret_cast<int (*)(const char *, const void *, void **)>(dlsym(RTLD_NEXT, "rtsBinaryLoadFromFile"))(
-        path, config, handle
-    );
-}
 
 extern "C" int rtsBinaryUnload(const void *handle) {
     ++unload_calls;

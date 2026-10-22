@@ -28,9 +28,9 @@
  *      preinstall basename), then resolves runtime SO entry points such as
  *      `simpler_aicpu_exec`, `simpler_aicpu_init`, and
  *      `simpler_aicpu_register_callable` to `rtFuncHandle`s via
- *      `rtsFuncGetByName`. Each loader owns a unique temporary JSON file
- *      so concurrent multi-chip / multi-worker initialization does not
- *      overwrite another loader's descriptor.
+ *      `rtsFuncGetByName`. JSON is per-process
+ *      (`/tmp/simpler_inner_<fp>_<pid>.json`) so concurrent multi-chip /
+ *      multi-worker tests don't race on a shared file.
  *
  *   3. LaunchBuiltInOp (per-task): `rtsLaunchCpuKernel` on the cached
  *      `rtFuncHandle`. No per-launch string marshalling, no global op
