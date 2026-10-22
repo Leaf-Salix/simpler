@@ -98,24 +98,20 @@ uint64_t Fingerprint(const char *data, uint64_t len) {
 }
 
 // CANN resolves and removes this process-owned directory at session teardown.
-std::string MakeInnerSoDir() {
+std::string MakeInnerSoPath(uint64_t fp, uint64_t device_id) {
     aicpu::aicpuContext_t ctx{};
     if (aicpu::aicpuGetContext == nullptr || aicpu::GetUniqueVfId == nullptr ||
         aicpu::aicpuGetContext(&ctx) != aicpu::AICPU_ERROR_NONE || ctx.hostPid <= 0) {
         DispatcherLog("cannot determine CANN process SO directory");
         return {};
     }
-    return "/usr/lib64/aicpu_kernels/" + std::to_string(aicpu::GetUniqueVfId()) + "/aicpu_kernels_device/" +
-           std::to_string(ctx.hostPid) + "_" + std::to_string(ctx.deviceId);
-}
-
-std::string MakeInnerSoPath(const std::string &dir, uint64_t fp, uint64_t device_id) {
-    char name[96];
+    char buf[256];
     snprintf(
-        name, sizeof(name), "/simpler_process_%016llx_%llu.so", static_cast<unsigned long long>(fp),
+        buf, sizeof(buf), "/usr/lib64/aicpu_kernels/%u/aicpu_kernels_device/%d_%u/simpler_process_%016llx_%llu.so",
+        aicpu::GetUniqueVfId(), ctx.hostPid, ctx.deviceId, static_cast<unsigned long long>(fp),
         static_cast<unsigned long long>(device_id)
     );
-    return dir + name;
+    return buf;
 }
 
 // Atomic publication preserves any existing mapping during a repeated upload.
@@ -200,13 +196,13 @@ __attribute__((visibility("default"))) uint32_t DynTileFwkBackendKernelServerIni
     }
     const char *inner_bytes = reinterpret_cast<const char *>(d->inner_so_bin);
     uint64_t fp = simpler_dispatcher::Fingerprint(inner_bytes, d->inner_so_len);
-    const std::string dir = simpler_dispatcher::MakeInnerSoDir();
-    if (dir.empty()) return 1;
+    const std::string path = simpler_dispatcher::MakeInnerSoPath(fp, d->device_id);
+    if (path.empty()) return 1;
+    const std::string dir = path.substr(0, path.find_last_of('/'));
     if (mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) {
         simpler_dispatcher::DispatcherLog("mkdir %s failed: %s", dir.c_str(), strerror(errno));
         return 1;
     }
-    std::string path = simpler_dispatcher::MakeInnerSoPath(dir, fp, d->device_id);
     if (!simpler_dispatcher::WriteBytes(path, inner_bytes, d->inner_so_len)) {
         simpler_dispatcher::DispatcherLog("Init: stage %s failed: %s", path.c_str(), strerror(errno));
         return 1;

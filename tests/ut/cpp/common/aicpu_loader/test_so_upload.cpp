@@ -36,8 +36,7 @@ status_t aicpuGetContext(aicpuContext_t *ctx) {
 uint32_t GetUniqueVfId() { return 9; }
 }  // namespace aicpu
 namespace simpler_dispatcher {
-std::string MakeInnerSoDir();
-std::string MakeInnerSoPath(const std::string &dir, uint64_t fp, uint64_t device_id);
+std::string MakeInnerSoPath(uint64_t fp, uint64_t device_id);
 bool WriteBytes(const std::string &path, const char *data, uint64_t len);
 }  // namespace simpler_dispatcher
 
@@ -48,20 +47,18 @@ using namespace simpler_dispatcher;  // NOLINT(build/namespaces)
 TEST(SoUpload, UsesCannOwnerDirectoryAndNeverSelectsSharedHistoricalName) {
     context = {1, 0, 123, 7};
     context_status = aicpu::AICPU_ERROR_NONE;
-    const std::string dir = MakeInnerSoDir();
-    EXPECT_EQ(dir, "/usr/lib64/aicpu_kernels/9/aicpu_kernels_device/123_1");
-    const auto path = MakeInnerSoPath(dir, 1, 12);
-    EXPECT_EQ(path, dir + "/simpler_process_0000000000000001_12.so");
+    const auto path = MakeInnerSoPath(1, 12);
+    EXPECT_EQ(path, "/usr/lib64/aicpu_kernels/9/aicpu_kernels_device/123_1/simpler_process_0000000000000001_12.so");
     context.hostPid = 124;
-    EXPECT_NE(MakeInnerSoDir(), dir);
+    EXPECT_NE(MakeInnerSoPath(1, 12), path);
     context.hostPid = 123;
     context.deviceId = 0;
-    EXPECT_NE(MakeInnerSoDir(), dir);
+    EXPECT_NE(MakeInnerSoPath(1, 12), path);
     context_status = aicpu::AICPU_ERROR_FAILED;
-    EXPECT_TRUE(MakeInnerSoDir().empty());
+    EXPECT_TRUE(MakeInnerSoPath(1, 12).empty());
     context_status = aicpu::AICPU_ERROR_NONE;
     context.hostPid = 0;
-    EXPECT_TRUE(MakeInnerSoDir().empty());
+    EXPECT_TRUE(MakeInnerSoPath(1, 12).empty());
 }
 
 class SoUploadFiles : public testing::Test {
