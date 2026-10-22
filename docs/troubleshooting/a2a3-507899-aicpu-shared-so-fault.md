@@ -82,9 +82,7 @@ exception you must surface the CANN device slog, which is otherwise hidden:
    files`), so the stdout slog above is the only channel from CI. The exception
    *type* (0x2a) plus the faulting `soName/funcName` is enough to localize.
 
-## Historical fix
-
-The current process-owned upload lifecycle is described in the [AICPU loader](../../src/common/aicpu_loader/README.md).
+## Fix
 
 Make the staged SO names **per-device** so paired dies never touch the same
 file:

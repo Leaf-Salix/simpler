@@ -107,14 +107,23 @@ std::string MakeInnerSoPath(uint64_t fp, uint64_t device_id) {
     }
     char buf[256];
     snprintf(
-        buf, sizeof(buf), "/usr/lib64/aicpu_kernels/%u/aicpu_kernels_device/%d_%u/simpler_process_%016llx_%llu.so",
+        buf, sizeof(buf), "/usr/lib64/aicpu_kernels/%u/aicpu_kernels_device/%d_%u/simpler_inner_%016llx_%llu.so",
         aicpu::GetUniqueVfId(), ctx.hostPid, ctx.deviceId, static_cast<unsigned long long>(fp),
         static_cast<unsigned long long>(device_id)
     );
     return buf;
 }
 
-// Atomic publication preserves any existing mapping during a repeated upload.
+// Atomic write: write to a per-upload temp path, then rename onto the target.
+// Without atomic rename a reader
+// (a sibling aicpu_scheduler's dlopen during its rtsBinaryLoadFromFile call) can observe a
+// truncated/partially-written file and fail with 507018 or 507046.
+//
+// Same fingerprint → same content, so whichever rename wins yields identical
+// bytes; existing dlopen handles in any aicpu_scheduler stay bound to their
+// captured inode and are unaffected by later renames. We don't fast-path on
+// the file already existing — a stale corrupt file from a pre-fix run could
+// match the fingerprint by chance, and the atomic rename overwrites cheaply.
 bool WriteBytes(const std::string &path, const char *data, uint64_t len) {
     char tmp_path[320];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.XXXXXX", path.c_str());

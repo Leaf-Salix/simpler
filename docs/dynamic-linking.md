@@ -37,7 +37,7 @@ Python process (ChipWorker)
     |     +-- LoadAicpuOp::BootstrapDispatcher()
     |     |     |
     |     |     +-- rtAicpuKernelLaunchExWithArgs(KERNEL_TYPE_AICPU_KFC)
-    |     |           dispatcher writes <hostPid>_<localDev>/simpler_process_<fp>_<device_id>.so
+    |     |           dispatcher writes simpler_inner_<fp>_<device_id>.so
     |     |
     |     +-- LoadAicpuOp::Init()
     |     |     |
@@ -273,7 +273,7 @@ Applies to all 4 runtime executors: a2a3 (hbg, tmr), a5 (hbg, tmr).
 | -------- | ------- | --------- |
 | Host runtime | `RuntimeModule` shared by context and native storage | Per runtime group, released after its final proven consumer; terminal failure retains code |
 | Dispatcher SO bytes | `DeviceRunnerBase::dispatcher_so_binary_` | Init-only: passed to `LoadAicpuOp::BootstrapDispatcher`, then cleared |
-| Runtime AICPU SO | Process-directory file `simpler_process_<fp>_<device_id>.so` | Uploaded per runner; TSD removes the process directory at session exit |
+| Runtime AICPU SO | Preinstall file `simpler_inner_<fp>_<device_id>.so` | Written once through dispatcher bootstrap, then registered via `rtsBinaryLoadFromFile` |
 | AICPU entry handles | `LoadAicpuOp` cached `rtFuncHandle`s | Per-runtime-group: reused by `rtsLaunchCpuKernel` on every task |
 | AICore binary | `rtRegisterAllKernel` handle | Lazily registered on the first `launch_aicore_kernel()`, then the cached handle is reused |
 | Kernel binaries | `func_id_to_addr_` (device GM addresses) | Per-task: uploaded to device GM, cached by func_id |
@@ -384,7 +384,7 @@ device_worker_main(device_id)
             rtStreamCreate(AICPU + AICore)
             LoadAicpuOp::BootstrapDispatcher()
               rtAicpuKernelLaunchExWithArgs(KERNEL_TYPE_AICPU_KFC)
-              dispatcher writes <hostPid>_<localDev>/simpler_process_<fp>_<device_id>.so
+              dispatcher writes simpler_inner_<fp>_<device_id>.so
             LoadAicpuOp::Init()
               rtsBinaryLoadFromFile()
               rtsFuncGetByName(simpler_aicpu_exec, ...)

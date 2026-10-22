@@ -111,7 +111,7 @@ set_target_properties(aicpu_kernel PROPERTIES OUTPUT_NAME aicpu_kernel)
 # rtAicpuKernelLaunchExWithArgs(KERNEL_TYPE_AICPU_KFC), invokes
 # DynTileFwkBackendKernelServerInit, which writes the bundled inner SO bytes
 # (passed via the extended DeviceArgs at offsets 120/128) to
-# <preinstall>/<hostPid>_<localDeviceId>/simpler_process_<fp>_<device_id>.so
+# <preinstall>/<hostPid>_<localDeviceId>/simpler_inner_<fp>_<device_id>.so
 # under a content-fingerprint + device-id basename. After bootstrap the host registers the
 # preinstall file via rtsBinaryLoadFromFile + rtsFuncGetByName and launches
 # per-task through rtsLaunchCpuKernel; the dispatcher SO itself is never

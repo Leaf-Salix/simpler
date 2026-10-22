@@ -6,7 +6,7 @@ write the bundled runtime SO bytes to the main `aicpu_scheduler`'s preinstall
 process directory under a content-fingerprint + device-id filename:
 
 ```text
-/usr/lib64/aicpu_kernels/<vf>/aicpu_kernels_device/<hostPid>_<localDeviceId>/simpler_process_<fp>_<device_id>.so
+/usr/lib64/aicpu_kernels/<vf>/aicpu_kernels_device/<hostPid>_<localDeviceId>/simpler_inner_<fp>_<device_id>.so
 ```
 
 The `<device_id>` suffix isolates the paired dies of one a2a3 chip (which share
@@ -26,16 +26,14 @@ preinstall file; the dispatcher is out of the picture once bootstrap returns.
 The source is runtime-agnostic. It is built per-arch under
 `build/lib/<arch>/dispatcher/libsimpler_aicpu_dispatcher.so`, one per arch and
 shared across every runtime. A single process binding multiple runtimes
-therefore shares one dispatcher SO on disk. Runtime uploads live in CANN's
-process-owned `<hostPid>_<localDeviceId>` directory. CANN resolves this directory
-when loading the basename and removes it at process-session teardown. Every
-runner uploads again, including after device reset; no cross-process reuse,
-file leases or directory-scanning GC is required. Host, dispatcher and the six
-standalone tools must be built from the same checkout.
+therefore shares one dispatcher SO on disk. Each runner uploads into CANN's
+`<hostPid>_<localDeviceId>` directory, including after device reset. CANN removes
+that directory at process-session teardown.
 
-The `simpler_process_` basename avoids selecting historical `simpler_inner_`
-files, which CANN would otherwise find in the shared root before the process
-directory. Those historical files are not touched by normal bootstrap.
+Historical files in the shared root remain untouched. CANN can still select
+those files first; recovering incorrect historical content is outside this
+change. Existing tool diagnostics may still print the shared-root path; the
+process directory above is the upload destination.
 
 ## Argument ABI boundaries
 

@@ -31,13 +31,13 @@
  *      invokes our `DynTileFwkBackendKernelServerInit`.
  *   3. Our Init reads inner_so_bin/inner_so_len/device_id from DeviceArgs,
  *      fingerprints the bytes (ELF Build-ID), and writes them to
- *      `<preinstall>/<hostPid>_<localDeviceId>/simpler_process_<fp>_<device_id>.so`.
+ *      `<preinstall>/<hostPid>_<localDeviceId>/simpler_inner_<fp>_<device_id>.so`.
  *      The sched thread (HwHiAiUser) owns this dir, so the write succeeds. The
  *      device_id suffix keeps paired dies sharing this filesystem from writing
  *      and executing one shared file (which corrupted the image under
  *      concurrent bootstrap and faulted simpler_aicpu_exec).
  *   4. host computes the same fingerprint + uses the same device_id to derive
- *      the basename. CANN resolves it in the process-owned directory.
+ *      the basename. CANN can resolve it in the process-owned directory.
  *   5. Per-task launches: host calls `rtsBinaryLoadFromFile` to
  *      JSON-register the preinstall file (cpuKernelMode=0), resolves
  *      `simpler_aicpu_exec` via `rtsFuncGetByName`,

@@ -44,11 +44,11 @@ namespace {
 namespace fs = std::filesystem;
 using namespace simpler_dispatcher;  // NOLINT(build/namespaces)
 
-TEST(SoUpload, UsesCannOwnerDirectoryAndNeverSelectsSharedHistoricalName) {
+TEST(SoUpload, UsesCannOwnerDirectory) {
     context = {1, 0, 123, 7};
     context_status = aicpu::AICPU_ERROR_NONE;
     const auto path = MakeInnerSoPath(1, 12);
-    EXPECT_EQ(path, "/usr/lib64/aicpu_kernels/9/aicpu_kernels_device/123_1/simpler_process_0000000000000001_12.so");
+    EXPECT_EQ(path, "/usr/lib64/aicpu_kernels/9/aicpu_kernels_device/123_1/simpler_inner_0000000000000001_12.so");
     context.hostPid = 124;
     EXPECT_NE(MakeInnerSoPath(1, 12), path);
     context.hostPid = 123;
