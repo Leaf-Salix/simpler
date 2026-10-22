@@ -195,14 +195,6 @@ constexpr size_t kSpreadMaxSlots = 104;
 
 void WriteU64(char *buf, size_t off, uint64_t v) { std::memcpy(buf + off, &v, sizeof(v)); }
 
-std::string MakePreinstallPath(uint64_t fp, int device_id) {
-    char buf[256];
-    std::snprintf(
-        buf, sizeof(buf), "/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_%016lx_%d.so", fp, device_id
-    );
-    return buf;
-}
-
 std::string MakeJsonDescriptor(uint64_t fp, const std::string &so_basename) {
     char init_op[128], spread_op[128];
     std::snprintf(init_op, sizeof(init_op), "simpler_aicpu_init_%016lx", fp);
@@ -331,12 +323,12 @@ int main(int argc, char **argv) {
 
     // Fingerprint + JSON descriptor.
     uint64_t fp = fp::Compute(inner_bytes.data(), inner_bytes.size());
-    std::string so_basename = "simpler_inner_" + [&] {
+    std::string so_basename = "simpler_process_" + [&] {
         char b[24];
         std::snprintf(b, sizeof(b), "%016lx_%d.so", fp, device_id);
         return std::string(b);
     }();
-    std::printf("[bootstrap] inner SO at %s (fp=%016lx)\n", MakePreinstallPath(fp, device_id).c_str(), fp);
+    std::printf("[bootstrap] process SO basename %s (fp=%016lx)\n", so_basename.c_str(), fp);
 
     char json_path_buf[128];
     std::snprintf(json_path_buf, sizeof(json_path_buf), "/tmp/simpler_inner_%016lx_%d.json", fp, getpid());

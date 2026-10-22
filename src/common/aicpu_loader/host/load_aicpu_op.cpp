@@ -22,9 +22,6 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
-#include <mutex>
-#include <set>
-#include <utility>
 #include <vector>
 
 #include "acl/acl.h"
@@ -39,7 +36,7 @@ namespace {
 
 std::string MakeInnerSoBasename(uint64_t fp, int device_id) {
     char buf[64];
-    snprintf(buf, sizeof(buf), "simpler_inner_%016lx_%d.so", fp, device_id);
+    snprintf(buf, sizeof(buf), "simpler_process_%016lx_%d.so", fp, device_id);
     return buf;
 }
 
@@ -68,26 +65,6 @@ struct DeviceBuf {
     aclError alloc(size_t bytes) { return aclrtMalloc(&ptr, bytes, ACL_MEM_MALLOC_HUGE_FIRST); }
 };
 
-// Process-level cache of (inner-SO fingerprint, device_id) pairs we've already
-// bootstrapped. Keyed by both because the preinstall file is now per-device
-// (simpler_inner_<fp>_<device_id>.so) — a single process driving multiple
-// devices must bootstrap each device's file even when the fp matches.
-// Multiple DeviceRunner instances in the same process share this; same-content
-// same-device uploads short-circuit. Guarded by a mutex so that callers
-// releasing the Python GIL (e.g. nanobind methods marked
-// `nb::call_guard<nb::gil_scoped_release>`) cannot race on the set's
-// internals. The lock is uncontended on the steady-state path and only
-// touched at DeviceRunner init time, so the overhead is negligible
-// compared to keeping the invariant alive in a comment.
-std::set<std::pair<uint64_t, int>> &BootstrappedFps() {
-    static std::set<std::pair<uint64_t, int>> kSet;
-    return kSet;
-}
-std::mutex &BootstrappedFpsMutex() {
-    static std::mutex m;
-    return m;
-}
-
 }  // namespace
 
 int LoadAicpuOp::BootstrapDispatcher(
@@ -104,30 +81,8 @@ int LoadAicpuOp::BootstrapDispatcher(
     }
     device_id_ = device_id;
     inner_fp_ = FingerprintBytes(inner_so_data, inner_so_len);
-    // Per-device basename: the paired dies of one a2a3 chip (e.g. devices 8/9 =
-    // chipId N die0/die1) share the preinstall filesystem. A content-only name
-    // would have both dies write/rename/execute one shared
-    // simpler_inner_<fp>.so; concurrent bootstrap there corrupts the mmap'd
-    // image and faults simpler_aicpu_exec (507018 aicpu exception → chip fault
-    // → 507899 cascade). Suffixing device_id isolates each die's file.
+    // CANN resolves this basename inside the current process-session directory.
     inner_so_basename_ = MakeInnerSoBasename(inner_fp_, device_id_);
-
-    {
-        std::lock_guard<std::mutex> lk(BootstrappedFpsMutex());
-        if (BootstrappedFps().count({inner_fp_, device_id_}) > 0) {
-            LOG_INFO(
-                "BootstrapDispatcher: inner SO fp=%016lx dev=%d already bootstrapped, skipping", inner_fp_, device_id_
-            );
-            return 0;
-        }
-    }
-    // Note: we deliberately drop the lock for the heavy bootstrap work and
-    // re-take it for the post-insert below. Two threads racing on the same
-    // fingerprint will each perform a bootstrap, which is harmless: CANN's
-    // libaicpu_extend_kernels has a one-shot `firstCreatSo_` latch, and the
-    // atomic tmp+rename in WriteBytes is idempotent across same-content
-    // racers. Holding the lock across the upload would serialize all
-    // multi-runtime ChipWorker init in the process — a real regression.
 
     size_t dispatcher_len = dispatcher_so_len;
     const char *inner_bytes = reinterpret_cast<const char *>(inner_so_data);
@@ -216,10 +171,6 @@ int LoadAicpuOp::BootstrapDispatcher(
         "BootstrapDispatcher: bundled dispatcher (%zu B) + inner SO (%zu B) uploaded; inner SO at %s", dispatcher_len,
         inner_len, inner_so_basename_.c_str()
     );
-    {
-        std::lock_guard<std::mutex> lk(BootstrappedFpsMutex());
-        BootstrappedFps().insert({inner_fp_, device_id_});
-    }
     return 0;
 }
 

@@ -450,11 +450,9 @@ int main(int argc, char **argv) {
     // ---- Fingerprint consumer SO + register via JSON descriptor ----
     uint64_t fp = fp::Compute(consumer_bytes.data(), consumer_bytes.size());
     char base[64];
-    std::snprintf(base, sizeof(base), "simpler_inner_%016lx_%d.so", fp, device_id);
+    std::snprintf(base, sizeof(base), "simpler_process_%016lx_%d.so", fp, device_id);
     std::string so_basename = base;
-    std::printf(
-        "[bootstrap] consumer landed at /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/%s (fp=%016lx)\n", base, fp
-    );
+    std::printf("[bootstrap] consumer basename=%s (fp=%016lx)\n", base, fp);
 
     struct TempFile {
         std::string path;

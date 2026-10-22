@@ -1909,8 +1909,7 @@ int DeviceRunnerBase::ensure_binaries_loaded(rtStream_t control_stream) {
     }
 
     // One-shot bootstrap: libaicpu_extend_kernels invokes our dispatcher,
-    // which writes the runtime AICPU SO bytes to
-    // simpler_inner_<fp>_<device_id>.so in the device-side preinstall path.
+    // which writes the runtime AICPU SO bytes to CANN's process directory.
     // The dispatcher SO itself is never persisted to disk — only the
     // transient libaicpu_extend_kernels dlopen. Subsequent per-task AICPU
     // launches resolve symbols via rtsBinaryLoadFromFile + rtsFuncGetByName +

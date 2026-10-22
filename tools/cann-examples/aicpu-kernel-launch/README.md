@@ -27,7 +27,7 @@ The full Mode A "Path A" pipeline:
    `rtAicpuKernelLaunchExWithArgs(KERNEL_TYPE_AICPU_KFC)`.
 2. `libaicpu_extend_kernels` dlopens the dispatcher inside the AICPU OS
    process; the dispatcher writes your inner SO bytes to
-   `/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<dev>.so`
+   `<preinstall>/<hostPid>_<localDev>/simpler_process_<fp>_<dev>.so`
    (writable from the AICPU OS process, no host-side filesystem access
    needed).
 3. Host fingerprints the inner SO by ELF Build-ID, generates a JSON
@@ -65,7 +65,7 @@ zero changes as long as you preserve the two-export contract.
 +---------------------+        rtAicpuKernelLaunchExWithArgs (KFC, libaicpu_extend_kernels)
 |   host launcher     | ---->  bootstrap: libaicpu_extend_kernels dlopens dispatcher SO,
 |   launch_hello      |        which writes our inner SO bytes to
-+---------------------+        /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/
++---------------------+        <preinstall>/<hostPid>_<localDev>/
           |
           | rtsBinaryLoadFromFile(JSON), rtsFuncGetByName, rtsLaunchCpuKernel
           v
@@ -164,7 +164,7 @@ task-submit --device auto --device-num 1 \
 Successful output:
 
 ```text
-[bootstrap] inner SO landed at /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<dev>.so
+[bootstrap] inner SO basename=simpler_process_<fp>_<dev>.so
 [bootstrap] fp=<16 hex>  (token=<16 hex>)
 
 === device=<N>  hello_aicpu HelloResult ===
