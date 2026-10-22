@@ -11,9 +11,61 @@
 from __future__ import annotations
 
 import operator
+import struct
 from dataclasses import dataclass, fields
+from typing import TYPE_CHECKING
 
-from .task_interface import CommBufferSpec
+from .buffer import AccessMode, AddressSpace, BackendKind, Buffer, CanonicalIdentity
+
+if TYPE_CHECKING:
+    from .task_interface import CommBufferSpec
+
+
+_DOMAIN_SLICE = struct.Struct("<QQIQ")
+
+
+@dataclass(frozen=True)
+class CommDomainRef:
+    """Immutable identity; access requires an existing grant on the receiving node."""
+
+    owner_instance_id: bytes
+    domain_id: int
+    generation: int
+
+    def __post_init__(self):
+        if not isinstance(self.owner_instance_id, bytes) or len(self.owner_instance_id) != 8:
+            raise ValueError("domain creator must be an 8-byte instance identity")
+        if not any(self.owner_instance_id) or not 0 <= self.domain_id < 2**64 or not 0 < self.generation < 2**64:
+            raise ValueError("invalid communication domain reference")
+
+    @classmethod
+    def from_tensor(cls, tensor):
+        desc = tensor.buffer
+        if desc.backend_kind != BackendKind.DOMAIN_WINDOW:
+            raise ValueError("Tensor does not carry a communication domain reference")
+        domain_id, generation, _rank, _offset = _DOMAIN_SLICE.unpack(desc.body)
+        return cls(bytes(desc.identity.owner_instance_id), domain_id, generation)
+
+
+def domain_buffers(command, rank: int, *, base: int = 0, worker_id: int = 0) -> dict[str, Buffer]:
+    """Reconstruct the same granted slice descriptors at every forwarding endpoint."""
+    result = {}
+    offset = 0
+    for index, spec in enumerate(command.buffers):
+        result[spec.name] = Buffer(
+            identity=CanonicalIdentity(
+                command.owner_instance_id, command.buffer_ids[rank * len(command.buffers) + index], 1
+            ),
+            address_space=AddressSpace.DEVICE,
+            access=AccessMode.READWRITE,
+            backend_kind=BackendKind.DOMAIN_WINDOW,
+            nbytes=spec.nbytes,
+            body=_DOMAIN_SLICE.pack(command.domain_id, command.generation, rank, offset),
+            base=base + offset if base else 0,
+            owner_worker_id=worker_id,
+        )
+        offset += spec.nbytes
+    return result
 
 
 @dataclass(frozen=True)
@@ -58,6 +110,8 @@ class DomainConfig:
         return cls(members, window_size, snapshot, bool(retain_after_run), tuple(topology))
 
     def specs(self) -> list[CommBufferSpec]:
+        from .task_interface import CommBufferSpec  # noqa: PLC0415
+
         return [CommBufferSpec(*buffer) for buffer in self.buffers]
 
     def difference(self, other: DomainConfig) -> str:

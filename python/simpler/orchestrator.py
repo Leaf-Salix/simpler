@@ -49,6 +49,7 @@ from .task_interface import (
     ChipCallable,
     CommBufferSpec,
     CommDomainHandle,
+    CommDomainRef,
     DataType,
     DeviceMemoryInfo,
     GlobalCommDomainHandle,
@@ -573,8 +574,8 @@ class Orchestrator:
             reuse=reuse,
         )
 
-    def get_domain(self, name: str) -> CommDomainHandle:
-        """Look up a live domain by name in its creator Worker; never create a domain."""
+    def get_domain(self, name: str | CommDomainRef) -> CommDomainHandle:
+        """Look up an owned domain by name or ref, or borrow an already-granted domain by ref."""
         if self._worker is None:
             raise RuntimeError("get_domain requires an Orchestrator bound to a Worker")
         return self._worker._get_domain(name)
@@ -660,7 +661,7 @@ class Orchestrator:
         handle._require_live()
         absolute = self._global_copy_range(handle, buffer=buffer, offset=offset, nbytes=size)
         handle.member(rank)
-        if not handle.workers:
+        if not handle.workers and not handle.borrowed:
             if writing:
                 self._worker._copy_to_global_domain(handle, rank, data, absolute)
                 return None
