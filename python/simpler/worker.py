@@ -10799,16 +10799,8 @@ class Worker:
             try:
                 self._free_domain_after_fence(handle)
             except BaseException:
-                # A fatal run may have already closed the chip's control lane.
-                # Keep ownership until whole-tree teardown reclaims its windows.
-                chip_pids = tuple(self._chip_pids[chip] for chip in handle.workers)
-
-                def retire() -> None:
-                    if not chip_pids or not all(pid in self._finalized_chip_pids for pid in chip_pids):
-                        raise RuntimeError(f"domain {handle.name!r}: window reclamation is unconfirmed")
-                    handle._freed = True
-
-                self._cleanup_journal.add_once("domain-retirement", str(handle.allocation_id), retire)
+                # Keep the queue's ownership even if the free helper was interrupted before entry.
+                self._defer_domain_retirement(handle)
                 raise
             # Retire only after exact-once backend success. An interruption
             # before this deletion leaves a replayable claim; an interruption
@@ -10838,6 +10830,21 @@ class Worker:
 
         _raise_first(_release, pending)
 
+    def _defer_domain_retirement(self, handle: CommDomainHandle) -> None:
+        """Transfer a failed free to receipt-backed whole-tree cleanup."""
+        chip_pids = tuple(self._chip_pids[chip] for chip in handle.workers)
+
+        def retire() -> None:
+            if not chip_pids or not all(pid in self._finalized_chip_pids for pid in chip_pids):
+                raise RuntimeError(f"domain {handle.name!r}: window reclamation is unconfirmed")
+            handle._freed = True
+
+        self._cleanup_journal.add_once("domain-retirement", str(handle.allocation_id), retire)
+        # Publish the new owner before removing the sweep's claim. Otherwise a
+        # cached free error would fence the teardown that can reclaim its window.
+        if self._live_domains.get(handle.name) is handle:
+            self._live_domains.pop(handle.name)
+
     def _free_domain_after_fence(self, handle: CommDomainHandle) -> None:
         """Back-end free for a handle whose owning run has retired.
 
@@ -10852,7 +10859,11 @@ class Worker:
         """
         if handle.freed:
             return
-        self._release_domain_now(handle)
+        try:
+            self._release_domain_now(handle)
+        except BaseException:
+            self._defer_domain_retirement(handle)
+            raise
         handle._freed = True  # noqa: SLF001 -- runtime owns this transition
 
     def _execute_pending_domain_releases(self, resources: _RunResources) -> None:
@@ -10882,8 +10893,8 @@ class Worker:
         caller mark the handle freed, drop it from ``_live_domains`` and — on
         the close() path — tear down the mailboxes the release is still using.
 
-        A failure is replayed to every later caller rather than retried, so the
-        sweeps keep the handle in ``_live_domains`` as a detectable residual.
+        A failure is replayed to every later caller rather than retried. The
+        caller transfers its ownership to receipt-backed whole-tree cleanup.
         """
         if self._worker is None:
             return
@@ -11931,8 +11942,8 @@ class Worker:
         immediate backend free + drop from ``_live_domains`` on each handle.
 
         Every handle is attempted and the first error is raised once they all
-        have been. A failed handle stays in ``_live_domains`` so close()'s
-        journal can retry it without losing the ownership record.
+        have been. A failed free transfers ownership to whole-tree teardown
+        without replaying a possibly partially committed backend release.
         """
         live_domains = self._live_domains if resources is None else resources.live_domains
 
@@ -11944,8 +11955,7 @@ class Worker:
             # deferred-release queue, so we use the direct path.
             if not handle.released:
                 handle._released = True  # noqa: SLF001 -- runtime owns the transition
-            self._release_domain_now(handle)
-            handle._freed = True  # noqa: SLF001
+            self._free_domain_after_fence(handle)
             if live_domains.get(handle.name) is handle:
                 live_domains.pop(handle.name)
 
