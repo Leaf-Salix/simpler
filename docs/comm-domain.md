@@ -72,9 +72,10 @@ L3 creation, reuse and staging precede its first task submission and use the
 existing control admission gate. L4 retains its existing control-plane paths
 without adding a first-task restriction.
 A successful run preserves domains created with `retain_after_run=True`.
-Each subsequent run must call `get_domain` or `get_or_allocate_domain`, then
-obtain its local Buffers again. Passing a previous run's domain Buffers as
-arguments or submitting them directly from a closure is unsupported.
+Each subsequent run consuming domain Buffers must call `get_domain` or
+`get_or_allocate_domain`, then obtain its local Buffers again. Passing a
+previous run's domain Buffers as arguments or submitting them directly from
+a closure is unsupported.
 Use `with` only when the scope should release the shared handle: context exit
 releases a reused handle too. After release, callers must not submit new uses
 of previously obtained Buffers; no additional per-submit domain check is made.
@@ -235,21 +236,21 @@ The handle is a context manager. Its lifecycle has **two distinct states**:
   exits). Further indexing (`handle[i]`) raises. This is the *user-visible*
   state: "do not hand this domain to any new `submit_*`."
 - **`freed`** — the backend `comm_release_domain_windows` has actually run and
-  the device memory is gone. This happens **after** the owning run's completion
-  fence, never inside the `with` block.
+  the device memory is gone.
 
-This split exists because `submit_next_level()` only *enqueues* DAG work;
+Inside an orchestration callback, `submit_next_level()` only *enqueues* DAG work;
 `Worker.run()` does not wait for completion until the orch function returns.
 If `release()` freed memory immediately on `with`-exit, a still-queued task that
 captured the domain's `device_ctx` / `buffers` would read freed memory. So
-**release is deferred**: `release()` flips `released` and queues the backend
-free; the real free runs after the run fence, when every task that could
-reference the window has completed.
+**release inside the callback is deferred**: `release()` flips `released` and
+queues the backend free; the real free runs after the run fence, when every
+task that could reference the window has completed.
 
-Mental model: like `with open(f) as fh: ...` — the user-visible close is
-lexical (end of block), the physical teardown is managed for you. Use
-`handle.released` to guard against accidental reuse; use `handle.freed` only if
-you must assert physical teardown.
+When a retained domain is released serially after its run has completed,
+the backend free is synchronous: `release()` returns with `freed=True`,
+including release at context-manager exit. Repeated release is a no-op.
+Use `handle.released` to guard against accidental reuse; use `handle.freed`
+to check physical teardown.
 
 Cleanup is **failure-safe**: even if a chip task fails and the run wait
 re-raises, `Worker.run` still executes pending releases and sweeps any live
