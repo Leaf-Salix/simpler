@@ -113,7 +113,8 @@ cannot walk a legal-looking length past the end.
 | ------ | ----- |
 | `run(callable, args=None, config=None, *, caller_stream=None) -> None` | Blocks until the run completes |
 | `submit(callable, args=None, config=None, *, caller_stream=None) -> RunHandle` | Non-blocking |
-| `live_domains() -> dict[str, CommDomainHandle]` | Currently allocated communication domains |
+| `live_domains: dict[str, CommDomainHandle]` | Snapshot of currently live communication domains |
+| `detach_persistent_domain(handle)` | Retain an owned domain from its callback, preserving the current run fence and cleanup journal |
 
 `RunHandle` exposes the `done` property, `wait(timeout=None)`, and
 `result(timeout=None)`.

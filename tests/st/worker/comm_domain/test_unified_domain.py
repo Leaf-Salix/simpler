@@ -26,7 +26,8 @@ _NBYTES = _NUMEL * 4
 @pytest.mark.platforms(["a2a3sim", "a5sim", "a2a3", "a5"])
 @pytest.mark.runtime(_RUNTIME)
 @pytest.mark.device_count(1)
-def test_retained_domain_reaches_chip_in_second_run(st_platform, st_device_ids):
+@pytest.mark.parametrize("cached", [False, True])
+def test_retained_domain_reaches_chip_in_second_run(st_platform, st_device_ids, cached):
     worker = Worker(
         level=3, platform=st_platform, runtime=_RUNTIME, device_ids=[int(st_device_ids[0])], num_sub_workers=0
     )
@@ -50,23 +51,27 @@ def test_retained_domain_reaches_chip_in_second_run(st_platform, st_device_ids):
 
         worker.run(first)
         domain = saved[0]
+        payload = domain.member(0).buffers["payload"]
 
         def second(orch, _args, cfg):
-            domain = orch.get_domain("tp")
-            assert domain is saved[0]
-            payload = domain.member(0).buffers["payload"]
+            if not cached:
+                assert orch.get_domain("tp") is domain
             args = TaskArgs()
             args.add_tensor(payload.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.INPUT)
             args.add_tensor(payload.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.INPUT)
             args.add_tensor(output.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
             orch.submit_next_level(chip, args, cfg, worker=0)
-            resources = worker._building_run_resources
-            assert resources is not None and resources.live_domains.get("tp") is domain
-            assert resources.requires_ordered_cleanup
+            if not cached:
+                domain.release()
+                assert domain.released and not domain.freed
+
+        run = worker.submit(second)
+        if cached:
+            assert run._resources.live_domains.get("tp") is domain
+            assert run._resources.requires_ordered_cleanup
             domain.release()
             assert domain.released and not domain.freed
-
-        worker.run(second)
+        run.wait()
         assert domain.freed
         assert struct.unpack_from(f"<{_NUMEL}f", output.shm.buf) == (70.0,) * _NUMEL
     finally:
@@ -76,7 +81,8 @@ def test_retained_domain_reaches_chip_in_second_run(st_platform, st_device_ids):
 @pytest.mark.platforms(["a2a3sim", "a5sim"])
 @pytest.mark.runtime(_RUNTIME)
 @pytest.mark.device_count(1)
-def test_l4_reuse_keeps_domain_until_child_kernel_completes(st_platform, st_device_ids):
+@pytest.mark.parametrize("cached", [False, True])
+def test_l4_reuse_keeps_domain_until_child_kernel_completes(st_platform, st_device_ids, cached):
     worker = Worker(level=4, num_sub_workers=0)
     try:
         child = Worker(
@@ -128,18 +134,27 @@ def test_l4_reuse_keeps_domain_until_child_kernel_completes(st_platform, st_devi
         worker.run(first)
         allocation_count = worker._next_alloc_id
         assert not saved[0].released and not saved[0].freed
+        domain = saved[0]
+        payload = domain.member(0).buffers["payload"]
 
         def second(orch, _args, cfg):
-            domain = orch.get_or_allocate_domain(**request)
-            assert domain is saved[0] and worker._next_alloc_id == allocation_count
+            if not cached:
+                assert orch.get_or_allocate_domain(**request) is domain
+            assert worker._next_alloc_id == allocation_count
             args = TaskArgs()
-            args.add_tensor(domain.member(0).buffers["payload"].tensor([_NUMEL], DataType.FLOAT32), TensorArgType.INPUT)
+            args.add_tensor(payload.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.INPUT)
             args.add_tensor(output.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
             orch.submit_next_level(forward_handle, args, cfg, worker=node)
+            if not cached:
+                domain.release()
+                assert domain.released and not domain.freed
+
+        run = worker.submit(second)
+        if cached:
+            assert run._resources.live_global_domains.get("tp") is domain
             domain.release()
             assert domain.released and not domain.freed
-
-        worker.run(second)
+        run.wait()
         assert saved[0].freed and worker.live_domains == {}
         assert struct.unpack_from(f"<{_NUMEL}f", output.shm.buf) == (70.0,) * _NUMEL
     finally:

@@ -1028,8 +1028,10 @@ def test_global_domain_backend_release_failure_is_terminal(monkeypatch):
 def test_global_domain_release_uses_allocation_run_after_graph_build(monkeypatch):
     from simpler.remote_l3_protocol import ControlName  # noqa: PLC0415
     from simpler.task_interface import CommBufferSpec  # noqa: PLC0415
+    from simpler.worker import _Lifecycle  # noqa: PLC0415
 
     worker, resources, node_ids = _failure_injection_worker()
+    worker._lifecycle = _Lifecycle.READY
     _install_global_domain_failure_injector(
         monkeypatch,
         worker,
