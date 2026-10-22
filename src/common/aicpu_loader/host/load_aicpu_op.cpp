@@ -35,7 +35,7 @@ namespace {
 
 std::string MakeInnerSoBasename(uint64_t fp, int device_id) {
     char buf[64];
-    snprintf(buf, sizeof(buf), "simpler_inner_%016lx_%d.so", fp, device_id);
+    snprintf(buf, sizeof(buf), "simpler_process_%016lx_%d.so", fp, device_id);
     return buf;
 }
 
@@ -80,12 +80,7 @@ int LoadAicpuOp::BootstrapDispatcher(
     }
     device_id_ = device_id;
     inner_fp_ = FingerprintBytes(inner_so_data, inner_so_len);
-    // Per-device basename: the paired dies of one a2a3 chip (e.g. devices 8/9 =
-    // chipId N die0/die1) share the preinstall filesystem. A content-only name
-    // would have both dies write/rename/execute one shared
-    // simpler_inner_<fp>.so; concurrent bootstrap there corrupts the mmap'd
-    // image and faults simpler_aicpu_exec (507018 aicpu exception → chip fault
-    // → 507899 cascade). Suffixing device_id isolates each die's file.
+    // CANN resolves this basename inside the current process-session directory.
     inner_so_basename_ = MakeInnerSoBasename(inner_fp_, device_id_);
 
     size_t dispatcher_len = dispatcher_so_len;

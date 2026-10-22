@@ -31,13 +31,13 @@
  *      invokes our `DynTileFwkBackendKernelServerInit`.
  *   3. Our Init reads inner_so_bin/inner_so_len/device_id from DeviceArgs,
  *      fingerprints the bytes (ELF Build-ID), and writes them to
- *      `/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<device_id>.so`.
+ *      `<preinstall>/<hostPid>_<localDeviceId>/simpler_process_<fp>_<device_id>.so`.
  *      The sched thread (HwHiAiUser) owns this dir, so the write succeeds. The
  *      device_id suffix keeps paired dies sharing this filesystem from writing
  *      and executing one shared file (which corrupted the image under
  *      concurrent bootstrap and faulted simpler_aicpu_exec).
  *   4. host computes the same fingerprint + uses the same device_id to derive
- *      the same preinstall filename.
+ *      the basename. CANN resolves it in the process-owned directory.
  *   5. Per-task launches: host calls `rtsBinaryLoadFromFile` to
  *      JSON-register the preinstall file (cpuKernelMode=0), resolves
  *      `simpler_aicpu_exec` via `rtsFuncGetByName`,
@@ -45,11 +45,9 @@
  *      `rtFuncHandle`. The main aicpu_scheduler owns the dlopen of the
  *      preinstall file; this dispatcher SO is no longer in the picture.
  *
- * Multi-runtime in one host process: each DeviceRunner bootstraps with the
- * same dispatcher bytes + its own runtime SO bytes. Each bootstrap acquires
- * a device-process shared file lease, reusing matching bytes. A subsequent
- * bootstrap reclaims files without live leases. Host, dispatcher and tools use
- * one implementation; upgrades require stopped consumers and cache maintenance.
+ * Each runner uploads its runtime SO into CANN's process-owned directory.
+ * CANN removes the directory at session teardown; the dispatcher does not scan
+ * historical files or reuse another process's uploads.
  */
 
 #ifndef COMMON_AICPU_DISPATCHER_AICPU_DISPATCHER_H_

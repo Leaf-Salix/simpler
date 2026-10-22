@@ -23,7 +23,7 @@
 //   5. Bootstrap via rtAicpuKernelLaunchExWithArgs(KERNEL_TYPE_AICPU_KFC,
 //      libaicpu_extend_kernels.so) — this dlopens the dispatcher inside the
 //      AICPU OS process, which writes our inner SO bytes to
-//      /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<dev>.so.
+//      <preinstall>/<hostPid>_<localDev>/simpler_process_<fp>_<dev>.so.
 //   6. Fingerprint inner SO + write a JSON descriptor pointing at the
 //      preinstall basename, register via rtsBinaryLoadFromFile.
 //   7. rtsFuncGetByName for init + run handles.
@@ -431,7 +431,7 @@ int main(int argc, char **argv) {
     // ---- Fingerprint inner SO + register via JSON descriptor ----
     uint64_t fp = fp::Compute(inner_bytes.data(), inner_bytes.size());
     char base[64];
-    std::snprintf(base, sizeof(base), "simpler_inner_%016lx_%d.so", fp, device_id);
+    std::snprintf(base, sizeof(base), "simpler_process_%016lx_%d.so", fp, device_id);
     std::string so_basename = base;
     std::printf("[bootstrap] inner SO landed at /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/%s\n", base);
     std::printf("[bootstrap] fp=%016lx (token=%016lx)\n", fp, input_token);

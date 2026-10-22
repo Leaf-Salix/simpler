@@ -7,10 +7,10 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 #
-# The dispatcher cache uses only POSIX filesystem primitives, without CANN.
+# Test dispatcher path selection and publication with a CPU-only CANN context stub.
 macro(aicpu_loader_case src)
     simpler_ut_plain_case(${src}
         SOURCES ${SIMPLER_SRC}/common/aicpu_loader/device/aicpu_dispatcher.cpp
-        INCLUDES ${SIMPLER_SRC}/common LABEL no_hardware)
+        INCLUDES ${SIMPLER_SRC}/common ${CMAKE_CURRENT_SOURCE_DIR}/support LABEL no_hardware)
 endmacro()
 simpler_ut_glob_cases(aicpu_loader_case)
