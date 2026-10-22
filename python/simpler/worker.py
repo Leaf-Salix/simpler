@@ -3161,44 +3161,32 @@ def _handle_ctrl_global_domain_import(cw: _ChipWorker, buf: memoryview, store: _
             raise RuntimeError("Global CommDomain import payload is truncated")
         magic, version, domain_id, generation, descriptor_count = LOCAL_IMPORT_REQUEST.unpack_from(payload, 0)
         _validate_local_global_header(magic, version, domain_id, generation, operation="import")
-        expected_size = LOCAL_IMPORT_REQUEST.size + int(descriptor_count) * GLOBAL_DOMAIN_DESCRIPTOR_BYTES
-        if descriptor_count <= 0 or descriptor_count > GLOBAL_DOMAIN_MAX_RANKS or expected_size > payload_size:
-            raise RuntimeError("Global CommDomain import descriptor table size is invalid")
         entry = store.domains.get(int(domain_id))
         if entry is None or entry.generation != generation:
             raise RuntimeError("Global CommDomain import requires a matching prepared domain")
-        descriptor_bytes = bytes(payload[LOCAL_IMPORT_REQUEST.size : expected_size])
-        descriptors = tuple(
-            GlobalDomainDescriptor.decode(descriptor_bytes[offset : offset + GLOBAL_DOMAIN_DESCRIPTOR_BYTES])
-            for offset in range(0, len(descriptor_bytes), GLOBAL_DOMAIN_DESCRIPTOR_BYTES)
-        )
-        profile = next(
-            name for name, profile_id in GLOBAL_DOMAIN_PROFILE_IDS.items() if profile_id == entry.descriptor.profile_id
-        )
-        validate_descriptor_table(descriptors, rank_count=entry.rank_count, profile=profile)
+        command = decode_domain_command(bytes(payload[LOCAL_IMPORT_REQUEST.size : payload_size]))
+        descriptors = command.descriptors
+        if (
+            command.phase is not GlobalDomainPhase.IMPORT
+            or command.domain_id != domain_id
+            or command.generation != generation
+            or command.window_size != entry.requested_window_size
+            or len(descriptors) != descriptor_count
+            or len(descriptors) != entry.rank_count
+            or GLOBAL_DOMAIN_PROFILE_IDS[command.profile] != entry.descriptor.profile_id
+        ):
+            raise ValueError("Global CommDomain import command conflicts with the prepared window")
         if descriptors[entry.domain_rank] != entry.descriptor:
             raise RuntimeError("Global CommDomain import table does not contain the local exported descriptor")
+        descriptor_bytes = b"".join(descriptor.encode() for descriptor in descriptors)
         if entry.descriptor_table and entry.descriptor_table != descriptor_bytes:
             raise RuntimeError("Global CommDomain repeated import carries a different descriptor table")
-        if payload_size > expected_size:
-            command_size = struct.unpack_from("<I", payload, expected_size)[0]
-            if command_size:
-                if command_size > payload_size - expected_size - 4:
-                    raise ValueError("Global CommDomain slice grant is truncated")
-                command = decode_domain_command(bytes(payload[expected_size + 4 : expected_size + 4 + command_size]))
-                if (
-                    command.phase is not GlobalDomainPhase.IMPORT
-                    or command.domain_id != domain_id
-                    or command.generation != generation
-                    or command.descriptors != descriptors
-                    or command.window_size != entry.requested_window_size
-                ):
-                    raise ValueError("Global CommDomain slice grant conflicts with the imported window")
-                buffers = _domain_buffers(command, entry.domain_rank, base=entry.local_window_base)
-                granted = {buffer.identity: buffer for buffer in buffers.values()}
-                if entry.buffers and entry.buffers != granted:
-                    raise ValueError("Global CommDomain repeated import changes its slice grants")
-                entry.buffers = granted
+        if command.owner_instance_id:
+            buffers = _domain_buffers(command, entry.domain_rank, base=entry.local_window_base)
+            granted = {buffer.identity: buffer for buffer in buffers.values()}
+            if entry.buffers and entry.buffers != granted:
+                raise ValueError("Global CommDomain repeated import changes its slice grants")
+            entry.buffers = granted
         if entry.device_ctx == 0:
             entry.device_ctx = int(cw.comm_global_domain_import(int(domain_id), descriptor_bytes))
             if entry.device_ctx == 0:
@@ -3497,9 +3485,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     global_domain_store = _L2GlobalDomainStore()
 
     def local_base(descriptor):
-        if descriptor.backend_kind == BackendKind.DOMAIN_WINDOW:
-            return global_domain_store.resolve(descriptor)
-        return import_registry.materialize(descriptor).base
+        return import_registry.materialize(descriptor, global_domain_store.resolve).base
 
     base_comm_handle = 0
     diagnostic_capture_index = 0
@@ -10405,7 +10391,11 @@ class Worker:
         resources = self._building_run_resources
         if _callback_frame_for(self) is None or resources is None:
             raise RuntimeError("domain creation and reuse require this Worker's orchestration callback")
-        control = self._control_admission("allocate_domain") if self.level == 3 else contextlib.nullcontext()
+        control = (
+            self._control_admission("allocate_domain")
+            if self.level == 3 and (not reuse or name not in self._live_domains)
+            else contextlib.nullcontext()
+        )
         with control:
             if not name:
                 raise ValueError("domain name must be non-empty")
@@ -10429,7 +10419,7 @@ class Worker:
                     )
                     handle.retain_after_run = config.retain_after_run
                     handle.members = tuple(
-                        GlobalDomainMember(-1, chip, config.topology[2][chip], rank)
+                        GlobalDomainMember(-1, chip, config.topology[2][chip], rank, handle.contexts[chip].buffers)
                         for rank, chip in enumerate(config.members)
                     )
                     handle.buffers = tuple(
@@ -10472,6 +10462,8 @@ class Worker:
             table = resources.live_domains if local else resources.live_global_domains
             table[handle.name] = handle
             resources.requires_ordered_cleanup = True
+        release = self._release_domain_handle if local else self._release_global_domain_handle
+        handle._release_fn = lambda released, owner=resources: release(released, owner)
 
     def _domain_serialization(self):
         # Graph construction already holds this Worker's submission serializer.
@@ -10492,26 +10484,12 @@ class Worker:
             if allocation_id in used:
                 self._use_domain(handle)
 
-    def _request_domain_release(self, handle: CommDomainHandle, resources: _RunResources) -> None:
+    @contextlib.contextmanager
+    def _domain_release_scope(self, handle: CommDomainHandle):
         with self._operation_lease("release_domain", allow_continuation=True), self._domain_serialization():
-            if handle.released:
-                return
-            handle._released = True
-            current = self._building_run_resources
-            if current is not None:
-                resources = current
-            else:
-                with self._hierarchical_start_cv:
-                    accepted = tuple(self._accepted_run_handles)
-                for run in accepted:
-                    candidate = run._resources
-                    with candidate.domain_lock:
-                        table = candidate.live_domains if handle.workers else candidate.live_global_domains
-                        if not candidate.retired and table.get(handle.name) is handle:
-                            resources = candidate
-                            break
-            release = self._release_domain_handle if handle.workers else self._release_global_domain_handle
-            release(handle, resources)
+            if not handle.released:
+                self._use_domain(handle)
+            yield
 
     def _get_domain(self, name: str | CommDomainRef) -> CommDomainHandle:
         with self._domain_serialization():
@@ -10537,7 +10515,9 @@ class Worker:
                 return state.borrowed_handle
             state.borrowed_handle = CommDomainHandle(
                 name=command.name,
-                members=command.members,
+                members=tuple(
+                    replace(member, buffers=_domain_buffers(command, member.domain_rank)) for member in command.members
+                ),
                 buffers=command.buffers,
                 contexts=state.contexts,
                 domain_id=command.domain_id,
@@ -10547,7 +10527,6 @@ class Worker:
                 borrowed=True,
                 requested_window_size=command.window_size,
                 retain_after_run=command.retain_after_run,
-                member_buffers={rank: _domain_buffers(command, rank) for rank in range(len(command.members))},
                 _release_fn=None,
             )
             return state.borrowed_handle
@@ -10632,8 +10611,9 @@ class Worker:
                     workers=workers,
                     contexts={},
                     allocation_id=allocation_id,
-                    _release_fn=lambda released, owner=resources: self._request_domain_release(released, owner),
-                    _release_fn_manages_state=True,
+                    _release_fn=lambda released, owner=resources: self._release_domain_handle(released, owner),
+                    _release_scope=self._domain_release_scope,
+                    requested_window_size=window_size,
                     _domain_size=len(workers),
                     _domain_ranks=worker_to_rank,
                 )
@@ -10803,7 +10783,13 @@ class Worker:
         """Free a snapshot while each source-queue claim stays durable."""
 
         def _release(handle: CommDomainHandle) -> None:
-            self._free_domain_after_fence(handle)
+            try:
+                self._free_domain_after_fence(handle)
+            except BaseException:
+                self._cleanup_journal.add_once(
+                    "domain-release", str(handle.allocation_id), lambda: self._free_domain_after_fence(handle)
+                )
+                raise
             # Retire only after exact-once backend success. An interruption
             # before this deletion leaves a replayable claim; an interruption
             # after it is safe because the allocation is already gone.
@@ -11201,9 +11187,8 @@ class Worker:
             profile=command.profile,
         )
         local_members = self._global_local_members(command, node_worker_id)
-        descriptor_bytes = b"".join(descriptor.encode() for descriptor in command.descriptors)
-        slice_grant = encode_domain_command(replace(command, attachments=())) if command.owner_instance_id else b""
-        request_size = LOCAL_IMPORT_REQUEST.size + len(descriptor_bytes) + (4 + len(slice_grant) if slice_grant else 0)
+        import_command = encode_domain_command(replace(command, attachments=()))
+        request_size = LOCAL_IMPORT_REQUEST.size + len(import_command)
         capacity = max(request_size, LOCAL_IMPORT_REPLY.size)
         try:
             for member in local_members:
@@ -11217,13 +11202,7 @@ class Worker:
                     command.generation,
                     len(command.descriptors),
                 )
-                payload[LOCAL_IMPORT_REQUEST.size : LOCAL_IMPORT_REQUEST.size + len(descriptor_bytes)] = (
-                    descriptor_bytes
-                )
-                if slice_grant:
-                    start = LOCAL_IMPORT_REQUEST.size + len(descriptor_bytes)
-                    struct.pack_into("<I", payload, start, len(slice_grant))
-                    payload[start + 4 : start + 4 + len(slice_grant)] = slice_grant
+                payload[LOCAL_IMPORT_REQUEST.size : request_size] = import_command
                 reply = bytes(
                     self._worker.control_payload(
                         WorkerType.NEXT_LEVEL,
@@ -11241,11 +11220,14 @@ class Worker:
                 if mapping_size != command.descriptors[member.domain_rank].mapping_size:
                     raise RuntimeError("Global CommDomain import reply mapping size mismatch")
                 offset = 0
-                buffer_bases: dict[str, int] = {}
-                domain_buffers: dict[str, Buffer] = {}
-                for buffer in command.buffers:
+                domain_buffers = (
+                    _domain_buffers(command, member.domain_rank, base=int(local_base), worker_id=member.local_worker_id)
+                    if command.owner_instance_id
+                    else {}
+                )
+                legacy_buffers = () if command.owner_instance_id else command.buffers
+                for buffer in legacy_buffers:
                     base = int(local_base) + offset
-                    buffer_bases[buffer.name] = base
                     identity = self._burn_buffer_identity()
                     domain_buffers[buffer.name] = wrap_vmm_window(
                         base,
@@ -11257,10 +11239,6 @@ class Worker:
                         owner_worker_id=int(member.local_worker_id),
                     )
                     offset += buffer.nbytes
-                if command.owner_instance_id:
-                    domain_buffers = _domain_buffers(
-                        command, member.domain_rank, base=int(local_base), worker_id=member.local_worker_id
-                    )
                 state.contexts[member.local_worker_id] = ChipDomainContext(
                     name=command.name,
                     domain_rank=member.domain_rank,
@@ -11747,27 +11725,29 @@ class Worker:
 
         handle = CommDomainHandle(
             name=name,
-            members=domain_members_tuple,
+            members=tuple(
+                replace(
+                    member, buffers=_domain_buffers(base_command, member.domain_rank, worker_id=member.node_worker_id)
+                )
+                for member in domain_members_tuple
+            ),
             buffers=global_buffers,
             domain_id=domain_id,
             generation=generation,
             mapping_size=descriptors[0].mapping_size,
             retain_after_run=retain_after_run,
-            _release_fn=lambda released, owner=resources: self._request_domain_release(released, owner),
-            _release_fn_manages_state=True,
+            _release_fn=lambda released, owner=resources: self._release_global_domain_handle(released, owner),
+            _release_scope=self._domain_release_scope,
+            requested_window_size=window_size,
             attachments=attachment_matrix,
             ref=CommDomainRef(base_command.owner_instance_id, domain_id, generation),
-            member_buffers={
-                rank: _domain_buffers(base_command, rank, worker_id=member.node_worker_id)
-                for rank, member in enumerate(domain_members_tuple)
-            },
         )
         self._live_global_domains[name] = handle
         resources.live_global_domains[name] = handle
         resources.requires_ordered_cleanup = True
         with self._child_prov_lock:
-            for buffers_by_name in handle._member_buffers.values():
-                for buffer in buffers_by_name.values():
+            for member in handle.members:
+                for buffer in member.buffers.values():
                     self._record_device_alloc(buffer, domain_allocation_id=self._global_domain_provenance_id(domain_id))
         return handle
 
@@ -13710,27 +13690,25 @@ class Worker:
         try:
             self._orch._scope_begin()
             scope_open = True
-            with _callback_run(run_id, self):
-                try:
-                    if _host_spans_active():
-                        graph_start_ns = time.monotonic_ns()
-                        try:
-                            callable(self._orch, args, cfg)
-                        finally:
-                            graph_end_ns = time.monotonic_ns()
-                            _emit_host_span(
-                                f"{self._host_span_prefix}.graph_build",
-                                run_id,
-                                0,
-                                0,
-                                graph_start_ns,
-                                graph_end_ns - graph_start_ns,
-                                f"run_id={run_id} role=facade",
-                            )
-                    else:
+            with _callback_run(run_id, self), contextlib.ExitStack() as domain_uses:
+                domain_uses.callback(self._enroll_domain_uses, resources)
+                if _host_spans_active():
+                    graph_start_ns = time.monotonic_ns()
+                    try:
                         callable(self._orch, args, cfg)
-                finally:
-                    self._enroll_domain_uses(resources)
+                    finally:
+                        graph_end_ns = time.monotonic_ns()
+                        _emit_host_span(
+                            f"{self._host_span_prefix}.graph_build",
+                            run_id,
+                            0,
+                            0,
+                            graph_start_ns,
+                            graph_end_ns - graph_start_ns,
+                            f"run_id={run_id} role=facade",
+                        )
+                else:
+                    callable(self._orch, args, cfg)
             if self._delegated_session_fatal is not None:
                 raise RuntimeError(
                     "Worker.submit: delegated-region session is fatal and no further work is admitted"
@@ -14634,6 +14612,9 @@ class Worker:
         # Register the whole pre-transport ownership set before driving it. The
         # journal attempts every independent action and removes only successful
         # entries. Any survivor fences the transport teardown below.
+        domain_error = self._cleanup_journal.drive_kinds({"domain-release"})
+        if domain_error is not None:
+            errors.append(domain_error)
         pre_transport_keys: set[tuple[str, str]] = set()
         for kind, identity, cleanup in (
             ("region", "all region instances", self._sweep_region_instances),
@@ -14653,8 +14634,8 @@ class Worker:
         journal_err = self._cleanup_journal.drive(pre_transport_keys)
         if journal_err is not None:
             errors.append(journal_err)
-            if not startup_abort:
-                raise journal_err
+        if errors and not startup_abort:
+            raise errors[0]
 
         # Session shutdown is the remote transport barrier: never run it in the
         # same all-attempt batch as pending remote frees.
