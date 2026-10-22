@@ -838,8 +838,8 @@ def test_interrupted_global_free_remains_close_owned(domain_worker, monkeypatch,
     assert domain.freed and worker._failed_global_domain_releases == {}
 
 
-@pytest.mark.parametrize("domain_worker", [3], indirect=True)
-def test_failed_pending_local_release_remains_worker_owned(domain_worker, monkeypatch):
+@pytest.mark.parametrize("domain_worker", [3, 4], indirect=True)
+def test_failed_pending_release_remains_worker_owned(domain_worker, monkeypatch):
     worker, members = domain_worker
     saved = []
 
@@ -852,7 +852,8 @@ def test_failed_pending_local_release_remains_worker_owned(domain_worker, monkey
         raise RuntimeError("pending free failed")
 
     with monkeypatch.context() as patch:
-        patch.setattr(worker, "_free_domain_after_fence", interrupt)
+        boundary = "_free_domain_after_fence" if worker.level == 3 else "_free_global_domain_after_fence"
+        patch.setattr(worker, boundary, interrupt)
         with pytest.raises(RuntimeError, match="pending free failed"):
             worker.run(build)
     assert saved[0].released and not saved[0].freed
@@ -965,6 +966,162 @@ def test_freed_global_domain_retires_duplicate_cleanup_debt(domain_worker, monke
     monkeypatch.setattr(worker, "_release_global_domain_now", double_free)
     worker._free_global_domain_after_fence(domain)
     assert worker._failed_global_domain_releases == {}
+
+
+@pytest.mark.parametrize("domain_worker", [4], indirect=True)
+def test_successful_global_free_interrupted_before_freed_publication(domain_worker, monkeypatch):
+    worker, members = domain_worker
+    saved, calls = [], []
+    worker.run(lambda orch, _args, _cfg: saved.append(orch.allocate_domain(**_request(members))))
+    domain = saved[0]
+    release_now, release_claimed = worker._release_global_domain_now, worker._release_global_domain_claimed
+
+    def counted_release(handle):
+        calls.append(handle)
+        release_claimed(handle)
+
+    def interrupt_publication(handle):
+        release_now(handle)
+        raise KeyboardInterrupt("freed publication interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(worker, "_release_global_domain_claimed", counted_release)
+        with monkeypatch.context() as interrupt_patch:
+            interrupt_patch.setattr(worker, "_release_global_domain_now", interrupt_publication)
+            with pytest.raises(KeyboardInterrupt, match="freed publication interrupted"):
+                domain.release()
+        assert not domain.freed and worker._global_domain_free_results[domain.domain_id] is None
+        worker.close()
+        assert domain.freed and not worker._failed_global_domain_releases
+        assert calls == [domain]
+
+
+@pytest.mark.parametrize("domain_worker", [4], indirect=True)
+@pytest.mark.parametrize("release_path", ["explicit", "automatic", "external", "failed_consumer", "close"])
+@pytest.mark.parametrize("backend_completed", [False, True])
+def test_cached_global_release_failure_allows_tree_teardown(
+    domain_worker, monkeypatch, release_path, backend_completed
+):
+    worker, members = domain_worker
+    saved, calls = [], []
+    release_claimed = worker._release_global_domain_claimed
+    mailboxes = tuple(shm.name for shm in worker._next_level_shms)
+
+    def build(orch, _args, _cfg):
+        domain = orch.allocate_domain(**_request(members, retain_after_run=release_path != "automatic"))
+        saved.append(domain)
+        if release_path == "explicit":
+            domain.release()
+
+    def fail_consumer(orch, _args, _cfg):
+        orch.get_domain("tp")
+        raise RuntimeError("consumer failed")
+
+    def fail_release(domain):
+        calls.append(domain)
+        if backend_completed:
+            release_claimed(domain)
+        raise RuntimeError("global backend release failed")
+
+    try:
+        with monkeypatch.context() as patch:
+            if release_path in ("external", "failed_consumer", "close"):
+                worker.run(build)
+            patch.setattr(worker, "_release_global_domain_claimed", fail_release)
+            with pytest.raises(RuntimeError, match="consumer failed|global backend release failed"):
+                if release_path == "external":
+                    saved[0].release()
+                elif release_path == "failed_consumer":
+                    worker.run(fail_consumer)
+                elif release_path == "close":
+                    worker.close()
+                else:
+                    worker.run(build)
+            domain = saved[0]
+            for _ in range(2):
+                with pytest.raises(RuntimeError, match="reclamation is unconfirmed"):
+                    worker.close()
+                assert worker._worker is None
+                assert not worker._next_level_pids and not worker._next_level_shms
+                for name in mailboxes:
+                    with pytest.raises(FileNotFoundError):
+                        worker_mod.SharedMemory(name=name)
+                assert domain.released and not domain.freed
+                assert worker._failed_global_domain_releases[domain.domain_id] is domain
+                assert calls == [domain]
+    finally:
+        # Restore only this test's deliberately injected unknown record. On the
+        # unfixed code, replay only when no backend operation actually ran.
+        if worker._worker is not None and saved:
+            if backend_completed:
+                worker._global_domain_free_results[saved[0].domain_id] = None
+            else:
+                worker._global_domain_free_results.pop(saved[0].domain_id, None)
+            worker._free_global_domain_after_fence(saved[0])
+        worker._failed_global_domain_releases.clear()
+
+
+@pytest.mark.parametrize("domain_worker", [3, 4], indirect=True)
+@pytest.mark.parametrize("action", ["release", "lookup"])
+@pytest.mark.parametrize("waiter_thread", [False, True])
+@pytest.mark.timeout(10)
+def test_predecessor_destructor_can_access_domain(domain_worker, action, waiter_thread, monkeypatch):
+    worker, members = domain_worker
+    saved, results = [], []
+
+    class Graph:
+        def __call__(self, orch, _args, _cfg):
+            saved.append(orch.allocate_domain(**_request(members)))
+
+        def __del__(self):
+            try:
+                if action == "release":
+                    saved[0].release()
+                else:
+                    assert worker.live_domains["tp"] is saved[0]
+                results.append("done")
+            except BaseException as exc:
+                results.append(exc)
+
+    first = worker.submit(Graph())
+    elected, resume = threading.Event(), threading.Event()
+    errors = []
+
+    def pause_waiter(phase):
+        if phase == "after_election":
+            elected.set()
+            assert resume.wait(5)
+
+    def wait_first():
+        try:
+            first.wait()
+        except BaseException as exc:
+            errors.append(exc)
+
+    handoff = first._wait_for_handoff
+
+    def resume_waiter():
+        resume.set()
+        handoff()
+
+    thread = threading.Thread(target=wait_first)
+    if waiter_thread:
+        first._wait_boundary_hook = pause_waiter
+        monkeypatch.setattr(first, "_wait_for_handoff", resume_waiter)
+        thread.start()
+    try:
+        if waiter_thread:
+            assert elected.wait(5)
+        worker.submit(lambda _orch, _args, _cfg: None).wait()
+    finally:
+        resume.set()
+        if waiter_thread:
+            thread.join(5)
+            assert not thread.is_alive()
+    first.wait()
+    assert not errors
+    assert results == ["done"]
+    assert saved[0].freed == (action == "release")
 
 
 def test_detach_retains_same_owner_and_run_fence(domain_worker):

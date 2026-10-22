@@ -10819,7 +10819,11 @@ class Worker:
         """Free global-domain claims without dropping unfinished cleanup debt."""
 
         def _release(handle: GlobalCommDomainHandle) -> None:
-            self._free_global_domain_after_fence(handle)
+            try:
+                self._free_global_domain_after_fence(handle)
+            except BaseException:
+                self._failed_global_domain_releases[handle.domain_id] = handle
+                raise
             with resources.domain_lock:
                 for index, candidate in enumerate(resources.pending_release_global_domains):
                     if candidate is handle:
@@ -11866,6 +11870,18 @@ class Worker:
             pending = list(resources.pending_release_global_domains)
         self._drain_pending_global_domain_snapshot(resources, pending)
 
+    def _defer_global_domain_retirement(self, handle: GlobalCommDomainHandle) -> None:
+        """Keep an unconfirmed global release owned after transport teardown."""
+
+        def retire() -> None:
+            if handle.domain_id not in self._failed_global_domain_releases:
+                return
+            if not handle.freed:
+                raise RuntimeError(f"Global CommDomain {handle.domain_id}: window reclamation is unconfirmed")
+            self._failed_global_domain_releases.pop(handle.domain_id)
+
+        self._cleanup_journal.add_once("domain-retirement", f"global:{handle.domain_id}", retire)
+
     def _release_all_live_global_domains(
         self,
         resources: _RunResources | None = None,
@@ -11878,6 +11894,14 @@ class Worker:
             if handle.retain_after_run and not handle.released and not include_retained:
                 return
             handle._released = True  # noqa: SLF001 -- runtime owns this transition
+            if resources is None and self._global_domain_free_results.get(handle.domain_id) is not None:
+                # A cached failure cannot be replayed. Keep ownership while allowing
+                # native shutdown and child reclamation to proceed.
+                self._failed_global_domain_releases[handle.domain_id] = handle
+                self._defer_global_domain_retirement(handle)
+                if live_domains.get(handle.name) is handle:
+                    live_domains.pop(handle.name)
+                return
             self._free_global_domain_after_fence(handle)
             if live_domains.get(handle.name) is handle:
                 live_domains.pop(handle.name)
@@ -13260,27 +13284,19 @@ class Worker:
             submit_options = {} if caller_stream is None else {"caller_stream": caller_stream}
             return self._submit_l2_locked(state.slot_id, args, cfg, **submit_options)
 
-        with self._submit_mu.exclusive():
-            # Graph callbacks stay serialized, so a predecessor's callback has
-            # always returned by the time we get here — which is what makes the
-            # decision below a fact about that run rather than a guess about
-            # this one.
-            #
-            # Native begin_run owns depth-two backpressure and slot generations
-            # for runs that only dispatch tasks. A predecessor whose cleanup
-            # itself touches the device gets stricter treatment: its teardown is
-            # mailbox control that the whole-run FIFO cannot order against this
-            # run's control, so we wait for that teardown and this worker
-            # degrades to depth one for exactly those runs.
-            predecessor = self._cleanup_bearing_predecessor()
-            if predecessor is not None:
-                predecessor._wait_for_handoff()
-            # Re-check under _submit_mu, after the wait. Two submissions can
-            # both pass the lease's admission check before either reaches here,
-            # and the poison may have been published by the cleanup this call
-            # just waited on — the check at lease time cannot have seen it.
-            self._require_no_ordered_cleanup_failure("submit")
-            return self._submit_l3_locked(callable, args, cfg)
+        while True:
+            with self._submit_mu.exclusive():
+                # Device-touching cleanup must finish before another callback.
+                # Other runs retain native begin_run's backpressure and depth.
+                predecessor = self._cleanup_bearing_predecessor()
+                if predecessor is None:
+                    # Another submitter may have published a new predecessor or
+                    # cleanup error while this caller waited outside the lock.
+                    self._require_no_ordered_cleanup_failure("submit")
+                    return self._submit_l3_locked(callable, args, cfg)
+            # Waiting drops Python keepalives, whose destructors may release a
+            # domain. They must not wait for a serializer owned by this waiter.
+            predecessor._wait_for_handoff()
 
     def _record_unreclaimable(self, message: str, cause: BaseException | None = None) -> RuntimeError:
         """Refuse all further work on this worker, and return the reason.
