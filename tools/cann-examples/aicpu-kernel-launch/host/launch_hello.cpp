@@ -433,7 +433,7 @@ int main(int argc, char **argv) {
     char base[64];
     std::snprintf(base, sizeof(base), "simpler_process_%016lx_%d.so", fp, device_id);
     std::string so_basename = base;
-    std::printf("[bootstrap] inner SO landed at /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/%s\n", base);
+    std::printf("[bootstrap] inner SO basename=%s\n", base);
     std::printf("[bootstrap] fp=%016lx (token=%016lx)\n", fp, input_token);
 
     // Use mkstemp instead of a predictable /tmp path: dev box is shared,
