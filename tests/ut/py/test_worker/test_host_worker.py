@@ -6365,7 +6365,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
 
             def committed(*args):
                 ctypes.c_uint64.from_address(args[5]).value = 1
-                return 0xC7, 0xB000
+                return 0xC7, 0xB000, 64
 
             cw.comm_alloc_domain_windows = committed
             mailbox = memoryview(bytearray(worker_mod.mailbox_size(worker_mod._DEFAULT_PIPELINE_DEPTH_REQUEST)))
@@ -6932,7 +6932,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 assert reply_shms is not None
                 reply = reply_shms[0]
                 assert reply.buf is not None
-                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 0)
+                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 0, 4096)
 
             monkeypatch.setattr(worker, "_dispatch_control_domain", commit_domain)
         else:
@@ -7029,7 +7029,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 interrupt_main()
                 reply = reply_shms[0]
                 assert reply.buf is not None
-                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 0)
+                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 0, 4096)
 
             monkeypatch.setattr(worker, "_dispatch_control_domain", commit_domain)
         else:
@@ -7704,7 +7704,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             staged_shms.extend(reply_shms.values())
             reply_buf = reply_shms[0].buf
             assert reply_buf is not None
-            worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply_buf, 0, 1, 0xC7, 0xB000, 0)
+            worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply_buf, 0, 1, 0xC7, 0xB000, 0, 64)
 
         monkeypatch.setattr(worker, "_dispatch_control_domain", successful_dispatch)
         real_close = worker_mod.os.close

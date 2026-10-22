@@ -582,6 +582,12 @@ class Orchestrator:
 
     def release_domain(self, handle: CommDomainHandle) -> None:
         """Release a domain through its creating Worker's completion fence."""
+        if (
+            self._worker is None
+            or handle._ref is None
+            or handle._ref.owner_instance_id != self._worker._owner_instance_id
+        ):
+            raise ValueError("release_domain requires the domain's creating Worker")
         handle.release()
 
     def allocate_global_domain(
@@ -657,6 +663,20 @@ class Orchestrator:
     def _copy_domain(self, handle, rank, data, buffer, offset, *, writing):
         if self._worker is None:
             raise RuntimeError("domain copy requires an Orchestrator bound to a Worker")
+        with (
+            self._worker._operation_lease("domain copy", allow_continuation=True),
+            contextlib.nullcontext()
+            if _callback_frame_for(self._worker) is not None
+            else self._worker._control_reservation("domain copy"),
+        ):
+            return self._copy_domain_locked(handle, rank, data, buffer, offset, writing=writing)
+
+    def _copy_domain_locked(self, handle, rank, data, buffer, offset, *, writing):
+        assert self._worker is not None
+        if not handle.borrowed:
+            if handle._ref is None or handle._ref.owner_instance_id != self._worker._owner_instance_id:
+                raise ValueError("domain copy requires the domain's creating Worker")
+            self._worker._use_domain(handle)
         size = len(data) if writing else data
         handle._require_live()
         absolute = self._global_copy_range(handle, buffer=buffer, offset=offset, nbytes=size)

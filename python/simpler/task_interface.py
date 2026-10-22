@@ -1155,9 +1155,9 @@ class CommDomainHandle:
     Callers must treat handle attributes and context/buffer mappings as read-only
     metadata. Reassignment is unsupported; configure through allocation arguments
     and end ownership through ``release()``. Buffer contents remain writable.
-    Each run consuming domain Buffers must obtain the domain through allocation or
-    lookup; carrying Buffers directly across runs is unsupported. Retained handles
-    may be inspected and released serially after run completion.
+    Submitted Tensor identities register domain use in the current run, including
+    cached Tensors. Scalar-only use requires explicit lookup in that run. Retained
+    handles may be inspected and released serially after run completion.
     """
 
     __slots__ = (
@@ -1168,6 +1168,7 @@ class CommDomainHandle:
         "_domain_size",
         "_domain_ranks",
         "_release_fn",
+        "_release_fn_manages_state",
         "_released",
         "_freed",
         "members",
@@ -1205,6 +1206,7 @@ class CommDomainHandle:
         borrowed: bool = False,
         member_buffers: dict[int, dict[str, Buffer]] | None = None,
         requested_window_size: int | None = None,
+        _release_fn_manages_state: bool = False,
     ) -> None:
         self.name = name
         self.workers = tuple(workers)
@@ -1215,6 +1217,7 @@ class CommDomainHandle:
             {worker: rank for rank, worker in enumerate(self.workers)} if _domain_ranks is None else dict(_domain_ranks)
         )
         self._release_fn = _release_fn
+        self._release_fn_manages_state = _release_fn_manages_state
         self.members = tuple(members)
         self.buffers = tuple(buffers)
         self.domain_id = self.allocation_id if domain_id is None else int(domain_id)
@@ -1323,7 +1326,8 @@ class CommDomainHandle:
             raise RuntimeError("borrowed communication domain cannot be released")
         if self._released:
             return
-        self._released = True
+        if not self._release_fn_manages_state:
+            self._released = True
         self._release_fn(self)
 
     def __enter__(self) -> CommDomainHandle:

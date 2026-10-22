@@ -80,21 +80,21 @@ L3 creation, reuse and staging precede its first task submission and use the
 existing control admission gate. L4 retains its existing control-plane paths
 without adding a first-task restriction.
 A successful run preserves domains created with `retain_after_run=True`.
-Each subsequent run consuming domain Buffers must call `get_domain` or
-`get_or_allocate_domain`, then obtain its local Buffers again. Passing a
-previous run's domain Buffers as arguments or submitting them directly from
-a closure is unsupported.
+Ordinary Tensor submissions and synchronous Buffer copies register domain use
+in the current run, including cached Tensors from a previous run. Explicit lookup
+also registers use when kernels consume only `CommContext` scalars.
 Use `with` only when the scope should release the shared handle: context exit
 releases a reused handle too. After release, callers must not submit new uses
-of previously obtained Buffers; no additional per-submit domain check is made.
+of previously obtained Buffers; logical release revokes their submit provenance.
 Physical release still waits for accepted tasks and their children to complete.
 After run completion, retained handles can be inspected, copied through a
 matching Orchestrator and released serially outside a callback; release then
 reclaims the backend resources synchronously and repeated release is a no-op.
-Release follows the handle's existing callback to its creating Worker; callers
-must pair copy operations with the matching Orchestrator and handle.
-Concurrency follows the existing backend contracts; no additional
-concurrent-access or cross-Worker misuse checks are added.
+Release follows the handle's callback to its creating Worker;
+`orch.release_domain` rejects a foreign owner. Concurrent run callbacks,
+lookup and release use the existing submission serializer. Domain-using runs
+retain the existing ordered-cleanup policy: a successor waits for its
+predecessor's fence and cleanup. This does not add concurrent device execution.
 `Worker.close()` frees remaining owned domains after its existing lease/fence drain.
 `Worker.live_domains` includes both backends.
 
@@ -103,8 +103,9 @@ bounds checks. They synchronously stage data and do not wait for already queued
 DAG work. L3 staging precedes task submission and reuses ordinary VMM Buffer
 copies and must stay inside the declared slices, including when `buffer=None`.
 L4 retains the existing bounded whole-window copy path. `buffer_range(name)`
-returns the slice's window offset and byte size. `mapping_size` is the requested
-extent on the local L3 backend and the returned mapping extent on L4.
+returns the slice's window offset and byte size. `mapping_size` is the
+returned backend mapping extent on both L3 and L4. Outside a callback, staging
+requires all outstanding run handles to have completed; it never waits implicitly.
 
 `member(rank).buffers[name]` returns an ordinary public `Buffer` in both layers.
 L4 Buffers carry an address-free `DOMAIN_WINDOW` descriptor: creator incarnation,
@@ -124,22 +125,25 @@ are refused. `local_context(rank)` is available only for ranks actually mapped
 on this node. Legacy `get_global_domain(domain_id)` remains session-local.
 `handle.buffers` contains complete buffer definitions, and
 `requested_window_size` distinguishes the request from `mapping_size`.
-The L3 backend does not report a rounded physical extent; its `mapping_size`
-continues to record the requested size.
-
-The creator must still explicitly obtain the domain in every consuming run.
 The existing root run fence protects its accepted descendants; holding a
 descriptor or borrowed handle alone adds no retention. Logical release revokes
-new owning L4 Tensor submissions while previously accepted descendants keep
-their node grants until the fence. Pure references passed as scalars or closure
-values remain subject to the caller's no-new-use-after-release convention;
-they do not introduce arbitrary independent child runs or a global close
-notification protocol. L3's legacy cached-Buffer convention is unchanged.
-Graph/replay retention, general Remote COPY/lease and mapping semantics remain
-separate work under #2460. No new proof of device quiescence is added for an
-ambiguous native failure. #2120 remains a follow-up compatibility integration:
-its detach API must share the same Worker retention, use enrollment and cleanup
-authority rather than create a second persistent-domain registry.
+new L3/L4 Tensor submissions while previously accepted descendants keep their
+node grants until the fence. For pure references passed as scalars or closure
+values, the root callback must first call `get_domain(ref)` and submit the
+descendant before release; arbitrary integer semantics cannot imply a use.
+There is no independent graph capture/replay API; `host_build_graph` executes
+within the same run fence. General Remote COPY/lease and mapping remain #2460
+work. An ambiguous native completion retains its resources until whole-tree
+teardown rather than reporting them freed.
+
+`Worker.detach_persistent_domain(handle)` adapts #2120's proposed retention API
+to the same ownership model: inside the owning callback it changes an unretained
+domain to `retain_after_run=True`, preserving the current run's registration
+and cleanup debt. It does not move the handle to another registry or discard
+its fence. Reuse must then specify `retain_after_run=True`; a second detach is
+an error. Callers can migrate private journal manipulation to this method,
+or request retention directly at allocation. A failed consuming run still
+closes the retained domain, and `Worker.close()` remains the final owner.
 
 ### `ChipDomainContext` (one per participating chip, via `handle[chip_idx]`)
 
@@ -150,7 +154,7 @@ authority rather than create a second persistent-domain registry.
 | `domain_size` | number of ranks in the subset |
 | `device_ctx` | pointer to the device-side `CommContext` (pass as a kernel scalar) |
 | `local_window_base` | base device address of this rank's window |
-| `actual_window_size` | imported backend extent; the L3-local backend records the requested extent |
+| `actual_window_size` | actual backend mapping extent, including backend alignment |
 | `buffers` | `{buffer_name: Buffer}` for each `CommBufferSpec`, resolved on this chip; L3-local VMM or imported logical domain slice |
 
 Kernels read peer windows through `device_ctx` (which holds every rank's
