@@ -21,7 +21,6 @@
 
 #include "aicpu_dispatcher.h"
 
-#include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -119,55 +118,6 @@ std::string MakeInnerSoPath(const std::string &dir, uint64_t fp, uint64_t device
     return dir + name;
 }
 
-// Read-only owner-directory inventory for lifecycle acceptance.
-void AuditProcessSoDirectories(const std::string &dir) {
-    const int saved_errno = errno;
-    const std::string root = dir.substr(0, dir.rfind('/'));
-    DIR *entries = opendir(root.c_str());
-    const auto scan = static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(entries));
-    DispatcherLog("PROCESS_SO_AUDIT_2651 begin scan=%llx owner=%s", scan, dir.c_str());
-    bool complete = entries != nullptr;
-    size_t visited = 0, directories = 0;
-    if (entries != nullptr) {
-        while (true) {
-            errno = 0;
-            auto *entry = readdir(entries);
-            if (entry == nullptr) {
-                if (errno != 0) complete = false;
-                break;
-            }
-            if (++visited > 8192) {
-                complete = false;
-                break;
-            }
-            const std::string name = entry->d_name;
-            const size_t split = name.find('_');
-            if (split == std::string::npos || split == 0 || split + 1 == name.size() ||
-                name.find('_', split + 1) != std::string::npos ||
-                name.find_first_not_of("0123456789_") != std::string::npos)
-                continue;
-            const std::string path = root + "/" + name;
-            struct stat st{};
-            if (lstat(path.c_str(), &st) != 0) {
-                if (errno != ENOENT) complete = false;
-                continue;
-            }
-            if (S_ISDIR(st.st_mode)) {
-                ++directories;
-                DispatcherLog("PROCESS_SO_AUDIT_2651 scan=%llx directory=%s", scan, path.c_str());
-            } else {
-                complete = false;
-            }
-        }
-        if (closedir(entries) != 0) complete = false;
-    }
-    DispatcherLog(
-        "PROCESS_SO_AUDIT_2651 end scan=%llx owner=%s scan_complete=%d visited=%zu directories=%zu", scan, dir.c_str(),
-        complete, visited, directories
-    );
-    errno = saved_errno;
-}
-
 // Atomic publication preserves any existing mapping during a repeated upload.
 bool WriteBytes(const std::string &path, const char *data, uint64_t len) {
     char tmp_path[320];
@@ -252,7 +202,6 @@ __attribute__((visibility("default"))) uint32_t DynTileFwkBackendKernelServerIni
     uint64_t fp = simpler_dispatcher::Fingerprint(inner_bytes, d->inner_so_len);
     const std::string dir = simpler_dispatcher::MakeInnerSoDir();
     if (dir.empty()) return 1;
-    simpler_dispatcher::AuditProcessSoDirectories(dir);
     if (mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) {
         simpler_dispatcher::DispatcherLog("mkdir %s failed: %s", dir.c_str(), strerror(errno));
         return 1;
