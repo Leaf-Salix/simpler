@@ -972,8 +972,8 @@ def _run_program_callable_release(arch, runtime, device):
         lib.destroy_device_context(ctx)
 
 
-def _run_loader_unload_retry(arch, runtime, device, scenario):
-    """The AICPU loader's binary is a kernel-context owner: a failed
+def _run_loader_lifecycle(arch, runtime, device, scenario):
+    """Each AICPU loader owns its JSON descriptor and binary: a failed
     `rtsBinaryUnload` keeps its handle, reports the failure out of close, and
     holds off destruction until a retry succeeds. A kernel context borrows its
     device and never resets it, so nothing else can retire that binary."""
@@ -1005,7 +1005,30 @@ def _run_loader_unload_retry(arch, runtime, device, scenario):
         1,
     )
     try:
-        if scenario == "init_rollback":
+        if scenario == "json_isolation":
+            faults.last_loader_json_path.restype = ctypes.c_char_p
+            assert lib.simpler_kernel_mode_init(*init_args) == 0
+            first = Path(faults.last_loader_json_path().decode())
+            descriptor = first.read_bytes()
+            second_ctx = lib.create_device_context()
+            assert second_ctx
+            try:
+                assert lib.simpler_kernel_mode_init(second_ctx, *init_args[1:-1], 2) == 0
+                second = Path(faults.last_loader_json_path().decode())
+                assert first != second
+                assert first.suffix == second.suffix == ".json"
+                assert second.read_bytes() == descriptor
+                assert first.read_bytes() == descriptor
+                assert lib.finalize_device(ctx) == 0
+                assert not first.exists()
+                assert second.read_bytes() == descriptor
+                assert lib.finalize_device(second_ctx) == 0
+                assert not second.exists()
+            finally:
+                assert lib.finalize_device(second_ctx) == 0
+                lib.destroy_device_context(second_ctx)
+                assert lib.finalize_device(ctx) == 0
+        elif scenario == "init_rollback":
             # Symbol resolution fails after the binary is loaded, so `Init`
             # rolls back — and its rollback unload fails too. The handle is the
             # only thing naming a loaded binary, so init must not clear it.
@@ -1177,6 +1200,22 @@ def test_loader_unload_failure_keeps_a_retryable_owner(arch, runtime, scenario, 
     assert result.returncode == 0, result.stdout + result.stderr
     if scenario == "close_retry":
         assert "refusing to destroy an unclosed kernel context" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_CASES)
+def test_loader_json_descriptors_belong_to_each_context(arch, runtime, kernel_close_faults, request):
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    env = dict(os.environ)
+    env["LD_PRELOAD"] = str(kernel_close_faults) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), arch, runtime, device, "loader_json_isolation"],
+        check=False,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_CASES)
@@ -1613,6 +1652,6 @@ if __name__ == "__main__":
             sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4] == "program_double_acl"
         )
     elif sys.argv[4].startswith("loader_"):
-        _run_loader_unload_retry(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4][len("loader_") :])
+        _run_loader_lifecycle(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4][len("loader_") :])
     else:
         _run_lifecycle_retry(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4])

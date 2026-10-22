@@ -93,25 +93,38 @@ TEST_F(SoUploadFiles, ConcurrentRepeatedWritesAreAtomicAndLeaveOtherFilesAlone) 
     std::ifstream file(path, std::ios::binary);
     const std::string actual((std::istreambuf_iterator<char>(file)), {});
     ASSERT_EQ(actual.size(), 65536);
+    EXPECT_GE(actual[0], 'a');
+    EXPECT_LE(actual[0], 'd');
     EXPECT_EQ(actual, std::string(actual.size(), actual[0]));
     EXPECT_TRUE(fs::exists(history));
     EXPECT_EQ(std::distance(fs::directory_iterator(dir), fs::directory_iterator()), 2);
 }
 
-TEST_F(SoUploadFiles, FailedUploadLeavesNeitherPublishedNorPartialFile) {
+TEST_F(SoUploadFiles, FailedUploadPreservesExistingTargetAndAllowsRetry) {
     const std::string path = dir + "/owned.so";
-    ASSERT_EXIT(
-        {
-            signal(SIGXFSZ, SIG_IGN);
-            struct rlimit limit;
-            limit.rlim_cur = limit.rlim_max = 4096;
-            if (setrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(1);
-            const std::string bytes(1024 * 1024, 'x');
-            if (WriteBytes(path, bytes.data(), bytes.size())) _exit(2);
-            _exit(fs::is_empty(dir) ? 0 : 3);
-        },
-        testing::ExitedWithCode(0), ""
-    );
-    EXPECT_TRUE(fs::is_empty(dir));
+    const std::string bytes(1024 * 1024, 'x');
+    for (bool existing : {false, true}) {
+        SCOPED_TRACE(existing);
+        if (existing) std::ofstream(path) << "old";
+        ASSERT_EXIT(
+            {
+                signal(SIGXFSZ, SIG_IGN);
+                struct rlimit limit;
+                limit.rlim_cur = limit.rlim_max = 4096;
+                if (setrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(1);
+                _exit(WriteBytes(path, bytes.data(), bytes.size()) ? 2 : 0);
+            },
+            testing::ExitedWithCode(0), ""
+        );
+        EXPECT_EQ(std::distance(fs::directory_iterator(dir), fs::directory_iterator()), existing ? 1 : 0);
+        if (existing) {
+            std::ifstream previous(path, std::ios::binary);
+            EXPECT_EQ(std::string(std::istreambuf_iterator<char>(previous), {}), "old");
+        }
+        ASSERT_TRUE(WriteBytes(path, bytes.data(), bytes.size()));
+        std::ifstream retried(path, std::ios::binary);
+        EXPECT_EQ(std::string(std::istreambuf_iterator<char>(retried), {}), bytes);
+        ASSERT_TRUE(fs::remove(path));
+    }
 }
 }  // namespace
