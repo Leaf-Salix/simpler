@@ -5500,14 +5500,13 @@ class TestRunHandle:
         """The owner's failure reaches every later caller, so no path reports
         success for an allocation whose backend release did not happen.
 
-        ``_release_all_live_domains`` keeps an un-freed handle in
-        ``_live_domains`` precisely so ``close()`` reports it as a residual; a
-        second caller that returned success would erase that.
+        The sweep transfers failed releases to teardown without reporting
+        them freed or replaying the backend operation.
         """
         worker = Worker(level=3, num_sub_workers=0)
         worker._worker = cast(Any, object())
         boom = RuntimeError("backend release failed")
-        _entered, in_backend, let_go = self._gated_domain_worker(worker, target_id=7, outcome=boom)
+        entered, in_backend, let_go = self._gated_domain_worker(worker, target_id=7, outcome=boom)
         let_go.set()
 
         resources = worker_mod._RunResources()
@@ -5518,13 +5517,20 @@ class TestRunHandle:
         assert in_backend.is_set()
         assert not contested.freed
 
-        # The sweep is the second caller: it must see the failure, keep the
-        # handle, leave `freed` false, and report the failure to its own caller
-        # rather than returning as if the domain were reclaimed.
+        # The sweep reports the cached failure and hands ownership to teardown.
         with pytest.raises(RuntimeError, match="backend release failed"):
             worker._release_all_live_domains()
         assert not contested.freed, "a failed release must not be reported as freed"
-        assert "contested" in worker._live_domains, "a failed release must stay a detectable residual"
+        assert "contested" not in worker._live_domains
+        assert not worker._cleanup_journal.empty
+        replacement = self._retired_domain(worker, resources, "contested", 8)
+        with pytest.raises(RuntimeError, match="backend release failed"):
+            worker._free_domain_after_fence(contested)
+        assert worker._live_domains["contested"] is replacement
+        error = worker._cleanup_journal.drive_kinds({"domain-retirement"})
+        assert isinstance(error, RuntimeError) and "reclamation is unconfirmed" in str(error)
+        assert not contested.freed and not worker._cleanup_journal.empty
+        assert entered == [7], "a cached failure must never retry the backend free"
 
     def test_allocate_domain_outside_graph_construction_is_rejected(self):
         worker = Worker(level=3, num_sub_workers=0)

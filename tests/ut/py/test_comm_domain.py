@@ -861,17 +861,23 @@ def test_failed_pending_local_release_remains_worker_owned(domain_worker, monkey
 
 
 @pytest.mark.parametrize("domain_worker", [3], indirect=True)
+@pytest.mark.parametrize("release_path", ["explicit", "automatic", "external", "failed_consumer", "close"])
 @pytest.mark.parametrize(
     "teardown_failure", [None, "_reclaim_child_groups", "_close_worker_chip_orch_comm", "journal", "proof"]
 )
-def test_cached_release_failure_waits_for_tree_teardown(domain_worker, monkeypatch, teardown_failure):
+def test_cached_release_failure_waits_for_tree_teardown(domain_worker, monkeypatch, teardown_failure, release_path):
     worker, members = domain_worker
     saved, calls = [], []
 
     def build(orch, _args, _cfg):
-        domain = orch.allocate_domain(**_request(members))
+        domain = orch.allocate_domain(**_request(members, retain_after_run=release_path != "automatic"))
         saved.append(domain)
-        domain.release()
+        if release_path == "explicit":
+            domain.release()
+
+    def fail_consumer(orch, _args, _cfg):
+        orch.get_domain("tp")
+        raise RuntimeError("consumer failed")
 
     def fail_release(domain):
         calls.append(domain)
@@ -894,9 +900,18 @@ def test_cached_release_failure_waits_for_tree_teardown(domain_worker, monkeypat
 
     try:
         with monkeypatch.context() as patch:
-            patch.setattr(worker, "_release_domain_claimed", fail_release)
-            with pytest.raises(RuntimeError, match="backend release failed"):
+            if release_path in ("external", "failed_consumer", "close"):
                 worker.run(build)
+            patch.setattr(worker, "_release_domain_claimed", fail_release)
+            with pytest.raises(RuntimeError, match="consumer failed|backend release failed"):
+                if release_path == "external":
+                    saved[0].release()
+                elif release_path == "failed_consumer":
+                    worker.run(fail_consumer)
+                elif release_path == "close":
+                    worker.close()
+                else:
+                    worker.run(build)
             domain = saved[0]
             assert domain.released and not domain.freed
             assert isinstance(worker._domain_free_results[domain.allocation_id], RuntimeError)
