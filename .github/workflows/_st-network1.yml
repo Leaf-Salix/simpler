@@ -209,6 +209,35 @@ jobs:
             --require-pto-isa
             --pto-session-timeout 1200
 
+      - name: Export process SO lifecycle evidence
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          AUDIT_PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -uo pipefail
+          [ -r "${NETWORK1_SSH_HELPER:-}" ] && [ -n "${REMOTE_WORKDIR:-}" ] || exit 1
+          source "$NETWORK1_SSH_HELPER"
+          status=0
+          (
+            set +u
+            source "$NETWORK1_CANN_ENV"
+            source .venv/bin/activate
+            bash tools/export_process_so_audit.sh "$RUN_DIR/audit-parent" "$AUDIT_PLATFORM" "$NETWORK1_LOCAL_DEVICES"
+          ) || status=1
+          network1_ssh "
+            cd '$REMOTE_WORKDIR' &&
+            source '$NETWORK1_REMOTE_CANN_ENV' &&
+            source .venv/bin/activate &&
+            bash tools/export_process_so_audit.sh output/so-cache-audit '$AUDIT_PLATFORM' '$NETWORK1_REMOTE_DEVICES'
+          " || status=1
+          mkdir -p "$RUN_DIR/audit-peer"
+          rsync -a -e "$RSYNC_SSH" \
+            "$REMOTE_TARGET:$REMOTE_WORKDIR/output/so-cache-audit/" \
+            "$RUN_DIR/audit-peer/" || status=1
+          exit "$status"
+
       - name: Clear the network1 staging tree
         if: always()
         uses: ./.github/actions/network1-teardown
