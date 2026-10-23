@@ -234,6 +234,8 @@ before a consumer can dereference a device window.
 
 Host-owned DRAM pools are a separate opt-in `host_windows` configuration;
 they do not turn attachment records into CPU mappings of remote HBM.
+Their export table contains the R NPU windows followed by the H Host windows;
+the member rank table and CommContext still contain only the R NPUs.
 See the [Host domain design](zh-cn/host-comm-domain-design.md) and
 [single-host/two-host acceptance runbook](zh-cn/host-domain-mpi-validation.md)
 for protected local CPU access, explicit ACL copy, and kernel-visible views.

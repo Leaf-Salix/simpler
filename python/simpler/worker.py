@@ -93,10 +93,8 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAX_REGISTERED_CALLABLE_IDS,
     RUNTIME_ENV_RING_COUNT,
     WorkerType,
-    _decode_buffer_descriptor_wire,
     _DomainHostMemory,
     _emit_host_span,
-    _encode_buffer_descriptor_wire,
     _mailbox_load_i32,
     _mailbox_load_u64,
     _mailbox_store_i32,
@@ -265,7 +263,6 @@ from .global_comm_domain import (
     decode_copy_result,
     decode_descriptor_table,
     decode_domain_command,
-    decode_domain_exports,
     decode_release_command,
     encode_comm_init,
     encode_comm_init_result,
@@ -273,8 +270,6 @@ from .global_comm_domain import (
     encode_copy_result,
     encode_descriptor_table,
     encode_domain_command,
-    encode_domain_exports,
-    encode_host_descriptors,
     encode_release_command,
     resolve_global_comm_capability,
     validate_descriptor_table,
@@ -3236,20 +3231,20 @@ def _handle_ctrl_global_domain_import(cw: _ChipWorker, buf: memoryview, store: _
         if entry is None or entry.descriptor is None or entry.revoked or entry.generation != generation:
             raise RuntimeError("Global CommDomain import requires a matching prepared domain")
         command = decode_domain_command(bytes(payload[LOCAL_IMPORT_REQUEST.size : payload_size]))
-        descriptors = command.descriptors
+        descriptors = command.descriptors[: entry.rank_count]
         if (
             command.phase is not GlobalDomainPhase.IMPORT
             or command.domain_id != domain_id
             or command.generation != generation
             or command.window_size != entry.requested_window_size
-            or len(descriptors) != descriptor_count
+            or len(command.descriptors) != descriptor_count
             or len(descriptors) != entry.rank_count
             or GLOBAL_DOMAIN_PROFILE_IDS[command.profile] != entry.descriptor.profile_id
         ):
             raise ValueError("Global CommDomain import command conflicts with the prepared window")
         if descriptors[entry.domain_rank] != entry.descriptor:
             raise RuntimeError("Global CommDomain import table does not contain the local exported descriptor")
-        host_bytes = encode_host_descriptors(command)
+        host_bytes = b"".join(d.encode() for d in command.descriptors[entry.rank_count :])
         descriptor_bytes = b"".join(descriptor.encode() for descriptor in descriptors)
         table = descriptor_bytes + host_bytes
         if bool(command.host_windows) != entry.host_enabled or (
@@ -3370,10 +3365,29 @@ def _handle_ctrl_global_domain_copy(
         staged.close()
 
 
+def _domain_copy_ranges(domain_id, generation, descriptors, offsets, nbytes):
+    operands = []
+    for descriptor, offset in zip(descriptors, offsets):
+        identity, gen, slot, slice_offset = _DOMAIN_SLICE.unpack(descriptor.body)
+        if descriptor.backend_kind != BackendKind.DOMAIN_WINDOW or (identity, gen) != (domain_id, generation):
+            raise ValueError("domain copy operands must belong to the same live domain")
+        RegionPartSpan(0, descriptor.nbytes).validate_range(offset, nbytes, "domain copy")
+        operands.append((slot, slice_offset + offset, descriptor.access))
+    dst, src = operands
+    if dst[2] not in (AccessMode.WRITE, AccessMode.READWRITE) or src[2] not in (
+        AccessMode.READ,
+        AccessMode.READWRITE,
+    ):
+        raise ValueError("domain copy requires destination WRITE and source READ")
+    if dst[0] == src[0] and dst[1] < src[1] + nbytes and src[1] < dst[1] + nbytes:
+        raise ValueError("domain copy ranges overlap in the same pool")
+    return (*dst[:2], *src[:2])
+
+
 def _handle_ctrl_domain_pool_copy(cw, buf, store) -> None:
     staged, payload, size = _open_global_domain_payload(buf)
     try:
-        if size != LOCAL_POOL_COPY.size + 176:
+        if size != LOCAL_POOL_COPY.size + 2 * CALLABLE_HASH_DIGEST_BYTES:
             raise ValueError("domain copy metadata size mismatch")
         magic, version, domain_id, generation, dst_offset, src_offset, nbytes = LOCAL_POOL_COPY.unpack_from(payload)
         _validate_local_global_header(magic, version, domain_id, generation, operation="domain copy")
@@ -3386,28 +3400,17 @@ def _handle_ctrl_domain_pool_copy(cw, buf, store) -> None:
             or not entry.host_enabled
         ):
             raise ValueError("domain copy requires a live Host domain grant")
-        operands = []
-        for index, offset in enumerate((dst_offset, src_offset)):
-            start = LOCAL_POOL_COPY.size + index * 88
-            descriptor = _decode_buffer_descriptor_wire(bytes(payload[start : start + 88]))
-            granted = entry.buffers.get(descriptor.identity)
-            if granted is None or granted.to_descriptor() != descriptor:
-                raise ValueError("domain copy descriptor does not match its granted Buffer")
-            RegionPartSpan(0, descriptor.nbytes).validate_range(offset, nbytes, "domain copy")
-            identity, gen, slot, slice_offset = _DOMAIN_SLICE.unpack(descriptor.body)
-            if (identity, gen) != (domain_id, generation):
-                raise ValueError("domain copy grant belongs to another domain")
-            operands.append((slot, slice_offset + offset, descriptor.access))
-        dst, src = operands
-        if dst[2] not in (AccessMode.WRITE, AccessMode.READWRITE) or src[2] not in (
-            AccessMode.READ,
-            AccessMode.READWRITE,
-        ):
-            raise ValueError("domain copy access mode mismatch")
-        if dst[0] == src[0] and dst[1] < src[1] + nbytes and src[1] < dst[1] + nbytes:
-            raise ValueError("domain copy ranges overlap in the same pool")
+        descriptors = []
+        for start in (LOCAL_POOL_COPY.size, LOCAL_POOL_COPY.size + CALLABLE_HASH_DIGEST_BYTES):
+            granted = entry.buffers.get(
+                _unpack_identity_wire(bytes(payload[start : start + CALLABLE_HASH_DIGEST_BYTES]))
+            )
+            if granted is None:
+                raise ValueError("domain copy identity has no granted Buffer")
+            descriptors.append(granted.to_descriptor())
+        ranges = _domain_copy_ranges(domain_id, generation, descriptors, (dst_offset, src_offset), nbytes)
         try:
-            cw.comm_global_domain_copy(domain_id, *dst[:2], *src[:2], nbytes)
+            cw.comm_global_domain_copy(domain_id, *ranges, nbytes)
         except BaseException:
             entry.revoked = True
             raise
@@ -11183,7 +11186,7 @@ class Worker:
             command.owner_instance_id,
             command.buffer_ids,
             command.retain_after_run,
-            tuple(replace(h, mapping_size=0, handle=b"") for h in command.host_windows),
+            command.host_windows,
         )
 
     def _global_domain_attachment_matrix(
@@ -11307,12 +11310,14 @@ class Worker:
                         host.spec.numa_id,
                         host.spec.nbytes,
                     )
-                state.command = replace(
-                    command,
-                    host_windows=tuple(
-                        replace(h, mapping_size=mapping_size, handle=bytes(token)) if h == host else h
-                        for h in command.host_windows
-                    ),
+                slot = len(command.members) + command.host_windows.index(host)
+                state.descriptors[slot] = GlobalDomainDescriptor(
+                    GLOBAL_DOMAIN_VERSION,
+                    GLOBAL_DOMAIN_PROFILE_IDS[command.profile],
+                    slot,
+                    len(command.members),
+                    mapping_size,
+                    bytes(token),
                 )
             for member in local_members:
                 payload = bytearray(capacity)
@@ -11360,12 +11365,7 @@ class Worker:
             raise
 
     def _prepare_global_domain_reply(self, command, node_worker_id) -> bytes:
-        descriptors = self._prepare_global_domain_node(command, node_worker_id)
-        if not command.host_windows:
-            return encode_descriptor_table(descriptors)
-        state = self._global_node_domains[command.domain_id]
-        hosts = tuple(h for h in state.command.host_windows if h.node_worker_id == node_worker_id)
-        return encode_domain_exports(descriptors, hosts)
+        return encode_descriptor_table(self._prepare_global_domain_node(command, node_worker_id))
 
     def _import_global_domain_node(self, command: GlobalDomainCommand, node_worker_id: int) -> None:
         if self.level != 3 or self._worker is None:
@@ -11388,11 +11388,10 @@ class Worker:
             command.descriptors,
             rank_count=len(command.members),
             profile=command.profile,
+            host_windows=command.host_windows,
         )
-        local_exports = tuple(h for h in state.command.host_windows if h.node_worker_id == node_worker_id)
-        received_exports = tuple(h for h in command.host_windows if h.node_worker_id == node_worker_id)
-        if local_exports != received_exports:
-            raise RuntimeError("Host import table changes this node's exported backing")
+        if any(command.descriptors[slot] != descriptor for slot, descriptor in state.descriptors.items()):
+            raise RuntimeError("Import table changes this node's exported backing")
         local_members = self._global_local_members(command, node_worker_id)
         import_command = encode_domain_command(replace(command, attachments=()))
         request_size = LOCAL_IMPORT_REQUEST.size + len(import_command)
@@ -11501,7 +11500,6 @@ class Worker:
         if (
             self._global_domain_command_identity(state.command) != self._global_domain_command_identity(command)
             or state.command.descriptors != command.descriptors
-            or state.command.host_windows != command.host_windows
         ):
             raise RuntimeError("Global CommDomain commit command conflicts with IMPORT")
         state.phase = GlobalDomainPhase.COMMIT
@@ -11643,9 +11641,7 @@ class Worker:
             if not state.command.host_windows or worker not in state.contexts:
                 raise ValueError("copy_domain requires a participating local Host domain chip")
             with self._child_prov_worker_lock(worker), self._child_prov_lock:
-                for descriptor, offset in zip(descriptors, (dst_offset, src_offset)):
-                    if _DOMAIN_SLICE.unpack(descriptor.body)[:2] != (domain_id, generation):
-                        raise ValueError("copy_domain operands must belong to the same live domain")
+                for descriptor in descriptors:
                     slot = _DOMAIN_SLICE.unpack(descriptor.body)[2]
                     if slot < len(state.command.members):
                         candidates = _domain_buffers(state.command, slot).values()
@@ -11656,20 +11652,11 @@ class Worker:
                         candidates = ()
                     if not any(buffer.to_descriptor() == descriptor for buffer in candidates):
                         raise ValueError("copy_domain operand does not match its granted Buffer")
-                    RegionPartSpan(0, descriptor.nbytes).validate_range(offset, nbytes, "copy_domain")
-                if descriptors[0].access not in (AccessMode.WRITE, AccessMode.READWRITE) or descriptors[
-                    1
-                ].access not in (AccessMode.READ, AccessMode.READWRITE):
-                    raise ValueError("copy_domain requires destination WRITE and source READ")
-                dst_slot, dst_slice = _DOMAIN_SLICE.unpack(descriptors[0].body)[2:]
-                src_slot, src_slice = _DOMAIN_SLICE.unpack(descriptors[1].body)[2:]
-                dst_start, src_start = dst_slice + dst_offset, src_slice + src_offset
-                if dst_slot == src_slot and dst_start < src_start + nbytes and src_start < dst_start + nbytes:
-                    raise ValueError("copy_domain ranges overlap in the same pool")
+                _domain_copy_ranges(domain_id, generation, descriptors, (dst_offset, src_offset), nbytes)
                 payload = LOCAL_POOL_COPY.pack(
                     LOCAL_DOMAIN_MAGIC, GLOBAL_DOMAIN_VERSION, domain_id, generation, dst_offset, src_offset, nbytes
                 )
-                payload += b"".join(bytes(_encode_buffer_descriptor_wire(d)) for d in descriptors)
+                payload += b"".join(_pack_identity_wire(d.identity) for d in descriptors)
                 try:
                     self._worker.control_payload(
                         WorkerType.NEXT_LEVEL,
@@ -11739,7 +11726,7 @@ class Worker:
         if control is ControlName.ALLOC_DOMAIN:
             command = decode_domain_command(payload)
             if command.phase is GlobalDomainPhase.PREPARE_EXPORT:
-                return 8 + GLOBAL_DOMAIN_MAX_RANKS * (GLOBAL_DOMAIN_DESCRIPTOR_BYTES + 40 + 256)
+                return 4 + 2 * GLOBAL_DOMAIN_MAX_RANKS * GLOBAL_DOMAIN_DESCRIPTOR_BYTES
             return 0
         if control is ControlName.COPY_FROM_DOMAIN:
             command = decode_copy_command(payload, include_data=False)
@@ -11810,35 +11797,30 @@ class Worker:
         from .remote_l3_protocol import ControlName  # noqa: PLC0415
 
         descriptor_by_rank: dict[int, GlobalDomainDescriptor] = {}
-        host_by_node = {}
         for node_worker_id in involved_nodes:
             prepared_nodes.append(node_worker_id)
-            reply = self._global_domain_control(
-                node_worker_id,
-                ControlName.ALLOC_DOMAIN,
-                encode_domain_command(base_command),
+            exports = decode_descriptor_table(
+                self._global_domain_control(
+                    node_worker_id,
+                    ControlName.ALLOC_DOMAIN,
+                    encode_domain_command(base_command),
+                )
             )
-            exports, hosts = (
-                decode_domain_exports(reply) if base_command.host_windows else (decode_descriptor_table(reply), ())
+            expected_slots = {m.domain_rank for m in base_command.members if m.node_worker_id == node_worker_id}
+            expected_slots.update(
+                len(base_command.members) + i
+                for i, h in enumerate(base_command.host_windows)
+                if h.node_worker_id == node_worker_id
             )
-            expected_hosts = tuple(h for h in base_command.host_windows if h.node_worker_id == node_worker_id)
-            if len(hosts) != len(expected_hosts) or any(
-                replace(actual, mapping_size=0, handle=b"") != expected
-                for actual, expected in zip(hosts, expected_hosts)
-            ):
-                raise RuntimeError("Host export reply does not match the requested node pool")
-            host_by_node.update((h.node_worker_id, h) for h in hosts)
+            if len(exports) != len(expected_slots) or {d.domain_rank for d in exports} != expected_slots:
+                raise RuntimeError("Export reply does not match the requested node windows")
             for descriptor in exports:
                 if descriptor.domain_rank in descriptor_by_rank:
-                    raise RuntimeError("Global CommDomain prepare returned a duplicate rank")
+                    raise RuntimeError("Global CommDomain prepare returned a duplicate slot")
                 descriptor_by_rank[descriptor.domain_rank] = descriptor
-        descriptors = tuple(descriptor_by_rank[rank] for rank in range(len(base_command.members)))
-        if base_command.host_windows:
-            base_command = replace(
-                base_command,
-                host_windows=tuple(host_by_node[h.node_worker_id] for h in base_command.host_windows),
-            )
-        return descriptors, base_command
+        return tuple(
+            descriptor_by_rank[rank] for rank in range(len(base_command.members) + len(base_command.host_windows))
+        )
 
     def _allocate_global_domain(  # noqa: PLR0912 -- transaction validation and prepare/import/commit rollback stay ordered
         self,
@@ -12000,10 +11982,13 @@ class Worker:
                 )
                 descriptors = decode_descriptor_table(reply)
             else:
-                descriptors, base_command = self._collect_global_domain_exports(
-                    base_command, involved_nodes, prepared_nodes
-                )
-            validate_descriptor_table(descriptors, rank_count=len(domain_members_tuple), profile=profile)
+                descriptors = self._collect_global_domain_exports(base_command, involved_nodes, prepared_nodes)
+            validate_descriptor_table(
+                descriptors,
+                rank_count=len(domain_members_tuple),
+                profile=profile,
+                host_windows=base_command.host_windows,
+            )
             if descriptors[0].mapping_size < window_size:
                 raise RuntimeError("Global CommDomain backend mapped less than the requested window size")
 
@@ -12503,9 +12488,9 @@ class Worker:
 
         Each chip's identities are revoked under that chip's ``_child_prov_worker_lock``, the same
         fence an authorized copy holds through its native call, so a release can never land between
-        a copy's authorization and its commit. The chips are taken one at a time and never nested:
-        an identity belongs to exactly one ``owner_worker_id``, so per-chip exclusion is the whole
-        requirement, and the backend free still runs after every revocation.
+        a copy's authorization and its commit. Shared Host identities are revoked first, then
+        every possible target's fence is waited before physical release; single-chip identities
+        are revoked under their own fence. Worker locks are taken one at a time, never nested.
 
         The final pass drops the membership record. Its ``_child_alloc`` sweep is fail-safe rather
         than load-bearing: both tables are written together, and a ``buffer_id`` never repeats
@@ -12520,7 +12505,6 @@ class Worker:
                     if (handle := self._child_alloc.get(identity)) is not None
                 }
             )
-        with self._child_prov_lock:
             shared = [
                 identity
                 for identity in self._domain_members.get(allocation_id, ())

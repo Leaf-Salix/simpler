@@ -8,6 +8,7 @@
 18 项矩阵（CPU 本地 2、ACL 4、kernel 12）、7 步同址交接、完整窗口与 guard、显式释放全部通过，
 `released=true` 且任务退出码为 0。该环境没有 MPI 启动器，因而此结果仅证明单机本体流程；
 Direct MPI 启动与双机四卡矩阵尚未实测通过。
+统一 export 表和 identity-only copy 请求后，已用同一矩阵复测通过。
 
 ## 验证内容
 
@@ -53,6 +54,8 @@ owner CPU 写入 → 本地 NPU0 读后写入 → 本地 NPU1 读后写入 → o
 
 共享服务器必须先按当地调度规范预约两台机器的相关设备。下列硬件命令只适用于已获分配的环境；
 不能在要求单卡 task-submit 的服务器上直接占用两卡，或借 MPI 绕过设备调度。
+以下 A/B 命令分别在各自 checkout 的隔离 `.venv` 中安装和构建，再检查导入路径；
+runtime 构建会校验并记录 pinned PTO-ISA 与 onboard 元数据，仅有 sim runtime 不能运行硬件验收。
 
 ### B 机器：准备环境与远端解释器
 
@@ -64,7 +67,14 @@ cd "$SIMPLER_ROOT"
 source /usr/local/Ascend/cann-9.0.0/set_env.sh
 export ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.0.0
 export PYTHONNOUSERSITE=1
+test -d .venv || python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
+export CCACHE_DIR="$PWD/.ccache"
+export CMAKE_BUILD_PARALLEL_LEVEL=4
+ccache -s
+python -m pip install scikit-build-core 'nanobind>=2,<3' cmake ninja
+python -m pip install -v --no-build-isolation -e '.[mpi]'
+python -c 'from simpler_setup.runtime_builder import RuntimeBuilder; print(RuntimeBuilder("a2a3").get_binaries("tensormap_and_ringbuffer", build=True))'
 python -c 'import simpler, _task_interface, mpi4py; print(simpler.__file__); print(_task_interface.__file__); print(mpi4py.__version__)'
 command -v mpirun
 command -v mpiexec
@@ -93,7 +103,14 @@ cd "$SIMPLER_ROOT"
 source /usr/local/Ascend/cann-9.0.0/set_env.sh
 export ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.0.0
 export PYTHONNOUSERSITE=1
+test -d .venv || python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
+export CCACHE_DIR="$PWD/.ccache"
+export CMAKE_BUILD_PARALLEL_LEVEL=4
+ccache -s
+python -m pip install scikit-build-core 'nanobind>=2,<3' cmake ninja
+python -m pip install -v --no-build-isolation -e '.[mpi]'
+python -c 'from simpler_setup.runtime_builder import RuntimeBuilder; print(RuntimeBuilder("a2a3").get_binaries("tensormap_and_ringbuffer", build=True))'
 python -c 'import simpler, _task_interface, mpi4py; print(simpler.__file__); print(_task_interface.__file__); print(mpi4py.__version__)'
 command -v mpirun
 command -v mpiexec
@@ -113,22 +130,7 @@ ssh -o BatchMode=yes -o ConnectTimeout=10 192.0.2.20 \
 ```
 
 确认两个 `git rev-parse HEAD` 相同，导入路径指向各自的预期 checkout/安装。
-若尚未安装，按项目构建文档在各自隔离 `.venv` 中安装；不要临时换用其他 checkout 的 native 二进制。
-两边都在上述已加载 CANN 的 shell 中执行以下安装与 onboard runtime 构建：
-
-```bash
-cd "$SIMPLER_ROOT"
-python3 -m venv --system-site-packages .venv
-source .venv/bin/activate
-export CCACHE_DIR="$PWD/.ccache"
-export CMAKE_BUILD_PARALLEL_LEVEL=4
-ccache -s
-python -m pip install scikit-build-core 'nanobind>=2,<3' cmake ninja
-python -m pip install -v --no-build-isolation -e '.[mpi]'
-python -c 'from simpler_setup.runtime_builder import RuntimeBuilder; print(RuntimeBuilder("a2a3").get_binaries("tensormap_and_ringbuffer", build=True))'
-```
-
-最后一条会校验并记录 pinned PTO-ISA 与 onboard runtime 元数据；仅有 sim runtime 不能运行硬件验收。
+不要临时换用其他 checkout 的 native 二进制。
 
 ## A 机器：先跑单机两卡对照
 
