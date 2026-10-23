@@ -350,9 +350,9 @@ A `Tensor` on the wire is materialized differently by each consumer:
 
 | Consumer | What it does |
 | -------- | ------------ |
-| **Chip leaf (L2 runtime)** | Decode the POD blob with `read_args_from_blob`, then materialize each one to a `ChipTensor` via `ImportRegistry.materialize_args`, including **strided** views, and submit with `_submit_chip_run_materialized`. Ordinary mappings are cached by identity; domain windows revalidate their grant on every use. |
+| **Chip leaf (L2 runtime)** | Decode the POD blob with `read_args_from_blob`, then materialize each one to a `ChipTensor` via `ImportRegistry.materialize_args`, including **strided** views, and submit with `_submit_chip_run_materialized`. Mappings are cached by identity; device submissions are authorized against the owning Worker's live allocation table before reaching the leaf. |
 | **Python sub-worker** (compute) | Map each one into a `MappedArg`; the callable computes with `torch.frombuffer(arg.buffer, ...)`. No `ChipTensor`. |
-| **Nested L4→L3 orch** (forwarding) | **Re-export** ordinary backings to a descriptor `H'` that keeps the source's canonical identity, without mapping. Domain windows keep their logical descriptor after validation against an existing node grant. |
+| **Nested L4→L3 orch** (forwarding) | Re-export ordinary backings without mapping, preserving canonical identity. Address-free slice references resolve to existing local Buffers, or through the existing remote sidecar and session table. |
 
 **Re-export.** An ordinary upper-level tensor is forwarded on receipt as a
 descriptor `H'` that keeps the source's **canonical identity unchanged** (invariant
@@ -362,8 +362,10 @@ mapping. A downstream compute leaf maps lazily, so pure forwarding carries no ma
 cost. Dependency inference keys on the invariant identity, so an alias /
 retain-release does not split across layers.
 
-Domain windows already carry an address-free descriptor, which is validated
-against the receiving node's existing grant and forwarded unchanged.
+An address-free domain reference names an already registered backing. The
+receiver returns its actual Buffer, whose storage backend determines further
+resolution; the reference exposes no window address and causes no allocation
+or mapping.
 
 ## Canonical identity
 
@@ -391,14 +393,19 @@ gates, or keys on it.
 | `FORK_SHM` | the same VA, no map | exactly 8 bytes, a non-zero u64 LE base | a pre-fork `MAP_SHARED` host buffer (e.g. `share_memory_()`), writable from the child |
 | `FORK_COW` | the same VA, no map | exactly 8 bytes, a non-zero u64 LE base | a pre-fork plain host buffer: copy-on-write, so **READ only** |
 | `VMM_WINDOW` | the device VA of the window carved by `allocate_domain`, no map | exactly 8 bytes, a non-zero u64 LE base | communication-domain window / buffer |
-| `DOMAIN_WINDOW` (7) | the slice base resolved against a live endpoint/chip grant | exactly 28 bytes, `<QQIQ>`: domain id, generation, domain rank, slice byte offset | logical L4 domain Buffer, forwarded through L3 to its chip |
 | `DEVICE_MALLOC` | the device pointer, no map (chip-local) | exactly 8 bytes, a non-zero u64 LE base | `alloc_child_tensor` |
-| `REMOTE_SIDECAR` | (P2) resolved via the remote transport | empty | an arg to a remote L3; the descriptor rides in the sidecar |
+| `REMOTE_SIDECAR` | resolve a registered reference to its actual Buffer, then use that backend | empty | ordinary remote arguments and address-free L4 domain slices; network sidecars or local lookup name an existing Buffer |
 
-For `DOMAIN_WINDOW`, the creator incarnation is carried by canonical identity;
-Tensor view offsets remain in the Tensor. `ImportRegistry.materialize` rechecks
-the committed grant even on a cache hit, while cache-only `require` refuses
-domain windows. See the [communication-domain contract](comm-domain.md#unified-creation-and-reuse).
+Domain slices reuse `REMOTE_SIDECAR`, without adding a storage backend; their
+actual Buffers currently use `VMM_WINDOW`. Domain COMMIT replies provide the
+backing's canonical identity and an address-free session locator. Identity
+drives dependencies and authorization; the protocol buffer ID locates an entry
+and is not assumed to be the Buffer identity. Forwarding preserves the backing's
+identity, extent/access and Tensor view. Each submission checks the current
+registration, full descriptor and target chip; an import-cache hit cannot
+revive a revoked reference. Session entries only borrow domain windows:
+ordinary remote free/copy/export rejects them, while domain staging delegates
+device copies. See the [domain contract](comm-domain.md#unified-creation-and-reuse).
 
 **The body rule is enforced, not advisory.** `backend_kind` is what selects how a
 consumer reads `body`, so a body that does not fit that reading is not a smaller

@@ -85,8 +85,8 @@ enum class AccessMode : uint8_t {
 };
 
 // Materialization backend of a buffer. The consumer resolves a Tensor to a local address via the
-// import registry or domain grant keyed by canonical identity; this tag selects how. Values 0–5
-// are frozen; VMM_SHAREABLE is 6; DOMAIN_WINDOW is 7; 8.. reserved (unknown tag => reject).
+// import registry keyed by canonical identity; this tag selects how. Values 0–5
+// are frozen; VMM_SHAREABLE is 6; 7.. reserved (unknown tag => reject).
 //
 // FORK_SHM and FORK_COW materialize identically — the body is a base VA the child already has,
 // inherited across the fork — but the kernel's write semantics are opposite, so they are separate
@@ -97,7 +97,6 @@ enum class AccessMode : uint8_t {
 // VMM_WINDOW and VMM_SHAREABLE are distinct tags: the former's body is an already-valid owner-chip
 // device VA that cannot leave that context, while the latter carries a shareable handle an importer
 // maps for itself.
-// DOMAIN_WINDOW carries a logical domain/rank/slice reference resolved against an existing grant.
 enum class BackendKind : uint8_t {
     FORK_SHM = 0,
     POSIX_SHM = 1,
@@ -106,7 +105,6 @@ enum class BackendKind : uint8_t {
     DEVICE_MALLOC = 4,
     FORK_COW = 5,
     VMM_SHAREABLE = 6,
-    DOMAIN_WINDOW = 7,
 };
 
 /**
@@ -299,7 +297,7 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     if (h.address_space > static_cast<uint8_t>(AddressSpace::DEVICE))
         reject("invalid BufferDescriptor: address_space out of range");
     if (h.access > static_cast<uint8_t>(AccessMode::READWRITE)) reject("invalid BufferDescriptor: access out of range");
-    if (h.backend_kind > static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW))
+    if (h.backend_kind > static_cast<uint8_t>(BackendKind::VMM_SHAREABLE))
         reject("invalid BufferDescriptor: backend_kind out of range");
     if (h.body_len > DESC_MAX_BYTES) reject("invalid BufferDescriptor: body_len exceeds DESC_MAX_BYTES");
     if (h.identity.generation == 0) reject("invalid BufferDescriptor: generation 0 is reserved (uninitialized)");
@@ -309,7 +307,7 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     const bool device_space = h.address_space == static_cast<uint8_t>(AddressSpace::DEVICE);
     if (backend != BackendKind::REMOTE_SIDECAR) {
         const bool device_backend = backend == BackendKind::VMM_WINDOW || backend == BackendKind::DEVICE_MALLOC ||
-                                    backend == BackendKind::VMM_SHAREABLE || backend == BackendKind::DOMAIN_WINDOW;
+                                    backend == BackendKind::VMM_SHAREABLE;
         if (device_backend != device_space)
             reject("invalid BufferDescriptor: unsupported address_space x backend_kind (capability matrix)");
     }
@@ -324,16 +322,6 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     // does not fit the reading is not a smaller backing — it is a different value. A DEVICE_MALLOC
     // body of 3 bytes reads as a TRUNCATED pointer with nothing to distinguish it from a real one.
     switch (backend) {
-    case BackendKind::DOMAIN_WINDOW: {
-        // Domain id, generation, rank and slice offset; no endpoint address.
-        if (h.body_len != 28) reject("invalid BufferDescriptor: DOMAIN_WINDOW body must be exactly 28 bytes");
-        uint64_t generation = 0;
-        uint32_t rank = 0;
-        std::memcpy(&generation, h.body + 8, sizeof(generation));
-        std::memcpy(&rank, h.body + 16, sizeof(rank));
-        if (generation == 0 || rank >= 64) reject("invalid BufferDescriptor: DOMAIN_WINDOW identity or rank");
-        break;
-    }
     case BackendKind::FORK_SHM:
     case BackendKind::FORK_COW:
     case BackendKind::DEVICE_MALLOC:
@@ -380,8 +368,8 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
         break;
     }
     case BackendKind::REMOTE_SIDECAR:
-        // The authoritative descriptor rides in the per-task sidecar, so nothing belongs here.
-        if (h.body_len != 0) reject("invalid BufferDescriptor: REMOTE_SIDECAR carries no body in P1");
+        // The receiving worker resolves this reference from its registered backing.
+        if (h.body_len != 0) reject("invalid BufferDescriptor: REMOTE_SIDECAR carries no body");
         break;
     }
 

@@ -12,6 +12,7 @@ import pytest
 from simpler.worker import MpiL3GroupSpec, RemoteWorkerSpec, Worker
 
 from examples.workers.l3.multi_chip_dispatch.main import build_chip_callable
+from examples.workers.l4.global_tload_mixed_l3.main import _build_tload_callable
 from examples.workers.l4.global_tload_mpirun_l3.test_global_tload_mpirun_l3 import _require_mpirun_network1_env
 from simpler_setup import SceneTestLevel, scene_level
 from tests.st.worker.comm_domain.test_domain_tensor_remote import exercise_domain_tensors
@@ -36,6 +37,7 @@ def test_domain_tensor_tcp(
 ):
     worker = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=st_network1_peer.session_timeout_s)
     callable_obj = build_chip_callable(st_platform)
+    tload_callable = _build_tload_callable(st_platform, "tensormap_and_ringbuffer")
     child = Worker(
         level=3,
         platform=st_platform,
@@ -46,6 +48,7 @@ def test_domain_tensor_tcp(
         global_device_ranks=(0, 1),
     )
     chip = child.register(callable_obj)
+    tload_chip = child.register(tload_callable)
     local = worker.add_worker(child)
     remote = worker.add_remote_worker(
         RemoteWorkerSpec(
@@ -59,7 +62,14 @@ def test_domain_tensor_tcp(
         )
     )
     members = [(node, chip_index) for node in (local, remote) for chip_index in range(2)]
-    exercise_domain_tensors(worker, members, callable_obj, local_chip=(local, chip))
+    exercise_domain_tensors(
+        worker,
+        members,
+        callable_obj,
+        tload_callable=tload_callable,
+        local_chip=(local, chip),
+        local_tload_chip=tload_chip,
+    )
 
 
 @scene_level(SceneTestLevel.NETWORK1)
@@ -82,4 +92,9 @@ def test_domain_tensor_mpi(
         )
     )
     members = [(node, chip_index) for node in nodes for chip_index in range(2)]
-    exercise_domain_tensors(worker, members, build_chip_callable(st_platform))
+    exercise_domain_tensors(
+        worker,
+        members,
+        build_chip_callable(st_platform),
+        tload_callable=_build_tload_callable(st_platform, "tensormap_and_ringbuffer"),
+    )

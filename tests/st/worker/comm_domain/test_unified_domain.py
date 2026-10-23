@@ -17,6 +17,7 @@ from simpler.task_interface import CommBufferSpec, DataType, TaskArgs, TensorArg
 from simpler.worker import Worker
 
 from examples.workers.l3.multi_chip_dispatch.main import N_COLS, N_ROWS, build_chip_callable
+from examples.workers.l4.global_tload_mixed_l3.main import _build_tload_callable
 
 from .test_domain_tensor_remote import exercise_domain_tensors
 
@@ -91,13 +92,17 @@ def exercise_local_domain(platform, device_ids, *, cached=True):
         comm_profile="sim" if platform.endswith("sim") else "a3-fabric-v1",
     )
     callable_obj = build_chip_callable(platform)
+    tload_callable = _build_tload_callable(platform, _RUNTIME)
     chip = child.register(callable_obj)
+    tload_chip = child.register(tload_callable)
     node = worker.add_worker(child)
     exercise_domain_tensors(
         worker,
         [(node, index) for index in range(len(device_ids))],
         callable_obj,
+        tload_callable=tload_callable,
         local_chip=(node, chip),
+        local_tload_chip=tload_chip,
         cached=cached,
     )
 

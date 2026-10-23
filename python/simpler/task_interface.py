@@ -149,7 +149,7 @@ def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -
             raise ValueError(f"argument {i}: HOST/NONE Buffer grant does not cover callable direction {direction}")
 
 
-def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry, domain_resolver=None) -> ChipStorageTaskArgs:
+def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry) -> ChipStorageTaskArgs:
     """Resolve accepted argument descriptors into this process's chip-only POD.
 
     The caller owns submission/callable checks, backing retention and the registry's
@@ -158,7 +158,7 @@ def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry, domain
     """
     if not isinstance(args, TaskArgs):
         raise TypeError("chip argument materialization requires address-free TaskArgs")
-    resolved = registry.materialize_args(args, domain_resolver)
+    resolved = registry.materialize_args(args)
     return _ti_module.materialize_task_args(args, resolved)
 
 

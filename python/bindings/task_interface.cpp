@@ -2263,8 +2263,7 @@ NB_MODULE(_task_interface, m) {
         .value("REMOTE_SIDECAR", BackendKind::REMOTE_SIDECAR)
         .value("DEVICE_MALLOC", BackendKind::DEVICE_MALLOC)
         .value("FORK_COW", BackendKind::FORK_COW)
-        .value("VMM_SHAREABLE", BackendKind::VMM_SHAREABLE)
-        .value("DOMAIN_WINDOW", BackendKind::DOMAIN_WINDOW);
+        .value("VMM_SHAREABLE", BackendKind::VMM_SHAREABLE);
 
     // --- CanonicalIdentity ---
     // Equality and hashing fold exactly the three meaningful fields, so a decode with dirty wire
@@ -2931,9 +2930,7 @@ NB_MODULE(_task_interface, m) {
                 const int32_t n = self.tensor_count();
                 for (int32_t i = 0; i < n; ++i) {
                     const auto backend = static_cast<BackendKind>(self.tensor(i).buffer.backend_kind);
-                    if (backend == BackendKind::DEVICE_MALLOC || backend == BackendKind::VMM_WINDOW ||
-                        backend == BackendKind::DOMAIN_WINDOW)
-                        return true;
+                    if (backend == BackendKind::DEVICE_MALLOC || backend == BackendKind::VMM_WINDOW) return true;
                 }
                 return false;
             },
@@ -3015,9 +3012,7 @@ NB_MODULE(_task_interface, m) {
                 for (int32_t i = 0; i < n; ++i) {
                     const BufferDescriptor &d = args.tensor(i).buffer;
                     const auto backend = static_cast<BackendKind>(d.backend_kind);
-                    if (backend != BackendKind::DEVICE_MALLOC && backend != BackendKind::VMM_WINDOW &&
-                        backend != BackendKind::DOMAIN_WINDOW)
-                        continue;
+                    if (backend != BackendKind::DEVICE_MALLOC && backend != BackendKind::VMM_WINDOW) continue;
                     auto it = self.entries.find(d.identity);
                     if (it == self.entries.end() || it->second.owner_worker_id != target_worker_id) {
                         return nb::make_tuple(i, PROV_NOT_LIVE);
