@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 import traceback
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import Any, Callable
 
@@ -55,6 +55,7 @@ from .callable_identity import (
 )
 from .global_comm_domain import (
     GLOBAL_DOMAIN_PROFILE_SIM,
+    GlobalDomainBufferRef,
     GlobalDomainCommand,
     GlobalDomainPhase,
     GlobalDomainReleaseCommand,
@@ -713,20 +714,16 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                 entry.close()
                 buffers.pop(key)
 
-    def register_domain_buffers(command: GlobalDomainCommand) -> bytes:
+    def register_domain_buffers(command: GlobalDomainCommand, backings: dict[tuple[int, int], Buffer]) -> bytes:
         nonlocal next_buffer_id
         refs = []
         domain_key = (command.domain_id, command.generation)
         registered = {
             entry.wire_buffer().identity: key for key, entry in buffers.items() if entry.borrowed_domain == domain_key
         }
-        for ref in inner_worker._global_domain_buffer_refs(command):  # noqa: SLF001
-            key = registered.get(ref.identity)
+        for (rank, slice_index), backing in backings.items():
+            key = registered.get(backing.identity)
             if key is None:
-                with inner_worker._child_prov_lock:  # noqa: SLF001
-                    backing = inner_worker._child_alloc.get(ref.identity)  # noqa: SLF001
-                if backing is None:
-                    raise ValueError("committed communication domain slice has no registered backing")
                 key = _buffer_key(next_buffer_id, command.generation)
                 next_buffer_id += 1
                 entry = _RemoteBufferEntry(
@@ -737,7 +734,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                     borrowed_domain=domain_key,
                 )
                 buffers[key] = entry
-            refs.append(replace(ref, reference_id=key[0], reference_generation=key[1]))
+            refs.append(GlobalDomainBufferRef(rank, slice_index, backing.identity, key[0], key[1]))
         return encode_domain_buffer_refs(tuple(refs))
 
     def mint_session_buffer(nbytes: int) -> Buffer:
@@ -1166,9 +1163,9 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                                 "",
                             )
                         elif command.phase is GlobalDomainPhase.COMMIT:
-                            inner_worker._commit_global_domain_node(command)  # noqa: SLF001
+                            backings = inner_worker._commit_global_domain_node(command)  # noqa: SLF001
                             try:
-                                result = register_domain_buffers(command)
+                                result = register_domain_buffers(command, backings)
                                 _control_result_reply(
                                     conn,
                                     manifest,

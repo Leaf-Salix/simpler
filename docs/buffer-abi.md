@@ -464,9 +464,10 @@ element is the `Tensor`, and `TaskArgsView::tensors` validates each one as it de
 it. `ChipTensor` survives only in `ChipStorageTaskArgs`, the POD `ChipWorker`
 consumes — an L2 worker materializes into it inside `run` before calling down.
 
-Single-machine (host + device) L3→L2 and L4→L3→L2 dispatch is implemented and
-verified in `a2a3sim` and onboard `a2a3`. The remote **receive** side is a later
-phase (P2).
+Single-machine (host + device) L3→L2 and L4→L3→L2 dispatch, including TCP/MPI
+remote receive, use the canonical buffer validation and materialization paths.
+Communication-domain Tensor tests cover local Fabric, TCP, and MPI on supported
+`a2a3` hardware.
 
 Buffer lifecycle robustness is partly in place, and which guarantee applies
 depends on the API that releases the storage. `Worker.free` is atomic with a

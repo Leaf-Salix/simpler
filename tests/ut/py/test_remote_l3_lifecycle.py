@@ -1164,18 +1164,17 @@ def _run_borrowed_session_controls(monkeypatch, actions, *, failed_reply=False, 
         (domain_wire.GlobalDomainDescriptor(domain_wire.GLOBAL_DOMAIN_VERSION, 1, 0, 1, 4096, b"unit"),),
         owner_instance_id=mint_owner_instance_id(),
     )
-    ref = domain_wire.GlobalDomainBufferRef(0, 0, borrowed.identity)
     releases = []
 
     def commit(candidate):
         if candidate != command:
             raise ValueError("COMMIT command differs from the prepared domain")
+        if missing_backing:
+            raise ValueError("committed communication domain slice has no registered backing")
+        return {(0, 0): borrowed}
 
     worker = SimpleNamespace(
-        _child_prov_lock=threading.Lock(),
-        _child_alloc={} if missing_backing else {borrowed.identity: borrowed},
         _commit_global_domain_node=commit,
-        _global_domain_buffer_refs=lambda _command: (ref,),
         _release_global_domain_node=lambda _command, **_kwargs: releases.append(_command),
     )
     commands = {

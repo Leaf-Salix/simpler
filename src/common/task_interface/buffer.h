@@ -285,8 +285,8 @@ inline uint64_t tensor_extent_bytes(const Tensor &r) {
  * `CanonicalIdentity` gets structurally, and the body itself is checked against the schema its
  * `backend_kind` implies. Throws `std::invalid_argument` naming the field.
  *
- * `REMOTE_SIDECAR` is a legal wire value and passes: an arg bound for a remote worker rides the wire
- * with no local backing, and it is *materialization* that refuses it in P1.
+ * `REMOTE_SIDECAR` carries no address: dispatch resolves its registered backing before
+ * materialization, using a per-task sidecar when crossing a remote boundary.
  */
 inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     auto reject = [](const char *what) {
@@ -369,7 +369,7 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     }
     case BackendKind::REMOTE_SIDECAR:
         // The receiving worker resolves this reference from its registered backing.
-        if (h.body_len != 0) reject("invalid BufferDescriptor: REMOTE_SIDECAR carries no body");
+        if (h.body_len != 0) reject("invalid BufferDescriptor: REMOTE_SIDECAR carries no body in P1");
         break;
     }
 

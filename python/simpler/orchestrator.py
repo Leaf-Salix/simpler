@@ -439,45 +439,41 @@ class Orchestrator:
         if remote_sidecars is not None:
             for c_args, remote_sidecar in zip(c_args_list, remote_sidecars):
                 _validate_remote_sidecar_access(c_args, remote_sidecar)
-        worker_id_sets = (
-            [
-                _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
-                for remote_sidecar in remote_sidecars
-            ]
-            if remote_sidecars is not None
-            else [list(eligible_worker_ids) for _ in args_list]
-            if eligible_worker_ids
-            else []
-        )
         # Per-member kind4 dispatch guard: each member's child_memory pointers
         # must be live on that member's exact submitted target.
         # Run this fallible analysis before publishing remote-ref ownership.
         worker = self._worker
         member_checks: list[tuple[int, TaskArgs]] = []
         if worker is not None:
-            for g, c_args in enumerate(c_args_list):
+            for index, c_args in enumerate(c_args_list):
                 if worker._names_device_allocation(c_args):
-                    member_checks.append((worker_ids[g], c_args))
+                    member_checks.append((index, c_args))
         prov_guard: Any = (
             worker._child_prov_lock if (worker is not None and member_checks) else contextlib.nullcontext()
         )
         with prov_guard:
-            for target_worker_id, c_args in member_checks:
+            for index, c_args in member_checks:
                 assert worker is not None
-                worker._child_prov_check_dispatch_locked(c_args, target_worker_id, api="submit_next_level_group")
-            if worker is not None:
-                for index, c_args in enumerate(c_args_list):
-                    prepared = worker._prepare_buffer_references(
-                        c_args,
-                        remote_sidecars[index] if remote_sidecars is not None else None,
-                        worker_ids[index],
-                    )
-                    if remote_sidecars is not None:
-                        remote_sidecars[index] = prepared
+                worker._child_prov_check_dispatch_locked(c_args, worker_ids[index], api="submit_next_level_group")
+            for index, c_args in member_checks:
+                assert worker is not None
+                prepared = worker._prepare_buffer_references(
+                    c_args,
+                    remote_sidecars[index] if remote_sidecars is not None else None,
+                    worker_ids[index],
+                )
                 if remote_sidecars is not None:
-                    worker_id_sets = [
-                        _remote_data_eligible_worker_ids(sidecar, eligible_worker_ids) for sidecar in remote_sidecars
-                    ]
+                    remote_sidecars[index] = prepared
+            worker_id_sets = (
+                [
+                    _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
+                    for remote_sidecar in remote_sidecars
+                ]
+                if remote_sidecars is not None
+                else [list(eligible_worker_ids) for _ in args_list]
+                if eligible_worker_ids
+                else []
+            )
             if worker is not None and remote_sidecars is not None:
                 worker._adopt_remote_sidecar_refs(remote_sidecars)
             if worker is not None:
