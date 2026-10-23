@@ -42,6 +42,7 @@
 #include "runtime_c_api.h"
 #include "native_run_execution.h"
 #include "runtime.h"
+#include "tensormap_and_ringbuffer/kernel_invocation.h"
 
 /**
  * Query both streams that form one onboard run without waiting.
@@ -234,6 +235,7 @@ struct KernelArgsHelper {
         initializing_slot_(std::exchange(other.initializing_slot_, nullptr)),
         slot_(std::exchange(other.slot_, nullptr)),
         plan_(other.plan_),
+        kernel_invocation_(std::move(other.kernel_invocation_)),
         graph_section_bytes_(std::exchange(other.graph_section_bytes_, 0)),
         launch_payload_(nullptr),
         launch_payload_bytes_(std::exchange(other.launch_payload_bytes_, 0)) {
@@ -257,6 +259,8 @@ struct KernelArgsHelper {
     // changing its source, destination, or allocator. After publication or
     // release, a fresh prepare withdraws the previous publication status.
     int prepare_runtime_args(const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot);
+
+    int prepare_kernel_invocation(const simpler::tmr::KernelCallableIdentity &identity);
 
     /**
      * Consume the snapshot by enqueueing metadata H2D on `stream`, having recorded
@@ -334,6 +338,7 @@ struct KernelArgsHelper {
         initializing_slot_ = nullptr;
         slot_ = nullptr;
         plan_ = LaunchEntryArgsPlan{};
+        kernel_invocation_.clear();
         launch_payload_ = nullptr;
         launch_payload_bytes_ = 0;
     }
@@ -380,6 +385,7 @@ private:
     // This run's entry-argument routing facts, read while the source was still
     // this run's. The launch side works from this and the snapshot alone.
     LaunchEntryArgsPlan plan_{};
+    std::vector<std::byte> kernel_invocation_;
     // The Definition-section length this run's descriptor names, captured with
     // the snapshot. The publication stamps the section only when the slot's
     // staged length agrees with it, so a length a failed prepare left staged
@@ -388,6 +394,8 @@ private:
 
     void *launch_payload_{nullptr};
     size_t launch_payload_bytes_{0};
+
+    bool build_kernel_launch_package();
 
     // Fill the slot's staging with this run's launch package, reading the entry
     // values out of the captured snapshot. Returns false when the snapshot does

@@ -17,8 +17,8 @@
  * split mgmt threads (drain polls per-thread ready queues and refills the
  * single instance's free_queue from recycled lanes; replenish returns done
  * buffers to recycled lanes). ScopeStatsCollector's collector thread shards
- * append each full buffer's ScopeStatsRecords to an in-memory vector. After
- * stop(), write_jsonl() renders them to
+ * append each full buffer's ScopeStatsRecords to host-owned storage. The
+ * ordinary run boundary renders safe evidence to
  * <output_dir>/scope_stats/scope_stats.jsonl.
  *
  * Memory mirroring is handled by the framework via the MemoryOps installed
@@ -34,12 +34,12 @@
  *                          (pre-fills free_queue; surplus → recycled pool).
  *   start(tf)            — Inherited: launches mgmt + collector threads.
  *   [device execution]
- *   stop()               — Inherited: drain queues, join threads.
- *   reconcile_counters() — Recover any un-flushed current buffer left by an
- *                          abnormal exit, then cross-check collected ==
- *                          total - dropped.
- *   write_jsonl()        — Emit scope_stats/scope_stats.jsonl
- *                          (meta line + one record/line).
+ *   close_ordinary_run() — With producer-stop proof: quiesce, recover held
+ *                          records and snapshot accounting; keep resident threads.
+ *                          Without proof: stop(false), join host readers and
+ *                          export host-owned samples with unknown accounting.
+ *   write_jsonl()        — Render the frozen host snapshot, never refresh live
+ *                          device state; direct use requires reconciliation.
  *   finalize()           — Free all device memory, unregister.
  *
  * Output (scope_stats/scope_stats.jsonl), NDJSON:
@@ -180,22 +180,10 @@ public:
         const ScopeStatsFreeCallback &free_cb, int device_id, ScopeStatsUnregisterCallback unregister_cb = nullptr
     );
 
-    // Start a run's collection window: drop the previous run's records, its
-    // counter, and the recovered-buffer bookkeeping reconcile_counters() leaves
-    // behind. execution_complete_ is re-armed because it is what tells the
-    // collector loop a run is still producing.
-    //
-    // The collector initializes once and serves every run, so this is the only
-    // point at which they are cleared; init() clears none of them, and left
-    // alone they accumulate across runs. The device's producer state is part of
-    // that: `run_epoch` is the identity a buffer the previous run left in
-    // `current_buf_ptr` is re-stamped with, so this run's records cannot inherit
-    // the previous run's.
-    //
-    // False iff such a buffer could not be made this run's, which leaves the
-    // device able to attribute this run's records to the previous one. Callers
-    // that keep per-run artifacts must refuse the run.
-    bool begin_run(uint64_t run_epoch);
+    // Clear the host collection window after the preceding run is settled.
+    // Producer counters and a carried buffer's identity belong to device init;
+    // admission does not read or write their device storage.
+    void begin_run(uint64_t run_epoch, const simpler::dfx::scope_stats_runs::CapacityMetadata *capacities = nullptr);
 
     // Device pointer to the ScopeStatsDataHeader. Set
     // kernel_args.scope_stats_data_base to this after init().
@@ -204,15 +192,21 @@ public:
     // Poll-thread hook: append the buffer's records to the in-memory vector.
     void on_buffer_collected(const ScopeStatsReadyBufferInfo &info);
 
-    // After stop(): recover a non-empty current buffer left by abnormal exit,
+    // Ordinary close recovers producer-held records only with a completion or
+    // independent producer-stop proof. Otherwise stop(false) joins host readers
+    // and exports only host-owned samples with unknown device accounting.
+    // Host-thread exit grants no authority to release device allocations.
+    int close_ordinary_run(const std::string &output_dir, bool producer_stop_proved);
+
+    // After producer stop and host quiescence: recover a non-empty current buffer left by abnormal exit,
     // warn on drops, and cross-check collected == total - dropped. Returns
     // true iff the run is clean.
     bool reconcile_counters();
 
-    // Render the collected records to
-    // <output_dir>/scope_stats/scope_stats.jsonl. Reads the static capacity
-    // metadata + fatal latch from the shared header (constant after
-    // orchestrator init). Must be called after stop().
+    // Render host-owned records and the checked, frozen metadata snapshot.
+    // Only close_ordinary_run can authorize a host-only unknown export; a
+    // skipped/failed direct reconciliation still refuses the direct export.
+    // Requires stopped or quiesced host readers.
     int write_jsonl(const std::string &output_dir);
 
     void finalize(ScopeStatsUnregisterCallback unregister_cb, const ScopeStatsFreeCallback &free_cb);
@@ -451,6 +445,16 @@ private:
 
     simpler::dfx::scope_stats_runs::RecordBlocks records_;
     mutable std::mutex records_mutex_;
+    // A required producer must initialize this run before ordinary/unmapped
+    // export. Zero also permits a producerless runtime's metadata-only artifact.
+    uint64_t expected_producer_epoch_ = 0;
+    simpler::dfx::scope_stats_runs::DeviceSnapshot device_snapshot_{};
+    // Owned at admission; an unproven close must not refresh the live header.
+    simpler::dfx::scope_stats_runs::CapacityMetadata ordinary_capacities_{};
+    bool ordinary_stop_unproved_ = false;
+    // Bound by begin_run, including producerless runs; direct legacy collectors
+    // without an admission retain their existing identity-observation behavior.
+    std::optional<uint64_t> ordinary_run_epoch_;
     uint64_t total_collected_ = 0;
     uint64_t refused_records_ = 0;
 
@@ -513,43 +517,19 @@ private:
     void append_buffer_records(const void *buf_host_ptr);
 
     /**
-     * Make the buffer the producer still names in `current_buf_ptr` belong to
-     * `run_epoch`, by rewriting its 64-byte header and nothing below it.
-     *
-     * A producer that reuses a non-zero `current_buf_ptr` never pops, so the
-     * engine's `claim_free` — the only writer of a buffer's `count` reset and,
-     * via `on_pop_success`, of its identity stamp — does not run. Left alone,
-     * this run would append after the previous run's records and carry its
-     * `run_epoch` and `local_seq`, which is a duplicate in one artifact and a
-     * misattribution in the other.
-     *
-     * The buffer is pool memory outside the manager's shm window, so
-     * `publish_field` cannot reach it; this publishes the header range alone
-     * rather than the whole buffer, so the records below it are never written
-     * back from the host shadow.
-     *
-     * The pointer is left in place. Clearing it would orphan a pool buffer, and
-     * pushing it back onto the free queue would make this a second runtime
-     * writer of `free_queue.tail` — the drain shard that serves the buffer's
-     * ready queue is its sole runtime writer (see `profiler_base.h`).
-     *
-     * Only ever called between runs, where the previous run's completion is
-     * proved and this run has submitted nothing, so the producer is not running.
-     */
-    bool adopt_current_buffer(uint64_t run_epoch);
-
-    /**
-     * Render one artifact's bytes. `extra` adds the background-mode metadata
-     * keys; a null `extra` reproduces today's metadata line exactly, which is
-     * what keeps the default path's file unchanged.
+     * Render host-owned artifact values. `extra` describes retained collection
+     * or an unproven ordinary close; null preserves the ordinary seven keys.
+     * Non-null `host_only_capacities` makes device accounting null and admits
+     * only its owned capacities, with null for absent capacity values.
      */
     static int render_jsonl_to(
         std::FILE *fp, const simpler::dfx::scope_stats_runs::DeviceSnapshot &device,
         const simpler::dfx::scope_stats_runs::RecordBlocks &records,
-        const simpler::dfx::scope_stats_runs::Collection *extra
+        const simpler::dfx::scope_stats_runs::Collection *extra,
+        const simpler::dfx::scope_stats_runs::CapacityMetadata *host_only_capacities = nullptr
     );
 
-    /** Today's unchecked read of the shared header, for the default path only. */
+    /** Read the shared mirror only while establishing a checked terminal snapshot. */
     simpler::dfx::scope_stats_runs::DeviceSnapshot snapshot_unchecked() const;
 
     /**
@@ -598,16 +578,6 @@ private:
      * have left behind are never published: the caller quarantines instead.
      */
     bool read_terminal_checked(simpler::dfx::scope_stats_runs::DeviceSnapshot *out);
-
-    /**
-     * Reset the host state one run owns: its records, its receipt counters and
-     * its completion observation.
-     *
-     * Separate from `begin_run` because the device half of that call — the
-     * counter reset and the held-buffer adoption — belongs to the producer once
-     * a terminal bank is mapped, while this half never does.
-     */
-    void begin_run_host_state();
 
     /** Device allocation trampolines for the bank array, bound to `this`. */
     static void *bank_alloc(void *owner, size_t bytes, void **host_out);

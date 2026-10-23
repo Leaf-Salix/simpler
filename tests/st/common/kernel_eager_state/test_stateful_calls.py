@@ -30,7 +30,7 @@ def _compile(platform, runtime, host_controls):
         "orchestration": {
             "source": str(Path(__file__).with_name("state_orchestration.cpp")),
             "function_name": function,
-            "signature": [D.INOUT, D.IN] if host_controls else [D.INOUT],
+            "signature": [D.INOUT, D.IN] if host_controls else [D.INOUT, D.SCALAR, D.SCALAR],
         },
         "incores": [
             {
@@ -42,7 +42,7 @@ def _compile(platform, runtime, host_controls):
                     / "tensormap_and_ringbuffer/predicated_dispatch/kernels/aic/kernel_write_gate.cpp"
                 ),
                 "core_type": "aic",
-                "signature": [D.INOUT],
+                "signature": [D.INOUT, D.SCALAR],
             }
         ],
     }

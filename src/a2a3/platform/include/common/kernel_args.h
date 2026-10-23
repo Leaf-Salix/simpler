@@ -322,6 +322,9 @@ struct RegisterCallableArgs {
     uint64_t dev_orch_so_size{0};                                    // orch SO image size in bytes
     char device_orch_func_name[INIT_ARGS_MAX_ORCH_SYMBOL_NAME]{};    // entry symbol
     char device_orch_config_name[INIT_ARGS_MAX_ORCH_SYMBOL_NAME]{};  // config symbol
+    uint64_t residency_generation{0};
+    uint32_t tensor_count{0};
+    uint32_t scalar_count{0};
 };
 
 #ifdef __cplusplus

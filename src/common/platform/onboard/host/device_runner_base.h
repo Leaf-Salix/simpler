@@ -2603,13 +2603,11 @@ protected:
     );
 
     /**
-     * Tear down the four shared diagnostics collectors after the launched
-     * kernels have synced. Each block is gated on `dfx`, this run's own
-     * configuration, and does: stop() → reconcile_counters() →
-     * export step (`chip_swimlane` writes swimlane JSON via
-     * `read_phase_header_metadata` + `export_swimlane_json`; `dump`
-     * writes dump files; `pmu` has no export step beyond reconcile;
-     * `scope_stats` writes JSONL).
+     * Close the shared diagnostic boundaries after completion or failure.
+     * Each block is gated on this run's `dfx`. ArgsDump uses its proof-aware
+     * ordinary close or retained settlement. Swimlane exports JSON via
+     * read_phase_header_metadata + export_swimlane_json; PMU reconciles;
+     * ScopeStats writes JSONL under its own boundary policy.
      *
      * Subclasses with arch-specific collectors (`dep_gen_collector_` + its
      * `dep_gen_replay_emit_deps_json` export) inline their own teardown after
@@ -2830,6 +2828,7 @@ protected:
     // `aicpu_seen_callable_ids_` tracks which ids have completed a successful
     // AICPU SO load for the monotonic dlopen counter.
     struct CallableState {
+        uint64_t residency_generation{0};
         // trb path (AICPU dlopens orch SO from device buffer)
         // Orchestration ELF Build-ID returned by callable_hash(); distinct from
         // chip_buffer_hash, which keys the retained buffer.
@@ -2852,6 +2851,7 @@ protected:
     // an explicit-ID claim of the same slot; runs, initialization and destroy
     // are serialized by their callers instead.
     std::mutex callable_registration_mu_;
+    uint64_t next_callable_generation_{1};
     // Opaque provider handle from dma_workspace_provision(), owned for the
     // Worker's life and released by finalize_common(). Null unless the Worker
     // was created with SDMA enabled.

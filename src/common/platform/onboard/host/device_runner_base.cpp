@@ -2332,6 +2332,11 @@ int DeviceRunnerBase::register_callable_on_device(int32_t callable_id, rtStream_
     reg_args.active_callable_id = callable_id;
     reg_args.dev_orch_so_addr = state.dev_orch_so_addr;
     reg_args.dev_orch_so_size = state.dev_orch_so_size;
+    reg_args.residency_generation = state.residency_generation;
+    for (const auto direction : state.signature) {
+        if (direction == ArgDirection::SCALAR) ++reg_args.scalar_count;
+        else ++reg_args.tensor_count;
+    }
     snprintf(reg_args.device_orch_func_name, sizeof(reg_args.device_orch_func_name), "%s", state.func_name.c_str());
     snprintf(
         reg_args.device_orch_config_name, sizeof(reg_args.device_orch_config_name), "%s", state.config_name.c_str()
@@ -2408,7 +2413,9 @@ int DeviceRunnerBase::record_device_orch_callable(
 
     const uint64_t hash = simpler::common::utils::elf_build_id_64(orch_so_data, orch_so_size);
 
+    if (next_callable_generation_ == 0) return PTO_RUNTIME_ERR_INVALID_STATE;
     CallableState state;
+    state.residency_generation = next_callable_generation_++;
     state.hash = hash;
     state.chip_buffer_hash = chip_buffer_hash;
     state.aicore_image_hash = aicore_image_hash;
@@ -3535,6 +3542,7 @@ int DeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig &c
     runtime.set_worker_count(num_aicore);
     runtime.set_aicpu_thread_num(config.aicpu_thread_num);
     runtime.dev.chip_swimlane_level = static_cast<uint32_t>(config.enable_chip_swimlane);
+    runtime.dev.dump_args_level = static_cast<uint32_t>(config.enable_dump_args);
 
     // First `block_dim` cores are AIC; remaining ~2/3 are AIV. The rule is host
     // state: every consumer of it runs on the host and needs it before any core
@@ -4265,6 +4273,21 @@ int DeviceRunnerBase::init_runtime_args_with_metadata(
         LOG_ERROR("prepare_runtime_args failed: %d", rc);
         return rc;
     }
+    if (execution_mode_latch_.is_kernel() && runtime_launch_entry_args_plan(runtime).supported) {
+        const int32_t callable_id = runtime.get_active_callable_id();
+        const auto registered = callables_.find(callable_id);
+        if (registered == callables_.end()) return PTO_RUNTIME_ERR_INVALID_STATE;
+        uint32_t tensors = 0;
+        uint32_t scalars = 0;
+        for (const auto direction : registered->second.signature) {
+            if (direction == ArgDirection::SCALAR) ++scalars;
+            else ++tensors;
+        }
+        rc = kernel_args.prepare_kernel_invocation(
+            {callable_id, registered->second.residency_generation, tensors, scalars}
+        );
+        if (rc != 0) return rc;
+    }
     // Both runtimes publish on the bound AICPU stream inside the launch
     // transaction. The slot retains the pinned source until run retirement.
     // Log config and device ordinal are no longer published per-run on
@@ -4536,7 +4559,7 @@ int DeviceRunnerBase::start_shared_collectors_for_run(
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
         } else {
-            dump_collector_.begin_run(dfx.output_prefix, dfx.dump_args_level);
+            dump_collector_.begin_run(dfx.output_prefix, dfx.dump_args_level, run_epoch);
             dump_collector_.start(thread_factory);
         }
     }
@@ -4588,11 +4611,9 @@ int DeviceRunnerBase::start_shared_collectors_for_run(
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
         } else {
-            // The default path writes one file per boundary rather than a
-            // per-run artifact, and on failure it keeps the behaviour it has
-            // without the re-stamp: a run is never refused here. The helper has
-            // already logged which buffer and which run it concerns.
-            (void)scope_stats_collector_.begin_run(run_epoch);
+            // The host window opens before its collector threads start;
+            // producer state is initialized at this run's device entry.
+            scope_stats_collector_.begin_run(run_epoch, run_metadata.scope_stats_capacity);
             scope_stats_collector_.start(thread_factory);
         }
     }
@@ -4814,10 +4835,7 @@ int DeviceRunnerBase::close_args_dump_run_boundary(
     const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
 ) {
     if (!dump_collector_.retains_runs()) {
-        dump_collector_.quiesce();
-        dump_collector_.reconcile_counters();
-        dump_collector_.export_dump_files();
-        return 0;
+        return dump_collector_.close_ordinary_run(device_execution_complete || device_producers_stopped);
     }
     // A retained run keeps only the run boundary's device-side reads — this
     // run's terminal lane state and, for a lane whose handover its receipt
@@ -4879,9 +4897,9 @@ void DeviceRunnerBase::close_scope_stats_run_boundary(
     const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
 ) {
     if (!scope_stats_collector_.retains_runs()) {
-        scope_stats_collector_.quiesce();
-        scope_stats_collector_.reconcile_counters();
-        scope_stats_collector_.write_jsonl(dfx.output_prefix);
+        scope_stats_collector_.close_ordinary_run(
+            dfx.output_prefix, device_execution_complete || device_producers_stopped
+        );
         return;
     }
     // A retained run keeps the boundary's ownership steps — the receive drain

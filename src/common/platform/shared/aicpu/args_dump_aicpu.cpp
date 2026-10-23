@@ -89,9 +89,8 @@ static inline void account_dropped_records(int thread_idx, DumpBufferState *stat
     if (state == nullptr) {
         return;
     }
-    uint32_t prev = state->dropped_record_count;
-    uint32_t next = prev + dropped_records;
-    state->dropped_record_count = (next < prev) ? UINT32_MAX : next;
+    state->dropped_record_count = diagnostic_terminal_add_u32(state->dropped_record_count, dropped_records);
+    state->run_dropped_record_count = diagnostic_terminal_add_u32(state->run_dropped_record_count, dropped_records);
 }
 
 // A record refused before anything was written for it: counted among this
@@ -106,7 +105,7 @@ static inline void account_refused_record(int thread_idx, DumpBufferState *state
 static constexpr uint64_t kDumpQueueBackpressureWaitCycles = PLATFORM_DFX_BACKPRESSURE_TIMEOUT_CYCLES;
 
 static bool g_enable_dump_args = false;
-// Dump level latched from the header in dump_args_init(). The selective
+// Dump level latched from this invocation in dump_args_init(). The selective
 // (PARTIAL) and metadata-first (HYBRID) modes are derived from it rather
 // than tracked as separate flags — mirrors g_chip_swimlane_level.
 static DumpArgsLevel g_dump_args_level = DumpArgsLevel::OFF;
@@ -697,7 +696,7 @@ static inline void write_dump_arg_logical_prefix(
     gather_dump_arg_dim(writer, info, elem_sz, 0, info.start_offset, &remaining_bytes);
 }
 
-void dump_args_init(int num_dump_threads) {
+void dump_args_init(int num_dump_threads, DumpArgsLevel level) {
     void *dump_base = reinterpret_cast<void *>(get_platform_dump_base());
     if (dump_base == nullptr) {
         LOG_ERROR("platform dump base is NULL, cannot initialize args dump");
@@ -710,11 +709,11 @@ void dump_args_init(int num_dump_threads) {
 
     s_dump_header = get_dump_header(dump_base);
 
-    // Latch dump level from the host-written header before any task is dumped.
+    // The descriptor selection is stable for this invocation before dispatch.
     // PARTIAL → selective (only Arg::dump()-marked args); FULL → every task;
     // HYBRID → every task's metadata; payload is copied only for
     // arguments selected through the same per-task mask as PARTIAL.
-    g_dump_args_level = static_cast<DumpArgsLevel>(s_dump_header->dump_args_level);
+    g_dump_args_level = level;
 
     LOG_INFO("Initializing args dump for %d threads", num_dump_threads);
 
@@ -722,6 +721,11 @@ void dump_args_init(int num_dump_threads) {
     for (int t = 0; t < num_dump_threads; t++) {
         DumpBufferState *state = get_dump_buffer_state(dump_base, t);
         s_dump_states[t] = state;
+        // Transport cursors span invocations; ordinary host credits start at
+        // this boundary, while retained collectors acknowledge lifetime totals.
+        state->run_published_payload_base = state->published_payload_count;
+        state->run_dropped_record_count = 0;
+        wmb();
 
         // Keep the buffer this thread already holds, or pop the first one.
         //
@@ -756,6 +760,9 @@ void dump_args_init(int num_dump_threads) {
             s_current_dump_buf[t] = nullptr;
             state->current_buf_ptr = 0;
         }
+        wmb();
+        state->run_epoch = get_platform_run_result_epoch();
+        wmb();
     }
 
     memset(s_logged_ready_queue_full, 0, sizeof(s_logged_ready_queue_full));
@@ -929,7 +936,7 @@ void dump_args_flush(int thread_idx) {
     }
 
     s_buffers_flushed[thread_idx]++;
-    uint32_t dropped = s_dump_states[thread_idx] ? s_dump_states[thread_idx]->dropped_record_count : 0;
+    uint32_t dropped = s_dump_states[thread_idx] ? s_dump_states[thread_idx]->run_dropped_record_count : 0;
     LOG_INFO(
         "Thread %d: dump_args_flush (records=%u, buf_switches=%u, flushes=%u, dropped=%u)", thread_idx,
         s_records_written[thread_idx], s_buffers_switched[thread_idx], s_buffers_flushed[thread_idx], dropped

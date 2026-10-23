@@ -33,6 +33,7 @@
 #include "common/kernel_args.h"
 #include "dispatch_payload.h"
 #include "runtime.h"
+#include "tensormap_and_ringbuffer/kernel_launch_admission.h"
 #include "spin_hint.h"
 
 // Runtime headers (full struct definition for create/destroy + SIMPLER_SCOPE)
@@ -118,6 +119,7 @@ static RuntimeContext *rt{nullptr};
 // see src/common/task_interface/callable_protocol.h.
 
 struct OrchSoEntry {
+    simpler::tmr::KernelCallableIdentity kernel_identity{};
     bool in_use{false};
     void *handle{nullptr};
     char path[256]{};
@@ -172,6 +174,7 @@ struct AicpuExecutor {
     // Entry-arg ChipTaskArgs built (via create_from_entry_storage) from get_orch_args()
     // before scheduler init; consumed by the (*p_func)(orch_args_cached_) below.
     ChipTaskArgs orch_args_cached_;
+    simpler::tmr::EntryArgsStorage kernel_args_storage_{};
 
     // Per-callable_id table. Single orch thread today, so first-write/read
     // race is not possible; if multiple orch threads are ever introduced,
@@ -321,6 +324,11 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         serial_orch_sched_ = runtime->dev.serial_orch_sched;
 
         hs_arrived_.store(0, std::memory_order_relaxed);
+#if SIMPLER_DFX
+        // One leader initializes accounting before handshake/configuration can
+        // fail. The completed predecessor owns no producer writes here.
+        scope_stats_aicpu_begin_run();
+#endif
         if (sched_ctx_.pre_handshake_init(runtime, aicpu_thread_num_, sched_thread_num_, get_platform_regs()) != 0) {
             init_failed_.store(true, std::memory_order_release);
             hs_setup_done_.store(true, std::memory_order_release);
@@ -640,7 +648,15 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
             // prevents. Runs before create_from_entry_storage below, and only on
             // the orchestrator thread: the scheduler threads are still waiting
             // on runtime_init_ready_, and nothing else reads these values.
-            if (!adopt_launch_entry_args(runtime, thread_idx)) {
+            const auto entry_view = get_platform_entry_args(thread_idx);
+            const bool kernel_invocation =
+                entry_view.source == static_cast<uint32_t>(EntryArgsSource::KernelInvocation);
+            const bool args_admitted = kernel_invocation ? simpler::tmr::admit_kernel_launch_entry(
+                                                               *runtime, entry_view, entry.kernel_identity,
+                                                               get_platform_run_result_epoch(), &kernel_args_storage_
+                                                           ) :
+                                                           adopt_launch_entry_args(runtime, thread_idx);
+            if (!args_admitted) {
                 // Pre-runtime failure, reported by the thread's own return: rt
                 // and the SM header do not exist yet, so there is no shared
                 // error state to latch. The two statements below are the same
@@ -669,14 +685,15 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
 
             // Build the entry-arg once per run; both the config call below and
             // the orchestration entry (consumed at orch_args_cached_) use it.
-            orch_args_cached_.create_from_entry_storage(runtime->get_orch_args());
+            const auto &invocation_args = kernel_invocation ? kernel_args_storage_ : runtime->get_orch_args();
+            orch_args_cached_.create_from_entry_storage(invocation_args);
 
             // Validate arg count on every run against the registered SO.
             if (*p_config_func != nullptr) {
                 OrchestrationConfig cfg = (*p_config_func)(orch_args_cached_);
                 LOG_DEBUG("Thread %d: Config: expected_args=%d", thread_idx, cfg.expected_arg_count);
                 if (cfg.expected_arg_count > 0) {
-                    const simpler::tmr::EntryArgsStorage &args_validate = runtime->get_orch_args();
+                    const simpler::tmr::EntryArgsStorage &args_validate = invocation_args;
                     int32_t actual_arg_count = args_validate.tensor_count() + args_validate.scalar_count();
                     if (actual_arg_count < cfg.expected_arg_count) {
                         LOG_ERROR(
@@ -813,12 +830,6 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
         // state null) when scope_stats is disabled; the current buffer is
         // popped lazily on the first scope_end append.
         scope_stats_aicpu_set_orch_thread_idx(thread_idx);
-        // This run's own counters, zeroed on the device rather than by the
-        // host at admission: with a successor already queued a host instant
-        // can fall either side of a producer transition, and this one cannot —
-        // the predecessor's producer is gone with its operator. A no-op when
-        // no bank was resolved, which is every run on the default path.
-        scope_stats_aicpu_begin_run();
 #endif
 
 #if SIMPLER_DFX
@@ -1136,6 +1147,7 @@ void AicpuExecutor::deinit(Runtime * /*runtime*/) {
     serial_orch_sched_ = false;
 
     orch_args_cached_.reset();
+    kernel_args_storage_.clear();
     // orch_so_table_ entries are intentionally preserved across deinit: they
     // are loaded once by register_callable and consumed by every subsequent
     // run. The destructor releases them at process teardown.
@@ -1182,6 +1194,9 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_register_cal
         return rc;
     }
     LOG_INFO("simpler_aicpu_register_callable: completed for callable_id=%d", args->active_callable_id);
+    g_aicpu_executor.orch_so_table_[args->active_callable_id].kernel_identity = {
+        args->active_callable_id, args->residency_generation, args->tensor_count, args->scalar_count
+    };
     return 0;
 }
 
