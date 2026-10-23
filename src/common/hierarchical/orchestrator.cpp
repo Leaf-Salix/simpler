@@ -1445,12 +1445,6 @@ void Orchestrator::validate_remote_sidecars(
         for (int32_t i = 0; i < args.tensor_count(); ++i) {
             const Tensor &ref = args.tensor(i);
             const RemoteTensorSidecar &tensor_sidecar = sidecar.tensors[static_cast<size_t>(i)];
-            if (ref.buffer.backend_kind == static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW)) {
-                if (tensor_sidecar.present) {
-                    throw std::invalid_argument("Orchestrator: domain Tensor cannot carry a remote sidecar");
-                }
-                continue;
-            }
             // A remote arg carries no local backing: its Tensor is a placeholder (nbytes 0 or a
             // REMOTE_SIDECAR backend) and the real descriptor lives in the sidecar.
             bool has_local_backing =
@@ -1603,12 +1597,16 @@ void Orchestrator::infer_deps(
                     TensorAddressKind kind = desc.address_space == RemoteAddressSpace::HOST_INLINE ?
                                                  TensorAddressKind::HOST_INLINE :
                                                  TensorAddressKind::REMOTE_BUFFER;
-                    // A remote key already carries the view's offset, so every entry under one
-                    // of them denotes the same origin and a footprint adds nothing; the default
-                    // whole-backing one keeps this path's behaviour exactly as it was.
+                    const bool inline_payload = desc.address_space == RemoteAddressSpace::HOST_INLINE;
                     key = TensorKey::remote_buffer(
-                        kind, desc.owner_worker_id, desc.buffer_id, desc.generation, desc.offset
+                        kind, desc.owner_worker_id, desc.buffer_id, desc.generation, inline_payload ? desc.offset : 0
                     );
+                    if (!inline_payload) {
+                        view = tensor_footprint(r);
+                        // Imported ranges use the owner's byte origin, not the import's local origin.
+                        view.byte_offset = desc.offset;
+                        view.backing_nbytes = tensor_add_sat(desc.offset, desc.nbytes);
+                    }
                     has_key = true;
                 }
             }

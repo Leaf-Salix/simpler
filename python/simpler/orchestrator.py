@@ -344,7 +344,6 @@ class Orchestrator:
                 raise TypeError("RemoteTensorRef is only supported for RemoteCallable NEXT_LEVEL submits")
             remote_sidecar = None
         _validate_remote_sidecar_access(c_args, remote_sidecar)
-        final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
         worker = self._worker
         # Provenance validation precedes run ownership publication. Once a remote
         # ref is published, only the run fence may release it because the native
@@ -356,6 +355,8 @@ class Orchestrator:
         with prov_guard:
             if needs_prov:
                 worker._child_prov_check_dispatch_locked(c_args, cpp_worker_id, api="submit_next_level")
+                remote_sidecar = worker._prepare_buffer_references(c_args, remote_sidecar, cpp_worker_id)
+            final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
             if worker is not None:
                 worker._adopt_remote_sidecar_refs((remote_sidecar,))
                 worker._record_touched_identities(c_args)
@@ -464,6 +465,19 @@ class Orchestrator:
             for target_worker_id, c_args in member_checks:
                 assert worker is not None
                 worker._child_prov_check_dispatch_locked(c_args, target_worker_id, api="submit_next_level_group")
+            if worker is not None:
+                for index, c_args in enumerate(c_args_list):
+                    prepared = worker._prepare_buffer_references(
+                        c_args,
+                        remote_sidecars[index] if remote_sidecars is not None else None,
+                        worker_ids[index],
+                    )
+                    if remote_sidecars is not None:
+                        remote_sidecars[index] = prepared
+                if remote_sidecars is not None:
+                    worker_id_sets = [
+                        _remote_data_eligible_worker_ids(sidecar, eligible_worker_ids) for sidecar in remote_sidecars
+                    ]
             if worker is not None and remote_sidecars is not None:
                 worker._adopt_remote_sidecar_refs(remote_sidecars)
             if worker is not None:

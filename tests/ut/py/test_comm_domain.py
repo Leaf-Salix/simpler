@@ -58,6 +58,11 @@ def _request(members, **changes) -> dict[str, Any]:
     return config
 
 
+def _check_domain_dispatch_locked(worker, args, target):
+    worker._prepare_buffer_references(args, None, target)
+    worker._child_prov_check_dispatch_locked(args, target, api="test")
+
+
 def test_reuse_snapshot_data_and_second_run_release(domain_worker):
     worker, members = domain_worker
     request = _request(members)
@@ -77,9 +82,9 @@ def test_reuse_snapshot_data_and_second_run_release(domain_worker):
         args.add_tensor(payload.tensor([8], DataType.UINT8))
         target = members[0] if worker.level == 3 else members[0][0]
         with worker._child_prov_lock:
-            worker._child_prov_check_dispatch_locked(args, target, api="test")
+            _check_domain_dispatch_locked(worker, args, target)
             with pytest.raises(ValueError, match="wrong worker|stale"):
-                worker._child_prov_check_dispatch_locked(args, 999, api="test")
+                _check_domain_dispatch_locked(worker, args, 999)
         assert handle.member(0).local_worker_id == 1
         assert [handle.member(rank).global_device_rank for rank in range(2)] == [20, 10]
         orch.copy_to_domain(handle, 0, b"retained", buffer="payload", offset=3)
@@ -485,12 +490,11 @@ def test_accepted_callback_can_release_while_close_drains(domain_worker):
     assert saved[0].freed
 
 
-def test_domain_slice_grant_preserves_identity_views_and_rejects_stale_materialization(monkeypatch):
+def test_domain_reference_preserves_views_and_revokes_before_failed_backend_release(monkeypatch):
     from dataclasses import replace  # noqa: PLC0415
     from multiprocessing.shared_memory import SharedMemory  # noqa: PLC0415
 
-    from simpler.buffer import ImportContext, ImportRegistry, re_export  # noqa: PLC0415
-    from simpler.comm_domain import CommDomainRef, domain_buffers  # noqa: PLC0415
+    from simpler.buffer import ImportContext, ImportRegistry, buffer_reference, wrap_vmm_window  # noqa: PLC0415
     from simpler.comm_endpoints import DEVICE_AICPU  # noqa: PLC0415
     from simpler.global_comm_domain import (  # noqa: PLC0415
         GlobalDomainBuffer,
@@ -512,17 +516,18 @@ def test_domain_slice_grant_preserves_identity_views_and_rejects_stale_materiali
         members=(GlobalDomainMember(2, 0, 10, 0),),
         buffers=(GlobalDomainBuffer("prefix", 16, "uint8", 16), GlobalDomainBuffer("payload", 32, "float32", 8)),
         owner_instance_id=b"creator1",
-        buffer_ids=(40, 41),
     )
     received = decode_domain_command(encode_domain_command(command))
     assert received == command
-    logical = domain_buffers(command, 0)["payload"]
-    granted = domain_buffers(received, 0, base=4096)["payload"]
-    assert logical.to_descriptor() == granted.to_descriptor()
+    worker = Worker(level=3, device_ids=(0,), num_sub_workers=0)
+    granted = wrap_vmm_window(4112, 32, worker._owner_instance_id, 41)
+    with worker._child_prov_lock:
+        worker._record_device_alloc(granted, domain_allocation_id=7)
+    logical = buffer_reference(granted)
+    assert logical.base == 0 and logical.body == b"" and logical.owner_worker_path_id == 0
     first = logical.tensor([2], DataType.FLOAT32, byte_offset=4)
     second = logical.tensor([2], DataType.FLOAT32, byte_offset=12)
     assert first.buffer.identity == second.buffer.identity == granted.identity
-    assert CommDomainRef.from_tensor(first) == CommDomainRef(b"creator1", 7, 3)
     entry = worker_mod._L2GlobalDomain(
         domain_id=7,
         generation=3,
@@ -533,34 +538,32 @@ def test_domain_slice_grant_preserves_identity_views_and_rejects_stale_materiali
         mapping_size=4096,
         requested_window_size=4096,
         device_ctx=1,
-        buffers={granted.identity: granted},
     )
     store = worker_mod._L2GlobalDomainStore({7: entry})
-    registry = ImportRegistry(ImportContext(deployment=DEVICE_AICPU))
-    args = TaskArgs()
-    args.add_tensor(first)
-    args.add_tensor(second)
-    native = _materialize_chip_task_args(args, registry, store.resolve)
-    assert native.tensor(0).data == 4096 + 16 + 4
-    assert native.tensor(1).data == 4096 + 16 + 12
-    with pytest.raises(ValueError, match="live grant"):
-        registry.require(granted.identity)
-    with pytest.raises(ValueError, match="grant"):
-        _materialize_chip_task_args(args, registry)
-    changed = re_export(first.buffer)
+    registry = ImportRegistry(
+        ImportContext(deployment=DEVICE_AICPU, device_owner_instance_id=worker._owner_instance_id)
+    )
+
+    def materialize():
+        backing = worker._reexport(first.buffer)
+        args = TaskArgs()
+        for tensor in (first, second):
+            args.add_tensor(backing.tensor(tensor.shapes, tensor.dtype, byte_offset=tensor.byte_offset))
+        with worker._child_prov_lock:
+            worker._child_prov_check_dispatch_locked(args, 0, api="test")
+            with pytest.raises(ValueError, match="wrong worker|stale"):
+                worker._child_prov_check_dispatch_locked(args, 1, api="test")
+        return _materialize_chip_task_args(args, registry)
+
+    native = materialize()
+    assert native.tensor(0).data == 4116 and native.tensor(1).data == 4124
+    assert registry.require(granted.identity).base == granted.base
+    changed = replace(logical)
     changed.nbytes += 1
-    with pytest.raises(ValueError, match="granted slice"):
-        store.resolve(changed.to_descriptor())
-    for field, value in (("generation", 4), ("domain_rank", 1), ("revoked", True)):
-        previous = getattr(entry, field)
-        setattr(entry, field, value)
-        with pytest.raises(ValueError, match="stale|another chip"):
-            _materialize_chip_task_args(args, registry, store.resolve)
-        setattr(entry, field, previous)
-    assert _materialize_chip_task_args(args, registry, store.resolve).tensor(0).data == 4116
-    for bad in (replace(command, owner_instance_id=b""), replace(command, buffer_ids=(40, 40))):
-        with pytest.raises(ValueError):
-            encode_domain_command(bad)
+    with pytest.raises(ValueError, match="registered backing"):
+        worker._reexport(changed.to_descriptor())
+    with pytest.raises(ValueError, match="creator identity"):
+        encode_domain_command(replace(command, owner_instance_id=b""))
 
     class Chip:
         fail = True
@@ -582,49 +585,39 @@ def test_domain_slice_grant_preserves_identity_views_and_rejects_stale_materiali
 
     monkeypatch.setattr(worker_mod, "_open_global_domain_payload", release_payload)
     chip = Chip()
+    worker._drop_domain_allocs(7)
     with pytest.raises(RuntimeError, match="release failed"):
         worker_mod._handle_ctrl_global_domain_release(chip, memoryview(bytearray()), store)
-    assert store.domains[7] is entry and entry.revoked
+    assert store.domains[7] is entry
     with pytest.raises(ValueError, match="stale"):
-        _materialize_chip_task_args(args, registry, store.resolve)
+        materialize()
     chip.fail = False
     worker_mod._handle_ctrl_global_domain_release(chip, memoryview(bytearray()), store)
     assert store.domains == {}
     with pytest.raises(ValueError, match="stale"):
-        _materialize_chip_task_args(args, registry, store.resolve)
+        materialize()
+    registry.close()
+    worker.close()
 
 
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("separate", [False, True])
 @pytest.mark.parametrize("host_nbytes", [16, 32])
 def test_domain_and_host_descriptors_cannot_alias_identity(reverse, separate, host_nbytes):
-    from simpler.buffer import ImportContext, ImportRegistry, wrap_fork_inherited  # noqa: PLC0415
-    from simpler.comm_domain import domain_buffers  # noqa: PLC0415
+    from simpler.buffer import ImportContext, ImportRegistry, wrap_fork_inherited, wrap_vmm_window  # noqa: PLC0415
     from simpler.comm_endpoints import DEVICE_AICPU  # noqa: PLC0415
     from simpler.task_interface import _materialize_chip_task_args  # noqa: PLC0415
 
-    command = worker_mod.GlobalDomainCommand(
-        phase=worker_mod.GlobalDomainPhase.PREPARE_EXPORT,
-        domain_id=7,
-        generation=1,
-        name="tp",
-        profile="sim",
-        window_size=4096,
-        members=(worker_mod.GlobalDomainMember(0, 0, 0, 0),),
-        buffers=(worker_mod.GlobalDomainBuffer("payload", 32),),
-        owner_instance_id=b"creator1",
-        buffer_ids=(1,),
-    )
-    domain = domain_buffers(command, 0)["payload"]
+    domain = wrap_vmm_window(4096, 32, b"creator1", 1)
     host = wrap_fork_inherited(8192, host_nbytes, b"creator1", 1)
     ordered = (host, domain) if reverse else (domain, host)
-    registry = ImportRegistry(ImportContext(deployment=DEVICE_AICPU))
+    registry = ImportRegistry(ImportContext(deployment=DEVICE_AICPU, device_owner_instance_id=b"creator1"))
 
     def materialize(buffers):
         args = TaskArgs()
         for buffer in buffers:
             args.add_tensor(buffer.tensor([8], DataType.UINT8))
-        return _materialize_chip_task_args(args, registry, lambda _desc: 4096)
+        return _materialize_chip_task_args(args, registry)
 
     try:
         if separate:
@@ -635,6 +628,139 @@ def test_domain_and_host_descriptors_cannot_alias_identity(reverse, separate, ho
         assert materialize(ordered[:1]).tensor(0).data == (8192 if reverse else 4096)
     finally:
         registry.close()
+
+
+@pytest.fixture
+def logical_buffer_worker():
+    from simpler.buffer import buffer_reference, wrap_vmm_window  # noqa: PLC0415
+
+    worker = Worker(level=4, num_sub_workers=0)
+    actual = wrap_vmm_window(4096, 64, b"node-own", 7, "L3")
+    reference = buffer_reference(actual, owner_worker_id=3, remote_ref=(41, 2))
+    with worker._child_prov_lock:
+        worker._record_device_alloc(reference, domain_allocation_id=7)
+    try:
+        yield worker, actual, reference
+    finally:
+        worker.close()
+
+
+def test_buffer_reference_projects_storage_without_changing_canonical_identity(logical_buffer_worker):
+    from dataclasses import replace  # noqa: PLC0415
+
+    from simpler.buffer import BackendKind, buffer_reference  # noqa: PLC0415
+
+    _worker, actual, reference = logical_buffer_worker
+    assert reference.identity == actual.identity
+    assert reference.backend_kind == BackendKind.REMOTE_SIDECAR
+    assert reference.nbytes == actual.nbytes and reference.access == actual.access
+    assert reference.address_space == actual.address_space
+    assert reference.base == 0 and reference.body == b"" and reference.owner_worker_path_id == 0
+    assert reference.to_descriptor() == buffer_reference(actual.to_descriptor()).to_descriptor()
+    assert replace(reference)._remote_ref == (41, 2)
+
+
+@pytest.mark.parametrize("corruption", ["identity", "generation", "extent", "access", "path", "target", "stale"])
+def test_buffer_reference_submission_revalidates_private_registration(logical_buffer_worker, corruption):
+    from dataclasses import replace  # noqa: PLC0415
+
+    from simpler.buffer import AccessMode, CanonicalIdentity  # noqa: PLC0415
+    from simpler.task_interface import _empty_remote_sidecar_for  # noqa: PLC0415
+
+    worker, _actual, reference = logical_buffer_worker
+    changes = {
+        "identity": {"identity": CanonicalIdentity(b"forged!!", 7, 1)},
+        "generation": {"identity": CanonicalIdentity(b"node-own", 7, 2)},
+        "extent": {"nbytes": 65},
+        "access": {"access": AccessMode.READ},
+        "path": {"owner_worker_path_id": 1},
+    }
+    args = TaskArgs()
+    args.add_tensor(replace(reference, **changes.get(corruption, {})).tensor([4], DataType.UINT8, byte_offset=4))
+    if corruption == "stale":
+        worker._drop_domain_allocs(7)
+    with worker._child_prov_lock, pytest.raises(ValueError, match="stale|registration"):
+        worker._prepare_buffer_references(args, _empty_remote_sidecar_for(args), 4 if corruption == "target" else 3)
+
+
+@pytest.mark.parametrize("remote", [False, True])
+def test_buffer_reference_cannot_cross_dispatcher_kind(logical_buffer_worker, remote):
+    from dataclasses import replace  # noqa: PLC0415
+
+    from simpler.task_interface import _empty_remote_sidecar_for  # noqa: PLC0415
+
+    worker, _actual, reference = logical_buffer_worker
+    if remote:
+        reference = replace(reference, _remote_ref=None)
+        with worker._child_prov_lock:
+            worker._record_device_alloc(reference, domain_allocation_id=7)
+    args = TaskArgs()
+    args.add_tensor(reference.tensor([4], DataType.UINT8))
+    with worker._child_prov_lock, pytest.raises(ValueError, match="dispatcher"):
+        worker._prepare_buffer_references(args, _empty_remote_sidecar_for(args) if remote else None, 3)
+
+
+def test_buffer_reference_does_not_widen_registered_access(logical_buffer_worker):
+    from dataclasses import replace  # noqa: PLC0415
+
+    from simpler.buffer import AccessMode  # noqa: PLC0415
+    from simpler.task_interface import TensorArgType, _empty_remote_sidecar_for  # noqa: PLC0415
+
+    worker, _actual, reference = logical_buffer_worker
+    reference = replace(reference, access=AccessMode.READ)
+    with worker._child_prov_lock:
+        worker._record_device_alloc(reference, domain_allocation_id=7)
+    for tag in (TensorArgType.OUTPUT_EXISTING, TensorArgType.INOUT):
+        args = TaskArgs()
+        with pytest.raises(ValueError, match="access"):
+            args.add_tensor(reference.tensor([4], DataType.UINT8), tag)
+    args = TaskArgs()
+    args.add_tensor(reference.tensor([4], DataType.UINT8), TensorArgType.INPUT)
+    with worker._child_prov_lock:
+        assert worker._prepare_buffer_references(args, _empty_remote_sidecar_for(args), 3).tensors[0].present
+
+
+def test_automatic_sidecar_mixes_with_remote_refs_without_mutating_cached_args(logical_buffer_worker):
+    from simpler.task_interface import (  # noqa: PLC0415
+        RemoteAddressSpace,
+        RemoteBufferHandle,
+        RemoteTensorRef,
+        TensorArgType,
+        _remote_sidecar_for,
+        _validate_remote_sidecar_access,
+    )
+
+    worker, _actual, reference = logical_buffer_worker
+    ordinary = RemoteBufferHandle._from_remote_allocation(
+        worker_id=3,
+        buffer_id=90,
+        generation=5,
+        address_space=RemoteAddressSpace.REMOTE_DEVICE,
+        nbytes=64,
+        remote_addr=8192,
+        rkey_or_token=0,
+    )
+    args = TaskArgs()
+    args.add_tensor(reference.tensor([4], DataType.UINT8, byte_offset=4), TensorArgType.INOUT)
+    args.add_tensor(RemoteTensorRef(ordinary, offset=8, shape=(4,), dtype=DataType.UINT8))
+    args.add_scalar(19)
+    sidecar = _remote_sidecar_for(args)
+    assert sidecar is not None and sidecar.tensors[0] is None
+    original_tensor = args.tensor(0)
+    _validate_remote_sidecar_access(args, sidecar)
+    with worker._child_prov_lock:
+        prepared = worker._prepare_buffer_references(args, sidecar, 3)
+        assert worker._prepare_buffer_references(args, sidecar, 3) == prepared
+    assert _remote_sidecar_for(args) == sidecar and sidecar.tensors[0] is None
+    assert args.tensor(0).buffer == original_tensor.buffer and args.tensor(0).byte_offset == 4
+    assert args.tag(0) == TensorArgType.INOUT and args.scalar(0) == 19
+    generated = prepared.tensors[0]
+    assert generated is not None and generated.handle is None
+    assert (generated.desc.buffer_id, generated.desc.generation, generated.desc.offset) == (41, 2, 4)
+    assert prepared.tensors[1] == sidecar.tensors[1] and prepared.tensors[1].handle is ordinary
+    reference._remote_ref = (999, 999)
+    with worker._child_prov_lock:
+        assert worker._prepare_buffer_references(args, sidecar, 3) == prepared
 
 
 def test_release_and_rebuild_revoke_old_tensor_and_reference(domain_worker):
@@ -650,13 +776,13 @@ def test_release_and_rebuild_revoke_old_tensor_and_reference(domain_worker):
         old.release()
         target = members[0] if worker.level == 3 else members[0][0]
         with worker._child_prov_lock, pytest.raises(ValueError, match="stale"):
-            worker._child_prov_check_dispatch_locked(args, target, api="test")
+            _check_domain_dispatch_locked(worker, args, target)
         new = orch.allocate_domain(**_request(members))
         assert new.ref != ref and new.member(0).buffers["payload"].identity != payload.identity
         with pytest.raises(KeyError):
             orch.get_domain(ref)
         with worker._child_prov_lock, pytest.raises(ValueError, match="stale"):
-            worker._child_prov_check_dispatch_locked(args, target, api="test")
+            _check_domain_dispatch_locked(worker, args, target)
         saved.extend((old, new))
 
     worker.run(build)
@@ -668,7 +794,7 @@ def test_release_and_rebuild_revoke_old_tensor_and_reference(domain_worker):
         args.add_tensor(current.member(0).buffers["payload"].tensor([8], DataType.UINT8))
         with worker._child_prov_lock:
             target = members[0] if worker.level == 3 else members[0][0]
-            worker._child_prov_check_dispatch_locked(args, target, api="test")
+            _check_domain_dispatch_locked(worker, args, target)
         current.release()
 
     worker.run(finish)

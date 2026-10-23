@@ -101,24 +101,47 @@ returns the slice's window offset and byte size. `mapping_size` is the
 returned backend mapping extent on both L3 and L4. Outside a callback, staging
 requires all outstanding run handles to have completed; it never waits implicitly.
 
-`member(rank).buffers[name]` returns an ordinary public `Buffer` in both layers.
-L4 Buffers carry an address-free `DOMAIN_WINDOW` descriptor: creator incarnation,
-domain id/generation, rank and declared slice. Pass their Tensors through the
-existing `TaskArgs` to the member's L3, then to its exact chip. Local and TCP/MPI
-forwarding preserve the creator's canonical identity, view offset and geometry;
-the receiving node and chip resolve only an existing committed slice grant.
-Wrong targets, stale identities and modified descriptors are refused. Ordinary
-Tensor arguments name their own chip's storage; peer-window access still uses
-`CommContext`. Tensor construction performs no network copy or implicit H2D.
+`member(rank).buffers[name]` returns an ordinary `Buffer` in both layers.
+On domain commit, L3 registers the existing window slices as actual Buffers,
+currently backed by `VMM_WINDOW`, without allocating or mapping them again.
+L4 receives address-free `REMOTE_SIDECAR` references carrying those Buffers'
+canonical identities; the domain creator and backing owner can differ.
+Views preserve backing identity, offset and geometry. Pass their Tensors through
+ordinary `TaskArgs` to the exact L3/chip without constructing `RemoteTensorRef`.
 
-`domain.ref` is an immutable `CommDomainRef`, not a release callback or an access
-grant. A receiving L3 can use `orch.get_domain(ref)` to obtain the same public
-handle type in borrowed mode; `CommDomainRef.from_tensor(tensor)` extracts the
-reference from an incoming L4 domain Tensor. Borrowed `release()` and `with`
-are refused. `local_context(rank)` is available only for ranks actually mapped
-on this node. Legacy `get_global_domain(domain_id)` remains session-local.
-`handle.buffers` contains complete buffer definitions, and
-`requested_window_size` distinguishes the request from `mapping_size`.
+Remote dispatch supplies the existing sidecar internally; the receiver looks up
+the session entry and constructs a view over its registered Buffer. Local
+forwarding resolves the reference by identity. Both paths validate the full
+reference, range and target chip, reject stale or modified descriptors, and
+never create windows while receiving a task. Protocol buffer ID/generation
+locates a borrowed session entry, independently of the backing's canonical
+identity. A task can mix ordinary remote Buffers and domain slices. Tensor
+construction performs no network copy or implicit H2D.
+
+The domain owns its windows; session entries only borrow slices. Ordinary
+remote free, copy and export commands reject borrowed domain slices rather
+than dereferencing device addresses on the host. Domain staging still uses
+`copy_to_domain` / `copy_from_domain`. Failed creation revokes references;
+logical release rejects new submissions, while accepted tasks retain their
+entries until the existing fence. The domain performs physical reclamation.
+Session exit drops borrowed references without freeing them as independent
+allocations.
+
+`domain.ref` is an independent, immutable `CommDomainRef` containing the creator
+incarnation, domain ID and generation; it carries neither a release callback
+nor an access grant. A receiving L3 uses `orch.get_domain(ref)` to borrow an
+already committed domain. Borrowed `release()` and `with` are refused.
+The complete member topology and layout remain available, but
+`member(rank).buffers` contains only this node's actual slices; nonlocal members
+have empty buffer mappings. `local_context(rank)` likewise requires a local rank.
+
+For peer-window communication, L4 passes the ref and domain rank explicitly.
+L3 calls `orch.get_domain(ref).local_context(rank)` and submits its local
+`device_ctx` to the chip as a scalar. Context addresses never cross the network,
+and context lookup does not infer a domain from a Tensor or device address.
+Legacy `get_global_domain(domain_id)` remains session-local; a bare ID is not a
+global identity. `handle.buffers` retains the full slice definitions, and
+`requested_window_size` is distinct from the actual `mapping_size`.
 The existing root run fence protects its accepted descendants; holding a
 descriptor or borrowed handle alone adds no retention. Logical release revokes
 new L3/L4 Tensor submissions while previously accepted descendants keep their
@@ -149,7 +172,7 @@ closes the retained domain, and `Worker.close()` remains the final owner.
 | `device_ctx` | pointer to the device-side `CommContext` (pass as a kernel scalar) |
 | `local_window_base` | base device address of this rank's window |
 | `actual_window_size` | actual backend mapping extent, including backend alignment |
-| `buffers` | `{buffer_name: Buffer}` for each `CommBufferSpec`, resolved on this chip; L3-local VMM or imported logical domain slice |
+| `buffers` | Actual Buffer for each `CommBufferSpec` on this chip; currently `VMM_WINDOW` slices of the existing window |
 
 Kernels read peer windows through `device_ctx` (which holds every rank's
 window base, local + imported peer); `buffers[name]` is the local slice —

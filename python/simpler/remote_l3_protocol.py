@@ -462,8 +462,7 @@ def decode_tensor(reader: _Reader) -> Tensor:
     address_space = reader.u8()
     access = reader.u8()
     backend_kind = reader.u8()
-    # Remote backing is named by a sidecar or an existing domain grant, never a foreign device VA.
-    if backend_kind not in (int(BackendKind.REMOTE_SIDECAR), int(BackendKind.DOMAIN_WINDOW)):
+    if backend_kind != int(BackendKind.REMOTE_SIDECAR):
         raise ValueError("remote_wire: a remote TASK tensor must carry no local backing")
     nbytes = reader.u64()
     owner_worker_path_id = reader.u32()

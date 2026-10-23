@@ -28,11 +28,36 @@ from simpler.task_interface import (
 from simpler.worker import RemoteCallable, RemoteWorkerSpec, Worker
 
 from examples.workers.l3.multi_chip_dispatch.main import N_COLS, N_ROWS, build_chip_callable
+from examples.workers.l4.global_tload_mixed_l3.main import COUNT, _build_tload_callable
 
 _NUMEL = N_ROWS * N_COLS
 _NBYTES = _NUMEL * 4
 _RUNTIME = "tensormap_and_ringbuffer"
 _ACCEPTED_ARGS = {}
+_CONTEXT_ARGS = {}
+
+
+def _borrow_domain(orch, args):
+    ref = CommDomainRef(int(args.scalar(4)).to_bytes(8, "little"), int(args.scalar(5)), int(args.scalar(6)))
+    rank = int(args.scalar(7))
+    domain = orch.get_domain(ref)
+    assert domain.borrowed and domain.ref == ref
+    node = domain.member(rank).node_worker_id
+    for member in domain.members:
+        assert bool(member.buffers) == (member.node_worker_id == node)
+        if member.node_worker_id != node:
+            with pytest.raises(KeyError):
+                domain.local_context(member.domain_rank)
+    return domain, rank
+
+
+def _add_domain_scalars(args, domain, rank, chip):
+    for offset in range(0, 32, 8):
+        args.add_scalar(int.from_bytes(chip.digest[offset : offset + 8], "little"))
+    args.add_scalar(int.from_bytes(domain.ref.owner_instance_id, "little"))
+    args.add_scalar(domain.ref.domain_id)
+    args.add_scalar(domain.ref.generation)
+    args.add_scalar(rank)
 
 
 def remote_domain_add(orch, args, cfg, chip=None):
@@ -45,14 +70,12 @@ def remote_domain_add(orch, args, cfg, chip=None):
         with pytest.raises(ValueError, match="stale|not live"):
             orch.submit_next_level(chip, chip_args, cfg, worker=target)
         return
-    rank = int(args.scalar(4))
-    ref = CommDomainRef.from_tensor(args.tensor(0))
-    domain = orch.get_domain(ref)
-    assert domain.borrowed and domain.ref == ref
+    domain, rank = _borrow_domain(orch, args)
     member = domain.member(rank)
     payload = member.buffers["payload"]
     for tensor in (args.tensor(0), args.tensor(1)):
-        assert tensor.buffer == payload.to_descriptor()
+        assert tensor.buffer.identity == payload.identity
+        assert tensor.buffer.nbytes == payload.nbytes
         assert (tensor.shapes, tensor.strides, tensor.dtype) == ((_NUMEL,), (1,), DataType.FLOAT32.value)
     assert domain.buffers[0].count == _NUMEL + 32
     assert (args.tensor(0).byte_offset, args.tensor(1).byte_offset) == (64, 128)
@@ -69,11 +92,37 @@ def remote_domain_add(orch, args, cfg, chip=None):
         chip_args.add_tensor(args.tensor(i), tag)
     with pytest.raises(ValueError, match="wrong worker|stale"):
         orch.submit_next_level(chip, chip_args, cfg, worker=member.local_worker_id ^ 1)
-    _ACCEPTED_ARGS[rank] = ref, chip, chip_args, member.local_worker_id
+    _ACCEPTED_ARGS[rank] = domain.ref, chip, chip_args, member.local_worker_id
     orch.submit_next_level(chip, chip_args, cfg, worker=member.local_worker_id)
 
 
-def exercise_domain_tensors(worker, members, callable_obj, *, local_chip=None, cached=True):
+def remote_domain_tload(orch, args, cfg, chip=None):
+    from simpler.remote_l3_session import get_inner_handle  # noqa: PLC0415
+
+    domain, rank = _borrow_domain(orch, args)
+    context = domain.local_context(rank)
+    assert context.domain_rank == rank
+    member = domain.member(rank)
+    if chip is None:
+        digest = b"".join(int(args.scalar(i)).to_bytes(8, "little") for i in range(4))
+        chip = get_inner_handle(digest.hex())
+    chip_args = TaskArgs()
+    for index, (name, tag) in enumerate(
+        (("payload", TensorArgType.INPUT), ("context_result", TensorArgType.OUTPUT_EXISTING))
+    ):
+        tensor = args.tensor(index)
+        assert tensor.buffer.identity == member.buffers[name].identity
+        assert tensor.byte_offset == 64
+        chip_args.add_tensor(tensor, tag)
+    chip_args.add_scalar(context.domain_size)
+    chip_args.add_scalar(context.device_ctx)
+    _CONTEXT_ARGS[rank] = chip_args
+    orch.submit_next_level(chip, chip_args, cfg, worker=member.local_worker_id)
+
+
+def exercise_domain_tensors(  # noqa: PLR0915 -- shared setup, cross-run lifetime and peer-context assertions
+    worker, members, callable_obj, *, tload_callable, local_chip=None, local_tload_chip=None, cached=True
+):
     """Keep setup and assertions identical while topology and routing vary."""
     outputs, saved, cached_args = [], [], []
     nodes = tuple(dict.fromkeys(node for node, _chip in members))
@@ -82,21 +131,32 @@ def exercise_domain_tensors(worker, members, callable_obj, *, local_chip=None, c
         name="tp",
         members=members,
         window_size=_NBYTES + 4096,
-        buffers=[CommBufferSpec("payload", "float32", _NUMEL + 32, _NBYTES + 128)],
+        buffers=[
+            CommBufferSpec("payload", "float32", _NUMEL + 32, _NBYTES + 128),
+            CommBufferSpec("context_result", "float32", COUNT + 16, (COUNT + 16) * 4),
+        ],
         retain_after_run=True,
     )
     try:
         chip = worker.register(callable_obj)
-        routes = {}
+        tload_chip = worker.register(tload_callable)
+        routes, context_routes = {}, {}
         if local_chip is not None:
+            assert local_tload_chip is not None
 
             def forward(orch, args, cfg):
                 remote_domain_add(orch, args, cfg, local_chip[1])
 
+            def forward_context(orch, args, cfg):
+                remote_domain_tload(orch, args, cfg, local_tload_chip)
+
             routes[local_chip[0]] = worker.register(forward)
+            context_routes[local_chip[0]] = worker.register(forward_context)
         if remote_nodes:
             remote = worker.register(RemoteCallable(__name__ + ":remote_domain_add"), workers=remote_nodes)
             routes.update(dict.fromkeys(remote_nodes, remote))
+            remote_context = worker.register(RemoteCallable(__name__ + ":remote_domain_tload"), workers=remote_nodes)
+            context_routes.update(dict.fromkeys(remote_nodes, remote_context))
         worker.init()
         for node, _chip in members:
             outputs.append(
@@ -122,9 +182,7 @@ def exercise_domain_tensors(worker, members, callable_obj, *, local_chip=None, c
                     else output.tensor([_NUMEL], DataType.FLOAT32)
                 )
                 args.add_tensor(result, TensorArgType.OUTPUT_EXISTING)
-                for offset in range(0, 32, 8):
-                    args.add_scalar(int.from_bytes(chip.digest[offset : offset + 8], "little"))
-                args.add_scalar(rank)
+                _add_domain_scalars(args, domain, rank, chip)
                 cached_args.append(args)
 
         worker.run(first)
@@ -163,14 +221,49 @@ def exercise_domain_tensors(worker, members, callable_obj, *, local_chip=None, c
         def rebuild(orch, _args, cfg):
             replacement = orch.get_or_allocate_domain(**request)
             assert replacement.ref != domain_ref
+            saved.append(replacement)
             for rank, (node, _chip) in enumerate(members):
                 assert replacement.member(rank).buffers["payload"].identity != identities[rank]
+                values = [float(rank * 100 + index) for index in range(COUNT + 16)]
+                orch.copy_to_domain(replacement, rank, struct.pack(f"<{len(values)}f", *values), buffer="payload")
+                orch.copy_to_domain(
+                    replacement,
+                    rank,
+                    struct.pack(f"<{COUNT + 16}f", *([-1.0] * (COUNT + 16))),
+                    buffer="context_result",
+                )
+            for rank, (node, _chip) in enumerate(members):
                 args = TaskArgs()
                 args.add_scalar(rank)
                 orch.submit_next_level(routes[node], args, cfg, worker=node)
-            replacement.release()
+                args = TaskArgs()
+                for name, tag in (("payload", TensorArgType.INPUT), ("context_result", TensorArgType.OUTPUT_EXISTING)):
+                    args.add_tensor(
+                        replacement.member(rank).buffers[name].tensor([COUNT], DataType.FLOAT32, byte_offset=64),
+                        tag,
+                    )
+                _add_domain_scalars(args, replacement, rank, tload_chip)
+                orch.submit_next_level(context_routes[node], args, cfg, worker=node)
 
         worker.run(rebuild)
+        replacement = saved[-1]
+        assert not replacement.released
+
+        def read_and_release(orch, _args, _cfg):
+            assert orch.get_domain("tp") is replacement
+            rank_count = len(members)
+            expected = tuple(
+                float(rank_count * (index + 16) + 100 * rank_count * (rank_count - 1) // 2) for index in range(COUNT)
+            )
+            for rank in range(rank_count):
+                raw = orch.copy_from_domain(replacement, rank, (COUNT + 16) * 4, buffer="context_result")
+                values = struct.unpack(f"<{COUNT + 16}f", raw)
+                assert values[:16] == (-1.0,) * 16
+                assert values[16:] == expected
+            replacement.release()
+
+        worker.run(read_and_release)
+        assert replacement.freed
         assert worker.live_domains == {}
     finally:
         try:
@@ -225,4 +318,9 @@ def test_domain_tensor_reaches_remote_chip(tcp_daemon, st_platform, st_device_id
             comm_profile="sim",
         )
     )
-    exercise_domain_tensors(worker, [(node, 0)], build_chip_callable(st_platform))
+    exercise_domain_tensors(
+        worker,
+        [(node, 0)],
+        build_chip_callable(st_platform),
+        tload_callable=_build_tload_callable(st_platform, _RUNTIME),
+    )
