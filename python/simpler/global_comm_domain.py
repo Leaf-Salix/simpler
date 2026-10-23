@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 from _task_interface import AddressSpace  # pyright: ignore[reportMissingImports]
 
+from .comm_domain import HostWindowSpec
 from .comm_endpoints import (
     _ADAPTER_KIND_IDS,  # noqa: F401 — re-export of the comm_endpoints numeric table
     _ADAPTER_PROFILE_IDS,  # noqa: F401 — re-export of the comm_endpoints numeric table
@@ -51,7 +52,7 @@ if TYPE_CHECKING:
 #: descriptor it exports and ``_validate_descriptor`` checks it on decode, so advancing one
 #: without the other fails every allocation at PREPARE. The ``LOCAL_*`` L3->L2 mailbox structs
 #: in ``worker.py`` also carry it; producer and consumer there are the same build.
-GLOBAL_DOMAIN_VERSION = 2
+GLOBAL_DOMAIN_VERSION = 3
 GLOBAL_DOMAIN_MAX_RANKS = 64
 GLOBAL_DOMAIN_MAX_BUFFERS = 64
 GLOBAL_DOMAIN_MAX_ATTACHMENT_ROWS = GLOBAL_DOMAIN_MAX_RANKS
@@ -89,6 +90,12 @@ class GlobalDomainPhase(enum.IntEnum):
     IMPORT = 2
     COMMIT = 3
     ABORT = 4
+
+
+class GlobalDomainReleaseStage(enum.IntEnum):
+    FULL = 0
+    VIEWS = 1
+    OWNERS = 2
 
 
 @dataclass(frozen=True)
@@ -211,6 +218,15 @@ def resolve_global_comm_capability(*, platform: str, profile: str, local_device_
 
 
 @dataclass(frozen=True)
+class GlobalDomainHostWindow:
+    node_worker_id: int
+    spec: HostWindowSpec
+    buffer_id: int
+    mapping_size: int = 0
+    handle: bytes = b""
+
+
+@dataclass(frozen=True)
 class GlobalDomainCommand:
     phase: GlobalDomainPhase
     domain_id: int
@@ -225,6 +241,7 @@ class GlobalDomainCommand:
     owner_instance_id: bytes = b""
     buffer_ids: tuple[int, ...] = ()
     retain_after_run: bool = False
+    host_windows: tuple[GlobalDomainHostWindow, ...] = ()
 
     def attachments_for_node(self, node_worker_id: int) -> tuple[GlobalDomainAttachment, ...]:
         """Return the row addressed to one receiving L3 node.
@@ -250,6 +267,7 @@ class GlobalDomainCommand:
 class GlobalDomainReleaseCommand:
     domain_id: int
     generation: int
+    stage: GlobalDomainReleaseStage = GlobalDomainReleaseStage.FULL
 
 
 @dataclass(frozen=True)
@@ -654,9 +672,78 @@ def decode_comm_init_result(data: bytes) -> GlobalCommInitResult:
     return result
 
 
+def _validate_host_windows(command: GlobalDomainCommand) -> None:
+    hosts = command.host_windows
+    if not hosts:
+        return
+    nodes = sorted({member.node_worker_id for member in command.members})
+    if [host.node_worker_id for host in hosts] != nodes:
+        raise ValueError("Host windows must be ordered and cover exactly the participating nodes")
+    identities = (*command.buffer_ids, *(host.buffer_id for host in hosts))
+    if not command.owner_instance_id or len(set(identities)) != len(identities):
+        raise ValueError("Host windows require a creator and distinct Buffer identities")
+    exported = command.phase in (GlobalDomainPhase.IMPORT, GlobalDomainPhase.COMMIT)
+    _validate_host_table(hosts, exported=exported, profile=command.profile)
+
+
+def _validate_host_table(hosts, *, exported: bool, profile: str = "") -> None:
+    if len(hosts) > GLOBAL_DOMAIN_MAX_RANKS:
+        raise ValueError("Host window count exceeds maximum")
+    nodes = [host.node_worker_id for host in hosts]
+    identities = [host.buffer_id for host in hosts]
+    if nodes != sorted(set(nodes)) or len(set(identities)) != len(identities):
+        raise ValueError("Host windows require ordered unique nodes and Buffer identities")
+    for host in hosts:
+        if (
+            not 0 <= host.node_worker_id < 2**31
+            or not isinstance(host.spec, HostWindowSpec)
+            or not 0 < host.buffer_id < 2**64
+        ):
+            raise ValueError("invalid Host window specification or Buffer identity")
+        if exported:
+            if not host.spec.nbytes <= host.mapping_size < 2**64 or not host.handle:
+                raise ValueError("Host export requires complete mapping and handle")
+            if len(host.handle) > GLOBAL_DOMAIN_HANDLE_BYTES:
+                raise ValueError("Host Fabric handle exceeds maximum")
+            if profile == GLOBAL_DOMAIN_PROFILE_A3_FABRIC and len(host.handle) != 128:
+                raise ValueError("Host Fabric handle must contain 128 bytes")
+        elif host.mapping_size or host.handle:
+            raise ValueError("Host PREPARE/ABORT must not carry exports")
+
+
+def _put_host_windows(out: bytearray, hosts: tuple[GlobalDomainHostWindow, ...]) -> None:
+    if len(hosts) > GLOBAL_DOMAIN_MAX_RANKS:
+        raise ValueError("Host window count exceeds maximum")
+    out.extend(struct.pack("<I", len(hosts)))
+    for host in hosts:
+        out.extend(
+            struct.pack(
+                "<iiQQQ", host.node_worker_id, host.spec.numa_id, host.spec.nbytes, host.buffer_id, host.mapping_size
+            )
+        )
+        _put_blob(out, host.handle, GLOBAL_DOMAIN_HANDLE_BYTES, "Host handle")
+
+
+def _read_host_windows(reader: _Reader) -> tuple[GlobalDomainHostWindow, ...]:
+    count = reader.u32()
+    if count > GLOBAL_DOMAIN_MAX_RANKS:
+        raise ValueError("Host window count exceeds maximum")
+    return tuple(
+        GlobalDomainHostWindow(
+            reader.i32(),
+            HostWindowSpec(reader.i32(), reader.u64()),
+            reader.u64(),
+            reader.u64(),
+            reader.blob(GLOBAL_DOMAIN_HANDLE_BYTES, "Host handle"),
+        )
+        for _ in range(count)
+    )
+
+
 def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR0912 -- wire validation keeps phase rules adjacent to encoding
     validate_member_table(command.members)
     validate_attachment_table(command.attachments, command.members)
+    _validate_host_windows(command)
     if command.phase is not GlobalDomainPhase.PREPARE_EXPORT and command.attachments:
         raise ValueError("global domain attachments are only carried by PREPARE_EXPORT")
     if command.domain_id == 0 or command.generation == 0 or command.window_size <= 0:
@@ -714,13 +801,14 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
             not 0 < i < 2**64 for i in command.buffer_ids
         ):
             raise ValueError("global domain Buffer ids must be distinct positive uint64 values")
-        out.extend(b"SDB1" + command.owner_instance_id)
+        out.extend(b"SDB2" + command.owner_instance_id)
         out.extend(struct.pack("<?", command.retain_after_run))
         for identity in command.buffer_ids:
             out.extend(struct.pack("<Q", identity))
         for buffer in command.buffers:
             _put_string(out, buffer.dtype, "buffer.dtype")
             out.extend(struct.pack("<q??", buffer.count, buffer.load_from_host, buffer.store_to_host))
+        _put_host_windows(out, command.host_windows)
     elif command.buffer_ids or any(b.dtype or b.count or b.load_from_host or b.store_to_host for b in command.buffers):
         raise ValueError("global domain extended layout requires a creator identity")
     return bytes(out)
@@ -759,8 +847,9 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
     owner_instance_id = b""
     buffer_ids = ()
     retain_after_run = False
+    host_windows = ()
     if reader._offset != len(data):
-        if reader.fixed(4, "Buffer extension magic") != b"SDB1":
+        if reader.fixed(4, "Buffer extension magic") != b"SDB2":
             raise ValueError("global domain Buffer extension is unknown")
         owner_instance_id = reader.fixed(8, "creator identity")
         retention = reader.fixed(1, "retention policy")
@@ -774,6 +863,7 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
             count, load, store = struct.unpack("<q??", reader.fixed(10, "buffer definition"))
             definitions.append(replace(buffer, dtype=dtype, count=count, load_from_host=load, store_to_host=store))
         buffers = tuple(definitions)
+        host_windows = _read_host_windows(reader)
     reader.done("ALLOC_DOMAIN")
     command = GlobalDomainCommand(
         phase=phase,
@@ -789,6 +879,7 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
         owner_instance_id=owner_instance_id,
         buffer_ids=buffer_ids,
         retain_after_run=retain_after_run,
+        host_windows=host_windows,
     )
     encode_domain_command(command)
     return command
@@ -812,19 +903,42 @@ def decode_descriptor_table(data: bytes) -> tuple[GlobalDomainDescriptor, ...]:
     return descriptors
 
 
+def encode_domain_exports(descriptors, host_windows) -> bytes:
+    hosts = tuple(host_windows)
+    _validate_host_table(hosts, exported=True)
+    out = bytearray(encode_descriptor_table(tuple(descriptors)))
+    _put_host_windows(out, hosts)
+    return bytes(out)
+
+
+def decode_domain_exports(data: bytes):
+    reader = _Reader(data)
+    count = reader.u32()
+    if count > GLOBAL_DOMAIN_MAX_RANKS:
+        raise ValueError("global domain descriptor table exceeds maximum")
+    descriptors = tuple(
+        GlobalDomainDescriptor.decode(reader.fixed(GLOBAL_DOMAIN_DESCRIPTOR_BYTES, "descriptor")) for _ in range(count)
+    )
+    hosts = _read_host_windows(reader)
+    reader.done("domain exports")
+    _validate_host_table(hosts, exported=True)
+    return descriptors, hosts
+
+
 def encode_release_command(command: GlobalDomainReleaseCommand) -> bytes:
-    if command.domain_id == 0 or command.generation == 0:
+    if not 0 < command.domain_id < 2**64 or not 0 < command.generation < 2**64:
         raise ValueError("global domain release identity must be positive")
-    return struct.pack("<QQ", int(command.domain_id), int(command.generation))
+    stage = GlobalDomainReleaseStage(command.stage)
+    return struct.pack("<QQI", int(command.domain_id), int(command.generation), int(stage))
 
 
 def decode_release_command(data: bytes) -> GlobalDomainReleaseCommand:
-    if len(data) != struct.calcsize("<QQ"):
+    if len(data) != struct.calcsize("<QQI"):
         raise ValueError("global domain release size mismatch")
-    domain_id, generation = struct.unpack("<QQ", data)
+    domain_id, generation, stage = struct.unpack("<QQI", data)
     if domain_id == 0 or generation == 0:
         raise ValueError("global domain release identity is invalid")
-    return GlobalDomainReleaseCommand(int(domain_id), int(generation))
+    return GlobalDomainReleaseCommand(int(domain_id), int(generation), GlobalDomainReleaseStage(stage))
 
 
 def encode_copy_command(command: GlobalDomainCopyCommand, *, include_data: bool) -> bytes:

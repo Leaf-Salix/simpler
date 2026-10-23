@@ -97,7 +97,7 @@ enum class AccessMode : uint8_t {
 // VMM_WINDOW and VMM_SHAREABLE are distinct tags: the former's body is an already-valid owner-chip
 // device VA that cannot leave that context, while the latter carries a shareable handle an importer
 // maps for itself.
-// DOMAIN_WINDOW carries a logical domain/rank/slice reference resolved against an existing grant.
+// DOMAIN_WINDOW carries a logical domain/window-slot/slice reference resolved against an existing grant.
 enum class BackendKind : uint8_t {
     FORK_SHM = 0,
     POSIX_SHM = 1,
@@ -325,13 +325,13 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     // body of 3 bytes reads as a TRUNCATED pointer with nothing to distinguish it from a real one.
     switch (backend) {
     case BackendKind::DOMAIN_WINDOW: {
-        // Domain id, generation, rank and slice offset; no endpoint address.
+        // Domain id, generation, window slot and slice offset; no endpoint address.
         if (h.body_len != 28) reject("invalid BufferDescriptor: DOMAIN_WINDOW body must be exactly 28 bytes");
         uint64_t generation = 0;
-        uint32_t rank = 0;
+        uint32_t slot = 0;
         std::memcpy(&generation, h.body + 8, sizeof(generation));
-        std::memcpy(&rank, h.body + 16, sizeof(rank));
-        if (generation == 0 || rank >= 64) reject("invalid BufferDescriptor: DOMAIN_WINDOW identity or rank");
+        std::memcpy(&slot, h.body + 16, sizeof(slot));
+        if (generation == 0 || slot >= 128) reject("invalid BufferDescriptor: DOMAIN_WINDOW identity or slot");
         break;
     }
     case BackendKind::FORK_SHM:

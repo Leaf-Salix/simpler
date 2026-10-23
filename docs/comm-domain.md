@@ -212,7 +212,7 @@ not resend it: `COPY_TO_DOMAIN`/`COPY_FROM_DOMAIN` use
 
 `GlobalDomainMember` remains the rank table: one entry and one exported window
 per device rank. A host is not inserted into that table and never consumes an
-HCCL rank. The version-2 `GlobalDomainCommand` carries a flattened attachment
+HCCL rank. The version-3 `GlobalDomainCommand` carries a flattened attachment
 matrix alongside `members`. Each receiving L3 node contributes one row, and
 each row has one entry for every member in dense rank order. Thus a domain with
 three ranks on two nodes carries six attachment records; a receiver selects

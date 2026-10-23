@@ -391,11 +391,14 @@ gates, or keys on it.
 | `FORK_SHM` | the same VA, no map | exactly 8 bytes, a non-zero u64 LE base | a pre-fork `MAP_SHARED` host buffer (e.g. `share_memory_()`), writable from the child |
 | `FORK_COW` | the same VA, no map | exactly 8 bytes, a non-zero u64 LE base | a pre-fork plain host buffer: copy-on-write, so **READ only** |
 | `VMM_WINDOW` | the device VA of the window carved by `allocate_domain`, no map | exactly 8 bytes, a non-zero u64 LE base | communication-domain window / buffer |
-| `DOMAIN_WINDOW` (7) | the slice base resolved against a live endpoint/chip grant | exactly 28 bytes, `<QQIQ>`: domain id, generation, domain rank, slice byte offset | logical L4 domain Buffer, forwarded through L3 to its chip |
+| `DOMAIN_WINDOW` (7) | the slice base resolved against a live endpoint/chip grant | exactly 28 bytes, `<QQIQ>`: domain id, generation, window slot, slice byte offset | logical domain Buffer, forwarded through L3 to a granted chip |
 | `DEVICE_MALLOC` | the device pointer, no map (chip-local) | exactly 8 bytes, a non-zero u64 LE base | `alloc_child_tensor` |
 | `REMOTE_SIDECAR` | (P2) resolved via the remote transport | empty | an arg to a remote L3; the descriptor rides in the sidecar |
 
 For `DOMAIN_WINDOW`, the creator incarnation is carried by canonical identity;
+slots below the device-rank count name HBM, and subsequent slots name the
+node-ordered Host pools. Domain protocol version 3 rejects older peers; the
+unchanged body length does not imply semantic compatibility.
 Tensor view offsets remain in the Tensor. `ImportRegistry.materialize` rechecks
 the committed grant even on a cache hit, while cache-only `require` refuses
 domain windows. See the [communication-domain contract](comm-domain.md#unified-creation-and-reuse).

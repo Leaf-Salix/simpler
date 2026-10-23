@@ -127,7 +127,7 @@ from _task_interface import (
 )
 
 from .buffer import AccessMode, AddressSpace, Buffer, ImportContext, ImportRegistry, Tensor, TensorTransfer
-from .comm_domain import CommDomainRef
+from .comm_domain import CommDomainRef, HostWindowSpec
 from .comm_endpoints import DEVICE_AICPU
 
 
@@ -286,6 +286,7 @@ __all__ = [
     "ChipDomainContext",
     "CommDomainHandle",
     "CommDomainRef",
+    "HostWindowSpec",
     "CommDomainMember",
     "GlobalCommDomainHandle",
     "GlobalCommDomainView",
