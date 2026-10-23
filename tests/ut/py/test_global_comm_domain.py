@@ -1290,7 +1290,9 @@ def test_node_import_failure_rolls_back_partial_local_ranks_and_uses_configured_
         worker.close()
 
 
-def test_node_import_reuses_prepared_attachment_row_for_view():
+@pytest.mark.parametrize("commit_failure", [None, "missing", "wrong_chip", "descriptor"])
+def test_node_import_reuses_prepared_attachment_row_for_view(commit_failure):
+    from simpler.remote_l3_protocol import ControlName  # noqa: PLC0415
     from simpler.worker import (  # noqa: PLC0415
         CTRL_GLOBAL_DOMAIN_IMPORT,
         CTRL_GLOBAL_DOMAIN_RELEASE,
@@ -1298,6 +1300,8 @@ def test_node_import_reuses_prepared_attachment_row_for_view():
         LOCAL_IMPORT_REPLY,
         Worker,
         _GlobalNodeDomainState,
+        _GlobalNodeRuntime,
+        _run_local_global_domain_control,
     )
 
     prepare, imported = _local_node_domain_commands()
@@ -1344,12 +1348,44 @@ def test_node_import_reuses_prepared_attachment_row_for_view():
         assert import_workers == [0, 1]
         assert tuple(context.buffers["payload"].identity for context in state.contexts.values()) == identities
 
-        worker._commit_global_domain_node(commit)
+        first = state.contexts[0].buffers["payload"]
+        snapshot = worker._child_alloc.get(first.identity)
+        assert snapshot is not None
+        if commit_failure is not None:
+            if commit_failure == "missing":
+                worker._child_alloc.revoke(first.identity)
+            else:
+                changes = {"owner_worker_id": 1} if commit_failure == "wrong_chip" else {"nbytes": snapshot.nbytes + 64}
+                worker._child_alloc.register(replace(snapshot, **changes))
+            with pytest.raises(ValueError, match="no matching registered backing"):
+                worker._commit_global_domain_node(commit)
+            assert state.phase is GlobalDomainPhase.IMPORT and not state.view.committed
+            worker._child_alloc.register(snapshot)
+
+        backings = worker._commit_global_domain_node(commit)
         assert state.view.committed
-        refs = worker._global_domain_buffer_refs(commit)
-        worker._commit_global_domain_node(commit)
         worker._import_global_domain_node(imported, 0)
-        assert worker._global_domain_buffer_refs(commit) == refs
+        assert worker._commit_global_domain_node(commit) == backings
+        assert tuple(buffer.identity for buffer in backings.values()) == identities
+        assert all(buffer is worker._child_alloc.get(buffer.identity) for buffer in backings.values())
+        assert backings[(0, 0)] is not first
+        runtime = _GlobalNodeRuntime(
+            worker_id=0,
+            device_ids=(0, 1),
+            platform="a2a3sim",
+            comm_profile="sim",
+            global_device_ranks=(0, 1),
+            node_rank=0,
+            node_count=1,
+            cluster_id="unit",
+            is_remote=False,
+        )
+        init = GlobalCommInitCommand("unit", "topology", "sim", 0, 1, commit.members)
+        refs = decode_domain_buffer_refs(
+            _run_local_global_domain_control(
+                worker, runtime, {"topology": init}, ControlName.ALLOC_DOMAIN, encode_domain_command(commit)
+            )
+        )
         assert tuple(ref.identity for ref in refs) == identities
         assert all(ref.reference_id == ref.reference_generation == 0 for ref in refs)
         assert import_workers == [0, 1]

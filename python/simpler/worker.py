@@ -3152,24 +3152,23 @@ def _handle_ctrl_global_domain_import(cw: _ChipWorker, buf: memoryview, store: _
             raise RuntimeError("Global CommDomain import payload is truncated")
         magic, version, domain_id, generation, descriptor_count = LOCAL_IMPORT_REQUEST.unpack_from(payload, 0)
         _validate_local_global_header(magic, version, domain_id, generation, operation="import")
+        expected_size = LOCAL_IMPORT_REQUEST.size + int(descriptor_count) * GLOBAL_DOMAIN_DESCRIPTOR_BYTES
+        if descriptor_count <= 0 or descriptor_count > GLOBAL_DOMAIN_MAX_RANKS or expected_size > payload_size:
+            raise RuntimeError("Global CommDomain import descriptor table size is invalid")
         entry = store.domains.get(int(domain_id))
         if entry is None or entry.generation != generation:
             raise RuntimeError("Global CommDomain import requires a matching prepared domain")
-        command = decode_domain_command(bytes(payload[LOCAL_IMPORT_REQUEST.size : payload_size]))
-        descriptors = command.descriptors
-        if (
-            command.phase is not GlobalDomainPhase.IMPORT
-            or command.domain_id != domain_id
-            or command.generation != generation
-            or command.window_size != entry.requested_window_size
-            or len(descriptors) != descriptor_count
-            or len(descriptors) != entry.rank_count
-            or GLOBAL_DOMAIN_PROFILE_IDS[command.profile] != entry.descriptor.profile_id
-        ):
-            raise ValueError("Global CommDomain import command conflicts with the prepared window")
+        descriptor_bytes = bytes(payload[LOCAL_IMPORT_REQUEST.size : expected_size])
+        descriptors = tuple(
+            GlobalDomainDescriptor.decode(descriptor_bytes[offset : offset + GLOBAL_DOMAIN_DESCRIPTOR_BYTES])
+            for offset in range(0, len(descriptor_bytes), GLOBAL_DOMAIN_DESCRIPTOR_BYTES)
+        )
+        profile = next(
+            name for name, profile_id in GLOBAL_DOMAIN_PROFILE_IDS.items() if profile_id == entry.descriptor.profile_id
+        )
+        validate_descriptor_table(descriptors, rank_count=entry.rank_count, profile=profile)
         if descriptors[entry.domain_rank] != entry.descriptor:
             raise RuntimeError("Global CommDomain import table does not contain the local exported descriptor")
-        descriptor_bytes = b"".join(descriptor.encode() for descriptor in descriptors)
         if entry.descriptor_table and entry.descriptor_table != descriptor_bytes:
             raise RuntimeError("Global CommDomain repeated import carries a different descriptor table")
         if entry.device_ctx == 0:
@@ -3476,9 +3475,6 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     )
     global_domain_store = _L2GlobalDomainStore()
 
-    def local_base(descriptor):
-        return import_registry.materialize(descriptor).base
-
     base_comm_handle = 0
     diagnostic_capture_index = 0
 
@@ -3623,8 +3619,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 # backing means nothing in this process, so only a base resolved locally can be
                 # advanced. `_read_control_copy_request` has already bounded both spans.
                 dst_desc, src_desc, n, dst_off, src_off = _read_control_copy_request(mailbox_addr)
-                dst = _copy_span_base(local_base(dst_desc), dst_off)
-                src = _copy_span_base(local_base(src_desc), src_off)
+                dst = _copy_span_base(import_registry.materialize(dst_desc).base, dst_off)
+                src = _copy_span_base(import_registry.materialize(src_desc).base, src_off)
                 if sub_cmd == _CTRL_COPY_TO:
                     cw.copy_to(dst, src, n)
                 else:
@@ -4476,8 +4472,12 @@ def _run_local_global_domain_control(  # noqa: PLR0912 -- one ordered dispatcher
             inner_worker._import_global_domain_node(command, runtime.worker_id)
             return b""
         if command.phase is GlobalDomainPhase.COMMIT:
-            inner_worker._commit_global_domain_node(command)
-            return encode_domain_buffer_refs(inner_worker._global_domain_buffer_refs(command))
+            backings = inner_worker._commit_global_domain_node(command)
+            return encode_domain_buffer_refs(
+                tuple(
+                    GlobalDomainBufferRef(rank, index, backing.identity) for (rank, index), backing in backings.items()
+                )
+            )
         if command.phase is GlobalDomainPhase.ABORT:
             inner_worker._release_global_domain_node(
                 GlobalDomainReleaseCommand(command.domain_id, command.generation),
@@ -10508,22 +10508,15 @@ class Worker:
             command = state.command
             if state.borrowed_handle is not None:
                 return state.borrowed_handle
+            local_buffers = {context.domain_rank: context.buffers for context in state.contexts.values()}
             state.borrowed_handle = CommDomainHandle(
                 name=command.name,
                 members=tuple(
-                    replace(
-                        member,
-                        buffers=(
-                            context.buffers
-                            if (context := state.contexts.get(member.local_worker_id)) is not None
-                            and context.domain_rank == member.domain_rank
-                            else {}
-                        ),
-                    )
-                    for member in command.members
+                    replace(member, buffers=local_buffers.get(member.domain_rank, {})) for member in command.members
                 ),
                 buffers=command.buffers,
                 contexts=state.contexts,
+                attachments=command.attachments,
                 domain_id=command.domain_id,
                 generation=command.generation,
                 mapping_size=state.view.mapping_size,
@@ -11216,8 +11209,8 @@ class Worker:
                 raise RuntimeError("Global CommDomain repeated import changes its descriptor table")
             return
         local_members = self._global_local_members(command, node_worker_id)
-        import_command = encode_domain_command(replace(command, attachments=()))
-        request_size = LOCAL_IMPORT_REQUEST.size + len(import_command)
+        descriptor_bytes = b"".join(descriptor.encode() for descriptor in command.descriptors)
+        request_size = LOCAL_IMPORT_REQUEST.size + len(descriptor_bytes)
         capacity = max(request_size, LOCAL_IMPORT_REPLY.size)
         try:
             for member in local_members:
@@ -11231,7 +11224,7 @@ class Worker:
                     command.generation,
                     len(command.descriptors),
                 )
-                payload[LOCAL_IMPORT_REQUEST.size : request_size] = import_command
+                payload[LOCAL_IMPORT_REQUEST.size : request_size] = descriptor_bytes
                 reply = bytes(
                     self._worker.control_payload(
                         WorkerType.NEXT_LEVEL,
@@ -11297,7 +11290,7 @@ class Worker:
             )
             raise
 
-    def _commit_global_domain_node(self, command: GlobalDomainCommand) -> None:
+    def _commit_global_domain_node(self, command: GlobalDomainCommand) -> dict[tuple[int, int], Buffer]:
         state = self._global_node_domains.get(command.domain_id)
         if state is None or state.command.generation != command.generation:
             raise RuntimeError("Global CommDomain commit requires a matching imported domain")
@@ -11313,24 +11306,22 @@ class Worker:
             or state.command.descriptors != command.descriptors
         ):
             raise RuntimeError("Global CommDomain commit command conflicts with IMPORT")
+        backings = {}
+        with self._child_prov_lock:
+            for chip, context in state.contexts.items():
+                for index, spec in enumerate(command.buffers):
+                    public = context.buffers[spec.name]
+                    backing = self._child_alloc.get(public.identity)
+                    if (
+                        backing is None
+                        or backing.owner_worker_id != chip
+                        or backing.to_descriptor() != public.to_descriptor()
+                    ):
+                        raise ValueError("communication domain slice has no matching registered backing")
+                    backings[(context.domain_rank, index)] = backing
         state.phase = GlobalDomainPhase.COMMIT
         state.view._committed = True  # noqa: SLF001 -- session owns the transaction
-
-    def _global_domain_buffer_refs(self, command: GlobalDomainCommand) -> tuple[GlobalDomainBufferRef, ...]:
-        state = self._global_node_domains.get(command.domain_id)
-        if (
-            state is None
-            or state.phase is not GlobalDomainPhase.COMMIT
-            or state.command.generation != command.generation
-        ):
-            raise RuntimeError("communication domain references require a committed domain")
-        return tuple(
-            GlobalDomainBufferRef(member.domain_rank, index, context.buffers[spec.name].identity)
-            for member in command.members
-            if (context := state.contexts.get(member.local_worker_id)) is not None
-            and context.domain_rank == member.domain_rank
-            for index, spec in enumerate(command.buffers)
-        )
+        return backings
 
     def _release_global_domain_node(
         self, command: GlobalDomainReleaseCommand, *, suppress_errors: bool = False
@@ -11740,11 +11731,33 @@ class Worker:
             if descriptors[0].mapping_size < window_size:
                 raise RuntimeError("Global CommDomain backend mapped less than the requested window size")
 
-            commit_command = replace(
-                base_command, phase=GlobalDomainPhase.COMMIT, descriptors=descriptors, attachments=()
+            commit_command = GlobalDomainCommand(
+                phase=GlobalDomainPhase.COMMIT,
+                domain_id=domain_id,
+                generation=generation,
+                name=name,
+                profile=profile,
+                window_size=int(window_size),
+                members=domain_members_tuple,
+                buffers=global_buffers,
+                descriptors=descriptors,
+                owner_instance_id=base_command.owner_instance_id,
+                retain_after_run=base_command.retain_after_run,
             )
             if mpi_group is None:
-                import_command = replace(commit_command, phase=GlobalDomainPhase.IMPORT)
+                import_command = GlobalDomainCommand(
+                    phase=GlobalDomainPhase.IMPORT,
+                    domain_id=domain_id,
+                    generation=generation,
+                    name=name,
+                    profile=profile,
+                    window_size=int(window_size),
+                    members=domain_members_tuple,
+                    buffers=global_buffers,
+                    descriptors=descriptors,
+                    owner_instance_id=base_command.owner_instance_id,
+                    retain_after_run=base_command.retain_after_run,
+                )
                 for node_worker_id in involved_nodes:
                     self._global_domain_control(
                         node_worker_id,
@@ -11753,7 +11766,18 @@ class Worker:
                     )
             member_buffers = self._commit_global_domain_buffers(commit_command, involved_nodes)
         except BaseException:
-            abort_command = replace(base_command, phase=GlobalDomainPhase.ABORT, attachments=())
+            abort_command = GlobalDomainCommand(
+                phase=GlobalDomainPhase.ABORT,
+                domain_id=domain_id,
+                generation=generation,
+                name=name,
+                profile=profile,
+                window_size=int(window_size),
+                members=domain_members_tuple,
+                buffers=global_buffers,
+                owner_instance_id=base_command.owner_instance_id,
+                retain_after_run=base_command.retain_after_run,
+            )
             if mpi_group is not None and prepared_nodes:
                 try:
                     self._mpi_group_control(
