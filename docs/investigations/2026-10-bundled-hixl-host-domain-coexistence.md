@@ -44,17 +44,17 @@ confirmed the CANN ACL and metadef libraries. Hardware work used an exclusive
 single-device `task-submit` reservation with the executable receiving that
 exact device id. Each memory/order case ran in a fresh process.
 
-| Check                                                | HBM                         | Host NUMA/P2P_HUGE DRAM     |
-| ---------------------------------------------------- | --------------------------- | --------------------------- |
-| Allocate, reserve and map                            | success                     | success                     |
-| First ACL Fabric export                              | success                     | success                     |
-| Second export of the original handle                 | `507899`                    | `507899`                    |
-| Export a handle retained from the same VA            | `507899`                    | `507899`                    |
-| Import that token in the same process                | `507899`                    | success                     |
-| Export the imported handle                           | not reached                 | `507899`                    |
-| Original HIXL Initialize, without a preceding export | `503900`                    | `503900`                    |
-| ACL-export/HIXL-register order                       | blocked before registration | blocked before registration |
-| HIXL-register/ACL-export order                       | blocked before registration | blocked before registration |
+| Check | HBM | Host NUMA/P2P_HUGE DRAM |
+| ----- | --- | ----------------------- |
+| Allocate, reserve and map | success | success |
+| First ACL Fabric export | success | success |
+| Second export of the original handle | `507899` | `507899` |
+| Export a handle retained from the same VA | `507899` | `507899` |
+| Import that token in the same process | `507899` | success |
+| Export the imported handle | not reached | `507899` |
+| Original HIXL Initialize, without a preceding export | `503900` | `503900` |
+| ACL-export/HIXL-register order | blocked before registration | blocked before registration |
+| HIXL-register/ACL-export order | blocked before registration | blocked before registration |
 
 HIXL initialization logs identify `GetDeviceIp` failing to open
 `/etc/hccn.conf`, followed by failure to generate local communication resources.
