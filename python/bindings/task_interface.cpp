@@ -311,6 +311,12 @@ public:
         }
     }
 
+    void export_fabric(void *handle, void *token) const {
+        using Export = int (*)(void *, uint64_t, int, void *);
+        auto export_handle = reinterpret_cast<Export>(resolve_symbol("aclrtMemExportToShareableHandleV2"));
+        acl_check(export_handle(handle, 1, 2, token), "aclrtMemExportToShareableHandleV2");
+    }
+
 private:
     static constexpr int kAclSuccess = 0;
     static constexpr int kAclMemcpyHostToDevice = 1;
@@ -358,6 +364,74 @@ AclRuntimeApi &acl_api() {
     });
     return *api;
 }
+
+// Explicitly released by the node domain after every imported view is acknowledged gone.
+// Destruction cannot prove that acknowledgement and therefore does not free the allocation.
+class DomainHostMemory {
+public:
+    nb::tuple allocate(int device, uint32_t numa, uint64_t logical_bytes) {
+        if (handle_ || base_ || !logical_bytes) throw std::invalid_argument("Host allocation is not empty");
+        auto &api = acl_api();
+        api.bind_device_with_check(device);
+        device_ = device;
+        LocalAclPhysicalMemProp prop{};
+        prop.memAttr = 16;          // ACL_MEM_P2P_HUGE
+        prop.location = {numa, 4};  // ACL_MEM_LOCATION_TYPE_HOST_NUMA
+        size_t granularity = 0;
+        check(api.aclrtMemGetAllocationGranularity(&prop, 0, &granularity), "Host granularity");
+        if (!granularity || logical_bytes > SIZE_MAX - (granularity - 1))
+            throw std::invalid_argument("Host allocation extent overflow");
+        size_ = (logical_bytes + granularity - 1) / granularity * granularity;
+        logical_bytes_ = logical_bytes;
+        check(api.aclrtMallocPhysical(&handle_, size_, &prop, 0), "Host physical allocation");
+        check(api.aclrtReserveMemAddress(&base_, size_, 0, nullptr, 1), "Host VA reservation");
+        check(api.aclrtMapMem(base_, size_, 0, handle_, 0), "Host owner mapping");
+        mapped_ = true;
+        api.export_fabric(handle_, token_.data());
+        return nb::make_tuple(size_, nb::bytes(reinterpret_cast<const char *>(token_.data()), token_.size()));
+    }
+    nb::bytes read(uint64_t offset, uint64_t bytes) const {
+        bounds(offset, bytes);
+        return nb::bytes(static_cast<const char *>(base_) + offset, bytes);
+    }
+    void write(uint64_t offset, const nb::bytes &data) {
+        bounds(offset, data.size());
+        std::memcpy(static_cast<char *>(base_) + offset, data.c_str(), data.size());
+    }
+    void release() {
+        if (!base_ && !handle_) return;
+        auto &api = acl_api();
+        api.bind_device_with_check(device_);
+        if (mapped_) {
+            check(api.aclrtUnmapMem(base_), "Host unmap");
+            mapped_ = false;
+        }
+        if (base_) {
+            check(api.aclrtReleaseMemAddress(base_), "Host VA release");
+            base_ = nullptr;
+        }
+        if (handle_) {
+            check(api.aclrtFreePhysical(handle_), "Host physical free");
+            handle_ = nullptr;
+        }
+    }
+
+private:
+    int device_ = -1;
+    void *base_ = nullptr;
+    void *handle_ = nullptr;
+    bool mapped_ = false;
+    uint64_t size_ = 0;
+    uint64_t logical_bytes_ = 0;
+    std::array<uint8_t, 128> token_{};
+    static void check(int rc, const char *op) {
+        if (rc) throw std::runtime_error(std::string(op) + " failed with code " + std::to_string(rc));
+    }
+    void bounds(uint64_t offset, uint64_t bytes) const {
+        if (!mapped_ || offset > logical_bytes_ || bytes > logical_bytes_ - offset)
+            throw std::invalid_argument("Host access exceeds the live logical window");
+    }
+};
 
 std::string region_shm_name_for_open(const std::string &token) {
     if (token.empty()) {
@@ -2043,6 +2117,12 @@ BufferDescriptor decode_buffer_descriptor_wire(const uint8_t *raw, size_t size) 
 #endif
 
 NB_MODULE(_task_interface, m) {
+    nb::class_<DomainHostMemory>(m, "_DomainHostMemory")
+        .def(nb::init<>())
+        .def("allocate", &DomainHostMemory::allocate)
+        .def("read", &DomainHostMemory::read)
+        .def("write", &DomainHostMemory::write)
+        .def("release", &DomainHostMemory::release);
     m.doc() = "Nanobind bindings for task_interface (DataType, Buffer/Tensor wire ABI, ChipTensor, TaskArgs variants)";
 
     // Source commit this extension was compiled from; "" when git was
@@ -4127,33 +4207,41 @@ NB_MODULE(_task_interface, m) {
         .def(
             "comm_global_domain_prepare",
             [](ChipWorker &self, uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size,
-               uint32_t profile) {
-                auto [descriptor, local_window_base, actual_window_size] =
-                    self.comm_global_domain_prepare(domain_id, domain_rank, rank_count, window_size, profile);
+               uint32_t profile, bool host_enabled) {
+                auto [descriptor, local_window_base, actual_window_size] = self.comm_global_domain_prepare(
+                    domain_id, domain_rank, rank_count, window_size, profile, host_enabled
+                );
                 return nb::make_tuple(
                     nb::bytes(reinterpret_cast<const char *>(descriptor.data()), descriptor.size()), local_window_base,
                     actual_window_size
                 );
             },
             nb::arg("domain_id"), nb::arg("domain_rank"), nb::arg("rank_count"), nb::arg("window_size"),
-            nb::arg("profile"), "Create a Global CommDomain local window and return its transport descriptor."
+            nb::arg("profile"), nb::arg("host_enabled") = false,
+            "Create a Global CommDomain local window and return its transport descriptor."
         )
         .def(
             "comm_global_domain_import",
-            [](ChipWorker &self, uint64_t domain_id, nb::bytes descriptors) {
+            [](ChipWorker &self, uint64_t domain_id, nb::bytes descriptors, nb::bytes hosts) {
                 std::vector<uint8_t> descriptor_bytes(
                     reinterpret_cast<const uint8_t *>(descriptors.c_str()),
                     reinterpret_cast<const uint8_t *>(descriptors.c_str()) + descriptors.size()
                 );
-                return self.comm_global_domain_import(domain_id, descriptor_bytes);
+                std::vector<uint8_t> host_bytes(
+                    reinterpret_cast<const uint8_t *>(hosts.c_str()),
+                    reinterpret_cast<const uint8_t *>(hosts.c_str()) + hosts.size()
+                );
+                return self.comm_global_domain_import(domain_id, descriptor_bytes, host_bytes);
             },
-            nb::arg("domain_id"), nb::arg("descriptors"),
+            nb::arg("domain_id"), nb::arg("descriptors"), nb::arg("hosts") = nb::bytes("", 0),
             "Import a rank-ordered Global CommDomain descriptor table and return the device context."
         )
         .def(
             "comm_global_domain_release", &ChipWorker::comm_global_domain_release, nb::arg("domain_id"),
-            "Release a prepared or imported Global CommDomain."
+            nb::arg("stage") = 0, "Release a prepared or imported Global CommDomain."
         )
+        .def("comm_global_domain_window", &ChipWorker::comm_global_domain_window)
+        .def("comm_global_domain_copy", &ChipWorker::comm_global_domain_copy)
         .def("comm_barrier", &ChipWorker::comm_barrier, nb::arg("comm_handle"), "Synchronize all ranks.")
         .def(
             "comm_destroy", &ChipWorker::comm_destroy, nb::arg("comm_handle"),

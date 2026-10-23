@@ -295,7 +295,7 @@ int comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t ran
  */
 int comm_global_domain_prepare(
     uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
-    CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
+    uint32_t host_enabled, CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
 );
 
 /**
@@ -308,7 +308,8 @@ int comm_global_domain_prepare(
  * comm_global_domain_release().
  */
 int comm_global_domain_import(
-    uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count, uint64_t *device_ctx_out
+    uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count,
+    const CommGlobalDomainDescriptor *hosts, size_t host_count, uint64_t *device_ctx_out
 );
 
 /**
@@ -316,7 +317,14 @@ int comm_global_domain_import(
  * The L4 owner is responsible for
  * draining all rank tasks before fanout.
  */
-int comm_global_domain_release(uint64_t domain_id);
+int comm_global_domain_release(uint64_t domain_id, uint32_t stage);
+
+// Resolve an owned/imported pool without exposing a second address registry.
+int comm_global_domain_window(uint64_t domain_id, uint32_t slot, uint64_t *base, size_t *size);
+int comm_global_domain_copy(
+    uint64_t domain_id, uint32_t dst_slot, size_t dst_offset, uint32_t src_slot, size_t src_offset, size_t bytes,
+    void *stream
+);
 
 /**
  * Synchronize all ranks.

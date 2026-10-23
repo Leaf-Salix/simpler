@@ -9,8 +9,12 @@
 
 from __future__ import annotations
 
+import ctypes
+import os
 import struct
 from dataclasses import FrozenInstanceError, replace
+from multiprocessing.shared_memory import SharedMemory
+from pathlib import Path
 
 import pytest
 from simpler.buffer import AccessMode, AddressSpace, BackendKind, BufferDescriptor, CanonicalIdentity
@@ -190,3 +194,72 @@ def test_exports_reject_duplicate_and_excess_hosts():
     for hosts in [(host, host), tuple(replace(host, node_worker_id=i, buffer_id=i + 1) for i in range(65))]:
         with pytest.raises(ValueError):
             encode_domain_exports((), hosts)
+
+
+@pytest.mark.parametrize("arch", ["a2a3", "a5"])
+@pytest.mark.parametrize("runtime", ["host_build_graph", "tensormap_and_ringbuffer"])
+@pytest.mark.parametrize("oversized", [False, True])
+def test_native_host_views_copy_and_two_stage_release(arch, runtime, oversized):
+    root = Path(__file__).resolve().parents[3] / "build/lib"
+    ctypes.CDLL(str(root / "libcpu_sim_context.so"), mode=ctypes.RTLD_GLOBAL)
+    lib = ctypes.CDLL(str(root / arch / "sim" / runtime / "libhost_runtime.so"))
+    u64, u32, size, ptr = ctypes.c_uint64, ctypes.c_uint32, ctypes.c_size_t, ctypes.c_void_p
+    signatures = {
+        "prepare": [u64, u32, u32, size, u32, u32, ptr, ptr],
+        "import": [u64, ptr, size, ptr, size, ptr],
+        "window": [u64, u32, ptr, ptr],
+        "copy": [u64, u32, size, u32, size, size, ptr],
+        "release": [u64, u32],
+    }
+    for name, args in signatures.items():
+        function = getattr(lib, "comm_global_domain_" + name)
+        function.argtypes, function.restype = args, ctypes.c_int
+    domain_id = int.from_bytes(os.urandom(8), "little") or 1
+    owner = SharedMemory(create=True, size=128)
+    try:
+        assert owner.buf is not None
+        owner.buf[:128] = bytes(range(128))
+        descriptor, local_base = ctypes.create_string_buffer(288), u64()
+        assert lib.comm_global_domain_prepare(domain_id, 0, 1, 128, 1, 1, descriptor, ctypes.byref(local_base)) == 0
+        token = ("/" + owner.name).encode()
+        host = struct.pack(
+            "<IIIIQII256s",
+            GLOBAL_DOMAIN_VERSION,
+            1,
+            1,
+            1,
+            owner.size + 4096 if oversized else 128,
+            len(token),
+            0,
+            token,
+        )
+        context = u64()
+        rc = getattr(lib, "comm_global_domain_import")(domain_id, descriptor, 1, host, 1, ctypes.byref(context))
+        if oversized:
+            assert rc != 0
+            return
+        assert rc == 0
+        mapped, mapped_size = u64(), size()
+        assert lib.comm_global_domain_window(domain_id, 1, ctypes.byref(mapped), ctypes.byref(mapped_size)) == 0
+        assert mapped_size.value == 128
+        assert ctypes.string_at(mapped.value, 128) == bytes(range(128))
+        assert lib.comm_global_domain_copy(domain_id, 0, 32, 1, 16, 32, None) == 0
+        assert lib.comm_global_domain_copy(domain_id, 1, 64, 0, 32, 32, None) == 0
+        expected = bytearray(range(128))
+        expected[64:96] = bytes(range(16, 48))
+        assert bytes(owner.buf[:128]) == expected  # Includes both unchanged guards.
+        assert lib.comm_global_domain_copy(domain_id, 1, 16, 1, 20, 32, None) != 0
+        assert lib.comm_global_domain_copy(domain_id, 1, 120, 0, 0, 16, None) != 0
+        assert lib.comm_global_domain_release(domain_id, 0) != 0
+        assert lib.comm_global_domain_release(domain_id, 2) != 0
+        assert lib.comm_global_domain_release(domain_id, 1) == 0
+        assert lib.comm_global_domain_window(domain_id, 1, ctypes.byref(mapped), ctypes.byref(mapped_size)) != 0
+        assert lib.comm_global_domain_copy(domain_id, 1, 64, 0, 32, 32, None) != 0
+        assert ctypes.string_at(local_base.value, 16) == bytes(16)  # HBM owner still alive after VIEWS.
+        assert lib.comm_global_domain_release(domain_id, 2) == 0
+        assert lib.comm_global_domain_release(domain_id, 2) == 0
+    finally:
+        lib.comm_global_domain_release(domain_id, 1)
+        lib.comm_global_domain_release(domain_id, 2)
+        owner.close()
+        owner.unlink()

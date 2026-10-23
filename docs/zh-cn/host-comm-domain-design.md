@@ -86,7 +86,7 @@ HBM 使用已有 member Buffer，Host 使用 `host(node)`；不增加公开 stre
 
 ### ACL 路径
 
-L3 在既有 child fork 完成后，按需使用 native `AclRuntimeApi` 管理 Host owner：
+L3 在既有 child fork 完成后，建立本节点参与设备的 ACL context，按需使用 native `AclRuntimeApi` 管理 Host owner：
 `aclrtMemGetAllocationGranularity` 查询 `HOST_NUMA/P2P_HUGE` 粒度，
 `aclrtMallocPhysical` 分配，`aclrtReserveMemAddress` 与 `aclrtMapMem` 建立 CPU owner VA，
 `aclrtMemExportToShareableHandleV2(..., FABRIC, ...)` 导出同一物理 allocation。
@@ -99,17 +99,18 @@ NUMA id 由每节点配置给出，不按设备编号猜测。
 设备编号转换复用现有 logical/driver-visible 规则。
 
 用于 SDMA 的 pool VA 必须满足 CANN NoUC 约束，包括作为端点的本地 Host 别名及 HBM。
-沿 `aclrtReserveMemAddressNoUCMemory` 支持的预约方式和粒度管理 Device VA，
-不复制原型固定地址；VA 预约量不当作物理分配量。
-优先让同一组 Device view 同时服务 SDMA 与 kernel；若必须添加别名，仅增加 view，仍指向相同六块物理窗口。
-NoUC 地址选择、预约粒度和双用途映射须先做最小硬件对照；失败阻止上线，不静默换路径。
+`aclrtReserveMemAddressNoUCMemory` 要求显式地址及 1 GiB 预约粒度。
+地址在 CANN 文档给定的 40–224 TiB 区间内，从现有 native 域 view 推导活跃预约区间并选择空隙；
+确认释放后立即复用，不维护第二份地址注册表。外部库占用选定 VA 时明确失败，不覆盖映射、不盲目扫描重试。
+这只增加 VA 预约量，不增加物理分配量。指定地址能力在 CANN 文档中仍为实验接口，需按目标 CANN/A3 环境验证。
+同一组 NoUC Device view 同时服务 SDMA 与 kernel；单卡预验证已覆盖父进程持有 DRAM、子进程导入及完整窗口校验。
 
-选定 chip 解析两端 Device VA 后执行同步 copy。硬件预验证优先检查
-`aclrtMemcpy(..., ACL_MEMCPY_DEVICE_TO_DEVICE)` 是否覆盖这些 Fabric/NoUC 映射；通过即可省去私有 stream。
-若该接口不满足要求，则固定采用 `aclrtMemcpyAsync + stream synchronize`，
-沿既有 stream 创建通路为每 chip 持有一个私有 copy stream，跨域复用，排空后销毁。
-两者在预验证后选定一种实现，不在运行时 copy 出错后自动改试另一种；第一次调用可能已写入部分数据。
-GlobalDomain 不保证已有通信 stream，不能借用常驻计算流。
+选定 chip 解析两端 Device VA 后固定执行 `aclrtMemcpyAsync + stream synchronize`。
+CANN 对 VMM Device 间拷贝列出的接口及硬件预验证均采用此路径。
+沿既有 stream 创建通路为每 chip 持有一个私有 copy stream，跨域复用；
+每次 copy 必须完成同步才能返回成功。同步失败保留未知完成状态，阻止 view/owner 回收及设备 finalize。
+不在 copy 出错后自动改试另一种实现；第一次调用可能已写入部分数据。
+既有 stream 销毁是 best-effort，不将其返回值作为物理销毁证据；域回收依赖每次 copy 的完成同步。
 新增 ACL 符号只在 Host-enabled A3 路径按需解析，保留其他后端的原初始化行为。
 
 ### 描述符与授权
