@@ -74,13 +74,15 @@ CTRL_GLOBAL_DOMAIN_IMPORT = 20
 CTRL_GLOBAL_DOMAIN_RELEASE = 21
 CTRL_GLOBAL_DOMAIN_COPY_TO = 22
 CTRL_GLOBAL_DOMAIN_COPY_FROM = 23
+CTRL_GLOBAL_DOMAIN_POOL_COPY = 28
 
 LOCAL_DOMAIN_MAGIC = b"SGD1"
-LOCAL_PREPARE_REQUEST = struct.Struct("<4sIQQIIIQ")
+LOCAL_PREPARE_REQUEST = struct.Struct("<4sIQQIIIQ?")
 LOCAL_PREPARE_REPLY = struct.Struct("<4sIQQQQ")
 LOCAL_IMPORT_REQUEST = struct.Struct("<4sIQQI")
 LOCAL_IMPORT_REPLY = struct.Struct("<4sIQQQQQ")
-LOCAL_RELEASE_REQUEST = struct.Struct("<4sIQQ")
+LOCAL_RELEASE_REQUEST = struct.Struct("<4sIQQI")
+LOCAL_POOL_COPY = struct.Struct("<4sIQQQQQ")
 LOCAL_COPY_REQUEST = struct.Struct("<4sIQQQQ")
 LOCAL_COPY_REPLY = struct.Struct("<4sIQQQ")
 
@@ -901,6 +903,23 @@ def decode_descriptor_table(data: bytes) -> tuple[GlobalDomainDescriptor, ...]:
     )
     reader.done("descriptor table")
     return descriptors
+
+
+def encode_host_descriptors(command: GlobalDomainCommand) -> bytes:
+    _validate_host_windows(command)
+    return b"".join(
+        GLOBAL_DOMAIN_DESCRIPTOR.pack(
+            GLOBAL_DOMAIN_VERSION,
+            GLOBAL_DOMAIN_PROFILE_IDS[command.profile],
+            len(command.members) + index,
+            len(command.members),
+            host.mapping_size,
+            len(host.handle),
+            0,
+            host.handle,
+        )
+        for index, host in enumerate(command.host_windows)
+    )
 
 
 def encode_domain_exports(descriptors, host_windows) -> bytes:

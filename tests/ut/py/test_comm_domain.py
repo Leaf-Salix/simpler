@@ -576,7 +576,7 @@ def test_domain_slice_grant_preserves_identity_views_and_rejects_stale_materiali
         payload = shm.buf
         assert payload is not None
         worker_mod.LOCAL_RELEASE_REQUEST.pack_into(
-            payload, 0, worker_mod.LOCAL_DOMAIN_MAGIC, worker_mod.GLOBAL_DOMAIN_VERSION, 7, 3
+            payload, 0, worker_mod.LOCAL_DOMAIN_MAGIC, worker_mod.GLOBAL_DOMAIN_VERSION, 7, 3, 0
         )
         return shm, payload, size
 

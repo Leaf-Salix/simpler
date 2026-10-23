@@ -63,7 +63,6 @@ from .global_comm_domain import (
     decode_release_command,
     encode_comm_init_result,
     encode_copy_result,
-    encode_descriptor_table,
     resolve_global_comm_capability,
 )
 from .remote_l3_protocol import (
@@ -1102,8 +1101,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                                 else None
                             )
                             if result is None:
-                                descriptors = inner_worker._prepare_global_domain_node(command, worker_id)  # noqa: SLF001
-                                result = encode_descriptor_table(descriptors)
+                                result = inner_worker._prepare_global_domain_reply(command, worker_id)  # noqa: SLF001
                             _control_result_reply(
                                 conn,
                                 manifest,

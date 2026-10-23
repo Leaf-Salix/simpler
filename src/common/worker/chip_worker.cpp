@@ -2283,7 +2283,7 @@ std::tuple<std::vector<uint8_t>, uint64_t, size_t> ChipWorker::comm_global_domai
     if (comm_global_domain_prepare_fn_ == nullptr) {
         throw std::runtime_error("comm_global_domain_prepare is not supported by this runtime");
     }
-    auto [tracked, inserted] = global_domain_ids_.emplace(domain_id, host_enabled);
+    auto [tracked, inserted] = global_domain_ids_.emplace(domain_id, host_enabled ? profile : 0);
     if (!inserted) {
         throw std::runtime_error("comm_global_domain_prepare received a duplicate domain_id");
     }
@@ -2352,8 +2352,13 @@ void ChipWorker::comm_global_domain_copy(
     uint64_t id, uint32_t dst_slot, size_t dst_offset, uint32_t src_slot, size_t src_offset, size_t bytes
 ) {
     if (!comm_global_domain_copy_fn_) throw std::runtime_error("domain copy is unavailable");
-    if (!global_domain_copy_stream_) global_domain_copy_stream_ = create_comm_stream_checked("domain copy");
-    if (!global_domain_copy_stream_) throw std::runtime_error("domain copy stream creation failed");
+    auto domain = global_domain_ids_.find(id);
+    if (domain == global_domain_ids_.end() || domain->second == 0)
+        throw std::runtime_error("domain copy requires a live Host-enabled domain");
+    if (domain->second != COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM) {
+        if (!global_domain_copy_stream_) global_domain_copy_stream_ = create_comm_stream_checked("domain copy");
+        if (!global_domain_copy_stream_) throw std::runtime_error("domain copy stream creation failed");
+    }
     int rc =
         comm_global_domain_copy_fn_(id, dst_slot, dst_offset, src_slot, src_offset, bytes, global_domain_copy_stream_);
     if (rc) throw std::runtime_error("domain copy failed with code " + std::to_string(rc));

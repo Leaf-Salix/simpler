@@ -1,8 +1,8 @@
 # Host 接入通信域：双机 ACL 设计
 
-状态：设计提案，接口与测试尚未实现。基于 [#2668](https://github.com/hw-native-sys/simpler/pull/2668)
+状态：接口、ACL 后端与控制流程已实现；完整 MPI 验收仍在补齐。基于 [#2668](https://github.com/hw-native-sys/simpler/pull/2668)
 的 `1251133c07adfd25610614821a8bf80d45dc5235`，复用其 Buffer/Tensor、grant 和跨 run 使用追踪。
-本文描述待交付行为；当前可用接口见[通信域文档](../comm-domain.md)。
+本文描述实现契约；既有接口见[通信域文档](../comm-domain.md)。
 
 ## 1. 目标与边界
 
@@ -19,6 +19,8 @@
 每节点只有一块域内 Host DRAM，两个本地及两个远端 NPU 均访问这同一 allocation。
 四块 HBM 保持现有设备域窗口；域 payload 共六个物理 allocation。
 MPI 负责进程启动和控制消息，ACL 负责内存和数据传输；控制消息只交换描述符、范围与结果。
+含 Host 的域由 L4 复用逐节点 MPI 控制命令收集描述符并执行事务，暂不使用 NPU 域的
+MPI group/allgather 快路径；无 Host 的域保留原流程。
 
 | 发起者与目标 | 实际访问方式 | 完成条件 |
 | ------------ | ------------ | -------- |

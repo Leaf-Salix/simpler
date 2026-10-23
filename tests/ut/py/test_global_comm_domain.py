@@ -747,6 +747,7 @@ def test_mixed_local_remote_import_failure_rolls_back_local_node(monkeypatch):
                     rank_count,
                     profile_id,
                     window_size,
+                    _host_enabled,
                 ) = LOCAL_PREPARE_REQUEST.unpack_from(payload, 0)
                 descriptor = GlobalDomainDescriptor(
                     version=GLOBAL_DOMAIN_VERSION,

@@ -29,6 +29,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import ctypes
+import operator
 import os
 import shutil
 import sys
@@ -1166,6 +1167,8 @@ class CommDomainHandle:
         "_config",
         "_ref",
         "requested_window_size",
+        "_host_buffers",
+        "_local_host_fn",
     )
 
     def __init__(  # noqa: PLR0913 -- preserve the L3 and legacy L4 constructor keywords
@@ -1187,6 +1190,8 @@ class CommDomainHandle:
         _domain_ranks: dict[int, int] | None = None,
         ref: CommDomainRef | None = None,
         borrowed: bool = False,
+        host_buffers=None,
+        local_host_fn=None,
         requested_window_size: int | None = None,
         _release_scope: Callable[[CommDomainHandle], contextlib.AbstractContextManager] = contextlib.nullcontext,
     ) -> None:
@@ -1208,6 +1213,8 @@ class CommDomainHandle:
         self.retain_after_run = bool(retain_after_run)
         self.attachments = tuple(attachments)
         self._config = None
+        self._host_buffers = dict(host_buffers or {})
+        self._local_host_fn = local_host_fn
         self._released = False
         self._freed = False
         self._ref = ref
@@ -1228,6 +1235,18 @@ class CommDomainHandle:
         if rank < 0 or rank >= len(self.members):
             raise IndexError(f"domain rank {rank} is out of range")
         return self.members[rank]
+
+    def host(self, node_worker_id: int) -> Buffer:
+        """The node's logical DRAM pool; every chip consumes the same backing identity."""
+        self._require_live()
+        return self._host_buffers[operator.index(node_worker_id)]
+
+    def local_host(self):
+        """Protected byte access to the owning L3's local DRAM, without exposing its VA."""
+        self._require_live()
+        if self._local_host_fn is None:
+            raise RuntimeError("this handle has no local Host owner")
+        return self._local_host_fn()
 
     def local_context(self, domain_rank: int) -> ChipDomainContext:
         """Return this creator's local chip mapping; L4 creators hold no such mappings."""

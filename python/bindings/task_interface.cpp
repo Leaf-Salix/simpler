@@ -20,6 +20,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
@@ -387,6 +388,7 @@ public:
         check(api.aclrtReserveMemAddress(&base_, size_, 0, nullptr, 1), "Host VA reservation");
         check(api.aclrtMapMem(base_, size_, 0, handle_, 0), "Host owner mapping");
         mapped_ = true;
+        std::memset(base_, 0, logical_bytes_);
         api.export_fabric(handle_, token_.data());
         return nb::make_tuple(size_, nb::bytes(reinterpret_cast<const char *>(token_.data()), token_.size()));
     }
@@ -2004,6 +2006,7 @@ uint64_t encode_scalar(nb::handle value) {
 struct ProvenanceEntry {
     BufferDescriptor descriptor;
     int32_t owner_worker_id;
+    std::vector<int32_t> targets;
 };
 
 struct ProvenanceTable {
@@ -3052,10 +3055,11 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "insert",
-            [](ProvenanceTable &self, const BufferDescriptor &descriptor, int32_t owner_worker_id) {
-                self.entries[descriptor.identity] = ProvenanceEntry{descriptor, owner_worker_id};
+            [](ProvenanceTable &self, const BufferDescriptor &descriptor, int32_t owner_worker_id,
+               const std::vector<int32_t> &targets) {
+                self.entries[descriptor.identity] = ProvenanceEntry{descriptor, owner_worker_id, targets};
             },
-            nb::arg("descriptor"), nb::arg("owner_worker_id"),
+            nb::arg("descriptor"), nb::arg("owner_worker_id"), nb::arg("targets") = std::vector<int32_t>{},
             "Register one allocation, keyed by its descriptor's identity."
         )
 
@@ -3099,7 +3103,11 @@ NB_MODULE(_task_interface, m) {
                         backend != BackendKind::DOMAIN_WINDOW)
                         continue;
                     auto it = self.entries.find(d.identity);
-                    if (it == self.entries.end() || it->second.owner_worker_id != target_worker_id) {
+                    if (it == self.entries.end() ||
+                        (it->second.targets.empty() ?
+                             it->second.owner_worker_id != target_worker_id :
+                             std::find(it->second.targets.begin(), it->second.targets.end(), target_worker_id) ==
+                                 it->second.targets.end())) {
                         return nb::make_tuple(i, PROV_NOT_LIVE);
                     }
                     // Authorization and execution consume the same Buffer, so a same-identity

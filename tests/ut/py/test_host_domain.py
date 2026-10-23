@@ -263,3 +263,334 @@ def test_native_host_views_copy_and_two_stage_release(arch, runtime, oversized):
         lib.comm_global_domain_release(domain_id, 2)
         owner.close()
         owner.unlink()
+
+
+def test_two_node_host_cpu_copy_reuse_and_stale_access():
+    from simpler.comm_domain import CommDomainRef  # noqa: PLC0415
+    from simpler.task_interface import CommBufferSpec, DataType, TaskArgs  # noqa: PLC0415
+    from simpler.worker import Worker  # noqa: PLC0415
+
+    saved_parts = []
+    nodes = (0, 1)
+
+    def node_task(orch, args, _config):
+        node, phase = int(args.scalar(0)), int(args.scalar(1))
+        if phase == 2:
+            with pytest.raises((KeyError, RuntimeError)):
+                saved_parts[0].read(0, bytearray(1))
+            return
+        domain = orch.get_domain(CommDomainRef.from_tensor(args.tensor(0)))
+        part = domain.local_host()
+        local = domain.host(node)
+        if phase == 0:
+            saved_parts.append(part)
+            data = bytes([node + 11]) * 128 + bytes([0xCC]) * (1536 - 128)
+            part.write(0, data)
+            for member in domain.members:
+                if member.node_worker_id == node:
+                    orch.copy_domain(member.buffers["payload"], local, worker=member.local_worker_id, nbytes=512)
+            return
+        pools = [(domain.host(n), n) for n in nodes]
+        pools += [(member.buffers["payload"], member.node_worker_id) for member in domain.members]
+        for chip in (0, 1):
+            for pool, owner in pools:
+                orch.copy_domain(local, pool, worker=chip, nbytes=128, dst_offset=512)
+                result = bytearray(128)
+                part.read(512, result)
+                assert result == bytes([owner + 11]) * 128
+                orch.copy_domain(pool, local, worker=chip, nbytes=64, dst_offset=128)
+                orch.copy_domain(local, pool, worker=chip, nbytes=512, dst_offset=512)
+                result = bytearray(512)
+                part.read(512, result)
+                assert result == bytes([owner + 11]) * 128 + bytes([node + 11]) * 64 + bytes([0xCC]) * 320
+        with pytest.raises(ValueError, match="overlap"):
+            orch.copy_domain(local, local, worker=0, nbytes=64, dst_offset=16)
+        with pytest.raises(ValueError, match="range"):
+            orch.copy_domain(local, local, worker=0, nbytes=64, dst_offset=1530)
+
+    root = Worker(level=4, num_sub_workers=0)
+    task = root.register(node_task)
+    captured = []
+    try:
+        for node in nodes:
+            assert (
+                root.add_worker(
+                    Worker(
+                        level=3,
+                        platform="a2a3sim",
+                        runtime="tensormap_and_ringbuffer",
+                        device_ids=[0, 1],
+                        num_sub_workers=0,
+                        comm_profile="sim",
+                        global_device_ranks=[2 * node, 2 * node + 1],
+                    )
+                )
+                == node
+            )
+        root.init()
+        request = dict(
+            name="mixed",
+            members=tuple((n, c) for n in nodes for c in (0, 1)),
+            window_size=512,
+            buffers=[CommBufferSpec("payload", "uint8", 512, 512)],
+            retain_after_run=True,
+            host_windows={n: HostWindowSpec(0, 1536) for n in nodes},
+        )
+
+        def allocate(orch, _args, _config):
+            domain = orch.get_or_allocate_domain(**request)
+            assert orch.get_or_allocate_domain(**request) is domain
+            captured.append(domain)
+            with pytest.raises(RuntimeError, match="no local Host"):
+                domain.local_host()
+
+        root.run(allocate)
+        domain = captured[0]
+        assert len({b.identity for b in domain._host_buffers.values()}) == 2
+        for phase in (0, 1, 2):
+            if phase == 2:
+                domain.release()
+                assert domain.freed
+            for node in nodes:
+
+                def submit(orch, _args, _config, node=node, phase=phase):
+                    args = TaskArgs()
+                    if phase != 2:
+                        current = orch.get_domain(domain.ref)
+                        args.add_tensor(current.host(node).tensor([1536], DataType.UINT8))
+                    args.add_scalar(node)
+                    args.add_scalar(phase)
+                    orch.submit_next_level(task, args, worker=node)
+
+                root.run(submit)
+        assert not root.live_domains
+    finally:
+        root.close()
+
+
+def _control_payload(data):
+    shm = SharedMemory(create=True, size=len(data))
+    shm.unlink()
+    assert shm.buf is not None
+    shm.buf[: len(data)] = data
+    return shm, shm.buf[: len(data)], len(data)
+
+
+@pytest.mark.parametrize("failure", [None, (1, 2), (1, 5), (2, 2), (2, 5)])
+def test_owner_release_requires_every_node_view_ack(monkeypatch, failure):
+    from simpler.remote_l3_protocol import ControlName  # noqa: PLC0415
+    from simpler.worker import Worker  # noqa: PLC0415
+
+    worker, calls = Worker(level=4, num_sub_workers=0), []
+
+    def control(node, operation, payload):
+        assert operation == ControlName.RELEASE_DOMAIN
+        command = decode_release_command(payload)
+        calls.append((int(command.stage), node))
+        if calls[-1] == failure:
+            raise RuntimeError("lost ACK")
+        return b""
+
+    monkeypatch.setattr(worker, "_global_domain_control", control)
+    try:
+        if failure:
+            with pytest.raises(RuntimeError, match="unconfirmed"):
+                worker._release_host_domain_nodes(7, 3, (2, 5))
+        else:
+            worker._release_host_domain_nodes(7, 3, (2, 5))
+        assert calls == ([(1, 2), (1, 5)] if failure and failure[0] == 1 else [(1, 2), (1, 5), (2, 2), (2, 5)])
+    finally:
+        worker.close()
+
+
+def test_native_prepare_failure_remains_reachable_for_staged_release(monkeypatch):
+    import simpler.worker as module  # noqa: PLC0415
+
+    store, calls = module._L2GlobalDomainStore(), []
+
+    class Chip:
+        def comm_global_domain_prepare(self, *_args):
+            raise RuntimeError("physical allocation reply lost")
+
+        def comm_global_domain_release(self, identity, stage):
+            calls.append((identity, stage))
+
+    data = bytearray(module.LOCAL_PREPARE_REPLY.size + module.GLOBAL_DOMAIN_DESCRIPTOR_BYTES)
+    module.LOCAL_PREPARE_REQUEST.pack_into(
+        data, 0, module.LOCAL_DOMAIN_MAGIC, GLOBAL_DOMAIN_VERSION, 7, 3, 0, 1, 1, 128, True
+    )
+    monkeypatch.setattr(module, "_open_global_domain_payload", lambda _buf: _control_payload(data))
+    with pytest.raises(RuntimeError, match="reply lost"):
+        module._handle_ctrl_global_domain_prepare(Chip(), memoryview(bytearray()), store)
+    assert store.domains[7].descriptor is None and store.domains[7].host_enabled
+    for stage in (1, 2):
+        data = module.LOCAL_RELEASE_REQUEST.pack(module.LOCAL_DOMAIN_MAGIC, GLOBAL_DOMAIN_VERSION, 7, 3, stage)
+        module._handle_ctrl_global_domain_release(Chip(), memoryview(bytearray()), store)
+        assert (7 in store.domains) == (stage == 1)
+    assert calls == [(7, 1), (7, 2)]
+
+
+@pytest.mark.parametrize("mode", ["node", "cached-root", "untracked-root"])
+def test_host_close_cannot_bypass_global_release(monkeypatch, mode):
+    import simpler.worker as module  # noqa: PLC0415
+    from simpler.task_interface import CommDomainHandle  # noqa: PLC0415
+
+    worker, shutdown = module.Worker(level=3 if mode == "node" else 4, num_sub_workers=0), []
+    state = module._GlobalNodeDomainState(_command())
+    owner = object()
+    state.host_owner = owner
+    if mode == "node":
+        worker._global_node_domains[7] = state
+    elif mode == "cached-root":
+        handle = CommDomainHandle(
+            name="mixed",
+            _release_fn=lambda _handle: None,
+            domain_id=7,
+            generation=3,
+            members=_command().members,
+            host_buffers={2: host_buffer(_command(), 2)},
+        )
+        worker._live_global_domains["mixed"] = handle
+        worker._failed_global_domain_releases[7] = handle
+        worker._global_domain_free_results[7] = RuntimeError("lost view ACK")
+    else:
+        worker._record_unreclaimable("Host rollback unknown", keep_transport=True)
+    monkeypatch.setattr(worker, "_release_remote_sessions", lambda: shutdown.append(True))
+    try:
+        with pytest.raises(RuntimeError):
+            worker.close()
+        assert state.host_owner is owner and not shutdown
+        if mode == "node":
+            assert worker._global_node_domains[7] is state
+        elif mode == "cached-root":
+            assert worker._failed_global_domain_releases[7] is handle and not handle.freed
+    finally:
+        # Only synthetic debts: no backing, native context or child process was created.
+        worker._global_node_domains.clear()
+        worker._live_global_domains.clear()
+        worker._failed_global_domain_releases.clear()
+        worker._global_domain_free_results.clear()
+        worker._cleanup_journal = type(worker._cleanup_journal)()
+        with pytest.raises(RuntimeError):  # A failed close preserves its published error.
+            worker.close()
+
+
+@pytest.mark.parametrize("mutation", ["valid", "forged", "overlap", "range", "native-failure"])
+def test_pool_copy_reuses_grants_and_revokes_unknown_completion(monkeypatch, mutation):
+    import simpler.worker as module  # noqa: PLC0415
+    from _task_interface import _encode_buffer_descriptor_wire  # noqa: PLC0415
+
+    command = _command()
+    host, peer = host_buffer(command, 2, base=8192), domain_buffers(command, 1, base=4096)["payload"]
+    entry = module._L2GlobalDomain(
+        7,
+        3,
+        0,
+        2,
+        None,
+        0,
+        4096,
+        4096,
+        device_ctx=123,
+        host_enabled=True,
+        buffers={host.identity: host, peer.identity: peer},
+    )
+    store = module._L2GlobalDomainStore({7: entry})
+    assert store.resolve(host.to_descriptor()) == 8192
+    with pytest.raises(ValueError, match="another chip"):
+        store.resolve(peer.to_descriptor())
+    dst, src, offset = host, peer, 8
+    if mutation == "forged":
+        dst = replace(host, nbytes=64)
+    elif mutation == "overlap":
+        src, offset = host, 2
+    elif mutation == "range":
+        offset = host.nbytes
+    payload = module.LOCAL_POOL_COPY.pack(module.LOCAL_DOMAIN_MAGIC, GLOBAL_DOMAIN_VERSION, 7, 3, offset, 4, 8)
+    payload += bytes(_encode_buffer_descriptor_wire(dst.to_descriptor())) + bytes(
+        _encode_buffer_descriptor_wire(src.to_descriptor())
+    )
+    monkeypatch.setattr(module, "_open_global_domain_payload", lambda _buf: _control_payload(payload))
+    calls = []
+
+    class Chip:
+        def comm_global_domain_copy(self, *args):
+            calls.append(args)
+            if mutation == "native-failure":
+                raise RuntimeError("completion unknown")
+
+    if mutation == "valid":
+        module._handle_ctrl_domain_pool_copy(Chip(), memoryview(bytearray()), store)
+        assert calls == [(7, 2, 8, 1, 4, 8)]
+    elif mutation == "native-failure":
+        with pytest.raises(RuntimeError, match="unknown"):
+            module._handle_ctrl_domain_pool_copy(Chip(), memoryview(bytearray()), store)
+        assert entry.revoked
+        with pytest.raises(ValueError, match="stale"):
+            store.resolve(host.to_descriptor())
+    else:
+        with pytest.raises(ValueError):
+            module._handle_ctrl_domain_pool_copy(Chip(), memoryview(bytearray()), store)
+        assert not calls and not entry.revoked
+
+
+@pytest.mark.parametrize("field,value", [("handle", b"changed"), ("mapping_size", 8192)])
+def test_commit_freezes_complete_host_exports(field, value):
+    import simpler.worker as module  # noqa: PLC0415
+    from simpler.task_interface import GlobalCommDomainView  # noqa: PLC0415
+
+    command = replace(
+        _command(),
+        phase=GlobalDomainPhase.IMPORT,
+        host_windows=tuple(replace(h, mapping_size=4096, handle=b"shared") for h in _command().host_windows),
+    )
+    worker = module.Worker(level=3, num_sub_workers=0)
+    view = GlobalCommDomainView(
+        name="mixed", members=command.members, contexts={}, domain_id=7, generation=3, mapping_size=4096
+    )
+    state = module._GlobalNodeDomainState(command, phase=GlobalDomainPhase.IMPORT, view=view)
+    worker._global_node_domains[7] = state
+    try:
+        commit = replace(command, phase=GlobalDomainPhase.COMMIT)
+        changed = replace(
+            commit, host_windows=(commit.host_windows[0], replace(commit.host_windows[1], **{field: value}))
+        )
+        with pytest.raises(RuntimeError, match="conflicts"):
+            worker._commit_global_domain_node(changed)
+        assert not view.committed
+        worker._commit_global_domain_node(commit)
+        assert view.committed
+    finally:
+        worker._global_node_domains.clear()
+        worker.close()
+
+
+def test_shared_host_targets_preserve_exact_descriptor_and_hbm_chip_checks():
+    from simpler.task_interface import DataType, TaskArgs  # noqa: PLC0415
+    from simpler.worker import Worker  # noqa: PLC0415
+
+    worker = Worker(level=3, num_sub_workers=0)
+    host = host_buffer(_command(), 2, worker_id=-1)
+    hbm = domain_buffers(_command(), 0, worker_id=2)["payload"]
+    try:
+        with worker._child_prov_lock:
+            worker._record_device_alloc(host, targets=(2, 5))
+            worker._record_device_alloc(hbm)
+            args = TaskArgs()
+            args.add_tensor(host.tensor([8], DataType.UINT8))
+            for target in (2, 5):
+                worker._child_prov_check_dispatch_locked(args, target, api="test")
+            with pytest.raises(ValueError, match="wrong worker|stale"):
+                worker._child_prov_check_dispatch_locked(args, 999, api="test")
+            changed = TaskArgs()
+            changed.add_tensor(replace(host, nbytes=64).tensor([8], DataType.UINT8))
+            with pytest.raises(ValueError, match="descriptor"):
+                worker._child_prov_check_dispatch_locked(changed, 2, api="test")
+            args.add_tensor(hbm.tensor([8], DataType.UINT8))
+            with pytest.raises(ValueError, match="wrong worker|stale"):
+                worker._child_prov_check_dispatch_locked(args, 5, api="test")
+        with pytest.raises(ValueError, match="explicit copy_domain"):
+            worker._device_worker_for(host.identity, api="test")
+    finally:
+        worker._clear_child_prov()
+        worker.close()

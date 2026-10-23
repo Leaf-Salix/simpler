@@ -737,7 +737,7 @@ private:
     void *device_ctx_ = nullptr;
     std::vector<CommSession> comm_sessions_;
     std::unordered_map<uint64_t, size_t> comm_session_index_;
-    std::unordered_map<uint64_t, bool> global_domain_ids_;
+    std::unordered_map<uint64_t, uint32_t> global_domain_ids_;  // 0: HBM-only; otherwise Host profile
     uint64_t base_comm_handle_ = 0;
 
     uint32_t arena_bank_for_slot(uint32_t slot_id) const;
