@@ -46,8 +46,8 @@ L3 and L4 use `allocate_domain(members=...)`, `get_or_allocate_domain(...)`,
 `get_domain(name)` and `release_domain(handle)`, returning the same
 `CommDomainHandle`. L3 members are logical chip worker ids, such as `[1, 0]`;
 L4 members are `(node_worker_id, chip_worker_id)` pairs. Order defines domain
-rank. `member(rank)` returns topology metadata; `local_context(rank)` returns
-an L3 creator's local mapping. Legacy `handle[chip_id]` keeps chip-id semantics.
+rank. `member(rank)` returns topology and Buffers; `local_context(rank)` returns
+this node's local mapping. Legacy `handle[chip_id]` keeps chip-id semantics.
 For L3 member metadata, `node_worker_id=-1` denotes the creator's own node.
 
 Handle attributes and context/buffer mappings are read-only metadata by contract;
@@ -88,14 +88,15 @@ releases a reused handle too. After release, callers must not submit new uses
 of previously obtained Buffers; logical release revokes their submit provenance.
 Physical release still waits for accepted tasks and their children to complete.
 After run completion, retained handles can be inspected, copied through a
-matching Orchestrator and released serially outside a callback; release then
+matching Orchestrator and released serially outside a callback; successful release
 reclaims the backend resources synchronously and repeated release is a no-op.
 Release follows the handle's callback to its creating Worker;
 `orch.release_domain` rejects a foreign owner. Concurrent run callbacks,
 lookup and release use the existing submission serializer. Domain-using runs
 retain the existing ordered-cleanup policy: a successor waits for its
 predecessor's fence and cleanup. This does not add concurrent device execution.
-`Worker.close()` frees remaining owned domains after its existing lease/fence drain.
+`Worker.close()` drives owned-domain cleanup after its existing lease/fence drain;
+failed or unconfirmed reclamation remains tracked and is reported.
 `Worker.live_domains` includes both backends.
 
 `copy_to_domain` and `copy_from_domain` use domain rank and the same named-buffer
@@ -133,8 +134,8 @@ values, the root callback must first call `get_domain(ref)` and submit the
 descendant before release; arbitrary integer semantics cannot imply a use.
 There is no independent graph capture/replay API; `host_build_graph` executes
 within the same run fence. General Remote COPY/lease and mapping remain #2460
-work. An ambiguous native completion retains its resources until whole-tree
-teardown rather than reporting them freed.
+work. Unconfirmed completion or release remains tracked until physical
+reclamation is proved.
 
 `Worker.detach_persistent_domain(handle)` adapts #2120's proposed retention API
 to the same ownership model: inside the owning callback it changes an unretained
@@ -258,24 +259,24 @@ final safety net.
 Repository CI exercises the complete transaction, rollback, and mixed
 local/remote paths with the `sim` backend. It also exercises the real
 `a3-fabric-v1` backend: the two-machine `st-network1-onboard-a2a3` job runs
-`global_tload_mixed_l3` and `compute_then_tload_mixed_l3`, whose default
-profile is `a3-fabric-v1` on real A3 devices. Those two examples are the
-in-repository harness for the Fabric path; a run that needs to know whether
-Fabric was covered should read that job rather than infer it from the
-simulation checks. The job now drives their `test_*.py` wrappers through
-`network1-run-pytest` rather than calling `run_parent.sh` directly.
+the existing global-domain examples and the shared domain-Tensor flow in
+`test_domain_tensor_network1.py` on local L4, TCP and MPI topologies. The
+shared flow covers retained data, cached nonzero Tensor views, release before
+the run wait, independent outputs and stale receiver grants. Read that job's
+individual test results to verify hardware coverage; simulation checks or a
+skipped MPI test do not establish it.
 
 ---
 
 ## 2. Lifetime model
 
-The handle is a context manager. Its lifecycle has **two distinct states**:
+Owning handles move through `live → released → freed`:
 
-- **`released`** — set the moment `release()` is called (or the `with` block
-  exits). Further indexing (`handle[i]`) raises. This is the *user-visible*
+- **`live`** — allocated and available for new uses.
+- **`released`** — set when logical release is accepted through `release()` or
+  `with` exit. Further indexing (`handle[i]`) raises. This is the *user-visible*
   state: "do not hand this domain to any new `submit_*`."
-- **`freed`** — the backend `comm_release_domain_windows` has actually run and
-  the device memory is gone.
+- **`freed`** — physical reclamation has been confirmed.
 
 Inside an orchestration callback, `submit_next_level()` only *enqueues* DAG work;
 `Worker.run()` does not wait for completion until the orch function returns.
@@ -286,15 +287,20 @@ queues the backend free; the real free runs after the run fence, when every
 task that could reference the window has completed.
 
 When a retained domain is released serially after its run has completed,
-the backend free is synchronous: `release()` returns with `freed=True`,
+the backend free is synchronous: on success `release()` returns with `freed=True`,
 including release at context-manager exit. Repeated release is a no-op.
 Use `handle.released` to guard against accidental reuse; use `handle.freed`
 to check physical teardown.
 
-Cleanup is **failure-safe**: even if a chip task fails and the run wait
-re-raises, `Worker.run` still executes pending releases and sweeps any live
-domains the orch fn forgot to release (LIFO), so a failed run cannot strand
-backend allocations into the next run.
+A failed consuming run revokes new uses and retains cleanup responsibility.
+Pending releases and the run's domain sweep require proven completion; failed
+ordered cleanup blocks successor runs. Unconfirmed completion or release keeps
+the resource tracked and unfreed, with the error reported.
+
+L3 can confirm a failed release through participating chip-finalization receipts
+and complete tree teardown. L4 has no equivalent global-window teardown receipt:
+`close()` can reclaim the worker tree while retaining cleanup debt, reporting
+`window reclamation is unconfirmed` and keeping `freed=False`.
 
 ---
 
