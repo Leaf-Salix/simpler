@@ -3,8 +3,9 @@
 These internal interfaces implement the execution-slot trust root described in
 [v9 design, sections 3 and 8](https://icc.gt.tc/vllm-pto?i=2#v9-design).
 The public HBG kernel owner connects prepare-time registration, launch event
-ordering and context-close detachment. The leader restore consumes admission
-to validate and restore image contents before dispatch.
+ordering and context-close detachment. The canonical leader restore validates
+and copies packet images; the public prepared entry attaches Host-validated
+images published by ordered DMA.
 
 ## Ownership and prepare
 
@@ -38,6 +39,11 @@ The control sequence outside capture is:
    enqueued. Registration and every later launch share the AICPU stream, so its
    FIFO carries that ordering and no event is published for a launch to consume.
    Caller, AICPU and hidden AICore remain distinct streams.
+
+The public owner additionally prepares image destinations and the resident
+prepared execution context on that stream, then waits for initialization before
+returning the context. This work stays outside capture; replay does not repeat
+context setup.
 
 `inspect_frozen_resources` only reads frozen context views in Collecting or
 ReadyEnqueued state, checking device, generation and resource schema. It does not
@@ -106,9 +112,11 @@ not allocate device memory, build a graph, upload a graph image, synchronize a
 launch, or mutate program-mode callable registration. The public kernel owner
 connects detach to context close after caller-guaranteed quiescence.
 
-The resident AICPU DSO stores only one atomic registry pointer. Binding requires
+The registry-binding component stores one atomic registry pointer. Binding requires
 a valid Ready record and refuses a different live pointer. It stores no slot
 contents, generation history, callable table or cross-context conflict state.
+The prepared kernel entry separately retains its validated execution context and
+callable registrations; they do not replace the registry's live identity checks.
 After graph destruction and external quiescence, device control must detach that
 pointer before `context.close()` releases memory. The public close owner
 performs this ordered operation.
@@ -176,10 +184,48 @@ resource lifetime. Rejection preserves the output and every destination byte.
 
 ## Leader restore and execution publication
 
+### Prepared public entry
+
+The public kernel owner builds a canonical v5 template, validates its framing,
+checksum and full image contents on the Host, then retains an immutable pinned
+copy of its live payload. `GraphPreparedDispatch` is a fixed 432-byte metadata
+record carrying invocation, callable registration, graph header and up to three
+region descriptors. Its checksum covers that record, not the image contents.
+
+Each eager submission or captured replay uses this sequence:
+
+1. The shared binder orders H2D copies of each live region before the prepared
+   AICPU entry. Unused capacity and the device-only prefix are not transferred.
+   Capture records these copies; replay still restores the live image.
+2. Every executing role validates its own CANN HostArgs copy, metadata checksum,
+   slot/context/callable identity and destination bounds. Roles compare their
+   records and invalidate all live image regions before the leader attaches
+   them. A metadata failure reaches collective cancellation.
+3. `attach_prepared_graph_image` claims an Idle attempt, verifies canonical
+   offsets and bounded SM geometry, wires pointers and seeds scheduler queues.
+   Mailbox storage is reused only when the preceding attempt committed
+   successfully and retired to Idle at the same runtime address; otherwise
+   `init_empty` initializes it. The leader publishes Ready and the entry's
+   READY/CANCEL handshake before dispatch.
+4. All roles finish status reads and executor cleanup before
+   tail image maintenance. On success, Runtime image maintenance covers mutable
+   task state, excluding immutable fanin/argument pools; the executor also
+   maintains its handshake and teardown control rows. Definition and optional
+   scheduler regions retain their live maintenance. A second collective gate
+   precedes final slot retirement; fatal failures poison the slot.
+
+Prepared attach performs no AICPU payload copy or full payload checksum/task
+scan. Its admission depends on the validated immutable Host source, ordered DMA
+and retained context/callable lifetime. Older pinned sources remain owned when
+the callable's template changes, because existing captures can reference them;
+they are released only at externally quiescent context close.
+
+### Canonical packet consumer
+
 `restore_graph_packet(packet, bytes, device_id, runtime_binary_id,
 trusted_callable, out, ops)` runs on the AICPU leader after Start and before
-any scheduler dispatch or AICore window publication. Eager and replay use the
-same entry. The enclosing kernel entry supplies invocation barriers and lifetime
+any scheduler dispatch or AICore window publication for a canonical packet.
+The enclosing kernel entry supplies invocation barriers and lifetime
 protection; this interface does not register a CANN entry or enqueue streams.
 
 1. Run callable and execution-slot admission. Validate canonical runtime layout,

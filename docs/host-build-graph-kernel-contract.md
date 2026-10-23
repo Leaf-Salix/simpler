@@ -145,23 +145,23 @@ prepare/freeze and slot registration. Callable prepare uploads context-owned
 images and stores immutable registration metadata without enqueuing a registration
 kernel or synchronizing a stream/event/device. It may run inside capture, including
 after an earlier launch has joined the internal streams to that capture.
-Each launch carries that prepare-owned registration in a fixed version-1 HBG
-dispatch prefix, followed by the unchanged canonical version-5 graph packet.
-CANN deep-copies both into one task. The prefix has its own fixed-size checksum
-and length/identity checks; it is Host authority, not a registration synthesized
-from graph claims. Both placeholder offsets include the prefix. Before reading
-Runtime, the consumer checks the prefix, its context/slot identity, the entire
-source range against all destinations and the registry, and any existing
-registration for the same generation. The participant leader publishes the
-idempotent registration before restore/execution and releases all peers through
+Each public launch publishes the template's live image regions by ordered H2D
+DMA, then submits a 432-byte `GraphPreparedDispatch` containing the prepare-owned
+registration. CANN deep-copies this fixed record without an inline image or
+placeholder. The Host validates the complete canonical version-5 packet and
+image contents when constructing a prepared template; its pinned DMA source
+remains immutable and context-owned until quiescent close. Every executing role
+checks its own dispatch record, checksum, context/slot identity and destination
+bounds, then compares metadata across roles. The leader publishes idempotent
+callable registration, attaches the published image and releases peers through
 the existing epoch gate. An eager launch or another captured graph carries its
 own registration, so neither depends on the original capture having executed.
 Enqueue failures return through the binder and poison the context. The canonical
-packet still receives its full per-invocation checksum, slot and image checks.
-Launch receives only frozen bindings. It performs Host build, constructs or
-reuses an immutable graph template, makes a fresh HostArgs copy, and enters the
-shared three-stream binder. The TMR public launch keeps its independent packet
-and admission path.
+packet consumer retains its full per-invocation checksum, slot and image checks;
+the prepared consumer relies on the validated immutable source and ordered DMA
+instead of rescanning image contents on every replay. Launch receives only
+frozen bindings and enters the shared three-stream binder. The TMR public launch
+keeps its independent packet and admission path.
 
 ## Common contract and stream roles
 
@@ -295,18 +295,29 @@ the canonical common header:
 `address_offset = sizeof(SimplerKernelInvocationHeader) + offsetof(GraphPacketHeader, inline_payload_addr)` and
 `data_offset = sizeof(SimplerKernelInvocationHeader) + payload_offset`.
 `submit_graph_template` passes the canonical copy to a synchronous HostArgs
-consumer. The production path uses `make_graph_dispatch_args` and
-`submit_graph_dispatch` instead: the canonical bytes follow the 144-byte
+consumer. `make_graph_dispatch_args` and `submit_graph_dispatch` implement the
+canonical dispatch adapter: the canonical bytes follow the 144-byte
 `GraphDispatchHeader`, and both offsets above increase by 144. Its prefix
 checksum covers the complete fixed prefix except the checksum itself;
 the inner packet retains its own unchanged v5 checksum coverage.
-`aicpu_loader/host/kernel_graph_launch.h::launch_graph_template` adapts this dispatch copy to
+`aicpu_loader/host/kernel_graph_launch.h::launch_graph_template` adapts this canonical dispatch copy to
 `aclrtLaunchKernelWithHostArgs`, forwarding the supplied dedicated AICPU stream,
 function, block count and config, with exactly one `aclrtPlaceHolderInfo`.
 The adapter submits exactly once and returns the RTS status unchanged. It does
 not synchronize or retry on memory pressure; any enqueue failure follows the
 shared terminal partial-submission path. Capacity/workspace policy must prevent
 recoverable memory pressure outside this launch helper.
+
+The public kernel owner uses `make_graph_prepared_dispatch` and
+`launch_graph_prepared`. Its fixed 432-byte record has its own framing and
+metadata checksum; the checksum does not cover the separately DMA-published
+image. Host construction validates both the canonical packet and its images
+before retaining a pinned source. Each launch enqueues the live-region copies
+on the AICPU stream before the prepared entry. Capture records those DMA nodes
+and the entry; replay still transfers every live region. Replacing a callable's
+template retains older pinned sources because existing captures may reference
+them. Context close releases them only after external quiescence. The prepared
+adapter submits once with zero placeholders and returns the RTS status unchanged.
 
 The adapter assumes the enclosing protocol has established entry/exit events
 and retained the function/context leases. The public HBG launch owner and shared
@@ -317,9 +328,17 @@ Restore does not clear or flush the tensor heap. Tasks write tensor data and
 Graph localization/materialization initializes execution metadata independently;
 unused heap capacity remains untouched.
 The A5 scheduler image is restored from its zeroed template. The common
-scheduler queues, mailbox and runtime pointers are rebuilt by the leader restore.
+scheduler queues and runtime pointers are initialized by the leader attach.
+The prepared path reuses a successfully retired mailbox only for the immediately
+preceding committed attempt at the same runtime address; otherwise it initializes
+an empty mailbox.
 The AICPU-only prefix is published by coherence and release/acquire; explicit
-image flushes cover the serialized Runtime tail, Definitions and A5 scheduler.
+canonical restore flushes cover the serialized Runtime tail, Definitions and A5
+scheduler. Prepared entry instead invalidates every live image region on each
+executing role before attach. After all execution and cleanup readers finish,
+successful prepared retirement maintains the mutable task-state prefix and
+Runtime control rows; immutable fanin and argument pools are excluded from the
+tail maintenance.
 A5 dispatch-specific metadata binding remains with the kernel entry.
 Host framing/ownership tests and compilation against the installed CANN header
 are not evidence of on-device capture/restore correctness.
