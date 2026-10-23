@@ -1,5 +1,11 @@
 # Host 接入通信域：双机 ACL 设计
 
+`feat/host-domain-hixl` 对照分支目前处于接入验证阶段，尚未替换下面的 ACL 实现，不能用于宣称 HIXL 的功能或性能结果。
+本次 CANN 9.0 原版库初始化因无法打开 `/etc/hccn.conf` 获取设备 IP 返回 `503900`，尚未执行到 `RegisterMem`；
+独立 ACL 对照中，DRAM/HBM 的首次 Fabric export 成功，重复 export 返回 `507899`。
+当前公共 HIXL 接口未提供复用已有 Fabric token 或取得内部 Device view 的入口，因此同 allocation 供 HIXL 与 kernel 共享仍待验证。
+[兼容性调查](../investigations/2026-10-bundled-hixl-host-domain-coexistence.md)区分了环境阻塞、已测限制及后续验收条件。
+
 状态：接口、ACL 后端、控制流程与[单／双机验收脚本](host-domain-mpi-validation.md)已实现；
 单机两卡本体验收已通过，Direct MPI 与双机硬件验收仍待完成。基于 [#2668](https://github.com/hw-native-sys/simpler/pull/2668)
 的 `1251133c07adfd25610614821a8bf80d45dc5235`，复用其 Buffer/Tensor、grant 和跨 run 使用追踪。
