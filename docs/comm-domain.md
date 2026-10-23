@@ -232,6 +232,12 @@ host-consumer record with no adapter instead of being mistaken for a usable
 mapping. Host access still needs the separate host-window access primitive
 before a consumer can dereference a device window.
 
+Host-owned DRAM pools are a separate opt-in `host_windows` configuration;
+they do not turn attachment records into CPU mappings of remote HBM.
+See the [Host domain design](zh-cn/host-comm-domain-design.md) and
+[single-host/two-host acceptance runbook](zh-cn/host-domain-mpi-validation.md)
+for protected local CPU access, explicit ACL copy, and kernel-visible views.
+
 The descriptor reports the backend's actual mapped size. A3 Fabric may align
 the requested size to its VMM granularity; buffer carving and bounds checks
 therefore use the returned mapping size. Handles and device pointers never

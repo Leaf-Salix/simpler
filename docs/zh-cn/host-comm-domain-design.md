@@ -1,6 +1,7 @@
 # Host 接入通信域：双机 ACL 设计
 
-状态：接口、ACL 后端与控制流程已实现；完整 MPI 验收仍在补齐。基于 [#2668](https://github.com/hw-native-sys/simpler/pull/2668)
+状态：接口、ACL 后端、控制流程与[单／双机验收脚本](host-domain-mpi-validation.md)已实现；
+单机两卡本体验收已通过，Direct MPI 与双机硬件验收仍待完成。基于 [#2668](https://github.com/hw-native-sys/simpler/pull/2668)
 的 `1251133c07adfd25610614821a8bf80d45dc5235`，复用其 Buffer/Tensor、grant 和跨 run 使用追踪。
 本文描述实现契约；既有接口见[通信域文档](../comm-domain.md)。
 
