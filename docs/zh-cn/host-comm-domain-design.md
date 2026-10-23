@@ -23,7 +23,7 @@ MPI 负责进程启动和控制消息，ACL 负责内存和数据传输；控制
 | 发起者与目标 | 实际访问方式 | 完成条件 |
 | ------------ | ------------ | -------- |
 | CPU → 本节点 DRAM | owner CPU VA 上的受保护字节访问 | CPU 操作完成，满足 CPU/设备交接契约 |
-| CPU → 其他 DRAM 或任意 HBM | 选本节点参与 NPU，ACL SDMA 读写 | 本次传输的 stream 同步成功 |
+| CPU → 其他 DRAM 或任意 HBM | 选本节点参与 NPU，ACL SDMA 读写 | 选定的同步 ACL copy 成功完成 |
 | NPU kernel → 任意 DRAM | 本 chip 导入的 Device VA，通过 Tensor 参数消费 | kernel 所属 run 完成 |
 | NPU kernel → HBM | 本地 Tensor，或现有 CommContext 的 peer window | kernel 所属 run 完成 |
 
@@ -104,9 +104,12 @@ NUMA id 由每节点配置给出，不按设备编号猜测。
 优先让同一组 Device view 同时服务 SDMA 与 kernel；若必须添加别名，仅增加 view，仍指向相同六块物理窗口。
 NoUC 地址选择、预约粒度和双用途映射须先做最小硬件对照；失败阻止上线，不静默换路径。
 
-选定 chip 解析两端 Device VA 后执行 `aclrtMemcpyAsync(..., ACL_MEMCPY_DEVICE_TO_DEVICE, stream)`，
-同步成功才返回。GlobalDomain 不保证已有通信 stream；沿现有 `create_comm_stream_checked`
-到 `DeviceRunner::create_comm_stream` 通路，为每 chip 惰性创建一个私有 copy stream，跨域复用，排空后销毁。
+选定 chip 解析两端 Device VA 后执行同步 copy。硬件预验证优先检查
+`aclrtMemcpy(..., ACL_MEMCPY_DEVICE_TO_DEVICE)` 是否覆盖这些 Fabric/NoUC 映射；通过即可省去私有 stream。
+若该接口不满足要求，则固定采用 `aclrtMemcpyAsync + stream synchronize`，
+沿既有 stream 创建通路为每 chip 持有一个私有 copy stream，跨域复用，排空后销毁。
+两者在预验证后选定一种实现，不在运行时 copy 出错后自动改试另一种；第一次调用可能已写入部分数据。
+GlobalDomain 不保证已有通信 stream，不能借用常驻计算流。
 新增 ACL 符号只在 Host-enabled A3 路径按需解析，保留其他后端的原初始化行为。
 
 ### 描述符与授权
@@ -115,18 +118,21 @@ Host pool 附属于现有域事务，单独携带 owner node、逻辑大小、ma
 Host 不占 NPU rank，不改固定 `CommContext` ABI。
 每个 Host pool 只有一个 canonical identity；各 chip VA 不同，但 backing 身份相同。
 
-`DOMAIN_WINDOW` body 由当前 28 字节扩为 32 字节：
+`DOMAIN_WINDOW` body 保持 28 字节，原 `rank` 字段明确改为内存窗口槽位 `window_slot`：
 
 ```text
-domain_id:u64 | generation:u64 | pool_kind:u32 | pool_index:u32 | slice_offset:u64
+domain_id:u64 | generation:u64 | window_slot:u32 | slice_offset:u64
 ```
 
-`DEVICE` 的 index 仍为 domain rank；`HOST` 的 index 为规范化节点顺序生成的稠密序号。
-仍在现有 body 上限内，不改 Buffer 总布局或新增 BackendKind。
-严格 codec、绑定一致性检查和通信版本一并更新，混用旧端明确拒绝。
-Host Buffer 的 `address_space=DEVICE` 描述 Tensor 的 Device 访问视图，物理归属由 pool 元数据标明。
+域有 R 个设备窗口、H 个 Host 窗口时，`[0,R)` 仍对应 device rank，
+`[R,R+H)` 按规范化节点顺序对应 Host pool；NPU 成员表和 CommContext 仍只有 R 项。
+不增加 kind 字段、BackendKind 或 Buffer 总布局。槽位含义由同一份不可变域元数据确定。
+通用 codec 校验格式与最大槽位数；当前 H≤R≤64，最多 128 个槽位，端点再按实际 R+H 校验。
+字节数不变不代表语义兼容；通信版本、绑定一致性检查和旧端拒绝仍须更新。
+Host Buffer 的 `address_space=DEVICE` 描述 Tensor 的 Device 访问视图，物理归属由槽位元数据标明。
 
-每 chip 在既有域状态内登记 pool→Device VA，只为 import/commit 成功的 pool 授权。
+每 chip 复用 `_L2GlobalDomain.buffers` 的 identity→Buffer 映射，登记 import/commit 成功的窗口切片，
+供显式 copy 核验本地/peer HBM 和 Host 两端；Tensor 解析仍额外执行设备 slot 的正确目标 chip 校验。
 复用 ImportRegistry，包括缓存命中时的 grant 重验、完整 descriptor 比对、generation 和撤销检查。
 保留普通 HBM Tensor 的正确目标 chip 校验；peer HBM kernel 继续用 CommContext，显式 copy 单独按域 grant 解析。
 Host Tensor 沿用普通 TaskArgs 与跨 run 登记。
@@ -141,6 +147,43 @@ Host Tensor 沿用普通 TaskArgs 与跨 run 登记。
 | A3 `comm_hccl.cpp`、`ChipWorker` | Device view、pool copy 与 view/owner 分离回收 | Fabric VMM helper、控制通道、stream 创建通路 |
 
 不另建 registry、session、launcher 或 adapter 框架，不复制 #2668，也不搬入原型整套测试 harness。
+
+### 代码分工与调用链
+
+实现以现有函数为入口，避免再加一层通用 manager：
+
+| 位置 | 最小职责 |
+| ---- | -------- |
+| `DomainConfig.capture` | 只规范化 Host 请求配置，不分配 identity 或产生设备副作用 |
+| 实际 allocate 事务、`domain_buffers` | 创建时分配一次 Host identity 写入命令；各端按命令重建 slot 描述符，复用不重新分配 |
+| `_GlobalNodeDomainState` | 保存本节点 Host owner 和既有域命令中的完整描述符；释放进度属于同一状态 |
+| `_prepare/_import/_commit_global_domain_node` | 各阶段补 Host owner/export/import；沿原有事务发布 grant |
+| `_L2GlobalDomainStore.resolve` | 共用完整 grant/范围检查；Tensor 路径额外检查设备 slot 的目标 chip，copy 路径允许已授权 peer slot |
+| `DomainAllocation`、现有 VMM helper | 保存 Host imported views；内部 `window_at(slot)` 从既有 owner/imported views 取地址，不另建地址注册表 |
+| `PayloadPart` 的薄 access backend | 验证活性、范围和门禁后读写 owner VA，不增加另一种 CPU buffer API |
+| `Orchestrator.copy_domain` | 验证两个逻辑 Buffer，发一条本地 chip 控制命令，等待本次 ACL copy 完成 |
+| `_release_global_domain_claimed/_node` | 原有 fanout 执行 VIEWS、OWNERS 两轮，正常 release 和 ABORT 共享同一 helper |
+
+Host owner 在 L3 的 native allocation 对象中保存 handle、CPU VA、实际大小和必要的释放进度，
+由 `_GlobalNodeDomainState` 及现有清理 journal 持有；不建立全局 owner-id→allocation 注册表。
+导入结果回到所属 chip 的既有域状态，Python grant 与 native view 共用 slot 顺序。
+import 时将全部 HBM slice Buffer 和 Host Buffer 登记到同一个 `entry.buffers` 字典，均保留完整 descriptor；
+不另存 slot→VA、identity→VA 或一份仅供 copy 使用的完整命令。
+显式 copy 的本地控制请求只携带域身份、两端 Buffer identity、偏移和字节数；
+L2 查同一份已登记 Buffer 得出 slot、切片范围与权限，native 再按 slot 和映射范围检查，禁止请求直接提供 VA。
+不为 peer copy 复制一份 Buffer 注册表，也不因 copy 可达就允许 peer HBM Tensor 提交到错误 chip。
+不复用会搬运 payload 的 `COPY_TO_DOMAIN/COPY_FROM_DOMAIN` staging 命令冒充 Fabric copy。
+
+```text
+建域：L4 allocate → L3 prepare owner/export → chip import → 全员 commit
+CPU：L3 local_host → 现有门禁/lease → owner read/write
+搬运：L3 copy_domain → 已有 mailbox → chip 校验/解析 → 同步 ACL copy
+计算：TaskArgs Host Tensor → 既有 grant resolver → 本 chip Device VA → kernel
+回收：既有 run fence → 所有 VIEWS 确认 → 所有 OWNERS 确认 → freed
+```
+
+代码 review 按调用链检查，每处新状态必须有唯一写入者、使用者和撤销点；
+若一个字段能从域命令或现有 Buffer 推导，就不再缓存一份。
 
 ## 4. 建域、排序与回收
 
@@ -157,7 +200,8 @@ CPU 字节访问与同步 copy 沿用现有 direct-control 门禁：callback 内
 callback 外要求 outstanding runs 已完成，并持有现有控制预约。`scope_end` 不代替完成等待。
 操作全程持有 mapping/operation lease，release 不能撤走正在使用的映射。
 
-这些操作不创建 DAG 依赖，不自动等待已排队任务。一次 stream 同步只证明本次传输完成；
+这些操作不创建 DAG 依赖，不自动等待已排队任务。选定实现的同步 ACL API 返回成功，
+或其异步 API 后的 stream 同步成功，只证明本次传输完成；
 跨节点同范围交接由已完成的全域 L4 run 或明确任务依赖排序。
 CPU↔NPU 可见性采用 CANN 支持的内存属性与同步契约，须用真实同址交接验证；
 普通 CPU fence 不能替代缓存一致性证明，不加入 EL0 cache 指令或 DMA 回读来掩盖 CPU 校验失败。
