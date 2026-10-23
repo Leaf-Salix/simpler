@@ -1128,12 +1128,13 @@ class CommDomainHandle:
 
         live           — allocated, indexable, can be passed to submit_*
         released       — release() called; further indexing raises;
-                          backend memory still alive until Worker.run drain
-        freed          — backend release_domain has executed, memory gone
+                          physical reclamation is pending or unconfirmed
+        freed          — physical reclamation has been confirmed
 
     Most users only see ``released``; the ``live → released`` transition
     happens at ``with`` exit (or explicit ``release()``), and the
-    ``released → freed`` transition is the runtime's job at end-of-run.
+    ``released → freed`` transition requires proven completion and physical
+    reclamation. Failed or unconfirmed cleanup remains tracked and is reported.
 
     Callers must treat handle attributes and context/buffer mappings as read-only
     metadata. Reassignment is unsupported; configure through allocation arguments
@@ -1257,32 +1258,32 @@ class CommDomainHandle:
 
     @property
     def released(self) -> bool:
-        """True once ``release()`` (or ``with`` exit) has been called.
+        """True once logical release has been accepted through ``release()`` or ``with`` exit.
 
-        Backend memory may still be alive — it is freed by the Worker after
-        DAG drain at end-of-run.  Use this to gate further indexing /
-        submission, not to assert physical teardown (use ``freed`` for that).
+        Backend memory may still be alive until completion and successful cleanup.
+        Use this to gate further indexing/submission, not to assert physical
+        teardown (use ``freed`` for that).
         """
         return self._released
 
     @property
     def freed(self) -> bool:
-        """True once the backend ``comm_release_domain_windows`` has executed.
+        """True once physical reclamation has been confirmed.
 
-        Flips after the owning run's fence and physical release. Releasing a
-        retained handle after run completion frees it synchronously. An ``orch_fn``
-        will never observe ``True`` for a handle it released within the same run.
+        Accepted uses must finish first. A retained domain released serially
+        after run completion is freed synchronously on success. Failed or
+        unconfirmed cleanup remains tracked and is reported.
         """
         return self._freed
 
     def release(self) -> None:
         """Mark this handle for collective release.  Idempotent.
 
-        Inside an orch function, this is a non-blocking mark — the actual
-        backend ``comm_release_domain_windows`` runs after
-        the owning run's completion wait so that tasks already submitted with
+        Inside an orch function, this is a non-blocking mark — backend cleanup
+        follows the owning run's completion wait so that tasks already submitted with
         this domain's ``device_ctx`` see live memory through execution.
-        Serial release after run completion frees a retained domain immediately.
+        Serial release after run completion attempts immediate physical release.
+        Failure is reported and the cleanup obligation remains tracked.
 
         After this returns, the handle is treated as released for the
         user's purposes: ``__getitem__`` raises, repeated ``release()`` is
