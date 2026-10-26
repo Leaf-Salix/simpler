@@ -1,13 +1,8 @@
 # Host 接入通信域：双机 ACL 设计
 
-`feat/host-domain-hixl` 对照分支目前处于接入验证阶段，尚未替换下面的 ACL 实现，不能用于宣称 HIXL 的功能或性能结果。
-本次 CANN 9.0 原版库初始化因无法打开 `/etc/hccn.conf` 获取设备 IP 返回 `503900`，尚未执行到 `RegisterMem`；
-独立 ACL 对照中，DRAM/HBM 的首次 Fabric export 成功，重复 export 返回 `507899`。
-当前公共 HIXL 接口未提供复用已有 Fabric token 或取得内部 Device view 的入口，因此同 allocation 供 HIXL 与 kernel 共享仍待验证。
-[兼容性调查](../investigations/2026-10-bundled-hixl-host-domain-coexistence.md)区分了环境阻塞、已测限制及后续验收条件。
+`feat/host-domain-hixl` 对照分支尚未接入 HIXL 数据面；下面描述的是继承的 ACL 实现。
 
-状态：接口、ACL 后端、控制流程与[单／双机验收脚本](host-domain-mpi-validation.md)已实现；
-单机两卡本体验收已通过，Direct MPI 与双机硬件验收仍待完成。基于 [#2668](https://github.com/hw-native-sys/simpler/pull/2668)
+基于 [#2668](https://github.com/hw-native-sys/simpler/pull/2668)
 的 `1251133c07adfd25610614821a8bf80d45dc5235`，复用其 Buffer/Tensor、grant 和跨 run 使用追踪。
 本文描述实现契约；既有接口见[通信域文档](../comm-domain.md)。
 
@@ -112,10 +107,10 @@ NUMA id 由每节点配置给出，不按设备编号猜测。
 地址在 CANN 文档给定的 40–224 TiB 区间内，从现有 native 域 view 推导活跃预约区间并选择空隙；
 确认释放后立即复用，不维护第二份地址注册表。外部库占用选定 VA 时明确失败，不覆盖映射、不盲目扫描重试。
 这只增加 VA 预约量，不增加物理分配量。指定地址能力在 CANN 文档中仍为实验接口，需按目标 CANN/A3 环境验证。
-同一组 NoUC Device view 同时服务 SDMA 与 kernel；单卡预验证已覆盖父进程持有 DRAM、子进程导入及完整窗口校验。
+同一组 NoUC Device view 同时服务 SDMA 与 kernel。
 
 选定 chip 解析两端 Device VA 后固定执行 `aclrtMemcpyAsync + stream synchronize`。
-CANN 对 VMM Device 间拷贝列出的接口及硬件预验证均采用此路径。
+CANN 对 VMM Device 间拷贝列出的接口采用此路径。
 沿既有 stream 创建通路为每 chip 持有一个私有 copy stream，跨域复用；
 每次 copy 必须完成同步才能返回成功。同步失败保留未知完成状态，阻止 view/owner 回收及设备 finalize。
 不在 copy 出错后自动改试另一种实现；第一次调用可能已写入部分数据。
@@ -211,25 +206,7 @@ chip finalize 回执不证明 L3 持有的 Host allocation 已释放。
 borrowed handle 也不能在仅完成 VIEWS 时标记 `freed`。
 MPI Abort/进程退出可能回收内存，本提案不保证失联 owner 留存或恢复；未知回收不报告成功。
 
-## 5. 验收与实现约束
+## 5. 实现约束
 
-一份参数化流程覆盖单机正对照与必测双机，不为每种方向另写脚本。
-双机由现有 Direct MPI supervisor 启动完整作业，域内实际 owner 为两块 DRAM、四块 HBM。
-六个发起者对六个池的 READ/WRITE 共 72 项，分别标注 CPU 本地、ACL SDMA 与 kernel；本地结果不代替跨机证明。
-源、目标、结果区互不重叠，每项比较完整逻辑窗口和两侧 guard，不访问对齐 padding。
-同一 DRAM 区间另做 `CPU → NPU0 → NPU1 → CPU` 及远端 NPU 交接，以完成的 L4 run 分轮等待且不重置 allocation。
-详细矩阵、范围布局、A/B 命令及成功条件以[验收流程](host-domain-mpi-validation.md)为准；
-六个 allocation 只统计域 payload，结果 Buffer/workspace 单独计数。释放和 executor 清理必须成功，缺硬件、跳过或 sim 不记作双机 PASS。
-
-最小回归集合：
-
-- 参数化 UT：配置规范化与精确复用、单 owner、pool/identity/generation/范围/grant 拒绝、释放后缓存对象失效、
-  纯 Ref 后代 CPU/copy 使用的根 run 登记。
-- 失败注入 UT：第二 chip import 失败、PREPARE 响应丢失、VIEWS 确认丢失及 view/owner free 失败；
-  校验未收齐确认不 free owner、不 finalize/reset context、不误报 `freed`、清理责任不丢失。
-- 同一 E2E 流程的单机与 Direct MPI 双机矩阵、同址交接、释放顺序和域 allocation 计数。
-- 原有 HBM 域、Buffer codec 和跨 run 使用回归，以及构建/链接检查无新增 HIXL/ADXL 依赖。
-
-旧原型和 #2668 的 MPI group 测试只作参考，不替代这个组合验收。
 若需要别名，逐个登记其 lease 与清理责任，不增加物理 payload 副本。
 每处新状态须有唯一写入者、使用者和撤销点；测试复用既有 fixture 与参数化流程。
