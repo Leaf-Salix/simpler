@@ -85,11 +85,14 @@ releases a reused handle too. After release, callers must not submit new uses
 of previously obtained Buffers; lookup, submission and local resolution reject revoked references.
 Physical release still waits for accepted tasks and their children to complete.
 After run completion, retained handles can be inspected, copied through a
-matching Orchestrator and released serially outside a callback; release then
+matching Orchestrator and released serially outside a callback; successful release
 reclaims the backend resources synchronously and repeated release is a no-op.
 Only the creating Worker owns release. Lookup, creation, publication and release share
 the callback serializer; concurrent matching requests share one transaction and conflicts fail.
-`Worker.close()` frees remaining owned domains after its existing lease/fence drain.
+`Worker.close()` attempts to free remaining owned domains after its existing lease/fence drain.
+If device completion or reclamation is unconfirmed, the domain remains released
+but not freed; its cleanup obligation stays tracked and is reported, while
+independent worker-tree cleanup continues.
 `Worker.live_domains` includes both backends.
 
 `copy_to_domain` and `copy_from_domain` use domain rank and the same named-buffer
@@ -260,15 +263,16 @@ queues the backend free; the real free runs after the run fence, when every
 task that could reference the window has completed.
 
 When a retained domain is released serially after its run has completed,
-the backend free is synchronous: `release()` returns with `freed=True`,
+the backend free is synchronous: successful `release()` returns with `freed=True`,
 including release at context-manager exit. Repeated release is a no-op.
 Use `handle.released` to guard against accidental reuse; use `handle.freed`
 to check physical teardown.
 
 Cleanup is **failure-safe**: even if a chip task fails and the run wait
-re-raises, `Worker.run` still executes pending releases and sweeps any live
-domains the orch fn forgot to release (LIFO), so a failed run cannot strand
-backend allocations into the next run.
+re-raises, `Worker.run` still attempts pending releases and sweeps any live
+domains the orch fn forgot to release (LIFO). Failed or unconfirmed releases
+remain tracked and prevent a successor run from using unresolved device state;
+neither a failed wait nor child-process exit proves physical reclamation.
 
 ---
 

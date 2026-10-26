@@ -3819,7 +3819,6 @@ NB_MODULE(_task_interface, m) {
             nb::call_guard<nb::gil_scoped_release>(),
             "Validate, copy back, emit diagnostics, and destroy a prepared native run."
         )
-        .def("_unproven_native_run_count", &ChipWorker::unproven_native_run_count)
         .def(
             "_probe_run_retention",
             [](ChipWorker &self, const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &successor,

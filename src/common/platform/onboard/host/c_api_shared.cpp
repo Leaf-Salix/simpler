@@ -2626,11 +2626,7 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         state->runner->release_native_run_reservation(state);
         state->runner_reserved = false;
     }
-    const bool device_settled =
-        ((phase == NativeRunPhase::Prepared || no_submission) && !launched) || (launched && execution_rc == 0) ||
-        state->runner->observed_run_boundaries(state->identity()) == RunCompletionFence::Completion::Complete;
     destroy_native_run_context(state);
-    if (!device_settled) mark_native_run_device_unsettled(state);
     emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns, trace_attrs);
     if (export_clock_log && !export_host_clock_alignment_log(output_prefix, trace_inv, clock_log_offset)) {
         return PTO_RUNTIME_ERR_INTERNAL;

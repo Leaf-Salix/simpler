@@ -668,11 +668,12 @@ void ChipWorker::finalize() {
             // Final device teardown below is the last-resort reclamation path;
             // destructors must not terminate while reporting a prior run error.
         }
+        comm_reclamation_unconfirmed_ |= run_lane_->poisoned();
         run_lane_.reset();
     }
     cleanup_native_runs_noexcept();
-    // An unproved carrier destruction or device stop still retains the run's resources.
-    // Everything below this point —
+    // A run whose destruction could not be proved still owns whatever its carrier holds, and the
+    // carrier itself still lives in this worker's runtime storage. Everything below this point —
     // the device teardown, the context destruction, the `dlclose` and the release of that storage
     // — would either free those resources a second time or unload the code that owns their release
     // routines. So the close stops here and keeps all of it, which is the same contract the device
@@ -692,18 +693,22 @@ void ChipWorker::finalize() {
             " run storage block(s) and kept the context and the host runtime loaded"
         );
     }
-    // Global domains are independent of the legacy communicator sessions.
-    // Release them while the host runtime and device context are still alive.
-    if (comm_global_domain_release_fn_ != nullptr) {
-        for (uint64_t domain_id : global_domain_ids_) {
-            comm_global_domain_release_fn_(domain_id);
+    if (comm_reclamation_unconfirmed_) {
+        // Carrier destruction does not prove device users stopped. Keep comm
+        // owners and their code alive, but allow the device's reset path below.
+        if ((!comm_sessions_.empty() || !global_domain_ids_.empty()) && runtime_module_ != nullptr) {
+            runtime_module_->retain_until_process_exit();
         }
+    } else {
+        // Release windows while the host runtime and device context are alive.
+        if (comm_global_domain_release_fn_ != nullptr) {
+            for (uint64_t domain_id : global_domain_ids_) {
+                comm_global_domain_release_fn_(domain_id);
+            }
+        }
+        global_domain_ids_.clear();
+        clear_comm_sessions();
     }
-    global_domain_ids_.clear();
-
-    // Defensive: if the user never called comm_destroy, reclaim all owned
-    // communicator handles and streams before tearing down the device context.
-    clear_comm_sessions();
 
     int device_finalize_rc = 0;
     if (device_ctx_ != nullptr && finalize_device_fn_ != nullptr && runtime_module_ != nullptr) {
@@ -1881,7 +1886,7 @@ size_t ChipWorker::abandon_unproven_native_run_storage() noexcept {
         ++abandoned;
         std::fprintf(
             stderr,
-            "ChipWorker: abandoning the run storage of set %u; its retirement is unconfirmed, so the "
+            "ChipWorker: abandoning the run storage of set %u; its carrier could not be proved destroyed, so the "
             "block is not returned to the allocator\n",
             slot
         );
@@ -2062,6 +2067,13 @@ void ChipWorker::clear_comm_sessions() {
     comm_sessions_.clear();
     comm_session_index_.clear();
     base_comm_handle_ = 0;
+}
+
+void ChipWorker::require_comm_reclamation_safe() const {
+    if (comm_reclamation_unconfirmed_ || (run_lane_ != nullptr && run_lane_->poisoned()) ||
+        unproven_native_run_count() != 0) {
+        throw std::runtime_error("communication resource reclamation is unconfirmed");
+    }
 }
 
 uint64_t ChipWorker::malloc(size_t size) {
@@ -2255,9 +2267,7 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
 void ChipWorker::comm_release_domain_windows(
     uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank
 ) {
-    if (unproven_native_run_count() != 0) {
-        throw std::runtime_error("comm_release_domain_windows: native run destruction is unconfirmed");
-    }
+    require_comm_reclamation_safe();
     if (comm_release_domain_windows_fn_ == nullptr) {
         throw std::runtime_error("comm_release_domain_windows is not supported by this runtime");
     }
@@ -2319,9 +2329,7 @@ uint64_t ChipWorker::comm_global_domain_import(uint64_t domain_id, const std::ve
 }
 
 void ChipWorker::comm_global_domain_release(uint64_t domain_id) {
-    if (unproven_native_run_count() != 0) {
-        throw std::runtime_error("comm_global_domain_release: native run destruction is unconfirmed");
-    }
+    require_comm_reclamation_safe();
     if (comm_global_domain_release_fn_ == nullptr) {
         throw std::runtime_error("comm_global_domain_release is not supported by this runtime");
     }
@@ -2340,6 +2348,7 @@ void ChipWorker::comm_barrier(uint64_t comm_handle) {
 }
 
 void ChipWorker::comm_destroy(uint64_t comm_handle) {
+    require_comm_reclamation_safe();
     CommSession *session = find_comm_session(comm_handle);
     if (session == nullptr) {
         int rc = comm_destroy_fn_(reinterpret_cast<void *>(comm_handle));
@@ -2365,6 +2374,7 @@ void ChipWorker::comm_destroy(uint64_t comm_handle) {
 }
 
 void ChipWorker::comm_destroy_all() {
+    require_comm_reclamation_safe();
     int first_rc = 0;
     for (auto it = comm_sessions_.rbegin(); it != comm_sessions_.rend(); ++it) {
         if (it->handle == nullptr && it->stream == nullptr) {
