@@ -76,28 +76,10 @@ int make_graph_launch_template(
     GraphLaunchTemplate &out
 );
 
-struct GraphHostArgs {
-    std::vector<uint64_t> storage;
-    size_t bytes{0};
-    uint32_t address_offset{0};
-    uint32_t data_offset{0};
-};
-
-// Fresh writable launch copy: CANN may patch it without changing the template.
-// Offsets include the common invocation envelope, not just the HBG sub-packet.
-int make_graph_host_args(const GraphLaunchTemplate &source, GraphHostArgs &out);
 // Validates canonical image contents once on the Host. The context retains a
 // private immutable DMA snapshot for every capture that uses this metadata.
 int make_graph_prepared_dispatch(
     const GraphLaunchTemplate &source, const HbgCallableRegistration &registration, GraphPreparedDispatch &out
 );
 
-struct GraphHostLaunchOps {
-    void *context{nullptr};
-    // Consumes host arguments synchronously into task-owned storage, enqueues
-    // the task, then returns. It must not retain a pointer to these Host bytes.
-    int (*launch)(void *, GraphHostArgs &){nullptr};
-};
-
-int submit_graph_template(const GraphLaunchTemplate &source, const GraphHostLaunchOps &ops);
 }  // namespace hbg

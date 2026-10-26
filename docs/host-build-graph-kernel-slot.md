@@ -3,9 +3,8 @@
 These internal interfaces implement the execution-slot trust root described in
 [v9 design, sections 3 and 8](https://icc.gt.tc/vllm-pto?i=2#v9-design).
 The public HBG kernel owner connects prepare-time registration, launch event
-ordering and context-close detachment. The canonical leader restore validates
-and copies packet images; the public prepared entry attaches Host-validated
-images published by ordered DMA.
+ordering and context-close detachment. The prepared entry attaches immutable
+Host-validated images published by ordered DMA.
 
 ## Ownership and prepare
 
@@ -129,180 +128,122 @@ Poisoning neither drains device work nor frees resources or resets the device.
 
 ## Invocation admission
 
-HBG packet version 6 has a 200-byte header containing device ID, runtime
-binary identity and live heap length. The common K1 header keeps the integrated
-ABI; offsets use `sizeof(SimplerKernelInvocationHeader)` and no common-header
-version fields are added. HBG version 1 through 5 packets fail closed.
-Callable generation, callable/argument/function
-hashes remain per-invocation fields, so different callables and arguments can
-share a slot. The common callable admission checks ID, effective argument counts and residency
-generation against an independently validated live registration. Function-table
-resolution remains the callable owner’s responsibility.
+The Host canonical packet uses version 6: its 200-byte HBG header carries the
+device, runtime binary, slot generation, live heap length and region bindings.
+The common K1 envelope retains its ABI. `make_graph_prepared_dispatch` validates
+packet framing/checksum, then runtime layout, null Host pointers, task/tensor
+contents, relative argument pools, dependencies, heap ranges and Definition
+structure. Rejection preserves the output descriptor and all working memory.
+Graph materialization retains its topology and tensor-source semantic checks.
 
-The device and runtime binary arguments come from trusted AICPU initialization,
-not from the packet being checked.
+The Host retains an immutable pinned image and orders H2D before the fixed
+432-byte `GraphPreparedDispatch` on the same AICPU stream. The entry accepts
+only this prepared transport. The descriptor checksum covers metadata, not the
+separately transferred image; execution relies on full Host validation, private
+immutable sources and stream ordering. Every replay transfers all live regions.
 
-`admit_graph_packet_for_restore(packet, bytes, device_id, runtime_binary_id,
-trusted_callable, out)`:
+Each execution role gets its participants and Runtime from independently bound
+context state, then:
 
-1. Acquires the independently latched registry, checking device, runtime binary
-   identity, publication state, registration checksum and context/slot generation.
-2. Bounds packet size before parsing its payload and rejects source overlap with
-   any working or registry region.
-3. Invalidates the complete bounded task-owned source before the first packet
-   read, then validates the common invocation header against the trusted callable view, then
-   runs the full HBG framing, placeholder-address, region and checksum validation
-   in DeviceCopy mode.
-4. Compares packet device, slot generation, runtime binary identity and every
-   destination base/capacity pair with the sealed record.
-5. Publishes a read-only `GraphRestoreView` containing the trusted slot, validated
-   header and payload view only after every check succeeds.
-
-Failure leaves the output, registry, working memory and generation unchanged.
-An optional synchronous source-visibility operation supports backend testing;
-its failure also rejects admission. Size and overlap checks precede that operation.
-A packet with a recomputed checksum still cannot authorize a changed binding.
-Admission neither copies images nor releases AICore/scheduler work.
-`restore_graph_packet` performs the subsequent image validation and restoration;
-launch integration handles cancellation on failure.
-The task-owned source and context must remain alive and immutable while the
-admission result is consumed.
+1. Acquires the live registry, checking Ready state, checksum, device, runtime
+   binary and generation.
+2. Rejects HostArgs overlap with the registry or working regions, then checks
+   its fixed descriptor's version, reserved fields, size, checksum, callable
+   identity and region bounds.
+3. Compares every destination base/capacity pair with the independent slot.
+   A recomputed checksum cannot authorize foreign destinations.
+4. Compares its descriptor with every role's record. Agreement permits image
+   maintenance and leader attach; disagreement collectively cancels execution.
 
 ## Shared callable admission
 
-The shared `PreparedInvocationView`, `ByteSpan`, effective-count derivation and
-`validate_invocation_header` interfaces use the integration line's 32-byte
-invocation envelope. The callable ID is context-local and is never reused while
-the context lives; the envelope therefore carries no callable generation.
+Callable registration and execution slots are independent authorities. The
+prepared invocation's callable ID, effective tensor/scalar counts, hashes and
+Runtime address must match its registration. Graph slot generation, device,
+runtime binary and destination ranges must match the context registry. An
+already registered callable/context generation accepts only an identical
+registration. Neither authority replaces context/callable lifetime protection.
 
-The callable owner supplies the view under submission/consumption protection,
-coordinated with prepare replacement and close. The HBG execution registry
-stores only context resources, not a duplicate callable registry. Packet
-`callable_id` is checked against callable residency; graph `slot_generation`
-is checked independently against context registration. Neither identity proves
-resource lifetime. Rejection preserves the output and every destination byte.
+The shared `PreparedInvocationView` and `validate_invocation_header` continue
+to serve other kernel submission paths; HBG's prepared entry validates its own
+`GraphPreparedDispatch`.
 
 ## Leader restore and execution publication
 
-### Prepared public entry
+### Host publication and prepared attach
 
-The Host validates the canonical packet and image contents once per template,
-then retains an immutable pinned source while DMA or a callable cache needs it.
-Any capture use pins that source until externally quiescent context close,
-including capture that reuses an eager cache entry. Ordinary eager template
-replacement reclaims uncaptured sources only after an earlier eager tail reports
-completion; pending or failed submissions never authorize reclamation.
-Every eager submission or captured replay orders live-region H2D copies before
-a fixed 432-byte `GraphPreparedDispatch`; the AICPU entry accepts only this
-prepared transport after context setup.
+The Host validates each new template and retains a private immutable pinned
+source while DMA or a callable cache needs it. Any capture use pins the source
+until externally quiescent context close, including capture that reuses an
+eager cache entry. An eager template miss reclaims uncaptured sources only
+after an earlier successful eager tail completes and no callable cache holds
+them. A capture-only tail record is not a completion proof.
 
-Every role checks its own HostArgs checksum, identity and bounds, compares the
-record with the leader's, and invalidates the live image before attach. Invalid
-metadata collectively cancels the launch. The leader claims an Idle attempt,
-wires pointers, seeds queues and publishes READY/CANCEL. A successfully retired
-mailbox at the same runtime address retains its ticket sequence; an intervening
-failed restore requires full initialization.
+`attach_prepared_graph_image(prepared, slot, out)` receives an independently
+acquired slot. Every role has maintained the DMA image and joined before this
+call. Attach performs no image copy, payload/task scan or image checksum:
 
-Prepared attach performs no image copy, payload checksum or task scan. After all
-execution and cleanup readers finish, each role maintains mutable task-state
-image spans; the executor maintains Runtime state. A second collective gate
-precedes retirement. Fatal failures poison the slot.
+1. Checks metadata/slot identity and canonical runtime/SM layout.
+2. Claims only an Idle attempt and advances its device-owned counter.
+   Ready/Restoring return Busy, Failed returns Quarantined, and exhaustion
+   returns Exhausted without wrapping the counter.
+3. Wires RuntimeContext/SM/scheduler and initializes queue headers/sequences.
+   Only an immediately preceding successful retirement at the same Runtime
+   address permits mailbox ticket-storage reuse; all other cases initialize
+   the complete mailbox.
+4. Publishes control metadata, commits the successful generation and
+   release-publishes Ready. Returns RuntimeContext, live SM bytes and task
+   count. Failure preserves the output; an already claimed failure stays Failed.
 
-### Canonical packet consumer
+Restore neither clears nor maintains the tensor heap. Task writers and Graph
+materialization initialize data and execution metadata respectively. The Runtime
+image starts at `runtime_offset`, omitting device-initialized scheduler/queue/
+mailbox storage. Definition and optional A5 scheduler images have zero
+destination offsets. Frozen physical arena sizes and offsets do not change
+with logical queue capacities.
 
-`restore_graph_packet(packet, bytes, device_id, runtime_binary_id,
-trusted_callable, out, ops)` is the standalone canonical validation/copy interface. Its caller supplies
-invocation barriers and lifetime protection; the public kernel entry uses
-prepared attach. This interface does not register a CANN entry or enqueue streams.
+The separate 128-byte `GraphRestoreControl` lives in the registry allocation,
+never the DMA image. Prepare still performs two physical allocations; attach
+allocates none. Host construction owns vector/pinned storage and is not an
+entirely allocation-free submission path. Host/device builds must match and
+old captures must be recreated.
 
-1. Run callable and execution-slot admission. Validate canonical runtime layout,
-   null Host pointers, task counts, relative argument spans, dependency indices,
-   packed heap ranges and referenced Definition framing/section bounds. These
-   checks read only the immutable packet, before any destination write. The
-   existing Graph materialization consumer retains its topology and tensor-source
-   semantic checks; restore is not a replacement for that consumer.
-2. Claim only an Idle restore line and advance its device-owned attempt. Ready
-   and Restoring reject with Busy; Failed rejects with Quarantined. Context and
-   callable generations are unchanged. Reject an exhausted attempt counter;
-   never wrap a generation to zero.
-3. Copy the live runtime/SM, Definition and optional A5 scheduler images. Tensor
-   heap contents are uninitialized; task writers initialize data and Graph
-   materialization initializes execution metadata. Image descriptors bound all
-   source reads and destination writes; unused frozen capacity remains untouched. Caller-owned
-   tensor storage and persistent
-   platform handshake/KernelArgs allocations are outside these regions.
-   The Runtime region starts at the canonical `runtime_offset` destination and
-   carries RuntimeContext plus the compact SM image. Device-only scheduler,
-   queue and mailbox storage is initialized in place, rather than transmitted.
-   Definition and A5 scheduler regions keep destination offset zero. Frozen
-   allocation sizes, layout keys and target runtime/SM offsets are unchanged.
-4. Wire runtime/SM/scheduler pointers against the registered destinations, attach
-   the populated SM, initialize scheduler queue headers and sequence ramps, and
-   reset the completion mailbox. The separate A5 scheduler image is restored to
-   its template; architecture-specific dispatch binding remains the kernel
-   entry's responsibility.
-5. Flush serialized image spans and the prepared control metadata before committing
-   the attempt as the successful restore generation and release-publishing Ready.
-   The memory backend can fail this pre-publication flush without committing.
-   Return the RuntimeContext address,
-   capacity-bounded SM span and task count for the dispatch owner.
-   The runtime image flush starts at `runtime_offset`. The device-only prefix is
-   published through AICPU coherence and the Ready release/acquire, without a
-   broad prefix flush. `live_bytes` still covers the complete initialized prefix;
-   Definition and optional A5 scheduler images retain their full live flushes.
+### Completion and retirement
 
-The 128-byte `GraphRestoreControl` is part of the context registry allocation,
-never part of a graph image. Resource prepare still performs two physical
-allocations; resource binding and device restore allocate nothing. Host packet
-construction still owns vector storage and must not be described as an entirely
-allocation-free Host launch path. Registration remains immutable
-while its separate restore line changes. Old registry/resource schema versions
-fail closed; the public K1 invocation layout is unchanged.
+The leader publishes this invocation's READY/CANCEL through its epoch/status
+barrier. Peers consume that result rather than sampling an unversioned old
+Ready flag. All execution/status readers, executor cleanup and AICore work
+finish before each role maintains mutable task-state image spans. All image
+maintenance finishes before the final role retires. The executor maintains
+Runtime state: A3 kernel mode maintains its control region, while program mode
+maintains the complete Runtime.
 
-A copy/flush failure may leave partially written working bytes. It publishes
-Failed, preserves the last committed generation and leaves the output unchanged.
-There is no rollback or dispatch permission. Direct retry is rejected while the
-slot is Failed. `retire_graph_restore(registry, attempt, completion)` checks the exact
-attempt, outcome and two independent error channels before making any transition:
+`retire_graph_restore(registry, attempt, completion)` checks the exact attempt,
+outcome and independent runtime/teardown errors:
 
 | Outcome | Required restore state | Result |
 | ------- | ---------------------- | ------ |
-| Completed | Ready, successful committed attempt | Idle, old peer result revoked |
-| ControlledFailure | Failed, known injected/controlled fault, clean teardown | Idle, full restore required next time |
-| FatalFailure | Ready or Failed | Terminal Poisoned registry; no retry |
+| Completed | Ready, matching successful committed attempt | Idle |
+| ControlledFailure | Failed, known controlled fault and clean teardown | Idle, full initialization next time |
+| FatalFailure | Ready or Failed | Terminal Poisoned, no retry |
 
-Retirement is an AICPU owner operation after all readers and AICore work are
-quiescent. On failure the entry must first make every peer skip classify/dispatch,
-run per-thread shutdown, completion gates and deinit (v9 section 10.2). The owner
-supplies runtime_status and unexpected_teardown_status independently in the
-completion record. Either nonzero status forces terminal poisoning, even when
-the outcome claims ControlledFailure or Completed. The owner also propagates
-poisoning to the Host context; controlled failure cannot hide either error. Retirement does not perform these cleanup operations itself.
-If rejection occurs before an attempt is claimed, the owner can poison the slot
-directly when the enclosing native invocation has already enqueued work.
+The public prepared entry submits only Completed or FatalFailure.
+ControlledFailure is the lower-level controlled-cleanup contract, not an
+automatic retry path for public kernel invocations. Either nonzero
+runtime_status or unexpected_teardown_status forces poisoning regardless of
+the claimed outcome. An entry failure before claiming an attempt poisons the
+registry directly. Retirement does not clean up, free memory, reset devices or
+advance committed_generation; the Host owner still propagates failure and
+protects resource lifetime.
 
-Unknown outcomes, stale attempts, duplicate retirement, success retirement of a
-failed slot, and all reuse of a Poisoned slot fail closed. Retirement never
-frees memory, resets the device or advances committed_generation.
+Unknown outcomes, stale attempts, duplicate retirement, success retirement of
+a Failed slot and reuse after poisoning fail closed. A prior successful result
+cannot authorize a new execution; the execution lease excludes concurrent reuse.
 
-After its invocation barrier, a peer calls
-`acquire_graph_restore_result(registry, successful_generation, out)`. It acquires
-the validated, non-poisoned registry and Ready state, checks the exact
-attempt/commit pair and successful status, and invalidates only each published
-live working span
-before consuming it. The entry must distribute the leader's status as well as
-its generation: on leader failure, peers exit through failure handling instead
-of polling an old Ready flag. A prevalidation rejection does not mint a new
-attempt and cannot authorize reuse of a prior successful output. The execution
-lease excludes retirement until all readers and AICore work have completed;
-the restore state machine independently refuses reuse before that retirement.
-
-Unit coverage includes repeated live-image restoration, internal intermediate
-tensors, unused-capacity preservation, corrupted first/middle/
-last source cache lines, forged runtime/relative-pool fields, every memory-operation
-failure (including the pre-publication flush), explicit controlled retry, stale
-retirement/publication rejection, terminal poisoning, peer readers and an empty
-image following a Graph image. These tests exercise the real restore implementation
-with Host-addressable memory on both architectures; they do not demonstrate CANN
-capture/replay or real-device cache coherence. Those require kernel-entry and binder
-integration.
+Unit coverage separately exercises Host image-semantic rejection, prepared
+metadata/independent slots, ordered DMA followed by attach, queue layout and
+capacity, mailbox wrap/reuse, empty graphs and retirement error classification.
+Host rejection preserves output metadata and working memory. These tests use
+Host-addressable memory and the real validation/attach/retire implementations;
+they do not demonstrate CANN capture or device cache coherence, which require
+kernel-entry/binder hardware regressions.

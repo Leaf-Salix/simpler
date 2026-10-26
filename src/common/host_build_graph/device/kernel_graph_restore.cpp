@@ -10,26 +10,13 @@
  */
 #include "host_build_graph/kernel_graph_restore.h"
 
-#include <cstring>
-
 #include "aicpu/cache_maintenance.h"
-#include "host_build_graph/kernel_graph_image_validation.h"
 #include "host_build_graph/kernel_graph_prepared.h"
 #include "host_build_graph/runtime_core.h"
 
 namespace hbg {
 namespace {
 
-bool copy_region(const GraphRestoreOps &ops, void *dst, const void *src, size_t bytes) noexcept {
-    if (ops.copy) return ops.copy(ops.context, dst, src, bytes);
-    std::memcpy(dst, src, bytes);
-    return true;
-}
-bool flush_region(const GraphRestoreOps &ops, const void *dst, size_t bytes) noexcept {
-    if (ops.flush) return ops.flush(ops.context, dst, bytes);
-    cache_flush_range(dst, bytes);
-    return true;
-}
 void publish(GraphRestoreControl &control, GraphRestorePhase phase, GraphRestoreStatus status) noexcept {
     control.status = static_cast<uint32_t>(status);
     cache_flush_range(&control, sizeof(control));
@@ -61,8 +48,8 @@ GraphRestoreStatus claim_restore(GraphRestoreControl &control) noexcept {
 }
 
 GraphRestoreStatus fail_restore(GraphRestoreControl &control) noexcept {
-    publish(control, GraphRestorePhase::Failed, GraphRestoreStatus::CopyFailed);
-    return GraphRestoreStatus::CopyFailed;
+    publish(control, GraphRestorePhase::Failed, GraphRestoreStatus::InitializationFailed);
+    return GraphRestoreStatus::InitializationFailed;
 }
 
 RuntimeContext *initialize_restored_runtime(
@@ -91,7 +78,7 @@ RuntimeContext *initialize_restored_runtime(
 
 GraphRestoreStatus finish_restore(
     const GraphRestoreView &view, RuntimeContext *runtime, uint64_t sm_bytes, GraphRestoreControl &control,
-    GraphRestoreResult &out, const GraphRestoreOps &ops
+    GraphRestoreResult &out
 ) noexcept {
     control.runtime_address = reinterpret_cast<uintptr_t>(runtime);
     control.sm_bytes = sm_bytes;
@@ -99,7 +86,7 @@ GraphRestoreStatus finish_restore(
     control.live_bytes[0] = view.graph.heap_bytes;
     for (size_t i = 1; i < 4; ++i)
         control.live_bytes[i] = view.regions[i].destination_offset + view.regions[i].bytes;
-    if (!flush_region(ops, &control, sizeof(control))) return fail_restore(control);
+    cache_flush_range(&control, sizeof(control));
     control.committed_generation = control.attempt;
     publish(control, GraphRestorePhase::Ready, GraphRestoreStatus::Ok);
     out = {runtime, control.attempt, sm_bytes, view.graph.total_tasks};
@@ -107,51 +94,11 @@ GraphRestoreStatus finish_restore(
 }
 }  // namespace
 
-GraphRestoreStatus restore_graph_packet(
-    const void *packet, size_t bytes, int device_id, uint64_t runtime_binary_id,
-    const simpler::kernel::PreparedInvocationView &trusted_callable, GraphRestoreResult &out, const GraphRestoreOps &ops
-) noexcept {
-    GraphRestoreView view{};
-    const auto admission =
-        admit_graph_packet_for_restore(packet, bytes, device_id, runtime_binary_id, trusted_callable, view);
-    if (admission == GraphSlotStatus::Poisoned) return GraphRestoreStatus::Poisoned;
-    if (admission != GraphSlotStatus::Ok) return GraphRestoreStatus::Rejected;
-    RuntimeArenaLayout layout{};
-    uint64_t sm_bytes = 0;
-    if (!detail::validate_graph_images(view, layout, sm_bytes)) return GraphRestoreStatus::InvalidImage;
-    auto *registry = reinterpret_cast<GraphSlotRegistry *>(view.slot.registry.address);
-    auto &control = registry->restore;
-    const auto claimed = claim_restore(control);
-    if (claimed != GraphRestoreStatus::Ok) return claimed;
-    for (size_t i = 1; i < 4; ++i) {
-        const auto &dst = view.slot.destinations[i];
-        const auto &region = view.regions[i];
-        if (region.bytes == 0) continue;
-        if (!copy_region(
-                ops, reinterpret_cast<void *>(dst.address + region.destination_offset),
-                view.payload + region.source_offset, region.bytes
-            ))
-            return fail_restore(control);
-    }
-    auto *runtime = initialize_restored_runtime(view, layout, sm_bytes);
-    if (runtime == nullptr) return fail_restore(control);
-    // Device-only queues and mailbox are shared through AICPU coherence and the Ready release/acquire.
-    for (size_t i = 1; i < 4; ++i)
-        if (view.regions[i].bytes &&
-            !flush_region(
-                ops, reinterpret_cast<void *>(view.slot.destinations[i].address + view.regions[i].destination_offset),
-                view.regions[i].bytes
-            ))
-            return fail_restore(control);
-    return finish_restore(view, runtime, sm_bytes, control, out, ops);
-}
-
 GraphRestoreStatus attach_prepared_graph_image(
     const GraphPreparedDispatch &prepared, const GraphSlotRegistration &slot, GraphRestoreResult &out
 ) noexcept {
     if (!graph_prepared_dispatch_matches_slot(prepared, slot)) return GraphRestoreStatus::Rejected;
     GraphRestoreView view{};
-    view.invocation = prepared.invocation;
     view.slot = slot;
     view.graph = prepared.graph;
     for (uint32_t i = 0; i < prepared.graph.region_count; ++i) {
@@ -183,7 +130,7 @@ GraphRestoreStatus attach_prepared_graph_image(
                                control.runtime_address == slot.destinations[1].address + layout.off_runtime;
     auto *runtime = initialize_restored_runtime(view, layout, sm_bytes, reuse_mailbox);
     if (runtime == nullptr) return fail_restore(control);
-    return finish_restore(view, runtime, sm_bytes, control, out, {});
+    return finish_restore(view, runtime, sm_bytes, control, out);
 }
 
 GraphRestoreStatus
@@ -222,33 +169,4 @@ retire_graph_restore(GraphSlotRegistry *registry, uint64_t attempt, const GraphR
     return GraphRestoreStatus::Ok;
 }
 
-GraphRestoreStatus
-acquire_graph_restore_result(const GraphSlotRegistry *registry, uint64_t generation, GraphRestoreResult &out) noexcept {
-    if (registry == nullptr || generation == 0 || reinterpret_cast<uintptr_t>(registry) % 1024 != 0)
-        return GraphRestoreStatus::NotReady;
-    GraphSlotRegistration slot{};
-    const auto status = acquire_graph_execution_slot(registry, registry->device_id, registry->runtime_binary_id, slot);
-    if (status == GraphSlotStatus::Poisoned) return GraphRestoreStatus::Poisoned;
-    if (status != GraphSlotStatus::Ok) return GraphRestoreStatus::NotReady;
-    const auto &control = registry->restore;
-    cache_invalidate_range(&control, sizeof(control));
-    if (__atomic_load_n(&control.phase, __ATOMIC_ACQUIRE) != static_cast<uint32_t>(GraphRestorePhase::Ready) ||
-        control.attempt != generation || control.committed_generation != generation ||
-        control.status != static_cast<uint32_t>(GraphRestoreStatus::Ok) ||
-        control.runtime_address < slot.destinations[1].address ||
-        !graph_span_fits(
-            control.runtime_address - slot.destinations[1].address, sizeof(RuntimeContext),
-            slot.destinations[1].capacity
-        ))
-        return GraphRestoreStatus::NotReady;
-    for (size_t i = 0; i < 4; ++i)
-        if (control.live_bytes[i] > slot.destinations[i].capacity) return GraphRestoreStatus::NotReady;
-    for (size_t i = 1; i < 4; ++i)
-        if (control.live_bytes[i])
-            cache_invalidate_range(reinterpret_cast<const void *>(slot.destinations[i].address), control.live_bytes[i]);
-    out = {
-        reinterpret_cast<RuntimeContext *>(control.runtime_address), generation, control.sm_bytes, control.total_tasks
-    };
-    return GraphRestoreStatus::Ok;
-}
 }  // namespace hbg

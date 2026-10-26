@@ -32,7 +32,8 @@ This borrowed intermediate is consumed by `make_graph_launch_template`, which
 produces an independently owned immutable packet. Kernel submission uses that
 packet and a prepared working slot, never the program upload path. Device
 admission checks the independently registered slot and trusted callable metadata.
-The leader restores the packet into that slot before dispatch; see
+Ordered DMA publishes the Host-validated image into that slot; the leader
+attaches it before dispatch. See
 [execution-slot registration and restoration](host-build-graph-kernel-slot.md).
 
 ## Graph requirements and context capacity
@@ -148,7 +149,7 @@ after an earlier launch has joined the internal streams to that capture.
 Each launch publishes an immutable prepared image by ordered DMA and submits
 fixed metadata through the shared three-stream binder. The prepared entry
 validates participant metadata collectively before attach; see
-[prepared execution](host-build-graph-kernel-slot.md#prepared-public-entry).
+[prepared execution](host-build-graph-kernel-slot.md#host-publication-and-prepared-attach).
 Enqueue failures poison the context. Callable prepare and captured replay do
 not depend on an earlier capture or eager launch having executed.
 
@@ -260,21 +261,21 @@ overflow, alignment, disjoint destination
 ranges, canonical region order and image lengths bounded by capacity. A checksum
 covers the
 common header, HBG binding/identity, descriptors, padding and payload, excluding
-only the checksum and the single patched address. It detects accidental
+only the checksum and the reserved-zero inline address field. It detects accidental
 corruption; it cannot replace H3's independent device registry trust check or
-the leader image validation and restore described in
+Host image validation and the prepared entry described in
 [execution-slot registration and restoration](host-build-graph-kernel-slot.md).
 
 Version 6 uses the common FNV-1a checksum. Host and device must use the same
 runtime revision; older packet versions are rejected and captures must be recreated.
 The outer K1 invocation ABI remains unchanged.
 
-`make_graph_host_args` and `submit_graph_template` provide canonical serialization
-copies for validation consumers. The public kernel owner instead constructs a
-432-byte `GraphPreparedDispatch` with `make_graph_prepared_dispatch` and submits
-it with `launch_graph_prepared`, using zero CANN placeholders. Its FNV-1a checksum
-covers metadata; the immutable, Host-validated image travels through separate
-captured H2D nodes. Replay transfers every live region. Replacing a template
+`make_graph_prepared_dispatch` validates the canonical template and complete
+image on the Host and constructs a 432-byte `GraphPreparedDispatch`.
+The kernel owner submits this fixed record with `launch_graph_prepared`, using
+zero CANN placeholders. Its FNV-1a checksum covers metadata; the immutable,
+Host-validated image travels through separate captured H2D nodes. Replay
+transfers every live region. Replacing a template
 retains sources used by capture until externally quiescent context close.
 The HBG Host owner reads capture status on each submission, including cache hits.
 On an eager template miss, a completed earlier eager tail permits releasing
@@ -296,10 +297,8 @@ scheduler queues and runtime pointers are initialized by the leader attach.
 The prepared path reuses a successfully retired mailbox only for the immediately
 preceding committed attempt at the same runtime address; otherwise it initializes
 an empty mailbox.
-The AICPU-only prefix is published by coherence and release/acquire; explicit
-canonical restore flushes cover the serialized Runtime tail, Definitions and A5
-scheduler. Prepared entry instead invalidates every live image region on each
-executing role before attach. After all execution and cleanup readers finish,
+The AICPU-only prefix is published by coherence and release/acquire. Prepared
+entry invalidates every live image region on each executing role before attach. After all execution and cleanup readers finish,
 successful prepared retirement maintains the mutable task-state prefix and
 Runtime state; immutable fanin and argument pools are excluded from image
 tail maintenance.

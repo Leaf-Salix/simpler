@@ -25,7 +25,6 @@ inline constexpr uint32_t GRAPH_PACKET_MAGIC = 0x50474248;  // HBGP
 inline constexpr uint16_t GRAPH_PACKET_VERSION = 6;
 
 enum class GraphImageKind : uint32_t { Runtime = 1, Definitions = 2, Scheduler = 3 };
-enum class GraphPacketAddress : uint32_t { HostTemplate, DeviceCopy };
 enum class GraphPacketStatus : uint32_t {
     Ok,
     InvalidEnvelope,
@@ -40,7 +39,7 @@ struct GraphDestination {
     uint64_t capacity;
 };
 
-// Offsets are relative to inline_payload_addr and the selected destination.
+// Offsets are relative to the canonical payload and the selected destination.
 struct GraphImageRegion {
     GraphImageKind kind;
     uint32_t reserved;
@@ -58,7 +57,7 @@ struct GraphPacketHeader {
     uint64_t total_bytes;
     uint64_t payload_offset;  // From this header, past the region table and padding.
     uint64_t payload_bytes;
-    uint64_t inline_payload_addr;  // Zero in the template; one CANN placeholder.
+    uint64_t inline_payload_addr;  // Reserved zero; retained in the v6 checksum layout.
     uint64_t checksum;             // Accidental-corruption check, not authentication.
     uint64_t slot_generation;      // Independent of callable residency generation in K9.
     uint64_t callable_hash;
@@ -108,8 +107,7 @@ inline uint64_t graph_packet_checksum(const void *packet, size_t size) noexcept 
 // Allocation-free framing validation. No device destination is read or written.
 // Registry identity checks and semantic validation of restored images precede
 // execution separately; a checksum-valid packet alone never authorizes restore.
-inline GraphPacketStatus
-validate_graph_packet(const void *packet, size_t size, GraphPacketAddress address_mode) noexcept {
+inline GraphPacketStatus validate_graph_packet(const void *packet, size_t size) noexcept {
     constexpr size_t prefix = sizeof(SimplerKernelInvocationHeader);
     if (packet == nullptr || size < prefix + sizeof(GraphPacketHeader) || size > UINT32_MAX)
         return GraphPacketStatus::InvalidEnvelope;
@@ -138,11 +136,7 @@ validate_graph_packet(const void *packet, size_t size, GraphPacketAddress addres
         return GraphPacketStatus::InvalidHeader;
     const uint64_t base = reinterpret_cast<uintptr_t>(packet);
     if (!graph_span_fits(base, size, UINT64_MAX)) return GraphPacketStatus::InvalidHeader;
-    const uint64_t expected_address = base + prefix + payload_offset;
-    if ((address_mode == GraphPacketAddress::HostTemplate && header.inline_payload_addr != 0) ||
-        (address_mode == GraphPacketAddress::DeviceCopy && header.inline_payload_addr != expected_address) ||
-        (address_mode != GraphPacketAddress::HostTemplate && address_mode != GraphPacketAddress::DeviceCopy))
-        return GraphPacketStatus::InvalidHeader;
+    if (header.inline_payload_addr != 0) return GraphPacketStatus::InvalidHeader;
     for (uint64_t i = table_end; i < payload_offset; ++i)
         if (bytes[prefix + i] != 0) return GraphPacketStatus::InvalidHeader;
     for (size_t i = 0; i < 4; ++i) {

@@ -24,7 +24,7 @@ enum class GraphRestoreStatus : uint32_t {
     InvalidImage,
     Busy,
     Exhausted,
-    CopyFailed,
+    InitializationFailed,
     NotReady,
     Quarantined,
     Poisoned
@@ -46,29 +46,6 @@ struct GraphRestoreResult {
     uint32_t total_tasks{0};
 };
 
-// Optional synchronous memory backend. A failed operation may have written a
-// prefix, but no dispatch is published. Null operations select device defaults.
-struct GraphRestoreOps {
-    void *context{nullptr};
-    bool (*copy)(void *, void *, const void *, size_t){nullptr};
-    bool (*flush)(void *, const void *, size_t){nullptr};
-};
-
-// Called by the AICPU leader after Start and before opening the dispatch window.
-// The owner excludes prior execution/readers, serializes this entire operation
-// with close/registration, and retains immutable packet/callable storage.
-// Source admission and image checks finish before any destination is written.
-// Tensor heap contents are uninitialized; task writers and Graph materialization
-// initialize their data and execution metadata independently of image restore.
-// Ready remains occupied until retirement; Failed remains quarantined until
-// controlled cleanup or terminal poisoning. Every admitted retry restores all image regions.
-// out changes only on success. This function neither launches nor synchronizes.
-GraphRestoreStatus restore_graph_packet(
-    const void *packet, size_t bytes, int device_id, uint64_t runtime_binary_id,
-    const simpler::kernel::PreparedInvocationView &trusted_callable, GraphRestoreResult &out,
-    const GraphRestoreOps &ops = {}
-) noexcept;
-
 // The Host validates the complete image before enqueueing DMA. Every participant
 // has invalidated its copied spans after DMA and joined before this leader call.
 // slot comes from the independently acquired live context registry. The owner
@@ -87,11 +64,5 @@ GraphRestoreStatus attach_prepared_graph_image(
 // The owner serializes this with restore, registration, poisoning and close.
 GraphRestoreStatus
 retire_graph_restore(GraphSlotRegistry *registry, uint64_t attempt, const GraphRestoreCompletion &completion) noexcept;
-
-// The kernel entry distributes the successful leader's generation through its
-// per-invocation barrier. Peers must never sample an unversioned old Ready flag.
-// The execution lease prevents another restore until these readers have exited.
-GraphRestoreStatus
-acquire_graph_restore_result(const GraphSlotRegistry *registry, uint64_t generation, GraphRestoreResult &out) noexcept;
 
 }  // namespace hbg
