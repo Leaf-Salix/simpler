@@ -507,10 +507,10 @@ def buffer_reference(
 
 
 def remote_backing_identity(owner_worker_id: int, buffer_id: int, generation: int) -> CanonicalIdentity:
-    """The canonical identity of a backing that lives on another machine's worker.
+    """The protocol-derived identity of an ordinary remote allocation.
 
-    A remote owner's ``owner_instance_id`` never crosses the remote L3 wire, so the nonce is the
-    owning worker's id instead. This is the single rule for naming a remote backing: the submitting
+    An ordinary allocation's ``owner_instance_id`` does not cross the remote L3 wire, so its nonce
+    is the owning worker's id instead. For these allocations, the submitting
     L4's ``REMOTE_SIDECAR`` placeholder and the importing session runner both derive from it, so one
     remote backing carries one identity on both sides of the hop.
     """
