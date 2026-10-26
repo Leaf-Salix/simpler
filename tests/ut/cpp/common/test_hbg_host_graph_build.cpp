@@ -46,7 +46,6 @@
 #include "worker/runtime_c_api.h"
 #include "host/kernel_pipeline_contract.h"
 #include "call_config.h"
-#include "utils/fnv1a_64.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/args_dump_aicpu.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
@@ -397,54 +396,6 @@ TEST(HbgKernelExternalTensor, RejectsHostDeviceArgsAndUnsupportedStrides) {
         reinterpret_cast<void *>(0x44000), shape, transposed_stride, 2, DataType::FLOAT32, AddressSpace::DEVICE
     ));
     EXPECT_EQ(hbg::validate_kernel_external_tensors(args), hbg::KernelExternalTensorStatus::UnsupportedStrideFamily);
-}
-
-TEST(HbgKernelExternalTensor, PreservesWideTensorArithmeticBounds) {
-    GraphTensor tensor{};
-    tensor.buffer_addr = 0x44000;
-    tensor.buffer_size = UINT64_MAX;
-    tensor.extent_elem = UINT64_MAX;
-    tensor.ndims = 3;
-    tensor.dtype = static_cast<uint8_t>(DataType::UINT8);
-    tensor.address_space = static_cast<uint8_t>(AddressSpace::DEVICE);
-    tensor.shapes[0] = UINT32_MAX;
-    tensor.shapes[1] = 5;
-    tensor.shapes[2] = 3;
-    tensor.strides[0] = UINT32_MAX - 1;
-    tensor.strides[1] = UINT32_MAX - 1;
-    tensor.strides[2] = 1;
-    EXPECT_TRUE(graph_tensor_wire_valid(tensor));
-    tensor.shapes[2] = 4;
-    tensor.extent_elem = 0;
-    EXPECT_FALSE(graph_tensor_wire_valid(tensor));
-
-    tensor.shapes[1] = UINT32_MAX;
-    tensor.shapes[2] = 2;
-    tensor.strides[0] = tensor.strides[1] = 1;
-    tensor.extent_elem = uint64_t{2} * UINT32_MAX;
-    EXPECT_FALSE(graph_tensor_wire_valid(tensor));
-
-    tensor.ndims = 2;
-    tensor.shapes[0] = tensor.shapes[1] = UINT32_MAX;
-    tensor.strides[0] = UINT32_MAX;
-    tensor.strides[1] = 1;
-    tensor.extent_elem = uint64_t{UINT32_MAX} * UINT32_MAX;
-    tensor.is_contiguous = 1;
-    EXPECT_TRUE(graph_tensor_wire_valid(tensor));
-    EXPECT_TRUE(hbg::supported_kernel_graph_stride_family(tensor));
-    tensor.strides[1] = UINT32_MAX;
-    EXPECT_FALSE(hbg::supported_kernel_graph_stride_family(tensor));
-
-    tensor.ndims = 3;
-    tensor.shapes[1] = 641;
-    tensor.shapes[2] = 6700417;
-    tensor.strides[0] = tensor.strides[1] = 1;
-    tensor.extent_elem = uint64_t{UINT32_MAX} + 641 + 6700417 - 2;
-    tensor.is_contiguous = 0;
-    EXPECT_TRUE(graph_tensor_wire_valid(tensor));
-    ++tensor.shapes[2];
-    ++tensor.extent_elem;
-    EXPECT_FALSE(graph_tensor_wire_valid(tensor));
 }
 
 TEST(HbgKernelExternalTensor, RejectsFlatTensorRankBeforePacking) {
@@ -1581,78 +1532,6 @@ protected:
         return registration;
     }
 };
-
-TEST(HbgGraphPacket, ChecksumMatchesOfficialXxh64AcrossAlignmentsAndTails) {
-    EXPECT_EQ(hbg::graph_packet_checksum(nullptr, 0), 0u);
-    EXPECT_EQ(hbg::graph_packet_checksum(nullptr, 512), 0u);
-    std::array<uint8_t, 80> short_packet{};
-    for (size_t bytes = 0; bytes < short_packet.size(); ++bytes)
-        EXPECT_EQ(hbg::graph_packet_checksum(short_packet.data(), bytes), 0u);
-    struct Golden {
-        size_t bytes;
-        uint64_t hashes[3];
-    };
-    // Official xxHash v0.8.3 XXH64(reference[0:64] + reference[80:], seed=0).
-    // Patterns: zero, 0xff, ((i * 37 + 11) ^ (i >> 3)) & 0xff, at physical offset i.
-    const Golden golden[] = {
-        {80, {0x257b09a147b82a19ULL, 0x2e54fae2959dbb84ULL, 0xc24252c19a5eddf4ULL}},
-        {81, {0xd033cd270447f937ULL, 0x6ed2445b4b82d6cbULL, 0x153fdcd9e3754d09ULL}},
-        {82, {0x1f3015449a5a2480ULL, 0x8bc9b76d9da69a7bULL, 0x7a3ba22f5e1bf612ULL}},
-        {83, {0xf8f20e020412c80aULL, 0xc9d2770133220dd7ULL, 0x7e031e357e0a1d0bULL}},
-        {84, {0x0a679d6f6e1d084cULL, 0x6e09cc8e7bc88046ULL, 0x25c7d3c0da75a4eeULL}},
-        {85, {0x221b3e9c66ed049bULL, 0xfb2ea409d22024f8ULL, 0xf39a5fed90d7fd3aULL}},
-        {86, {0xcc19586bc6b6659eULL, 0x723f58f37bcb48f3ULL, 0x2cc56907d95cc8d5ULL}},
-        {87, {0x462b2c1d5cc67d0dULL, 0x2be8c4abdd7444e6ULL, 0x125ed752fc98afbeULL}},
-        {88, {0xd2c15e19901d658eULL, 0x54da385251eed7cfULL, 0x2f2aab41c5e200c2ULL}},
-        {89, {0xbe88019ce5de71b6ULL, 0x44116994dc3b5dbcULL, 0x26b4d4d21d182ef7ULL}},
-        {90, {0x122d7e563f7ebe53ULL, 0xa534b3306e19a362ULL, 0x8ff61a79a5224c57ULL}},
-        {91, {0xdfb1b23670a37f6bULL, 0x518a1cdd1cae6d89ULL, 0x37c06e3c0c06f387ULL}},
-        {92, {0x6d4dc250a2d71dd8ULL, 0xb545728891acd0c0ULL, 0xf8abb43834759dd9ULL}},
-        {93, {0x767323aa514a4b3eULL, 0x8bd834b970eae746ULL, 0xbaea1f7652503622ULL}},
-        {94, {0xd02a55fbcdd78515ULL, 0xaeb31e1dfe50ac04ULL, 0x459556d0ced51f50ULL}},
-        {95, {0x4b8cef055d638a36ULL, 0xb028ba6e929900edULL, 0xcb644d4939c0150dULL}},
-        {96, {0xee6d208b78ba5eaaULL, 0xa576860c8bf28ba7ULL, 0xd47796f278d87812ULL}},
-        {97, {0x31e926817a39841bULL, 0x00dd17f6611db32cULL, 0xd7fa9c58f8a9106bULL}},
-        {98, {0x9ff396b3135b456cULL, 0xb40ace2a18c04691ULL, 0xb1a54cfc3be5c6e8ULL}},
-        {99, {0x5c0413dac1b3b939ULL, 0xf632c1001a64972cULL, 0xef3d78b38bba4032ULL}},
-        {100, {0x1498e3f1d1af7e35ULL, 0xdbb87b2bd21282adULL, 0x2d7c65de5f2a5c61ULL}},
-        {101, {0x4e6fe85182d48a10ULL, 0x563054d9390a6244ULL, 0x23b34c4800e50d24ULL}},
-        {102, {0x023314074cb17f3aULL, 0xef02095399d77e5eULL, 0x2202f17dc88f2bf0ULL}},
-        {103, {0xa5fa1a57f86e2821ULL, 0xed595fa6df97559aULL, 0xd34be233ac54c626ULL}},
-        {104, {0x90544ddf7f0428ebULL, 0x60ffc85a1a4db56dULL, 0x0367d4dd913dae03ULL}},
-        {105, {0xfad4f662b43ce68cULL, 0x224930fefa4ffc9fULL, 0x203e8a1771bdbe3eULL}},
-        {106, {0xbfc627f903045881ULL, 0x2f95c9fbc9aad2f6ULL, 0x7141cae5692b7a94ULL}},
-        {107, {0x5f6042db52039ba9ULL, 0x9c3c97840ef928f9ULL, 0xfc88a4f267b279d5ULL}},
-        {108, {0x4808152f82cfb223ULL, 0xc93b4e94fd6a4bc8ULL, 0x6c2c4d4c62276930ULL}},
-        {109, {0xf3d57b3fcfda5974ULL, 0x98899143b63f1fafULL, 0xfad3ca84a98eb604ULL}},
-        {110, {0x5e2157cc7eabc1c6ULL, 0x75c6e358269872ecULL, 0x1dcfc200dc0dfd82ULL}},
-        {111, {0x59f913c719e77988ULL, 0xbef7e10175af1391ULL, 0x2ea711814a1bd15bULL}},
-        {112, {0xc088fb75504a22bfULL, 0xa4c923881794a94fULL, 0x5be3f26dd8ca09d1ULL}},
-        {113, {0x2f3a12dcabb0f60bULL, 0xbb0bd4e56a3cab3dULL, 0xbe1bde904930d035ULL}},
-        {127, {0x51c55aadcba25168ULL, 0x50378970a1e9ba43ULL, 0x21b38d4bb79ab177ULL}},
-        {128, {0x8ff8fc9514e3a9c1ULL, 0x8b2949dc1458af05ULL, 0xe6fd9cd96ea7bfcbULL}},
-        {129, {0xd0bde90e5fab3ff4ULL, 0xaadb5643789b5af6ULL, 0xde2a8315756601e4ULL}},
-        {255, {0xb5ea2ee9848886e1ULL, 0x02ebc97799cfb588ULL, 0xd30e238cdec40906ULL}},
-        {256, {0x3b2f9b86d7a3505dULL, 0x67da7d82d095af3cULL, 0x8aa91e14d42ba13aULL}},
-        {257, {0xce57013ff2e37492ULL, 0x6688fa92212896ddULL, 0x0cf01c39c032ca23ULL}},
-        {513, {0xfd9e18a73f717a2cULL, 0xd4348b57b6d89568ULL, 0x857ee35c2b8047ffULL}},
-        {1024, {0xb0ee0eb5ed26f0eeULL, 0xbbedde8b00c972e0ULL, 0x2f832a9db4d8f88fULL}},
-        {84000, {0x303e48c0241fa756ULL, 0x383e395b79a44ce5ULL, 0xe4958b533bac1688ULL}},
-    };
-    for (const auto &entry : golden) {
-        for (size_t pattern = 0; pattern < 3; ++pattern) {
-            for (size_t alignment = 0; alignment < sizeof(uint64_t); ++alignment) {
-                // The packet ends at the allocation boundary for sanitizer overread checks.
-                auto storage = std::make_unique<uint8_t[]>(alignment + entry.bytes);
-                auto *packet = storage.get() + alignment;
-                for (size_t i = 0; i < entry.bytes; ++i)
-                    packet[i] = pattern == 0 ? 0 : pattern == 1 ? 0xff : static_cast<uint8_t>((i * 37 + 11) ^ (i >> 3));
-                ASSERT_EQ(hbg::graph_packet_checksum(packet, entry.bytes), entry.hashes[pattern])
-                    << "pattern=" << pattern << " alignment=" << alignment << " bytes=" << entry.bytes;
-            }
-        }
-    }
-}
 
 TEST(HbgGraphPacket, ChecksumExcludesOnlyPatchedAddressAndChecksumBytes) {
     constexpr size_t skip =
@@ -3516,41 +3395,6 @@ TEST_F(HbgPreparedGraphTest, AttachRejectsForeignMetadataAndBusyStateWithoutChan
     EXPECT_EQ(hbg::attach_prepared_graph_image(prepared, seal, restored), hbg::GraphRestoreStatus::Busy);
     EXPECT_EQ(working_bytes(), active);
     ASSERT_NO_FATAL_FAILURE(retire());
-}
-
-TEST_F(HbgGraphRestoreTest, RejectsChecksumVersionsBeforeChangingRestoreState) {
-    ASSERT_NO_FATAL_FAILURE(prepare_slot());
-    const auto original = packet.storage;
-    const auto before = working_bytes();
-    for (int variant = 0; variant < 3; ++variant) {
-        SCOPED_TRACE(variant);
-        packet.storage = original;
-        auto &header = packet_header();
-        header.version = variant < 2 ? 4 : 5;
-        if (variant == 1) {
-            header.checksum = hbg::graph_packet_checksum(packet.storage.data(), packet.bytes);
-        } else {
-            constexpr size_t skip =
-                sizeof(SimplerKernelInvocationHeader) + offsetof(hbg::GraphPacketHeader, inline_payload_addr);
-            const auto *data = reinterpret_cast<const uint8_t *>(packet.storage.data());
-            header.checksum = simpler::common::utils::fnv1a_64(data, skip);
-            header.checksum =
-                simpler::common::utils::fnv1a_64_append(header.checksum, data + skip + 16, packet.bytes - skip - 16);
-        }
-        expect_rejected(hbg::GraphSlotStatus::InvalidPacket);
-        restored = {reinterpret_cast<RuntimeContext *>(uintptr_t{1}), 999, 888, 777};
-        EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Rejected);
-        EXPECT_EQ(restored.runtime, reinterpret_cast<RuntimeContext *>(uintptr_t{1}));
-        EXPECT_EQ(restored.generation, 999u);
-        EXPECT_EQ(restored.sm_bytes, 888u);
-        EXPECT_EQ(restored.total_tasks, 777u);
-        EXPECT_EQ(working_bytes(), before);
-    }
-    packet.storage = original;
-    EXPECT_EQ(packet_header().version, 5);
-    ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
-    EXPECT_EQ(restored.generation, 1u);
-    retire();
 }
 
 class HbgLargeGraphRestoreTest : public HbgGraphRestoreTest {

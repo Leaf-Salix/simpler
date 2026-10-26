@@ -234,7 +234,7 @@ The canonical packet layout is:
 
 ```text
 SimplerKernelInvocationHeader (sizeof the shared K1 header)
-GraphPacketHeader            (200 bytes, HBG format version 5)
+GraphPacketHeader            (200 bytes, HBG format version 6)
 GraphImageRegion[]           (32 bytes each)
 zero padding to a 64-byte relative offset
 inline payload:
@@ -265,7 +265,7 @@ corruption; it cannot replace H3's independent device registry trust check or
 the leader image validation and restore described in
 [execution-slot registration and restoration](host-build-graph-kernel-slot.md).
 
-Version 5 uses the XXH64 checksum with seed zero. Host and device must use the same
+Version 6 uses the common FNV-1a checksum. Host and device must use the same
 runtime revision; older packet versions are rejected and captures must be recreated.
 The outer K1 invocation ABI remains unchanged.
 
