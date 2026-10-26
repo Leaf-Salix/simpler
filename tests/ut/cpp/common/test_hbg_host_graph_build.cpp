@@ -32,7 +32,6 @@
 #include "host_build_graph/kernel_callable_binding.h"
 #include "host_build_graph/kernel_argument_snapshot.h"
 #include "host_build_graph/kernel_graph_template.h"
-#include "host_build_graph/kernel_graph_dispatch.h"
 #include "host_build_graph/kernel_graph_prepared.h"
 #include "host_build_graph/kernel_graph_slot.h"
 #include "host_build_graph/kernel_graph_slot_registry.h"
@@ -1564,7 +1563,7 @@ protected:
         );
         return out;
     }
-    hbg::HbgCallableRegistration dispatch_registration() const {
+    hbg::HbgCallableRegistration callable_registration() const {
         const auto graph = header();
         hbg::HbgCallableRegistration registration{};
         registration.context_generation = graph.slot_generation;
@@ -1730,108 +1729,6 @@ TEST_F(HbgGraphPacketTest, SnapshotOwnsImagesAndPreservesSourceAndDeviceMemory) 
     ASSERT_EQ(hbg::make_graph_host_args(snapshot, args), 0);
     EXPECT_EQ(bytes(), original);
     EXPECT_EQ(std::memcmp(args.storage.data(), original.data(), args.bytes), 0);
-}
-
-TEST_F(HbgGraphPacketTest, DispatchKeepsCanonicalPacketAndRelocatesBothPlaceholders) {
-    ASSERT_EQ(build(chain_entry), 2);
-    prepare();
-    ASSERT_EQ(snapshot_graph(), 0);
-    const auto original = bytes();
-    const auto registration = dispatch_registration();
-    hbg::GraphHostArgs canonical;
-    hbg::GraphHostArgs args;
-    ASSERT_EQ(hbg::make_graph_host_args(snapshot, canonical), 0);
-    ASSERT_EQ(hbg::make_graph_dispatch_args(snapshot, registration, args), 0);
-    hbg::GraphDispatchHeader dispatch{};
-    ASSERT_TRUE(hbg::read_graph_dispatch_header(args.storage.data(), sizeof(dispatch), dispatch));
-    EXPECT_EQ(std::memcmp(&dispatch.registration, &registration, sizeof(registration)), 0);
-    EXPECT_EQ(args.bytes, sizeof(dispatch) + original.size());
-    EXPECT_EQ(args.address_offset, sizeof(dispatch) + canonical.address_offset);
-    EXPECT_EQ(args.data_offset, sizeof(dispatch) + canonical.data_offset);
-    auto *inner = reinterpret_cast<std::byte *>(args.storage.data()) + sizeof(dispatch);
-    EXPECT_EQ(std::memcmp(inner, original.data(), original.size()), 0);
-    const uint64_t address = reinterpret_cast<uintptr_t>(args.storage.data()) + args.data_offset;
-    std::memcpy(reinterpret_cast<std::byte *>(args.storage.data()) + args.address_offset, &address, sizeof(address));
-    EXPECT_EQ(
-        hbg::validate_graph_packet(inner, original.size(), hbg::GraphPacketAddress::DeviceCopy),
-        hbg::GraphPacketStatus::Ok
-    );
-    EXPECT_TRUE(hbg::read_graph_dispatch_header(args.storage.data(), sizeof(dispatch), dispatch));
-    inner[original.size() - 1] ^= std::byte{1};
-    EXPECT_EQ(
-        hbg::validate_graph_packet(inner, original.size(), hbg::GraphPacketAddress::DeviceCopy),
-        hbg::GraphPacketStatus::InvalidChecksum
-    );
-    EXPECT_EQ(bytes(), original);
-    const auto previous = args.storage;
-    auto conflict = registration;
-    ++conflict.function_hash;
-    EXPECT_EQ(hbg::make_graph_dispatch_args(snapshot, conflict, args), PTO_RUNTIME_ERR_INTERNAL);
-    EXPECT_EQ(args.storage, previous);
-}
-
-TEST_F(HbgGraphPacketTest, DispatchPrefixRejectsDamageAndFramingWithoutChangingOutput) {
-    ASSERT_EQ(build(chain_entry), 2);
-    prepare();
-    ASSERT_EQ(snapshot_graph(), 0);
-    hbg::GraphHostArgs args;
-    ASSERT_EQ(hbg::make_graph_dispatch_args(snapshot, dispatch_registration(), args), 0);
-    hbg::GraphDispatchHeader good{};
-    ASSERT_TRUE(hbg::read_graph_dispatch_header(args.storage.data(), sizeof(good), good));
-    hbg::GraphDispatchHeader output{};
-    std::memset(static_cast<void *>(&output), 0xa5, sizeof(output));
-    const auto unchanged = output;
-    auto rejected = [&](const void *data, size_t size) {
-        EXPECT_FALSE(hbg::read_graph_dispatch_header(data, size, output));
-        EXPECT_EQ(std::memcmp(&output, &unchanged, sizeof(output)), 0);
-    };
-    rejected(nullptr, sizeof(good));
-    for (size_t size = 0; size < sizeof(good); ++size)
-        rejected(&good, size);
-    for (size_t alignment = 0; alignment < 8; ++alignment) {
-        auto exact = std::make_unique<uint8_t[]>(sizeof(good) + alignment);
-        auto *data = exact.get() + alignment;
-        std::memcpy(data, &good, sizeof(good));
-        hbg::GraphDispatchHeader parsed{};
-        ASSERT_TRUE(hbg::read_graph_dispatch_header(data, sizeof(good), parsed));
-        EXPECT_EQ(std::memcmp(&parsed, &good, sizeof(good)), 0);
-        for (size_t byte = 0; byte < sizeof(good); ++byte) {
-            for (unsigned bit = 0; bit < 8; ++bit) {
-                data[byte] ^= uint8_t{1} << bit;
-                rejected(data, sizeof(good));
-                data[byte] ^= uint8_t{1} << bit;
-            }
-        }
-    }
-    std::vector<hbg::GraphDispatchHeader> invalid;
-    auto bad = good;
-    bad.version++;
-    invalid.push_back(bad);
-    bad = good;
-    bad.header_bytes--;
-    invalid.push_back(bad);
-    bad = good;
-    bad.packet_bytes = UINT64_MAX;
-    invalid.push_back(bad);
-    bad = good;
-    bad.packet_bytes = sizeof(SimplerKernelInvocationHeader) + sizeof(hbg::GraphPacketHeader) - 1;
-    invalid.push_back(bad);
-    bad = good;
-    bad.invocation.reserved_ = 1;
-    invalid.push_back(bad);
-    bad = good;
-    bad.invocation.host_copy_tensor_count = 1;
-    invalid.push_back(bad);
-    bad = good;
-    bad.registration.context_generation = 0;
-    invalid.push_back(bad);
-    bad = good;
-    bad.registration.tensor_count++;
-    invalid.push_back(bad);
-    for (auto &candidate : invalid) {
-        candidate.checksum = hbg::graph_dispatch_checksum(candidate);
-        rejected(&candidate, sizeof(candidate));
-    }
 }
 
 TEST_F(HbgGraphPacketTest, DefinitionSnapshotsIncludeRetainedSpilledAndRepeatedGraphs) {
@@ -2152,48 +2049,6 @@ TEST_F(HbgGraphPacketTest, RejectsUnpreparedContextAndAllowsConcurrentLaunchCopi
     auto second = std::async(std::launch::async, copy);
     EXPECT_TRUE(first.get());
     EXPECT_TRUE(second.get());
-    const auto registration = dispatch_registration();
-    auto copy_dispatch = [&]() {
-        hbg::GraphHostArgs args;
-        if (hbg::make_graph_dispatch_args(snapshot, registration, args) != 0) return false;
-        hbg::GraphDispatchHeader dispatch{};
-        if (!hbg::read_graph_dispatch_header(args.storage.data(), sizeof(dispatch), dispatch)) return false;
-        const auto *inner = reinterpret_cast<const std::byte *>(args.storage.data()) + sizeof(dispatch);
-        return hbg::validate_graph_packet(inner, dispatch.packet_bytes, hbg::GraphPacketAddress::HostTemplate) ==
-               hbg::GraphPacketStatus::Ok;
-    };
-    auto dispatch_first = std::async(std::launch::async, copy_dispatch);
-    auto dispatch_second = std::async(std::launch::async, copy_dispatch);
-    EXPECT_TRUE(dispatch_first.get());
-    EXPECT_TRUE(dispatch_second.get());
-}
-
-TEST_F(HbgGraphPacketTest, DispatchSubmissionPropagatesFailureWithoutChangingTemplate) {
-    ASSERT_EQ(build(chain_entry), 2);
-    prepare();
-    ASSERT_EQ(snapshot_graph(), 0);
-    const auto original = bytes();
-    int calls = 0;
-    const hbg::GraphHostLaunchOps ops{
-        &calls, [](void *opaque, hbg::GraphHostArgs &args) -> int {
-            ++*static_cast<int *>(opaque);
-            hbg::GraphDispatchHeader dispatch{};
-            EXPECT_TRUE(hbg::read_graph_dispatch_header(args.storage.data(), sizeof(dispatch), dispatch));
-            const uint64_t address = reinterpret_cast<uintptr_t>(args.storage.data()) + args.data_offset;
-            std::memcpy(
-                reinterpret_cast<std::byte *>(args.storage.data()) + args.address_offset, &address, sizeof(address)
-            );
-            const auto *inner = reinterpret_cast<const std::byte *>(args.storage.data()) + sizeof(dispatch);
-            EXPECT_EQ(
-                hbg::validate_graph_packet(inner, dispatch.packet_bytes, hbg::GraphPacketAddress::DeviceCopy),
-                hbg::GraphPacketStatus::Ok
-            );
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-    };
-    EXPECT_EQ(hbg::submit_graph_dispatch(snapshot, dispatch_registration(), ops), PTO_RUNTIME_ERR_INTERNAL);
-    EXPECT_EQ(calls, 1);
-    EXPECT_EQ(bytes(), original);
 }
 
 TEST_F(HbgGraphPacketTest, LaunchBridgeCopiesEachPacketAndPropagatesSubmissionFailure) {
@@ -2414,114 +2269,10 @@ protected:
     }
 };
 
-TEST_F(HbgGraphSlotTest, DispatchBoundsIncludeThePrefixAndRejectStaleContextAuthority) {
-    prepare_slot();
-    const auto before = working_bytes();
-    auto registration = dispatch_registration();
-    // Prefix/slot admission must not dereference this prepare-owned address.
-    registration.runtime_address = 1;
-    hbg::GraphHostArgs args;
-    ASSERT_EQ(hbg::make_graph_dispatch_args(snapshot, registration, args), 0);
-    hbg::GraphDispatchHeader dispatch{};
-    ASSERT_TRUE(hbg::read_graph_dispatch_header(args.storage.data(), sizeof(dispatch), dispatch));
-    ASSERT_TRUE(hbg::graph_dispatch_matches_slot(args.storage.data(), dispatch, seal));
-    auto conflict = dispatch;
-    ++conflict.registration.context_generation;
-    EXPECT_FALSE(hbg::graph_dispatch_matches_slot(args.storage.data(), conflict, seal));
-    conflict = dispatch;
-    ++conflict.registration.device_id;
-    EXPECT_FALSE(hbg::graph_dispatch_matches_slot(args.storage.data(), conflict, seal));
-    conflict = dispatch;
-    ++conflict.registration.runtime_binary_id;
-    EXPECT_FALSE(hbg::graph_dispatch_matches_slot(args.storage.data(), conflict, seal));
-    conflict = dispatch;
-    conflict.packet_bytes = seal.max_packet_bytes + 1;
-    EXPECT_FALSE(hbg::graph_dispatch_matches_slot(args.storage.data(), conflict, seal));
-    const uint64_t begin = reinterpret_cast<uintptr_t>(args.storage.data());
-    const hbg::GraphDestination inner{begin + sizeof(dispatch), dispatch.packet_bytes};
-    for (size_t destination = 0; destination < 5; ++destination) {
-        auto overlap = seal;
-        auto &window = destination == 4 ? overlap.registry : overlap.destinations[destination];
-        window = {begin, sizeof(dispatch)};
-        ASSERT_FALSE(hbg::graph_windows_overlap(inner, window));
-        EXPECT_FALSE(hbg::graph_dispatch_source_fits(args.storage.data(), sizeof(dispatch), overlap));
-        EXPECT_FALSE(hbg::graph_dispatch_matches_slot(args.storage.data(), dispatch, overlap));
-    }
-    EXPECT_FALSE(hbg::graph_dispatch_source_fits(nullptr, sizeof(dispatch), seal));
-    EXPECT_FALSE(hbg::graph_dispatch_source_fits(reinterpret_cast<void *>(UINTPTR_MAX - 8), sizeof(dispatch), seal));
-    EXPECT_EQ(working_bytes(), before);
-}
-
-TEST_F(HbgGraphSlotTest, DispatchConflictRejectsBeforeReadingUnmappedRuntime) {
-    prepare_slot();
-    EXPECT_EXIT(
-        {
-            alarm(5);
-            const auto before = working_bytes();
-            auto registration = dispatch_registration();
-            if (simpler_aicpu_l1_hbg_register_callable(&registration) != 0) _exit(2);
-            registration.runtime_address = 1;
-            hbg::GraphHostArgs args;
-            if (hbg::make_graph_dispatch_args(snapshot, registration, args) != 0) _exit(3);
-            const int rc = consume_kernel_task(args.storage.data());
-            _exit(rc != 0 && working_bytes() == before ? 0 : 1);
-        },
-        ::testing::ExitedWithCode(0), ""
-    );
-}
-
-TEST_F(HbgGraphSlotTest, DispatchPublicationFailureCancelsAndReleasesAllParticipants) {
-    prepare_slot();
-    auto isolated = [&]() {
-        alarm(5);
-        const auto before = working_bytes();
-        Runtime runtime;
-        runtime.set_aicpu_thread_num(4);
-        runtime.set_aicpu_allowed_cpu_count(4);
-        runtime.set_aicpu_launch_count(4);
-        auto registration = dispatch_registration();
-        registration.runtime_address = reinterpret_cast<uintptr_t>(&runtime);
-        if (simpler_aicpu_l1_hbg_register_callable(&registration) != 0) _exit(2);
-        set_platform_regs(registration.register_table_address + 8);
-        hbg::GraphHostArgs args;
-        if (hbg::make_graph_dispatch_args(snapshot, registration, args) != 0) _exit(3);
-        const uint64_t payload = reinterpret_cast<uintptr_t>(args.storage.data()) + args.data_offset;
-        std::memcpy(
-            reinterpret_cast<std::byte *>(args.storage.data()) + args.address_offset, &payload, sizeof(payload)
-        );
-        const auto *inner = reinterpret_cast<const std::byte *>(args.storage.data()) + sizeof(hbg::GraphDispatchHeader);
-        if (hbg::validate_graph_packet(inner, snapshot.size(), hbg::GraphPacketAddress::DeviceCopy) !=
-            hbg::GraphPacketStatus::Ok)
-            _exit(4);
-        for (int round = 0; round < 2; ++round) {
-            runtime.kernel_prelaunch.state = HBG_KERNEL_PRELAUNCH_WAIT;
-            std::array<int, 4> results{};
-            std::vector<std::thread> threads;
-            for (size_t thread = 0; thread < results.size(); ++thread)
-                threads.emplace_back([&, thread] {
-                    results[thread] = consume_kernel_task(args.storage.data());
-                });
-            for (auto &thread : threads)
-                thread.join();
-            if (std::any_of(
-                    results.begin(), results.end(),
-                    [](int rc) {
-                        return rc == 0;
-                    }
-                ) ||
-                runtime.kernel_prelaunch.state != HBG_KERNEL_PRELAUNCH_CANCEL || registry->restore.attempt != 0 ||
-                working_bytes() != before)
-                _exit(1);
-        }
-        _exit(0);
-    };
-    EXPECT_EXIT(isolated(), ::testing::ExitedWithCode(0), "");
-}
-
 TEST_F(HbgGraphSlotTest, KernelDfxRefreshTracksWindowsAndReplacesProgramGlobals) {
     prepare_slot();
     Runtime runtime;
-    auto registration = dispatch_registration();
+    auto registration = callable_registration();
     registration.runtime_address = reinterpret_cast<uintptr_t>(&runtime);
     KernelArgs args{};
     args.runtime_args = &runtime;
@@ -2592,7 +2343,7 @@ TEST_F(HbgGraphSlotTest, KernelDfxRefreshTracksWindowsAndReplacesProgramGlobals)
 TEST_F(HbgGraphSlotTest, KernelDfxRejectsInvalidResidentArgsBeforeBinding) {
     prepare_slot();
     Runtime runtime;
-    auto registration = dispatch_registration();
+    auto registration = callable_registration();
     registration.runtime_address = reinterpret_cast<uintptr_t>(&runtime);
     KernelArgs args{};
     args.runtime_args = &runtime;
@@ -3332,7 +3083,7 @@ protected:
         std::memcpy(&mailbox, saved.data(), saved.size());
     }
     void prepare_dispatch() {
-        ASSERT_EQ(hbg::make_graph_prepared_dispatch(snapshot, dispatch_registration(), prepared), 0);
+        ASSERT_EQ(hbg::make_graph_prepared_dispatch(snapshot, callable_registration(), prepared), 0);
         ASSERT_TRUE(hbg::graph_prepared_dispatch_matches_slot(prepared, seal));
     }
     void publish_image() {
@@ -3434,7 +3185,7 @@ TEST_F(HbgPreparedGraphTest, HostValidationRejectsCorruptSourceAndSemanticImageB
                 hbg::GraphPacketStatus::Ok
             );
         }
-        EXPECT_NE(hbg::make_graph_prepared_dispatch(damaged, dispatch_registration(), prepared), 0);
+        EXPECT_NE(hbg::make_graph_prepared_dispatch(damaged, callable_registration(), prepared), 0);
         EXPECT_EQ(std::memcmp(&prepared, &expected, sizeof(prepared)), 0);
         EXPECT_EQ(working_bytes(), before);
     }
@@ -3530,6 +3281,18 @@ TEST_F(HbgPreparedGraphTest, MetadataRejectsChangedIdentityBoundsAndUnusedRegion
 TEST_F(HbgPreparedGraphTest, MetadataRequiresTheIndependentSlotAndSupportsUnalignedReads) {
     ASSERT_NO_FATAL_FAILURE(prepare_slot());
     ASSERT_NO_FATAL_FAILURE(prepare_dispatch());
+    EXPECT_TRUE(hbg::graph_prepared_source_fits(&prepared, sizeof(prepared), seal));
+    EXPECT_FALSE(hbg::graph_prepared_source_fits(nullptr, sizeof(prepared), seal));
+    EXPECT_FALSE(hbg::graph_prepared_source_fits(reinterpret_cast<void *>(UINTPTR_MAX - 8), sizeof(prepared), seal));
+    for (const auto &destination : seal.destinations) {
+        if (destination.capacity == 0) continue;
+        EXPECT_FALSE(
+            hbg::graph_prepared_source_fits(reinterpret_cast<void *>(destination.address), sizeof(prepared), seal)
+        );
+    }
+    EXPECT_FALSE(
+        hbg::graph_prepared_source_fits(reinterpret_cast<void *>(seal.registry.address), sizeof(prepared), seal)
+    );
     for (int variant = 0; variant < 7; ++variant) {
         SCOPED_TRACE(variant);
         auto foreign = seal;
@@ -3574,7 +3337,7 @@ TEST_F(HbgPreparedGraphTest, SingleParticipantMetadataFailureCollectivelyCancels
                 auto callable = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
                     nullptr, 0, "prepared", nullptr, 0, nullptr, nullptr, 0, ""
                 );
-                auto registration = dispatch_registration();
+                auto registration = callable_registration();
                 registration.runtime_address = reinterpret_cast<uintptr_t>(&execution_runtime);
                 registration.callable_address = reinterpret_cast<uintptr_t>(callable.data());
                 registration.callable_bytes = callable.size();

@@ -132,7 +132,7 @@ Poisoning neither drains device work nor frees resources or resets the device.
 HBG packet version 5 has a 200-byte header containing device ID, runtime
 binary identity and live heap length. The common K1 header keeps the integrated
 ABI; offsets use `sizeof(SimplerKernelInvocationHeader)` and no common-header
-version fields are added. HBG version 1, 2, 3 and 4 packets fail closed.
+version fields are added. HBG version 1 through 4 packets fail closed.
 Callable generation, callable/argument/function
 hashes remain per-invocation fields, so different callables and arguments can
 share a slot. The common callable admission checks ID, effective argument counts and residency
@@ -186,47 +186,30 @@ resource lifetime. Rejection preserves the output and every destination byte.
 
 ### Prepared public entry
 
-The public kernel owner builds a canonical v5 template, validates its framing,
-checksum and full image contents on the Host, then retains an immutable pinned
-copy of its live payload. `GraphPreparedDispatch` is a fixed 432-byte metadata
-record carrying invocation, callable registration, graph header and up to three
-region descriptors. Its checksum covers that record, not the image contents.
+The Host validates the canonical packet and image contents once per template,
+then retains an immutable pinned source until externally quiescent context close.
+Every eager submission or captured replay orders live-region H2D copies before
+a fixed 432-byte `GraphPreparedDispatch`; the AICPU entry accepts only this
+prepared transport after context setup.
 
-Each eager submission or captured replay uses this sequence:
+Every role checks its own HostArgs checksum, identity and bounds, compares the
+record with the leader's, and invalidates the live image before attach. Invalid
+metadata collectively cancels the launch. The leader claims an Idle attempt,
+wires pointers, seeds queues and publishes READY/CANCEL. A successfully retired
+mailbox at the same runtime address retains its ticket sequence; an intervening
+failed restore requires full initialization.
 
-1. The shared binder orders H2D copies of each live region before the prepared
-   AICPU entry. Unused capacity and the device-only prefix are not transferred.
-   Capture records these copies; replay still restores the live image.
-2. Every executing role validates its own CANN HostArgs copy, metadata checksum,
-   slot/context/callable identity and destination bounds. Roles compare their
-   records and invalidate all live image regions before the leader attaches
-   them. A metadata failure reaches collective cancellation.
-3. `attach_prepared_graph_image` claims an Idle attempt, verifies canonical
-   offsets and bounded SM geometry, wires pointers and seeds scheduler queues.
-   Mailbox storage is reused only when the preceding attempt committed
-   successfully and retired to Idle at the same runtime address; otherwise
-   `init_empty` initializes it. The leader publishes Ready and the entry's
-   READY/CANCEL handshake before dispatch.
-4. All roles finish status reads and executor cleanup before
-   tail image maintenance. On success, Runtime image maintenance covers mutable
-   task state, excluding immutable fanin/argument pools; the executor also
-   maintains its handshake and teardown control rows. Definition and optional
-   scheduler regions retain their live maintenance. A second collective gate
-   precedes final slot retirement; fatal failures poison the slot.
-
-Prepared attach performs no AICPU payload copy or full payload checksum/task
-scan. Its admission depends on the validated immutable Host source, ordered DMA
-and retained context/callable lifetime. Older pinned sources remain owned when
-the callable's template changes, because existing captures can reference them;
-they are released only at externally quiescent context close.
+Prepared attach performs no image copy, payload checksum or task scan. After all
+execution and cleanup readers finish, each role maintains mutable task-state
+image spans; the executor maintains Runtime state. A second collective gate
+precedes retirement. Fatal failures poison the slot.
 
 ### Canonical packet consumer
 
 `restore_graph_packet(packet, bytes, device_id, runtime_binary_id,
-trusted_callable, out, ops)` runs on the AICPU leader after Start and before
-any scheduler dispatch or AICore window publication for a canonical packet.
-The enclosing kernel entry supplies invocation barriers and lifetime
-protection; this interface does not register a CANN entry or enqueue streams.
+trusted_callable, out, ops)` is the standalone canonical validation/copy interface. Its caller supplies
+invocation barriers and lifetime protection; the public kernel entry uses
+prepared attach. This interface does not register a CANN entry or enqueue streams.
 
 1. Run callable and execution-slot admission. Validate canonical runtime layout,
    null Host pointers, task counts, relative argument spans, dependency indices,

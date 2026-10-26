@@ -86,10 +86,6 @@ struct GraphHostArgs {
 // Fresh writable launch copy: CANN may patch it without changing the template.
 // Offsets include the common invocation envelope, not just the HBG sub-packet.
 int make_graph_host_args(const GraphLaunchTemplate &source, GraphHostArgs &out);
-int make_graph_dispatch_args(
-    const GraphLaunchTemplate &source, const HbgCallableRegistration &registration, GraphHostArgs &out
-);
-
 // Validates canonical image contents once on the Host. The context retains a
 // private immutable DMA snapshot for every capture that uses this metadata.
 int make_graph_prepared_dispatch(
@@ -104,8 +100,4 @@ struct GraphHostLaunchOps {
 };
 
 int submit_graph_template(const GraphLaunchTemplate &source, const GraphHostLaunchOps &ops);
-int submit_graph_dispatch(
-    const GraphLaunchTemplate &source, const HbgCallableRegistration &registration, const GraphHostLaunchOps &ops
-);
-
 }  // namespace hbg

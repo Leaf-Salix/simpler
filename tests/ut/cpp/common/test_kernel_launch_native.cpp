@@ -132,22 +132,6 @@ extern "C" aclError aclrtLaunchKernelWithHostArgs(
     return active->fixture.fake.append(Step::AicpuLaunch);
 }
 
-TEST(HbgKernelHostArgs, ForwardsEveryLaunchStatusWithoutSynchronizationOrRetry) {
-    for (const int error : {ACL_ERROR_RT_MEMORY_ALLOCATION, 12345, 0}) {
-        NativeFake f;
-        active = &f;
-        f.initialize();
-        f.host_args_errors = {error};
-        hbg::GraphHostArgs args;
-        args.storage.assign(10, 0);
-        args.bytes = 80;
-        args.address_offset = 64;
-        args.data_offset = 72;
-        EXPECT_EQ(hbg::launch_graph_host_args(args, ptr(201), 6, ptr(1), nullptr), error);
-        EXPECT_EQ(f.copies.size(), 1u);
-    }
-}
-
 TEST(HbgKernelHostArgs, PreparedMetadataUsesNoPlaceholdersAndForwardsStatusWithoutRetry) {
     for (const int error : {ACL_ERROR_RT_MEMORY_ALLOCATION, 12345, 0}) {
         SCOPED_TRACE(error);

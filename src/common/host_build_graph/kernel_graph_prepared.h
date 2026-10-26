@@ -10,9 +10,21 @@
  */
 #pragma once
 
-#include "host_build_graph/kernel_graph_dispatch.h"
+#include "host_build_graph/kernel_callable_registration.h"
+#include "host_build_graph/kernel_graph_slot_wire.h"
+#include "host_build_graph/kernel_graph_wire.h"
 
 namespace hbg {
+
+inline bool graph_prepared_source_fits(const void *data, size_t bytes, const GraphSlotRegistration &slot) noexcept {
+    const GraphDestination source{reinterpret_cast<uintptr_t>(data), bytes};
+    if (data == nullptr || !graph_span_fits(source.address, source.capacity, UINT64_MAX) ||
+        graph_windows_overlap(source, slot.registry))
+        return false;
+    for (const auto &destination : slot.destinations)
+        if (graph_windows_overlap(source, destination)) return false;
+    return true;
+}
 
 inline constexpr uint32_t GRAPH_PREPARED_DISPATCH_MAGIC = 0x50444748;  // HGDP
 inline constexpr uint16_t GRAPH_PREPARED_DISPATCH_VERSION = 1;

@@ -9,7 +9,6 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "host_build_graph/kernel_graph_template.h"
-#include "host_build_graph/kernel_graph_dispatch.h"
 #include "host_build_graph/kernel_graph_prepared.h"
 
 #include <algorithm>
@@ -405,52 +404,6 @@ int submit_graph_template(const GraphLaunchTemplate &source, const GraphHostLaun
     if (ops.launch == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     GraphHostArgs args;
     const int rc = make_graph_host_args(source, args);
-    return rc == 0 ? ops.launch(ops.context, args) : rc;
-}
-
-int make_graph_dispatch_args(
-    const GraphLaunchTemplate &source, const HbgCallableRegistration &registration, GraphHostArgs &out
-) {
-    if (validate_graph_packet(source.data(), source.size(), GraphPacketAddress::HostTemplate) !=
-            GraphPacketStatus::Ok ||
-        source.size() > UINT32_MAX - sizeof(GraphDispatchHeader))
-        return PTO_RUNTIME_ERR_INTERNAL;
-    GraphDispatchHeader dispatch{};
-    GraphPacketHeader graph{};
-    std::memcpy(&dispatch.invocation, source.data(), sizeof(dispatch.invocation));
-    std::memcpy(&graph, static_cast<const std::byte *>(source.data()) + sizeof(dispatch.invocation), sizeof(graph));
-    dispatch.packet_bytes = source.size();
-    dispatch.registration = registration;
-    dispatch.invocation.payload_bytes = sizeof(dispatch) - sizeof(dispatch.invocation) + source.size();
-    dispatch.checksum = graph_dispatch_checksum(dispatch);
-    SimplerKernelInvocationHeader invocation{};
-    std::memcpy(&invocation, source.data(), sizeof(invocation));
-    GraphDispatchHeader checked{};
-    if (!read_graph_dispatch_header(&dispatch, sizeof(dispatch), checked) ||
-        !graph_dispatch_matches_packet(dispatch, invocation, graph))
-        return PTO_RUNTIME_ERR_INTERNAL;
-    try {
-        GraphHostArgs next;
-        next.bytes = sizeof(dispatch) + source.size();
-        next.storage.resize((next.bytes + 7) / 8);
-        auto *data = reinterpret_cast<std::byte *>(next.storage.data());
-        std::memcpy(data, &dispatch, sizeof(dispatch));
-        std::memcpy(data + sizeof(dispatch), source.data(), source.size());
-        next.address_offset = sizeof(dispatch) + sizeof(invocation) + offsetof(GraphPacketHeader, inline_payload_addr);
-        next.data_offset = sizeof(dispatch) + sizeof(invocation) + graph.payload_offset;
-        out = std::move(next);
-        return 0;
-    } catch (const std::bad_alloc &) {
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-}
-
-int submit_graph_dispatch(
-    const GraphLaunchTemplate &source, const HbgCallableRegistration &registration, const GraphHostLaunchOps &ops
-) {
-    if (ops.launch == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-    GraphHostArgs args;
-    const int rc = make_graph_dispatch_args(source, registration, args);
     return rc == 0 ? ops.launch(ops.context, args) : rc;
 }
 
