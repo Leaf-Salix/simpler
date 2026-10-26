@@ -53,7 +53,7 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
     if (argument_hash == 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     const auto &cached = state.hbg_launch_state;
     const bool cache_hit = cached != nullptr && cached->argument_snapshot != nullptr &&
-                           cached->graph_template.size() != 0 && cached->argument_hash == argument_hash &&
+                           cached->prepared_image != nullptr && cached->argument_hash == argument_hash &&
                            hbg::same_kernel_argument_snapshot(*cached->argument_snapshot, args);
     if (!cache_hit) {
         hbg::GraphInvocationIdentity identity{
@@ -70,11 +70,10 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
         std::unique_ptr<ChipStorageTaskArgs> snapshot(new (std::nothrow) ChipStorageTaskArgs(args));
         if (snapshot == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
         auto next = std::make_shared<hbg::KernelCallableLaunchState>();
-        next->graph_template = std::move(candidate);
         next->argument_snapshot = std::move(snapshot);
         next->argument_hash = argument_hash;
         auto prepared = std::make_shared<hbg::KernelPreparedGraphImage>();
-        rc = hbg::make_graph_prepared_dispatch(next->graph_template, registration->second, prepared->dispatch);
+        rc = hbg::make_graph_prepared_dispatch(candidate, registration->second, prepared->dispatch);
         if (rc != 0) return rc;
         const auto &graph = prepared->dispatch.graph;
         rc = aclrtMallocHost(&prepared->pinned_image, static_cast<size_t>(graph.payload_bytes));
@@ -82,8 +81,8 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
         prepared->release_image = [](void *image) noexcept {
             return static_cast<int>(aclrtFreeHost(image));
         };
-        const auto *payload = static_cast<const std::byte *>(next->graph_template.data()) +
-                              sizeof(SimplerKernelInvocationHeader) + graph.payload_offset;
+        const auto *payload = static_cast<const std::byte *>(candidate.data()) + sizeof(SimplerKernelInvocationHeader) +
+                              graph.payload_offset;
         std::memcpy(prepared->pinned_image, payload, static_cast<size_t>(graph.payload_bytes));
         hbg_kernel_state_->prepared_images.push_back(prepared);
         next->prepared_image = std::move(prepared);
@@ -188,8 +187,8 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
         );
     };
     return kl::launch_bound_kernel(
-               {static_cast<const uint8_t *>(state.hbg_launch_state->graph_template.data()),
-                state.hbg_launch_state->graph_template.size(), nullptr, 0},
+               {reinterpret_cast<const uint8_t *>(&submission.prepared->dispatch),
+                sizeof(submission.prepared->dispatch), nullptr, 0},
                caller_stream, gate, ops
     )
         .status;

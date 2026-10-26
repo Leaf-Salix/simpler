@@ -15,7 +15,6 @@
 #include <vector>
 
 #include "host_build_graph/kernel_callable_registration.h"
-#include "host_build_graph/kernel_graph_template.h"
 #include "host_build_graph/kernel_graph_prepared.h"
 #include "host_build_graph/kernel_resource_requirements.h"
 #include "task_interface/task_args.h"
@@ -46,7 +45,6 @@ struct KernelPreparedGraphImage {
 };
 
 struct KernelCallableLaunchState {
-    GraphLaunchTemplate graph_template;
     std::shared_ptr<KernelPreparedGraphImage> prepared_image;
     std::unique_ptr<ChipStorageTaskArgs> argument_snapshot;
     uint64_t argument_hash{0};
