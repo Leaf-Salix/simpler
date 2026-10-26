@@ -1895,9 +1895,9 @@ size_t ChipWorker::abandon_unproven_native_run_storage() noexcept {
 }
 
 size_t ChipWorker::unproven_native_run_count() const noexcept {
-    // Every run whose destruction was proved is erased from this map by the finalization that
-    // proved it, so whatever is left after a teardown sweep is exactly what could not be closed —
-    // isolated, reserved by a finalization still running, or never past preparation.
+    // Entries remain until destruction is proved, including live preparation/launched runs,
+    // isolated runs and runs reserved by an active finalization. Any tracked entry blocks
+    // communication-resource release, even when no teardown sweep has run.
     std::lock_guard<std::mutex> lk(native_run_mu_);
     return native_runs_.size();
 }

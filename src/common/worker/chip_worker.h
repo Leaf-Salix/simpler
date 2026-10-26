@@ -790,7 +790,7 @@ private:
     void cleanup_native_runs_noexcept() noexcept;
     void clear_runtime_binding();
     void abandon_after_failed_teardown(std::exception_ptr error) noexcept;
-    /** How many runs a teardown sweep left behind, each of them not proved destroyed. */
+    /** How many runs remain tracked and not proved destroyed, including live runs. */
     size_t unproven_native_run_count() const noexcept;
     /**
      * Detach the run storage of every run not proved destroyed.
