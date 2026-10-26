@@ -551,7 +551,7 @@ size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
  * caller's already-current device and caller-owned stream to enqueue one
  * bounded asynchronous operator per launch: no device reset, no internal
  * stream/device synchronize on the launch path, zero
- * allocation at launch, and no capture/model-state queries, so a launch is
+ * allocation at launch, and TMR performs no capture/model-state queries, so a launch is
  * capturable by ACLGraph as an ordinary node.
  *
  * Identity is a write-once property of the context, not a state that evolves:
@@ -702,11 +702,14 @@ int simpler_kernel_mode_prepare_callable(
  * `args` points to a ChipStorageTaskArgs POD whose tensor addresses are
  * caller-owned device addresses; they are passed through without ever being
  * dereferenced on the host. A launch performs no device malloc/free, no
- * tensor staging, no synchronize, no capture-state query, and no
+ * tensor staging, no synchronize, and no
  * stream-to-model attachment: KernelLaunchOps is the vocabulary that makes
  * those unrepresentable, and routing every runtime call through it is the
  * implementation's obligation. A return of 0 means the sequence was enqueued;
  * device execution may still be in flight and may still fail asynchronously.
+ * HBG reads capture status to retain captured DMA sources; on a template miss,
+ * it may query an earlier eager tail and free completed uncaptured Host sources.
+ * TMR submission performs no capture-state query.
  */
 int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream);
 

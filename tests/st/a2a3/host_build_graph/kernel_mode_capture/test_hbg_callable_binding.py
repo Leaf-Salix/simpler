@@ -107,6 +107,8 @@ def _run(platform, device):
     caller.open()
     lib = caller.acl
     _bind_capture(lib)
+    faults = ctypes.CDLL(None)
+    faults.live_pinned_host_allocations.restype = ctypes.c_int64
     for context in range(2):
         worker = Worker(level=2, execution_mode="kernel", device_id=device, platform=platform, runtime=RUNTIME)
         config = CallConfig()
@@ -154,8 +156,22 @@ def _run(platform, device):
             _check(lib.aclrtSynchronizeStreamWithTimeout(caller.stream, 10000), "eager sync")
             io.verify(output, expected)
 
+        retained = faults.live_pinned_host_allocations()
+        for iteration in range(64):
+            # Include unique scalars: deduplicating A/B alone does not bound eager memory.
+            scalar = float(100 + iteration)
+            expected = seed_inputs(0, scalar, context)
+            launch(0, scalar)
+            _check(lib.aclrtSynchronizeStreamWithTimeout(caller.stream, 10000), "dynamic eager sync")
+            io.verify(output, expected)
+            assert faults.live_pinned_host_allocations() <= retained + 1, "dynamic eager retains old pinned sources"
+
         graphs = []
         for index in range(2):
+            expected = seed_inputs(index, 3.0, context)
+            launch(index, 3.0)
+            _check(lib.aclrtSynchronizeStreamWithTimeout(caller.stream, 10000), "cache before capture sync")
+            io.verify(output, expected)
             graph = ctypes.c_void_p()
             _check(lib.aclmdlRICaptureBegin(caller.stream, 0), "capture begin")
             launch(index, 3.0)

@@ -2950,6 +2950,42 @@ TEST(HbgPreparedImageLifetime, AbandonPreservesSourcesThroughContextAndCallableD
     EXPECT_EQ(second.calls, 0);
 }
 
+TEST(HbgPreparedImageLifetime, CompletedEagerSourcesPreserveCapturedAndCachedImages) {
+    PreparedImageReleaseProbe captured, completed, cached;
+    hbg::KernelContextLaunchState context;
+    context.prepared_images = {captured.make_image(), completed.make_image(), cached.make_image()};
+    context.prepared_images[0]->captured = true;
+    auto callable_cache = context.prepared_images[2];
+    ASSERT_EQ(context.release_completed_eager_images(), 0);
+    ASSERT_EQ(context.prepared_images.size(), 2u);
+    EXPECT_EQ(captured.calls, 0);
+    EXPECT_EQ(completed.calls, 1);
+    EXPECT_EQ(cached.calls, 0);
+    callable_cache.reset();
+    ASSERT_EQ(context.release_completed_eager_images(), 0);
+    ASSERT_EQ(context.prepared_images.size(), 1u);
+    EXPECT_EQ(cached.calls, 1);
+    ASSERT_EQ(context.release_prepared_images(), 0);
+    EXPECT_EQ(captured.calls, 1);
+    EXPECT_EQ(completed.calls, 1);
+    EXPECT_EQ(cached.calls, 1);
+}
+
+TEST(HbgPreparedImageLifetime, FailedEagerReleaseKeepsTheSourceForRetry) {
+    PreparedImageReleaseProbe failed, remaining;
+    failed.error = -73;
+    hbg::KernelContextLaunchState context;
+    context.prepared_images = {failed.make_image(), remaining.make_image()};
+    EXPECT_EQ(context.release_completed_eager_images(), -73);
+    ASSERT_EQ(context.prepared_images.size(), 2u);
+    EXPECT_EQ(remaining.calls, 0);
+    failed.error = 0;
+    ASSERT_EQ(context.release_completed_eager_images(), 0);
+    EXPECT_TRUE(context.prepared_images.empty());
+    EXPECT_EQ(failed.calls, 2);
+    EXPECT_EQ(remaining.calls, 1);
+}
+
 class HbgPreparedGraphTest : public HbgGraphRestoreTest {
 protected:
     hbg::GraphPreparedDispatch prepared{};

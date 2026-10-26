@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <dlfcn.h>
 #include <unistd.h>
@@ -33,6 +34,7 @@ bool override_device_query = false;
 int device_query_result = 0;
 int reported_device = -1;
 int device_queries = 0;
+std::atomic<int64_t> pinned_host_allocations{0};
 
 int forbidden(size_t index) {
     ++forbidden_calls[index];
@@ -112,6 +114,20 @@ extern "C" void arm_device_query_override(int result, int device) {
 }
 extern "C" void clear_device_query_override() { override_device_query = false; }
 extern "C" int device_query_attempts() { return device_queries; }
+
+extern "C" int64_t live_pinned_host_allocations() { return pinned_host_allocations.load(); }
+
+extern "C" int aclrtMallocHost(void **address, size_t bytes) {
+    const int rc = forward_cann("aclrtMallocHost", address, bytes);
+    if (rc == 0) ++pinned_host_allocations;
+    return rc;
+}
+
+extern "C" int aclrtFreeHost(void *address) {
+    const int rc = forward_cann("aclrtFreeHost", address);
+    if (rc == 0) --pinned_host_allocations;
+    return rc;
+}
 
 extern "C" int aclrtGetDevice(int *device) {
     ++device_queries;

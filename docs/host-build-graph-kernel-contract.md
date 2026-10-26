@@ -275,7 +275,12 @@ copies for validation consumers. The public kernel owner instead constructs a
 it with `launch_graph_prepared`, using zero CANN placeholders. Its FNV-1a checksum
 covers metadata; the immutable, Host-validated image travels through separate
 captured H2D nodes. Replay transfers every live region. Replacing a template
-retains older pinned sources until externally quiescent context close.
+retains sources used by capture until externally quiescent context close.
+The HBG Host owner reads capture status on each submission, including cache hits.
+On an eager template miss, a completed earlier eager tail permits releasing
+uncaptured sources no longer held by a callable cache. Pending DMA sources stay
+owned; entering capture revokes tail-reclamation eligibility until another eager
+submission succeeds. This adds no synchronization or capture query to TMR.
 The adapter submits once and returns the RTS status unchanged.
 
 The adapter assumes the enclosing protocol has established entry/exit events

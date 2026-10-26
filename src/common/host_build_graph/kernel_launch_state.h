@@ -25,6 +25,7 @@ struct KernelPreparedGraphImage {
     GraphPreparedDispatch dispatch{};
     void *pinned_image{nullptr};
     int (*release_image)(void *) noexcept {nullptr};
+    bool captured{false};
 
     ~KernelPreparedGraphImage() { (void)release(); }
     KernelPreparedGraphImage() = default;
@@ -54,11 +55,28 @@ struct KernelContextLaunchState {
     KernelResourcePlan resource_plan;
     GraphSlotRegistration slot_registration{};
     std::unordered_map<int32_t, HbgCallableRegistration> callable_registrations;
-    // Captured DMA nodes may retain an older source after the callable's cache
-    // changes. Sources remain immutable and owned until quiescent context close.
+    // Captured sources live until close; uncaptured sources need only outlive
+    // their DMA and any callable cache still borrowing them.
     std::vector<std::shared_ptr<KernelPreparedGraphImage>> prepared_images;
     bool resources_prepared{false};
     bool slot_registered{false};
+    // A capture records nodes without executing the tail event. Only a later
+    // successful eager submission establishes another queryable tail record.
+    bool eager_tail_recorded{false};
+
+    // The caller has observed an eager tail completion before recording a new tail.
+    int release_completed_eager_images() noexcept {
+        for (auto it = prepared_images.begin(); it != prepared_images.end();) {
+            if ((*it)->captured || it->use_count() != 1) {
+                ++it;
+                continue;
+            }
+            const int rc = (*it)->release();
+            if (rc != 0) return rc;
+            it = prepared_images.erase(it);
+        }
+        return 0;
+    }
 
     int release_prepared_images() noexcept {
         for (auto &image : prepared_images) {

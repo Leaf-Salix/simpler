@@ -32,7 +32,7 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
     if (it == callables_.end() || api == nullptr) return PTO_RUNTIME_ERR_CALLABLE_NOT_RESIDENT;
     auto &state = it->second;
     if (hbg_kernel_state_ == nullptr || !hbg_kernel_state_->resources_prepared || !hbg_kernel_state_->slot_registered ||
-        state.host_orch_func_ptr == nullptr)
+        state.host_orch_func_ptr == nullptr || !kernel_exec_state_.accepts_dispatch())
         return PTO_RUNTIME_ERR_INVALID_STATE;
 
     const auto registration = hbg_kernel_state_->callable_registrations.find(callable_id);
@@ -51,17 +51,37 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
 
     const uint64_t argument_hash = hbg::kernel_argument_snapshot_hash(args);
     if (argument_hash == 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    if (caller_stream == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    aclmdlRICaptureStatus capture_status{};
+    aclmdlRI capture{};
+    int rc = aclmdlRICaptureGetInfo(static_cast<aclrtStream>(caller_stream), &capture_status, &capture);
+    if (rc != 0) return rc;
+    if (capture_status != ACL_MODEL_RI_CAPTURE_STATUS_NONE && capture_status != ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    const bool capturing = capture_status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
+    if (capturing) hbg_kernel_state_->eager_tail_recorded = false;
     const auto &cached = state.hbg_launch_state;
     const bool cache_hit = cached != nullptr && cached->argument_snapshot != nullptr &&
                            cached->prepared_image != nullptr && cached->argument_hash == argument_hash &&
                            hbg::same_kernel_argument_snapshot(*cached->argument_snapshot, args);
     if (!cache_hit) {
+        bool previous_eager_complete = false;
+        if (!capturing && hbg_kernel_state_->eager_tail_recorded) {
+            aclrtEventRecordedStatus status{};
+            rc = aclrtQueryEventStatus(kernel_exec_state_.event(KernelEventKind::SerialTail), &status);
+            if (rc != 0) return rc;
+            previous_eager_complete = status == ACL_EVENT_RECORDED_STATUS_COMPLETE;
+            if (previous_eager_complete) {
+                rc = hbg_kernel_state_->release_completed_eager_images();
+                if (rc != 0) return rc;
+            }
+        }
         hbg::GraphInvocationIdentity identity{
             callable_id,   args.tensor_count(),     args.scalar_count(), state.chip_buffer_hash,
             argument_hash, state.aicore_image_hash,
         };
         hbg::GraphLaunchTemplate candidate;
-        int rc = hbg::build_kernel_graph_template(
+        rc = hbg::build_kernel_graph_template(
             kernel_runtime_, args, state.host_orch_func_ptr, kernel_exec_state_, device_id_,
             kernel_static_config_.generation(), kernel_runtime_binary_id_,
             hbg_kernel_state_->resource_plan.capacity().layout.task_capacity, identity, candidate
@@ -87,7 +107,12 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
         hbg_kernel_state_->prepared_images.push_back(prepared);
         next->prepared_image = std::move(prepared);
         state.hbg_launch_state = std::move(next);
+        if (previous_eager_complete) {
+            rc = hbg_kernel_state_->release_completed_eager_images();
+            if (rc != 0) return rc;
+        }
     }
+    if (capturing) state.hbg_launch_state->prepared_image->captured = true;
 
     namespace kl = simpler::kernel_launch;
     struct Submission {
@@ -96,6 +121,7 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
         const hbg::KernelPreparedGraphImage *prepared;
         uint64_t clear_address;
         size_t clear_bytes;
+        bool capturing;
     };
     const uint64_t runtime_address = reinterpret_cast<uint64_t>(persistent_args_.args().runtime_args);
     const auto *host_runtime_base = reinterpret_cast<const uint8_t *>(&kernel_runtime_);
@@ -109,8 +135,12 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
     if (runtime_address == 0 || workers_end <= clear_address || kernel_runtime_.get_worker_count() <= 0)
         return PTO_RUNTIME_ERR_INVALID_STATE;
     Submission submission{
-        this, caller_stream, state.hbg_launch_state->prepared_image.get(), clear_address,
-        static_cast<size_t>(workers_end - clear_address)
+        this,
+        caller_stream,
+        state.hbg_launch_state->prepared_image.get(),
+        clear_address,
+        static_cast<size_t>(workers_end - clear_address),
+        capturing
     };
     kl::KernelLaunchGateOps gate;
     gate.context = &submission;
@@ -136,6 +166,7 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
         auto &s = *static_cast<Submission *>(context);
         if (result.status == 0) {
             s.runner->kernel_previous_caller_ = reinterpret_cast<uintptr_t>(s.caller);
+            s.runner->hbg_kernel_state_->eager_tail_recorded = !s.capturing;
         } else if (result.enqueue_started) {
             s.runner->kernel_exec_state_.poison(result.status);
         }

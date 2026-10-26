@@ -187,7 +187,11 @@ resource lifetime. Rejection preserves the output and every destination byte.
 ### Prepared public entry
 
 The Host validates the canonical packet and image contents once per template,
-then retains an immutable pinned source until externally quiescent context close.
+then retains an immutable pinned source while DMA or a callable cache needs it.
+Any capture use pins that source until externally quiescent context close,
+including capture that reuses an eager cache entry. Ordinary eager template
+replacement reclaims uncaptured sources only after an earlier eager tail reports
+completion; pending or failed submissions never authorize reclamation.
 Every eager submission or captured replay orders live-region H2D copies before
 a fixed 432-byte `GraphPreparedDispatch`; the AICPU entry accepts only this
 prepared transport after context setup.
