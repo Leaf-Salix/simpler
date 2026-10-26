@@ -671,8 +671,8 @@ void ChipWorker::finalize() {
         run_lane_.reset();
     }
     cleanup_native_runs_noexcept();
-    // A run whose destruction could not be proved still owns whatever its carrier holds, and the
-    // carrier itself still lives in this worker's runtime storage. Everything below this point —
+    // An unproved carrier destruction or device stop still retains the run's resources.
+    // Everything below this point —
     // the device teardown, the context destruction, the `dlclose` and the release of that storage
     // — would either free those resources a second time or unload the code that owns their release
     // routines. So the close stops here and keeps all of it, which is the same contract the device
@@ -1881,7 +1881,7 @@ size_t ChipWorker::abandon_unproven_native_run_storage() noexcept {
         ++abandoned;
         std::fprintf(
             stderr,
-            "ChipWorker: abandoning the run storage of set %u; its carrier could not be proved destroyed, so the "
+            "ChipWorker: abandoning the run storage of set %u; its retirement is unconfirmed, so the "
             "block is not returned to the allocator\n",
             slot
         );
@@ -2255,6 +2255,9 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
 void ChipWorker::comm_release_domain_windows(
     uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank
 ) {
+    if (unproven_native_run_count() != 0) {
+        throw std::runtime_error("comm_release_domain_windows: native run destruction is unconfirmed");
+    }
     if (comm_release_domain_windows_fn_ == nullptr) {
         throw std::runtime_error("comm_release_domain_windows is not supported by this runtime");
     }
@@ -2316,6 +2319,9 @@ uint64_t ChipWorker::comm_global_domain_import(uint64_t domain_id, const std::ve
 }
 
 void ChipWorker::comm_global_domain_release(uint64_t domain_id) {
+    if (unproven_native_run_count() != 0) {
+        throw std::runtime_error("comm_global_domain_release: native run destruction is unconfirmed");
+    }
     if (comm_global_domain_release_fn_ == nullptr) {
         throw std::runtime_error("comm_global_domain_release is not supported by this runtime");
     }

@@ -94,6 +94,7 @@ int g_query_calls = 0;
 int g_device_finalize_rc = 0;
 int g_device_finalize_calls = 0;
 int g_destroy_context_calls = 0;
+int g_domain_release_calls = 0;
 
 int prepare_run(void *, void *runtime, int32_t, const void *, const CallConfig *, const NativeRunDescriptor *) {
     // The carrier the platform would place here; only its tag matters to the worker.
@@ -125,10 +126,8 @@ int finalize_run(void *, void *runtime) {
     if (g_finalize_destroys) {
         uint64_t cleared = 0;
         std::memcpy(runtime, &cleared, sizeof(cleared));
-    } else if (g_finalize_corrupts) {
-        uint64_t garbage = kNativeRunContextMagic ^ UINT64_C(0xff);
-        std::memcpy(runtime, &garbage, sizeof(garbage));
     }
+    if (g_finalize_corrupts) mark_native_run_device_unsettled(runtime);
     if (g_finalize_throws) throw std::runtime_error("stub finalize failed");
     return g_finalize_rc;
 }
@@ -681,6 +680,41 @@ TEST(NativeRunOperationLeaseTest, CapabilityQueryRefusesStaleIdentity) {
     // not about the fixture simply never being able to answer true.
     EXPECT_TRUE(worker.supports_joined_diagnostic_launch(behind, ahead));
     EXPECT_EQ(g_query_calls, 1);
+}
+
+TEST(NativeRunOperationLeaseTest, DomainReleaseRequiresProvenNativeDestruction) {
+    for (const auto &[destroys, unsettled] : {std::pair{false, false}, std::pair{true, false}, std::pair{true, true}}) {
+        ChipWorker worker;
+        prime(worker);
+        g_domain_release_calls = 0;
+        worker.comm_release_domain_windows_fn_ = +[](void *, uint64_t, size_t, uint32_t) {
+            ++g_domain_release_calls;
+            return 0;
+        };
+        worker.comm_global_domain_release_fn_ = +[](uint64_t) {
+            ++g_domain_release_calls;
+            return 0;
+        };
+        worker.global_domain_ids_.insert(42);
+        const ChipWorkerNativeRun run = prepare(worker, 0, 1);
+        g_finalize_destroys = destroys;
+        g_finalize_corrupts = unsettled;
+        g_finalize_rc = -5;
+        EXPECT_THROW(worker.finalize_native_run(run), std::runtime_error);
+        EXPECT_EQ(worker.unproven_native_run_count(), destroys && !unsettled ? 0 : 1);
+        if (destroys && !unsettled) {
+            EXPECT_NO_THROW(worker.comm_release_domain_windows(0, 42, 1, 0));
+            EXPECT_NO_THROW(worker.comm_global_domain_release(42));
+            EXPECT_EQ(worker.global_domain_ids_.count(42), 0);
+            EXPECT_EQ(g_domain_release_calls, 2);
+        } else {
+            EXPECT_THROW(worker.comm_release_domain_windows(0, 42, 1, 0), std::runtime_error);
+            EXPECT_THROW(worker.comm_global_domain_release(42), std::runtime_error);
+            EXPECT_EQ(worker.global_domain_ids_.count(42), 1);
+            EXPECT_EQ(g_domain_release_calls, 0);
+        }
+        worker.global_domain_ids_.clear();
+    }
 }
 
 // A teardown that leaves neither a destroyed nor a canonical tag is isolated, and a success is

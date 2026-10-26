@@ -1282,6 +1282,10 @@ class _FakeTwoFrameChipWorker(_FakeNativeRunImpl):
         self.unregister_called = threading.Event()
         self.unregister_error: Optional[BaseException] = None
         self.exported_device_regions_live: Optional[bool] = None
+        self.unconfirmed_native_destruction = False
+
+    def _unproven_native_run_count(self) -> int:
+        return int(self.unconfirmed_native_destruction)
 
     # The loop synchronizes exported-region ownership after every control
     # command, including a failed one: a command that failed can still have
@@ -1592,8 +1596,9 @@ def test_two_frame_success_survives_successor_poison_during_recursive_progress(m
         harness.publish(0, 1)
         harness.publish(1, 2)
         harness.start()
-        harness.thread.join(5.0)
-        assert not harness.thread.is_alive()
+        harness.wait_state(0, worker_mod._TASK_DONE)
+        harness.wait_state(1, worker_mod._TASK_FAILED)
+        assert harness.thread.is_alive()
         assert _mailbox_load_i32(harness.state_addr(0)) == worker_mod._TASK_DONE
         assert _mailbox_load_i32(harness.state_addr(1)) == worker_mod._TASK_FAILED
         # The terminal report lives on the run-state entry, not the frame: the frame carried only
@@ -2208,6 +2213,29 @@ def test_two_frame_launch_failure_does_not_accept_and_finalizes_once():
         harness.close()
 
 
+def test_two_frame_poison_keeps_domain_release_control_available(monkeypatch):
+    harness = _TwoFrameLoopHarness()
+    released = threading.Event()
+    monkeypatch.setattr(worker_mod, "_handle_ctrl_release_domain", lambda *_args, **_kwargs: released.set())
+    try:
+        harness.cw.finalize_errors[(0, 11)] = RuntimeError("run failed")
+        harness.publish(0, 1)
+        harness.start()
+        assert harness.cw.launched[0].wait(5.0)
+        harness.cw.completed[0].set()
+        harness.wait_state(0, worker_mod._TASK_FAILED)
+        struct.pack_into("Q", harness.buf, worker_mod._OFF_CALLABLE, worker_mod._CTRL_RELEASE_DOMAIN)
+        _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._CONTROL_REQUEST)
+        assert released.wait(5.0)
+        harness.wait_control_state(worker_mod._CONTROL_DONE)
+        assert harness.thread.is_alive()
+        harness.publish(1, 2)
+        harness.wait_state(1, worker_mod._TASK_FAILED)
+        assert not harness.cw.prepared[1].is_set() and not harness.cw.launched[1].is_set()
+    finally:
+        harness.close()
+
+
 def test_two_frame_launch_cleanup_failure_terminalizes_staged_successor():
     harness = _TwoFrameLoopHarness()
     try:
@@ -2219,8 +2247,7 @@ def test_two_frame_launch_cleanup_failure_terminalizes_staged_successor():
 
         harness.wait_state(0, worker_mod._TASK_FAILED)
         harness.wait_state(1, worker_mod._TASK_FAILED)
-        harness.thread.join(5.0)
-        assert not harness.thread.is_alive()
+        assert harness.thread.is_alive()
         assert not harness.cw.prepared[1].is_set()
         assert not harness.cw.launched[1].is_set()
         assert _mailbox_load_i32(harness.accepted_addr(1)) == 0
@@ -2228,7 +2255,7 @@ def test_two_frame_launch_cleanup_failure_terminalizes_staged_successor():
         harness.close()
 
 
-@pytest.mark.parametrize("failure_point", ["poll", "finalize"])
+@pytest.mark.parametrize("failure_point", ["poll", "finalize", "unsettled"])
 def test_two_frame_native_progress_failure_terminalizes_staged_successor(failure_point):
     harness = _TwoFrameLoopHarness()
     try:
@@ -2241,13 +2268,17 @@ def test_two_frame_native_progress_failure_terminalizes_staged_successor(failure
         if failure_point == "poll":
             harness.cw.poll_errors[(0, 11)] = RuntimeError("poll failed")
         else:
+            harness.cw.unconfirmed_native_destruction = failure_point == "unsettled"
             harness.cw.finalize_errors[(0, 11)] = RuntimeError("finalize failed")
             harness.cw.completed[0].set()
 
         harness.wait_state(0, worker_mod._TASK_FAILED)
         harness.wait_state(1, worker_mod._TASK_FAILED)
-        harness.thread.join(5.0)
-        assert not harness.thread.is_alive()
+        if failure_point == "unsettled":
+            harness.thread.join(5.0)
+            assert not harness.thread.is_alive()
+        else:
+            assert harness.thread.is_alive()
         assert not harness.cw.prepared[1].is_set()
         assert not harness.cw.launched[1].is_set()
         assert _mailbox_load_i32(harness.accepted_addr(1)) == 0

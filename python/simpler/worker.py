@@ -4136,9 +4136,13 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
 
                         code, msg = publish_completed_run(staged)
                         if code != 0 and staged.chip_run.lane_poisoned:
-                            shutdown_message = msg
-                            stop_progress = True
-                            break
+                            try:
+                                cw._close_chip_run_lane()
+                            except Exception as e:  # noqa: BLE001
+                                shutdown_message = msg + "; " + _format_exc("chip run lane close", e)
+                            if cw._unproven_native_run_count():
+                                stop_progress = True
+                                break
                     except Exception as e:  # noqa: BLE001
                         shutdown_message = _format_exc(f"chip_process dev={device_id}: chip run progress", e)
                         stop_progress = True

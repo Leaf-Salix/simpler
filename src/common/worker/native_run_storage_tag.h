@@ -21,9 +21,16 @@
  * The platform writes into worker-owned storage. Zero means the carrier has
  * been destroyed, not that all bindings were released. A pre-execution refusal
  * whose cleanup succeeded instead leaves a release marker and its run epoch.
+ * Unproved device completion leaves a noncanonical isolation tag.
  * Reading either is a byte read, never a use of a destroyed carrier object.
  */
 inline constexpr uint64_t kNativeRunContextMagic = UINT64_C(0x534d504c52554e31);  // "SMPLRUN1"
+
+// The host carrier is destroyed, but its device work is not proved finished.
+inline void mark_native_run_device_unsettled(void *storage) noexcept {
+    const uint64_t tag = UINT64_C(0x534d504c554e5354);  // "SMPLUNST"
+    std::memcpy(storage, &tag, sizeof(tag));
+}
 
 // Host-only result in the destroyed carrier's storage; no device image changes.
 inline constexpr uint64_t kNativeRunPrepareReleasedMagic = UINT64_C(0x534d504c5052454c);  // "SMPLPREL"

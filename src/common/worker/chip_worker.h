@@ -255,6 +255,9 @@ public:
      */
     bool teardown_report(SimplerTeardownReport *out) const;
 
+    /** Native runs still owned, including unproved carrier destruction or device stop. */
+    size_t unproven_native_run_count() const noexcept;
+
     /** Whether one workspace report could be produced, and why not. */
     enum class WorkspaceReportStatus : uint32_t {
         /** This context's workspace regions have no owner: a simulated
@@ -789,8 +792,6 @@ private:
     void cleanup_native_runs_noexcept() noexcept;
     void clear_runtime_binding();
     void abandon_after_failed_teardown(std::exception_ptr error) noexcept;
-    /** How many runs a teardown sweep left behind, each of them not proved destroyed. */
-    size_t unproven_native_run_count() const noexcept;
     /**
      * Detach the run storage of every run not proved destroyed.
      *
