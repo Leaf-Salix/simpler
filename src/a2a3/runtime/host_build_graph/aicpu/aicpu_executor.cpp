@@ -98,7 +98,7 @@ struct AicpuExecutor {
     // ===== Methods =====
     int32_t init(Runtime *runtime);
     int32_t run(Runtime *runtime, bool restored_graph);
-    void deinit();
+    void deinit(Runtime *runtime);
 };
 
 static AicpuExecutor g_aicpu_executor;
@@ -388,7 +388,12 @@ int32_t AicpuExecutor::run(Runtime *runtime, bool restored_graph) {
     return run_rc;
 }
 
-void AicpuExecutor::deinit() {
+void AicpuExecutor::deinit(Runtime *runtime) {
+    // 1. Invalidate AICPU cache for Runtime address range.
+    //    Next round's Host DMA (rtMemcpy) writes fresh Runtime to HBM but
+    //    bypasses this cache. Invalidating now ensures next round reads from HBM.
+    cache_invalidate_range(runtime, sizeof(Runtime));
+
     // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();
 
@@ -467,14 +472,7 @@ static int32_t execute_graph_runtime(Runtime *runtime, bool restored_graph) {
     // The finalizer publishes cleanup eligibility only after runtime destruction.
     if (g_aicpu_executor.completion_gate_.claim_cleanup()) {
         LOG_INFO("aicpu_execute: All threads finished, cleaning up");
-        if (restored_graph) {
-            // AICPU writes both handshake and return-gate rows during execution.
-            const auto *end = reinterpret_cast<const uint8_t *>(runtime->get_teardown_gates() + RUNTIME_MAX_WORKER);
-            cache_invalidate_range(runtime, static_cast<size_t>(end - reinterpret_cast<const uint8_t *>(runtime)));
-        } else {
-            cache_invalidate_range(runtime, sizeof(Runtime));
-        }
-        g_aicpu_executor.deinit();
+        g_aicpu_executor.deinit(runtime);
     }
 
     if (runtime_rc != 0) {
