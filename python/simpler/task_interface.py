@@ -1132,19 +1132,19 @@ class CommDomainHandle:
 
         live           — allocated, indexable, can be passed to submit_*
         released       — release() called; further indexing raises;
-                          physical reclamation is pending or unconfirmed
+                          backend memory still alive until Worker.run drain
         freed          — physical reclamation has been confirmed
 
     Most users only see ``released``; the ``live → released`` transition
     happens at ``with`` exit (or explicit ``release()``), and the
-    ``released → freed`` transition requires proven completion and physical
-    reclamation. Failed or unconfirmed cleanup remains tracked and is reported.
+    ``released → freed`` transition is the runtime's job at end-of-run.
 
     Callers must treat handle attributes and context/buffer mappings as read-only
     metadata. Reassignment is unsupported; configure through allocation arguments
     and end ownership through ``release()``. Buffer contents remain writable.
-    Submitted Tensor identities register domain use in the current run, including
-    cached Tensors. Scalar-only use requires explicit lookup in that run. Retained
+    Tensor submissions register domain use in the current run, including cached
+    Tensors. Scalar-only use requires explicit lookup. Failed or unconfirmed
+    reclamation remains tracked and reported with ``freed=False``. Retained
     handles may be inspected and released serially after run completion.
     """
 
@@ -1189,7 +1189,6 @@ class CommDomainHandle:
         _domain_size: int | None = None,
         _domain_ranks: dict[int, int] | None = None,
         ref: CommDomainRef | None = None,
-        borrowed: bool = False,
         requested_window_size: int | None = None,
         _release_scope: Callable[[CommDomainHandle], contextlib.AbstractContextManager] = contextlib.nullcontext,
     ) -> None:
@@ -1201,7 +1200,7 @@ class CommDomainHandle:
         self._domain_ranks = (
             {worker: rank for rank, worker in enumerate(self.workers)} if _domain_ranks is None else dict(_domain_ranks)
         )
-        self._release_fn = None if borrowed else _release_fn
+        self._release_fn = _release_fn
         self._release_scope = _release_scope
         self.members = tuple(members)
         self.buffers = tuple(buffers)
@@ -1224,8 +1223,8 @@ class CommDomainHandle:
         if self._released:
             raise RuntimeError(f"CommDomainHandle({self.name!r}) is already released")
 
-    def member(self, domain_rank: int) -> CommDomainMember:
-        """Return a member's topology and ordinary Buffers, indexed by domain rank."""
+    def member(self, domain_rank: int) -> GlobalDomainMember:
+        """Return rank-ordered topology and ordinary Buffer slices."""
         self._require_live()
         rank = int(domain_rank)
         if rank < 0 or rank >= len(self.members):
@@ -1242,6 +1241,7 @@ class CommDomainHandle:
 
     @property
     def ref(self) -> CommDomainRef:
+        """Return identity; scalar-only use still requires owner lookup in each run."""
         self._require_live()
         if self._ref is None:
             raise RuntimeError("domain has no exported reference")
@@ -1262,50 +1262,52 @@ class CommDomainHandle:
 
     @property
     def released(self) -> bool:
-        """True once logical release has been accepted through ``release()`` or ``with`` exit.
+        """True once ``release()`` (or ``with`` exit) has been called.
 
-        Backend memory may still be alive until completion and successful cleanup.
-        Use this to gate further indexing/submission, not to assert physical
-        teardown (use ``freed`` for that).
+        Backend memory may still be alive — it is freed by the Worker after
+        DAG drain at end-of-run.  Use this to gate further indexing /
+        submission, not to assert physical teardown (use ``freed`` for that).
         """
         return self._released
 
     @property
     def freed(self) -> bool:
-        """True once physical reclamation has been confirmed.
+        """True once the backend ``comm_release_domain_windows`` has executed.
 
-        Accepted uses must finish first. A retained domain released serially
-        after run completion is freed synchronously on success. Failed or
-        unconfirmed cleanup remains tracked and is reported.
+        Flips after the owning run's fence and physical release. Releasing a
+        retained handle after run completion frees it synchronously. An ``orch_fn``
+        will never observe ``True`` for a handle it released within the same run.
         """
         return self._freed
 
     def release(self) -> None:
         """Mark this handle for collective release.  Idempotent.
 
-        Inside an orch function, this is a non-blocking mark — backend cleanup
-        follows the owning run's completion wait so that tasks already submitted with
+        Inside an orch function, this is a non-blocking mark — the actual
+        backend ``comm_release_domain_windows`` runs after
+        the owning run's completion wait so that tasks already submitted with
         this domain's ``device_ctx`` see live memory through execution.
-        Serial release after run completion attempts immediate physical release.
-        Failure is reported and the cleanup obligation remains tracked.
+        Serial release after run completion frees a retained domain immediately.
 
         After this returns, the handle is treated as released for the
         user's purposes: ``__getitem__`` raises, repeated ``release()`` is
         a no-op, and the orch function must not pass it to further
         ``submit_*`` calls.
         """
-        if self._release_fn is None:
-            raise RuntimeError("borrowed communication domain cannot be released")
+        if self.borrowed:
+            raise RuntimeError("borrowed domain handles cannot release their owner")
         if self._released:
             return
         with self._release_scope(self):
-            if not self._released:
-                self._released = True
-                self._release_fn(self)
+            if self._released:
+                return
+            self._released = True
+            assert self._release_fn is not None
+            self._release_fn(self)
 
     def __enter__(self) -> CommDomainHandle:
         if self.borrowed:
-            raise RuntimeError("borrowed communication domain cannot enter a releasing context")
+            raise RuntimeError("borrowed domain handles cannot own a with scope")
         self._require_live()
         return self
 
@@ -1322,7 +1324,7 @@ class CommDomainHandle:
         return f"CommDomainHandle(name={self.name!r}, workers={self.workers}, {state})"
 
 
-# The legacy L4 spelling denotes the same public handle type.
+# The legacy L4 spelling denotes the same owning handle type.
 GlobalCommDomainHandle = CommDomainHandle
 
 

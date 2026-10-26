@@ -11,12 +11,17 @@
 from __future__ import annotations
 
 import enum
-import operator
 import struct
-from dataclasses import dataclass, field, replace
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from _task_interface import AddressSpace, CanonicalIdentity  # pyright: ignore[reportMissingImports]
+from _task_interface import (  # pyright: ignore[reportMissingImports]
+    AddressSpace,
+    BufferDescriptor,
+    _decode_buffer_descriptor_wire,
+    _encode_buffer_descriptor_wire,
+)
 
 from .comm_endpoints import (
     _ADAPTER_KIND_IDS,  # noqa: F401 — re-export of the comm_endpoints numeric table
@@ -68,6 +73,8 @@ GLOBAL_DOMAIN_PROFILE_IDS = {
 }
 GLOBAL_DOMAIN_MAX_STRING_BYTES = 1024
 GLOBAL_DOMAIN_MAX_COPY_BYTES = 8 * 1024 * 1024
+GLOBAL_DOMAIN_BUFFER_REF_BYTES = 104
+_DOMAIN_COMMAND_MAGIC = b"SDC1"
 
 CTRL_GLOBAL_DOMAIN_PREPARE = 19
 CTRL_GLOBAL_DOMAIN_IMPORT = 20
@@ -126,15 +133,6 @@ class GlobalDomainBuffer:
     count: int = 0
     load_from_host: bool = False
     store_to_host: bool = False
-
-
-@dataclass(frozen=True)
-class GlobalDomainBufferRef:
-    rank: int
-    slice_index: int
-    identity: CanonicalIdentity
-    reference_id: int = 0
-    reference_generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -689,8 +687,18 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
             raise ValueError("global domain IMPORT/COMMIT requires a complete descriptor table")
     elif command.descriptors:
         raise ValueError("global domain PREPARE/ABORT must not carry descriptors")
+    if command.owner_instance_id and (len(command.owner_instance_id) != 8 or not any(command.owner_instance_id)):
+        raise ValueError("global domain creator must be a nonzero 8-byte instance identity")
+    if not command.owner_instance_id and (
+        command.retain_after_run
+        or any(
+            buffer.dtype or buffer.count or buffer.load_from_host or buffer.store_to_host for buffer in command.buffers
+        )
+    ):
+        raise ValueError("global domain extended layout requires a creator identity")
 
-    out = bytearray(
+    out = bytearray(_DOMAIN_COMMAND_MAGIC)
+    out.extend(
         struct.pack(
             "<IQQQ",
             int(command.phase),
@@ -699,6 +707,7 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
             int(command.window_size),
         )
     )
+    out.extend(struct.pack("<8s?", command.owner_instance_id, command.retain_after_run))
     _put_string(out, command.name, "name")
     _put_string(out, command.profile, "profile")
     out.extend(struct.pack("<I", len(command.members)))
@@ -711,26 +720,18 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
     for buffer in command.buffers:
         _put_string(out, buffer.name, "buffer.name")
         out.extend(struct.pack("<Q", int(buffer.nbytes)))
+        _put_string(out, buffer.dtype, "buffer.dtype")
+        out.extend(struct.pack("<q??", buffer.count, buffer.load_from_host, buffer.store_to_host))
     out.extend(struct.pack("<I", len(command.descriptors)))
     for descriptor in command.descriptors:
         out.extend(descriptor.encode())
-    if command.owner_instance_id:
-        if len(command.owner_instance_id) != 8 or not any(command.owner_instance_id):
-            raise ValueError("global domain creator must be a nonzero 8-byte instance identity")
-        out.extend(b"SDB2" + command.owner_instance_id)
-        out.extend(struct.pack("<?", command.retain_after_run))
-        for buffer in command.buffers:
-            _put_string(out, buffer.dtype, "buffer.dtype")
-            out.extend(struct.pack("<q??", buffer.count, buffer.load_from_host, buffer.store_to_host))
-    elif command.retain_after_run or any(
-        b.dtype or b.count or b.load_from_host or b.store_to_host for b in command.buffers
-    ):
-        raise ValueError("global domain extended layout requires a creator identity")
     return bytes(out)
 
 
 def decode_domain_command(data: bytes) -> GlobalDomainCommand:
     reader = _Reader(data)
+    if reader.fixed(4, "domain command magic") != _DOMAIN_COMMAND_MAGIC:
+        raise ValueError("global domain command format is unknown")
     try:
         phase = GlobalDomainPhase(reader.u32())
     except ValueError as exc:
@@ -738,6 +739,12 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
     domain_id = reader.u64()
     generation = reader.u64()
     window_size = reader.u64()
+    owner_instance_id = reader.fixed(8, "creator identity")
+    if not any(owner_instance_id):
+        owner_instance_id = b""
+    retention = reader.fixed(1, "retention policy")
+    if retention not in (b"\x00", b"\x01"):
+        raise ValueError("global domain retention policy is invalid")
     name = reader.string("name")
     profile = reader.string("profile")
     member_count = reader.u32()
@@ -751,7 +758,15 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
     buffer_count = reader.u32()
     if buffer_count > GLOBAL_DOMAIN_MAX_BUFFERS:
         raise ValueError("global domain command buffer count exceeds maximum")
-    buffers = tuple(GlobalDomainBuffer(reader.string("buffer.name"), reader.u64()) for _ in range(buffer_count))
+    buffers = tuple(
+        GlobalDomainBuffer(
+            reader.string("buffer.name"),
+            reader.u64(),
+            reader.string("buffer.dtype"),
+            *struct.unpack("<q??", reader.fixed(10, "buffer definition")),
+        )
+        for _ in range(buffer_count)
+    )
     descriptor_count = reader.u32()
     if descriptor_count > GLOBAL_DOMAIN_MAX_RANKS:
         raise ValueError("global domain command descriptor count exceeds maximum")
@@ -759,22 +774,6 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
         GlobalDomainDescriptor.decode(reader.fixed(GLOBAL_DOMAIN_DESCRIPTOR_BYTES, "descriptor"))
         for _ in range(descriptor_count)
     )
-    owner_instance_id = b""
-    retain_after_run = False
-    if reader._offset != len(data):
-        if reader.fixed(4, "Buffer extension magic") != b"SDB2":
-            raise ValueError("global domain Buffer extension is unknown")
-        owner_instance_id = reader.fixed(8, "creator identity")
-        retention = reader.fixed(1, "retention policy")
-        if retention not in (b"\x00", b"\x01"):
-            raise ValueError("global domain retention policy is invalid")
-        retain_after_run = retention == b"\x01"
-        definitions = []
-        for buffer in buffers:
-            dtype = reader.string("buffer.dtype")
-            count, load, store = struct.unpack("<q??", reader.fixed(10, "buffer definition"))
-            definitions.append(replace(buffer, dtype=dtype, count=count, load_from_host=load, store_to_host=store))
-        buffers = tuple(definitions)
     reader.done("ALLOC_DOMAIN")
     command = GlobalDomainCommand(
         phase=phase,
@@ -788,7 +787,7 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
         descriptors=descriptors,
         attachments=attachments,
         owner_instance_id=owner_instance_id,
-        retain_after_run=retain_after_run,
+        retain_after_run=retention == b"\x01",
     )
     encode_domain_command(command)
     return command
@@ -812,66 +811,28 @@ def decode_descriptor_table(data: bytes) -> tuple[GlobalDomainDescriptor, ...]:
     return descriptors
 
 
-_DOMAIN_BUFFER_REF = struct.Struct("<II8sQIQQ")
-
-
-def encode_domain_buffer_refs(references: tuple[GlobalDomainBufferRef, ...]) -> bytes:
-    """Encode a node's committed slice identities and optional session locators, without addresses."""
+def encode_domain_buffer_refs(references: Sequence[tuple[BufferDescriptor, int, int]]) -> bytes:
+    """Encode committed backings in the command's node-member and buffer order."""
     if len(references) > GLOBAL_DOMAIN_MAX_RANKS * GLOBAL_DOMAIN_MAX_BUFFERS:
         raise ValueError("global domain Buffer reference count exceeds maximum")
-    out = bytearray(b"SBR1" + struct.pack("<I", len(references)))
-    slices, identities, locators = set(), set(), set()
-    for reference in references:
-        rank = operator.index(reference.rank)
-        index = operator.index(reference.slice_index)
-        identity = reference.identity
-        owner = bytes(identity.owner_instance_id)
-        buffer_id, generation = int(identity.buffer_id), int(identity.generation)
-        reference_id = operator.index(reference.reference_id)
-        reference_generation = operator.index(reference.reference_generation)
-        if not 0 <= rank < GLOBAL_DOMAIN_MAX_RANKS or not 0 <= index < GLOBAL_DOMAIN_MAX_BUFFERS:
-            raise ValueError("global domain Buffer reference rank or slice is out of range")
-        if len(owner) != 8 or not any(owner) or not 0 < buffer_id < 2**64 or not 0 < generation < 2**32:
-            raise ValueError("global domain Buffer reference has an invalid canonical identity")
-        if not 0 <= reference_id < 2**64 or not 0 <= reference_generation < 2**64:
-            raise ValueError("global domain Buffer reference locator is out of range")
-        if bool(reference_id) != bool(reference_generation):
-            raise ValueError("global domain Buffer reference locator must be zero or a positive pair")
-        locator = reference_id, reference_generation
-        if (rank, index) in slices or identity in identities or (reference_id and locator in locators):
-            raise ValueError("global domain Buffer references contain a duplicate slice, identity or locator")
-        slices.add((rank, index))
-        identities.add(identity)
-        locators.add(locator)
-        out.extend(_DOMAIN_BUFFER_REF.pack(rank, index, owner, buffer_id, generation, *locator))
-    return bytes(out)
+    return b"".join(
+        _encode_buffer_descriptor_wire(descriptor) + struct.pack("<QQ", reference_id, generation)
+        for descriptor, reference_id, generation in references
+    )
 
 
-def decode_domain_buffer_refs(data: bytes) -> tuple[GlobalDomainBufferRef, ...]:
-    reader = _Reader(data)
-    if reader.fixed(4, "Buffer reference magic") != b"SBR1":
-        raise ValueError("global domain Buffer reference format is unknown")
-    count = reader.u32()
-    if count > GLOBAL_DOMAIN_MAX_RANKS * GLOBAL_DOMAIN_MAX_BUFFERS:
-        raise ValueError("global domain Buffer reference count exceeds maximum")
-    references = []
-    for _ in range(count):
-        rank, index, owner, buffer_id, generation, reference_id, reference_generation = _DOMAIN_BUFFER_REF.unpack(
-            reader.fixed(_DOMAIN_BUFFER_REF.size, "Buffer reference")
+def decode_domain_buffer_refs(data: bytes) -> tuple[tuple[BufferDescriptor, int, int], ...]:
+    if len(data) % GLOBAL_DOMAIN_BUFFER_REF_BYTES or len(data) > (
+        GLOBAL_DOMAIN_MAX_RANKS * GLOBAL_DOMAIN_MAX_BUFFERS * GLOBAL_DOMAIN_BUFFER_REF_BYTES
+    ):
+        raise ValueError("global domain Buffer reference reply size is invalid")
+    return tuple(
+        (
+            _decode_buffer_descriptor_wire(data[offset : offset + 88]),
+            *struct.unpack_from("<QQ", data, offset + 88),
         )
-        references.append(
-            GlobalDomainBufferRef(
-                rank,
-                index,
-                CanonicalIdentity(owner, buffer_id, generation),
-                reference_id,
-                reference_generation,
-            )
-        )
-    reader.done("Buffer references")
-    result = tuple(references)
-    encode_domain_buffer_refs(result)
-    return result
+        for offset in range(0, len(data), GLOBAL_DOMAIN_BUFFER_REF_BYTES)
+    )
 
 
 def encode_release_command(command: GlobalDomainReleaseCommand) -> bytes:

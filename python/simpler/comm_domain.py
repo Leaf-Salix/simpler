@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class CommDomainRef:
-    """Immutable identity; access requires an existing grant on the receiving node."""
+    """Creator identity and generation of an already established domain."""
 
     owner_instance_id: bytes
     domain_id: int

@@ -692,42 +692,34 @@ TEST_F(OrchestratorFixture, RemoteInputSidecarUsesRemoteTensorMapKey) {
 
 TEST_F(OrchestratorFixture, RemoteViewsTrackOverlapInOwnerCoordinates) {
     for (RemoteAddressSpace space : {RemoteAddressSpace::REMOTE_DEVICE, RemoteAddressSpace::REMOTE_WINDOW}) {
-        const uint64_t import_offset = space == RemoteAddressSpace::REMOTE_WINDOW ? 1024 : 0;
-        auto args_for = [](uint64_t offset, TensorArgType tag) {
-            Tensor ref = remote_placeholder_args(tag).tensor(0);
-            ref.buffer.nbytes = 256;
-            ref.byte_offset = offset;
-            ref.shapes[0] = 16;
+        auto submit = [&](uint64_t offset, TensorArgType tag) {
+            Tensor tensor = remote_placeholder_args(tag).tensor(0);
+            tensor.buffer.nbytes = 256;
+            tensor.byte_offset = offset;
+            tensor.shapes[0] = 16;
             TaskArgs args;
-            args.add_tensor(ref, tag);
-            return args;
-        };
-        auto sidecar_for = [&](uint64_t offset) {
+            args.add_tensor(tensor, tag);
             RemoteTaskArgsSidecar sidecar;
             sidecar.tensors.resize(1);
-            auto &tensor = sidecar.tensors[0];
-            tensor.present = true;
-            tensor.desc.address_space = space;
-            tensor.desc.owner_worker_id = 3;
-            tensor.desc.buffer_id = 9;
-            tensor.desc.generation = static_cast<uint64_t>(space) + 1;
-            tensor.desc.offset = import_offset + offset;
-            tensor.desc.nbytes = 16;
-            return sidecar;
+            auto &remote = sidecar.tensors[0];
+            remote.present = true;
+            remote.desc.address_space = space;
+            remote.desc.owner_worker_id = 3;
+            remote.desc.buffer_id = 9;
+            remote.desc.generation = static_cast<uint64_t>(space) + 1;
+            remote.desc.offset = offset + (space == RemoteAddressSpace::REMOTE_WINDOW ? 1024 : 0);
+            remote.desc.nbytes = 16;
+            return orch.submit_next_level(C(42), args, cfg, 3, {3}, sidecar);
         };
-        auto producer =
-            orch.submit_next_level(C(42), args_for(64, TensorArgType::OUTPUT_EXISTING), cfg, 3, {3}, sidecar_for(64));
+        auto producer = submit(64, TensorArgType::OUTPUT_EXISTING);
         TaskSlot ready;
         ASSERT_TRUE(rq_next_level.try_pop_single(3, ready));
         ASSERT_EQ(ready, producer.task_slot);
-
-        auto overlapping =
-            orch.submit_next_level(C(43), args_for(72, TensorArgType::INPUT), cfg, 3, {3}, sidecar_for(72));
+        auto overlapping = submit(72, TensorArgType::INPUT);
         EXPECT_EQ(S(overlapping.task_slot).state.load(), TaskState::PENDING);
         ASSERT_EQ(S(overlapping.task_slot).fanin_producers.size(), 1u);
         EXPECT_EQ(S(overlapping.task_slot).fanin_producers[0], producer.task_slot);
-
-        auto disjoint = orch.submit_next_level(C(44), args_for(96, TensorArgType::INPUT), cfg, 3, {3}, sidecar_for(96));
+        auto disjoint = submit(96, TensorArgType::INPUT);
         EXPECT_EQ(S(disjoint.task_slot).state.load(), TaskState::READY);
         EXPECT_TRUE(S(disjoint.task_slot).fanin_producers.empty());
         ASSERT_TRUE(rq_next_level.try_pop_single(3, ready));

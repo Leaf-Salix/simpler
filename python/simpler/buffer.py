@@ -491,12 +491,9 @@ def re_export(source: BufferDescriptor) -> Buffer:
 
 
 def buffer_reference(
-    backing: Buffer | BufferDescriptor,
-    *,
-    owner_worker_id: int = 0,
-    remote_ref: tuple[int, int] | None = None,
+    backing: Buffer | BufferDescriptor, *, owner_worker_id: int = 0, remote_ref: tuple[int, int] | None = None
 ) -> Buffer:
-    """Name an existing backing without exposing an endpoint address or acquiring ownership."""
+    """Name an existing backing without an endpoint address or allocation ownership."""
     descriptor = backing.to_descriptor() if isinstance(backing, Buffer) else backing
     return Buffer(
         identity=descriptor.identity,

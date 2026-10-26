@@ -265,6 +265,13 @@ Buffer identity. A Tensor snapshot does not retain allocation ownership or preve
 explicit Buffer close; submission still validates live registration. Constructing
 a new view from a closed Buffer is rejected.
 
+Domains expose the same Buffer/Tensor interface through `domain.member(rank).buffers[name]`.
+Across nodes, existing `REMOTE_SIDECAR` entries locate VMM backings while preserving canonical
+identity, access, extent and view geometry. Sender and receiver revalidate private registration,
+target chip and the complete descriptor; release or name reuse invalidates old references.
+The domain owns its windows; session entries only borrow them, so ordinary remote free/copy/export
+rejects these entries. Pass domain ref/rank explicitly for context, without inferring it from a Tensor.
+
 `buffer.tensor(shapes, dtype, ...)` is a compatibility forwarding method to this
 constructor. The existing descriptor-based constructor remains available for
 internal wire callers. Both use the same geometry validator.
@@ -350,22 +357,17 @@ A `Tensor` on the wire is materialized differently by each consumer:
 
 | Consumer | What it does |
 | -------- | ------------ |
-| **Chip leaf (L2 runtime)** | Decode the POD blob with `read_args_from_blob`, then materialize each one to a `ChipTensor` via `ImportRegistry.materialize_args`, including **strided** views, and submit with `_submit_chip_run_materialized`. Mappings are cached by identity; device submissions are authorized against the owning Worker's live allocation table before reaching the leaf. |
+| **Chip leaf (L2 runtime)** | Decode the POD blob with `read_args_from_blob`, then materialize each one to a `ChipTensor` (map-once, keyed by canonical identity) via `ImportRegistry.materialize_args`, including **strided** views, and submit with `_submit_chip_run_materialized`. |
 | **Python sub-worker** (compute) | Map each one into a `MappedArg`; the callable computes with `torch.frombuffer(arg.buffer, ...)`. No `ChipTensor`. |
-| **Nested L4→L3 orch** (forwarding) | Re-export ordinary backings without mapping, preserving canonical identity. Address-free slice references resolve to existing local Buffers, or through the existing remote sidecar and session table. |
+| **Nested L4→L3 orch** (forwarding) | **Re-export** each backing to a descriptor `H'` that keeps the source's canonical identity — no pass-through, no map on the forwarding hop. |
 
-**Re-export.** An ordinary upper-level tensor is forwarded on receipt as a
+**Re-export (no pass-through).** An upper-level tensor is forwarded on receipt as a
 descriptor `H'` that keeps the source's **canonical identity unchanged** (invariant
 across every edge — an L4 buffer forwarded L4→L3→L2 carries one identity at all
 three layers; only role / materialized VA / view change), per-backing and without
 mapping. A downstream compute leaf maps lazily, so pure forwarding carries no map
 cost. Dependency inference keys on the invariant identity, so an alias /
 retain-release does not split across layers.
-
-An address-free domain reference names an already registered backing. The
-receiver returns its actual Buffer, whose storage backend determines further
-resolution; the reference exposes no window address and causes no allocation
-or mapping.
 
 ## Canonical identity
 
@@ -394,18 +396,7 @@ gates, or keys on it.
 | `FORK_COW` | the same VA, no map | exactly 8 bytes, a non-zero u64 LE base | a pre-fork plain host buffer: copy-on-write, so **READ only** |
 | `VMM_WINDOW` | the device VA of the window carved by `allocate_domain`, no map | exactly 8 bytes, a non-zero u64 LE base | communication-domain window / buffer |
 | `DEVICE_MALLOC` | the device pointer, no map (chip-local) | exactly 8 bytes, a non-zero u64 LE base | `alloc_child_tensor` |
-| `REMOTE_SIDECAR` | resolve a registered reference to its actual Buffer, then use that backend | empty | ordinary remote arguments and address-free L4 domain slices; network sidecars or local lookup name an existing Buffer |
-
-Domain slices reuse `REMOTE_SIDECAR`, without adding a storage backend; their
-actual Buffers currently use `VMM_WINDOW`. Domain COMMIT replies provide the
-backing's canonical identity and an address-free session locator. Identity
-drives dependencies and authorization; the protocol buffer ID locates an entry
-and is not assumed to be the Buffer identity. Forwarding preserves the backing's
-identity, extent/access and Tensor view. Each submission checks the current
-registration, full descriptor and target chip; an import-cache hit cannot
-revive a revoked reference. Session entries only borrow domain windows:
-ordinary remote free/copy/export rejects them, while domain staging delegates
-device copies. See the [domain contract](comm-domain.md#unified-creation-and-reuse).
+| `REMOTE_SIDECAR` | (P2) resolved via the remote transport | empty | an arg to a remote L3; the descriptor rides in the sidecar |
 
 **The body rule is enforced, not advisory.** `backend_kind` is what selects how a
 consumer reads `body`, so a body that does not fit that reading is not a smaller
@@ -464,10 +455,9 @@ element is the `Tensor`, and `TaskArgsView::tensors` validates each one as it de
 it. `ChipTensor` survives only in `ChipStorageTaskArgs`, the POD `ChipWorker`
 consumes — an L2 worker materializes into it inside `run` before calling down.
 
-Single-machine (host + device) L3→L2 and L4→L3→L2 dispatch, including TCP/MPI
-remote receive, use the canonical buffer validation and materialization paths.
-Communication-domain Tensor tests cover local Fabric, TCP, and MPI on supported
-`a2a3` hardware.
+Single-machine (host + device) L3→L2 and L4→L3→L2 dispatch is implemented and
+verified in `a2a3sim` and onboard `a2a3`. The remote **receive** side is a later
+phase (P2).
 
 Buffer lifecycle robustness is partly in place, and which guarantee applies
 depends on the API that releases the storage. `Worker.free` is atomic with a

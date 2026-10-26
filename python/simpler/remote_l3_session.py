@@ -55,7 +55,6 @@ from .callable_identity import (
 )
 from .global_comm_domain import (
     GLOBAL_DOMAIN_PROFILE_SIM,
-    GlobalDomainBufferRef,
     GlobalDomainCommand,
     GlobalDomainPhase,
     GlobalDomainReleaseCommand,
@@ -591,10 +590,13 @@ def _materialize_task_args(
 ) -> tuple[TaskArgs, list[Buffer]]:
     """The wire ``TaskArgs`` a remote TASK's orchestration function receives.
 
-    Views are rebuilt over the existing local backing named by their sidecar.
-    An orchestration function can forward the resulting Tensor to a chip child. The returned
-    ``Buffer`` list holds this task's session-scoped HOST_INLINE backings; the caller closes them
-    when the run returns.
+    The wire carries each argument as the submitter's own ``REMOTE_SIDECAR`` ``Tensor``: its view
+    (shapes, strides, dtype) is taken verbatim, and the sidecar names the local backing that view is
+    rebuilt over. Every element is therefore a ``Tensor`` over a backing this runner holds, so an
+    orchestration function forwards its own args to a chip child exactly as one at any other level
+    does. The returned ``Buffer`` list is the session-scoped backings minted for this task's
+    HOST_INLINE payloads; they live no longer than the run and the caller closes them once it
+    returns.
     """
     if len(args.remote_desc) != len(args.tensors):
         raise ValueError("remote TASK descriptor count does not match tensor count")
@@ -721,28 +723,27 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                 entry.close()
                 buffers.pop(key)
 
-    def register_domain_buffers(command: GlobalDomainCommand, backings: dict[tuple[int, int], Buffer]) -> bytes:
+    def register_domain_buffers(command: GlobalDomainCommand, backings: tuple[Buffer, ...]) -> bytes:
         nonlocal next_buffer_id
-        refs = []
         domain_key = (command.domain_id, command.generation)
         registered = {
             entry.wire_buffer().identity: key for key, entry in buffers.items() if entry.borrowed_domain == domain_key
         }
-        for (rank, slice_index), backing in backings.items():
+        references = []
+        for backing in backings:
             key = registered.get(backing.identity)
             if key is None:
                 key = _buffer_key(next_buffer_id, command.generation)
                 next_buffer_id += 1
-                entry = _RemoteBufferEntry(
+                buffers[key] = _RemoteBufferEntry(
                     backing,
                     backing.nbytes,
                     command.generation,
                     RemoteAddressSpace.REMOTE_DEVICE,
                     borrowed_domain=domain_key,
                 )
-                buffers[key] = entry
-            refs.append(GlobalDomainBufferRef(rank, slice_index, backing.identity, key[0], key[1]))
-        return encode_domain_buffer_refs(tuple(refs))
+            references.append((buffer_reference(backing).to_descriptor(), *key))
+        return encode_domain_buffer_refs(references)
 
     def mint_session_buffer(nbytes: int) -> Buffer:
         """A POSIX_SHM backing this loop owns, under a buffer_id no other one in the session reuses.
@@ -1172,14 +1173,13 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         elif command.phase is GlobalDomainPhase.COMMIT:
                             backings = inner_worker._commit_global_domain_node(command)  # noqa: SLF001
                             try:
-                                result = register_domain_buffers(command, backings)
                                 _control_result_reply(
                                     conn,
                                     manifest,
                                     header.sequence,
                                     control.control_name,
                                     control.control_version,
-                                    result,
+                                    register_domain_buffers(command, backings),
                                 )
                             except BaseException:
                                 revoke_domain_buffers(command.domain_id, command.generation)
@@ -1278,10 +1278,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                 if orch_fn is None:
                     raise KeyError(f"remote TASK dispatcher has no callable hashid {task.callable_digest.hex()}")
                 task_args, inline_backings = _materialize_task_args(
-                    task.args,
-                    buffers,
-                    worker_id,
-                    mint_inline_buffer=mint_session_buffer,
+                    task.args, buffers, worker_id, mint_inline_buffer=mint_session_buffer
                 )
                 try:
                     task.config.output_prefix = _level_capture_prefix(task.config.output_prefix, inner_worker)

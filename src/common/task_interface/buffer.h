@@ -85,8 +85,9 @@ enum class AccessMode : uint8_t {
 };
 
 // Materialization backend of a buffer. The consumer resolves a Tensor to a local address via the
-// import registry keyed by canonical identity; this tag selects how. Values 0–5
-// are frozen; VMM_SHAREABLE is 6; 7.. reserved (unknown tag => reject).
+// import registry keyed by canonical identity; this tag selects how. REMOTE_SIDECAR is reserved for
+// P2 and rejected on decode in P1. Values 0–5 are frozen; VMM_SHAREABLE is 6; 7.. reserved
+// (unknown tag => reject).
 //
 // FORK_SHM and FORK_COW materialize identically — the body is a base VA the child already has,
 // inherited across the fork — but the kernel's write semantics are opposite, so they are separate
@@ -285,8 +286,8 @@ inline uint64_t tensor_extent_bytes(const Tensor &r) {
  * `CanonicalIdentity` gets structurally, and the body itself is checked against the schema its
  * `backend_kind` implies. Throws `std::invalid_argument` naming the field.
  *
- * `REMOTE_SIDECAR` carries no address: dispatch resolves its registered backing before
- * materialization, using a per-task sidecar when crossing a remote boundary.
+ * `REMOTE_SIDECAR` is a legal wire value and passes: an arg bound for a remote worker rides the wire
+ * with no local backing, and it is *materialization* that refuses it in P1.
  */
 inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     auto reject = [](const char *what) {
@@ -368,7 +369,7 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
         break;
     }
     case BackendKind::REMOTE_SIDECAR:
-        // The receiving worker resolves this reference from its registered backing.
+        // The authoritative descriptor rides in the per-task sidecar, so nothing belongs here.
         if (h.body_len != 0) reject("invalid BufferDescriptor: REMOTE_SIDECAR carries no body in P1");
         break;
     }
