@@ -29,9 +29,16 @@ with orch.allocate_domain(
         orch.submit_next_level(chip_handle, args, cfg, worker=chip_idx)
 ```
 
-`window_size` is validated on the orch thread **before** any chip-side
-allocation: if `sum(b.nbytes) > window_size`, `allocate_domain` raises
-`ValueError` immediately and no backend allocation is registered.
+Buffer sizes and `window_size` are validated on the orch thread **before** any
+chip-side allocation. Each `CommBufferSpec.nbytes` is a physical allocation size
+and must be a positive multiple of **64 bytes**; `window_size` must also be a
+multiple of 64 covering their sum, so consecutive rank windows stay aligned.
+Invalid requests raise `ValueError` without registering a backend allocation.
+The caller (including pypto codegen) supplies the padding. Simpler places buffers
+consecutively in declaration order and never rounds their sizes or offsets.
+For example, a one-element `int32` signal uses `count=1, nbytes=64`; its tensor
+view still has shape `(1,)`. This separates named buffers at cache-line boundaries;
+concurrent signal slots inside one buffer still require a kernel-defined safe layout.
 
 ### Unified creation and reuse
 
@@ -39,8 +46,9 @@ L3 and L4 use `allocate_domain(members=...)`, `get_or_allocate_domain(...)`,
 `get_domain(name)` and `release_domain(handle)`, returning the same
 `CommDomainHandle`. L3 members are logical chip worker ids, such as `[1, 0]`;
 L4 members are `(node_worker_id, chip_worker_id)` pairs. Order defines domain
-rank. `member(rank)` returns topology and Buffers; `local_context(rank)` returns
-this node's local mapping. Legacy `handle[chip_id]` keeps chip-id semantics.
+rank. `member(rank).buffers[name]` provides the same logical Buffer and `.tensor(...)`
+interface at both levels. `local_context(rank)` requires a mapping on the current node.
+Legacy `handle[chip_id]` keeps chip-id semantics.
 For L3 member metadata, `node_worker_id=-1` denotes the creator's own node.
 
 Handle attributes and context/buffer mappings are read-only metadata by contract;
@@ -54,10 +62,16 @@ domain = orch.get_or_allocate_domain(
     buffers=[CommBufferSpec("payload", "float32", 1024, 4096)],
     retain_after_run=True,
 )
-# The same Buffer/Tensor access works in L3 and L4.
 payload = domain.member(0).buffers["payload"]
 tensor = payload.tensor([1024], DataType.FLOAT32)
 ```
+
+L4 domains can also request one shared DRAM pool per participating node through
+`host_windows={node_id: HostWindowSpec(numa_id, nbytes)}`. `domain.host(node_id)`
+names the same backing on every chip; each chip resolves its own authorized view.
+`domain.local_host()` provides protected byte access on the owning L3, and
+`orch.copy_domain(...)` performs synchronous pool-to-pool copies through a local chip.
+See [Host domain design](zh-cn/host-comm-domain-design.md) for the access and lifetime contracts.
 
 `allocate_domain` rejects a live name. `get_or_allocate_domain` returns the
 same handle only if ordered members and target identities, requested window
@@ -69,75 +83,51 @@ missing. `allocate_global_domain` and `release_global_domain` are compatibility
 wrappers; `workers=` remains the legacy L3 allocation spelling.
 
 Domain creation and configuration reuse occur in an orchestration callback.
-L3 creation and staging precede its first task submission and use the existing
-control admission gate. Registry-only reuse performs no device control and remains
-available after task submission. L4 retains its existing control-plane paths.
+L3 creation and staging precede its first submission; a reuse hit performs no device control and remains valid afterwards.
 A successful run preserves domains created with `retain_after_run=True`.
-Ordinary Tensor submissions and synchronous Buffer copies register domain use
-in the current run, including cached Tensors from a previous run. Explicit lookup
-also registers use when kernels consume only `CommContext` scalars.
+Later runs can submit cached Buffers/Tensors directly. Submission and ordinary copies enroll
+the current run; release waits for it and its descendants, while a failed run closes its used domains.
 Use `with` only when the scope should release the shared handle: context exit
 releases a reused handle too. After release, callers must not submit new uses
-of previously obtained Buffers; logical release revokes their submit provenance.
+of previously obtained Buffers; lookup, submission and local resolution reject revoked references.
 Physical release still waits for accepted tasks and their children to complete.
 After run completion, retained handles can be inspected, copied through a
 matching Orchestrator and released serially outside a callback; successful release
 reclaims the backend resources synchronously and repeated release is a no-op.
-Release follows the handle's callback to its creating Worker;
-`orch.release_domain` rejects a foreign owner. Concurrent run callbacks,
-lookup and release use the existing submission serializer. Domain-using runs
-retain the existing ordered-cleanup policy: a successor waits for its
-predecessor's fence and cleanup. This does not add concurrent device execution.
-`Worker.close()` drives owned-domain cleanup after its existing lease/fence drain;
-failed or unconfirmed reclamation remains tracked and is reported.
+Only the creating Worker owns release. Lookup, creation, publication and release share
+the callback serializer; concurrent matching requests share one transaction and conflicts fail.
+`Worker.close()` attempts to free remaining owned domains after its existing lease/fence drain.
+If device completion or reclamation is unconfirmed, the domain remains released
+but not freed; its cleanup obligation stays tracked and is reported, while
+independent worker-tree cleanup continues.
 `Worker.live_domains` includes both backends.
 
 `copy_to_domain` and `copy_from_domain` use domain rank and the same named-buffer
-bounds checks. They synchronously stage data and do not wait for already queued
-DAG work. L3 staging precedes task submission and reuses ordinary VMM Buffer
+bounds checks. They synchronously stage data without issuing an implicit run/DAG
+fence. L3 staging precedes task submission and reuses ordinary VMM Buffer
 copies and must stay inside the declared slices, including when `buffer=None`.
 L4 retains the existing bounded whole-window copy path. `buffer_range(name)`
-returns the slice's window offset and byte size. `mapping_size` is the
-returned backend mapping extent on both L3 and L4. Outside a callback, staging
-requires all outstanding run handles to have completed; it never waits implicitly.
+returns the slice's window offset and byte size. `requested_window_size` preserves the request;
+`mapping_size` reports the backend's actual mapping extent. Complete buffer definitions remain available.
 
-`member(rank).buffers[name]` returns an ordinary public `Buffer` in both layers.
-L4 Buffers carry an address-free `DOMAIN_WINDOW` descriptor: creator incarnation,
-domain id/generation, rank and declared slice. Pass their Tensors through the
-existing `TaskArgs` to the member's L3, then to its exact chip. Local and TCP/MPI
-forwarding preserve the creator's canonical identity, view offset and geometry;
-the receiving node and chip resolve only an existing committed slice grant.
-Wrong targets, stale identities and modified descriptors are refused. Ordinary
-Tensor arguments name their own chip's storage; peer-window access still uses
-`CommContext`. Tensor construction performs no network copy or implicit H2D.
+L4 Buffer/Tensor views reach their owning chip through local or remote L3s, preserving canonical
+identity without exposing remote device addresses. Pass an immutable `CommDomainRef` (creator instance,
+domain id, generation) across nodes; `get_domain(domain.ref)` borrows an established domain using the
+same handle type, with `release()` and `with` rejected. Pass ref/rank explicitly for kernel context
+and resolve it through `local_context(rank)`. Rebuilding a name creates new domain and Buffer identities.
+Scalar-only ref/context arguments require `get_domain(name_or_ref)` in the owner's current callback
+to enroll that run. A child lookup alone does not enroll the owner's run:
 
-`domain.ref` is an immutable `CommDomainRef`, not a release callback or an access
-grant. A receiving L3 can use `orch.get_domain(ref)` to obtain the same public
-handle type in borrowed mode; `CommDomainRef.from_tensor(tensor)` extracts the
-reference from an incoming L4 domain Tensor. Borrowed `release()` and `with`
-are refused. `local_context(rank)` is available only for ranks actually mapped
-on this node. Legacy `get_global_domain(domain_id)` remains session-local.
-`handle.buffers` contains complete buffer definitions, and
-`requested_window_size` distinguishes the request from `mapping_size`.
-The existing root run fence protects its accepted descendants; holding a
-descriptor or borrowed handle alone adds no retention. Logical release revokes
-new L3/L4 Tensor submissions while previously accepted descendants keep their
-node grants until the fence. For pure references passed as scalars or closure
-values, the root callback must first call `get_domain(ref)` and submit the
-descendant before release; arbitrary integer semantics cannot imply a use.
-There is no independent graph capture/replay API; `host_build_graph` executes
-within the same run fence. General Remote COPY/lease and mapping remain #2460
-work. Unconfirmed completion or release remains tracked until physical
-reclamation is proved.
+```python
+# Owner callback, before forwarding ref/rank as control scalars:
+domain = orch.get_domain("tp")
+ref, rank = domain.ref, 0
+# Child callback, after decoding those scalars:
+context = child_orch.get_domain(ref).local_context(rank)
+```
 
-`Worker.detach_persistent_domain(handle)` adapts #2120's proposed retention API
-to the same ownership model: inside the owning callback it changes an unretained
-domain to `retain_after_run=True`, preserving the current run's registration
-and cleanup debt. It does not move the handle to another registry or discard
-its fence. Reuse must then specify `retain_after_run=True`; a second detach is
-an error. Callers can migrate private journal manipulation to this method,
-or request retention directly at allocation. A failed consuming run still
-closes the retained domain, and `Worker.close()` remains the final owner.
+Failed or unknown release keeps cleanup debt visible and `freed=False` while transport/native teardown
+continues; child exit alone does not prove device reclamation.
 
 ### `ChipDomainContext` (one per participating chip, via `handle[chip_idx]`)
 
@@ -148,8 +138,8 @@ closes the retained domain, and `Worker.close()` remains the final owner.
 | `domain_size` | number of ranks in the subset |
 | `device_ctx` | pointer to the device-side `CommContext` (pass as a kernel scalar) |
 | `local_window_base` | base device address of this rank's window |
-| `actual_window_size` | actual backend mapping extent, including backend alignment |
-| `buffers` | `{buffer_name: Buffer}` for each `CommBufferSpec`, resolved on this chip; L3-local VMM or imported logical domain slice |
+| `actual_window_size` | window size actually allocated |
+| `buffers` | `{buffer_name: Buffer}` for each `CommBufferSpec` (device `VMM_WINDOW`, owned by this chip) |
 
 Kernels read peer windows through `device_ctx` (which holds every rank's
 window base, local + imported peer); `buffers[name]` is the local slice —
@@ -212,7 +202,7 @@ not resend it: `COPY_TO_DOMAIN`/`COPY_FROM_DOMAIN` use
 
 `GlobalDomainMember` remains the rank table: one entry and one exported window
 per device rank. A host is not inserted into that table and never consumes an
-HCCL rank. The version-3 `GlobalDomainCommand` carries a flattened attachment
+HCCL rank. The version-2 `GlobalDomainCommand` carries a flattened attachment
 matrix alongside `members`. Each receiving L3 node contributes one row, and
 each row has one entry for every member in dense rank order. Thus a domain with
 three ranks on two nodes carries six attachment records; a receiver selects
@@ -231,13 +221,6 @@ relation is currently supported; an unsupported relation remains an explicit
 host-consumer record with no adapter instead of being mistaken for a usable
 mapping. Host access still needs the separate host-window access primitive
 before a consumer can dereference a device window.
-
-Host-owned DRAM pools are a separate opt-in `host_windows` configuration;
-they do not turn attachment records into CPU mappings of remote HBM.
-Their export table contains the R NPU windows followed by the H Host windows;
-the member rank table and CommContext still contain only the R NPUs.
-See the [Host domain design](zh-cn/host-comm-domain-design.md)
-for protected local CPU access, explicit ACL copy, and kernel-visible views.
 
 The descriptor reports the backend's actual mapped size. A3 Fabric may align
 the requested size to its VMM granularity; buffer carving and bounds checks
@@ -259,24 +242,24 @@ final safety net.
 Repository CI exercises the complete transaction, rollback, and mixed
 local/remote paths with the `sim` backend. It also exercises the real
 `a3-fabric-v1` backend: the two-machine `st-network1-onboard-a2a3` job runs
-the existing global-domain examples and the shared domain-Tensor flow in
-`test_domain_tensor_network1.py` on local L4, TCP and MPI topologies. The
-shared flow covers retained data, cached nonzero Tensor views, release before
-the run wait, independent outputs and stale receiver grants. Read that job's
-individual test results to verify hardware coverage; simulation checks or a
-skipped MPI test do not establish it.
+`global_tload_mixed_l3` and `compute_then_tload_mixed_l3`, whose default
+profile is `a3-fabric-v1` on real A3 devices. Those two examples are the
+in-repository harness for the Fabric path; a run that needs to know whether
+Fabric was covered should read that job rather than infer it from the
+simulation checks. The job now drives their `test_*.py` wrappers through
+`network1-run-pytest` rather than calling `run_parent.sh` directly.
 
 ---
 
 ## 2. Lifetime model
 
-Owning handles move through `live → released → freed`:
+The handle is a context manager. Its lifecycle has **two distinct states**:
 
-- **`live`** — allocated and available for new uses.
-- **`released`** — set when logical release is accepted through `release()` or
-  `with` exit. Further indexing (`handle[i]`) raises. This is the *user-visible*
+- **`released`** — set the moment `release()` is called (or the `with` block
+  exits). Further indexing (`handle[i]`) raises. This is the *user-visible*
   state: "do not hand this domain to any new `submit_*`."
-- **`freed`** — physical reclamation has been confirmed.
+- **`freed`** — the backend `comm_release_domain_windows` has actually run and
+  the device memory is gone.
 
 Inside an orchestration callback, `submit_next_level()` only *enqueues* DAG work;
 `Worker.run()` does not wait for completion until the orch function returns.
@@ -287,20 +270,16 @@ queues the backend free; the real free runs after the run fence, when every
 task that could reference the window has completed.
 
 When a retained domain is released serially after its run has completed,
-the backend free is synchronous: on success `release()` returns with `freed=True`,
+the backend free is synchronous: successful `release()` returns with `freed=True`,
 including release at context-manager exit. Repeated release is a no-op.
 Use `handle.released` to guard against accidental reuse; use `handle.freed`
 to check physical teardown.
 
-A failed consuming run revokes new uses and retains cleanup responsibility.
-Pending releases and the run's domain sweep require proven completion; failed
-ordered cleanup blocks successor runs. Unconfirmed completion or release keeps
-the resource tracked and unfreed, with the error reported.
-
-L3 can confirm a failed release through participating chip-finalization receipts
-and complete tree teardown. L4 has no equivalent global-window teardown receipt:
-`close()` can reclaim the worker tree while retaining cleanup debt, reporting
-`window reclamation is unconfirmed` and keeping `freed=False`.
+Cleanup is **failure-safe**: even if a chip task fails and the run wait
+re-raises, `Worker.run` still attempts pending releases and sweeps any live
+domains the orch fn forgot to release (LIFO). Failed or unconfirmed releases
+remain tracked and prevent a successor run from using unresolved device state;
+neither a failed wait nor child-process exit proves physical reclamation.
 
 ---
 

@@ -89,6 +89,16 @@ the operator. Caller synchronization can establish device results; `RunHandle.wa
 still performs runtime retirement. Capture is rejected before run/source state is
 published. Borrowed close does not reset the caller device or destroy its stream.
 
+Frameworks with a separate host emission queue must place the submission in
+that queue's callback; passing a stream integer alone does not order a Python
+call against framework work still waiting for host emission. The optional
+[A3 framework eager reference](../../../examples/workers/l2/framework_eager/README.md)
+uses the same public Worker for TMR and HBG, preserves frame/storage owners and
+uses the final framework completion boundary before runtime retirement. It
+demonstrates ordering, not overlapping execution: native admission, predecessor
+retirement and capacity backpressure can still wait. It
+requires matching torch/torch_npu/CANN and does not enable capture submission.
+
 ### Memory
 
 | Method | Notes |
@@ -113,8 +123,7 @@ cannot walk a legal-looking length past the end.
 | ------ | ----- |
 | `run(callable, args=None, config=None, *, caller_stream=None) -> None` | Blocks until the run completes |
 | `submit(callable, args=None, config=None, *, caller_stream=None) -> RunHandle` | Non-blocking |
-| `live_domains: dict[str, CommDomainHandle]` | Snapshot of currently live communication domains |
-| `detach_persistent_domain(handle)` | Retain an owned domain from its callback, preserving the current run fence and cleanup journal |
+| `live_domains() -> dict[str, CommDomainHandle]` | Currently allocated communication domains |
 
 `RunHandle` exposes the `done` property, `wait(timeout=None)`, and
 `result(timeout=None)`.
@@ -170,11 +179,16 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | `submit_sub(callable_handle, args=None)` | Schedules a registered host-side Python callable |
 | `allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | L3/L4 creation returning `CommDomainHandle`; legacy L3 `workers=` and chip-id indexing remain supported |
 | `get_or_allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | Reuse the same live handle after full configuration validation, or create it |
-| `get_domain(name_or_ref)` / `release_domain(handle)` | Creator-local lookup or an already-granted L3 borrowed handle / deferred owning release |
-| `domain.member(rank).buffers[name].tensor(...)` | Common L3/L4 Buffer view; L4 descriptors forward to their exact L3/chip through ordinary TaskArgs |
-| `domain.ref` / `CommDomainRef.from_tensor(tensor)` | Immutable domain identity; does not authorize access or own the domain |
+| `get_domain(name_or_ref)` / `release_domain(handle)` | Creator-local name lookup or borrowing by `CommDomainRef`; only the creator owns release |
 | `copy_to_domain(handle, rank, data, ...)` / `copy_from_domain(handle, rank, nbytes, ...)` | Synchronous bounded staging before task submission; L3 requires declared slices |
 | `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Delegates allocation to the owning Worker; target chip memory is named by the returned handle |
+
+`domain.member(rank).buffers[name].tensor(...)` has the same L3/L4 semantics and routes to its owning chip.
+`domain.ref` is immutable across nodes; `local_context(rank)` requires a local mapping.
+Borrowed handles reject `release()` and `with`. Cached Tensor use enrolls later runs automatically;
+release waits for accepted tasks, and unknown cleanup remains tracked and reported with `freed=False`.
+For scalar-only ref/context tasks, the owner's callback must call `get_domain(name_or_ref)`;
+a child lookup does not enroll the owner's run.
 
 ## Callables and task args
 

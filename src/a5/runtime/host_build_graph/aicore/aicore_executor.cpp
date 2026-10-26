@@ -79,7 +79,8 @@ __aicore__ __attribute__((always_inline)) void stage_task_pmu(
     if (subtask >= SCHEDULER_TASK_SUBTASK_SLOTS) return;
     __gm__ SchedulerTaskPmuCell *cells =
         scheduler_state_at<SchedulerTaskPmuCell>(scheduler_state_base, local->config.pmu_cells_offset);
-    __gm__ SchedulerTaskPmuCell *cell = &cells[scheduler_trace_index_at(scheduler_state_base, local, task_id, subtask)];
+    __gm__ SchedulerTaskPmuCell *cell =
+        &cells[scheduler_trace_index_at(scheduler_state_base, local, task_id, static_cast<SubtaskSlot>(subtask))];
     pmu_aicore_read_counters(pmu_reg_base, cell->counters, &cell->total_cycles);
     cell->worker_id = static_cast<uint32_t>(local->config.worker_ids[local->config.self_lane]);
     OUT_OF_ORDER_STORE_BARRIER();
@@ -200,7 +201,7 @@ __aicore__ bool bootstrap_ready_graph(
                         SchedulerRouteResult::READY_TO_ENQUEUE;
         if (route == SchedulerRouteResult::ERROR) return false;
         if (route == SchedulerRouteResult::READY_TO_ENQUEUE) {
-            const uint32_t core_type = scheduler_task_ready_queue(metadata->flags, metadata->active_mask);
+            const uint32_t core_type = scheduler_task_ready_queue(metadata->flags, scheduler_task_lanes(*metadata));
             if (!scheduler_bootstrap_ready_batch_append(
                     scheduler_state_base, scheduler, static_cast<int64_t>(task_id), &batches[core_type],
                     phase_timing_enabled ? &stats->ready : nullptr, profiling_level

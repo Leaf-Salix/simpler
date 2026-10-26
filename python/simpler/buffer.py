@@ -75,6 +75,7 @@ __all__ = [
     "MappedArg",
     "MappedArgs",
     "Tensor",
+    "buffer_reference",
     "capabilities_for_adapter",
     "create_host_shared_buffer",
     "host_ptr_nbytes",
@@ -334,6 +335,7 @@ class Buffer:
     # which is the derivation gate — a close() whose unlink raised leaves this false so a retry
     # attempts the unlink again.
     unlinked: bool = False
+    _remote_ref: tuple[int, int] | None = field(default=None, compare=False, repr=False)
     # Set only on a Buffer whose descriptor fields are final for the rest of its life — the private
     # snapshot `Worker._record_device_alloc` registers. `init=False` keeps `replace()` from carrying
     # it onto a copy, so a handle a caller still holds derives a fresh descriptor on every call and
@@ -488,11 +490,27 @@ def re_export(source: BufferDescriptor) -> Buffer:
     )
 
 
-def remote_backing_identity(owner_worker_id: int, buffer_id: int, generation: int) -> CanonicalIdentity:
-    """The canonical identity of a backing that lives on another machine's worker.
+def buffer_reference(
+    backing: Buffer | BufferDescriptor, *, owner_worker_id: int = 0, remote_ref: tuple[int, int] | None = None
+) -> Buffer:
+    """Name an existing backing without an endpoint address or allocation ownership."""
+    descriptor = backing.to_descriptor() if isinstance(backing, Buffer) else backing
+    return Buffer(
+        identity=descriptor.identity,
+        address_space=descriptor.address_space,
+        access=descriptor.access,
+        backend_kind=BackendKind.REMOTE_SIDECAR,
+        nbytes=descriptor.nbytes,
+        owner_worker_id=owner_worker_id,
+        _remote_ref=remote_ref,
+    )
 
-    A remote owner's ``owner_instance_id`` never crosses the remote L3 wire, so the nonce is the
-    owning worker's id instead. This is the single rule for naming a remote backing: the submitting
+
+def remote_backing_identity(owner_worker_id: int, buffer_id: int, generation: int) -> CanonicalIdentity:
+    """The protocol-derived identity of an ordinary remote allocation.
+
+    An ordinary allocation's ``owner_instance_id`` does not cross the remote L3 wire, so its nonce
+    is the owning worker's id instead. For these allocations, the submitting
     L4's ``REMOTE_SIDECAR`` placeholder and the importing session runner both derive from it, so one
     remote backing carries one identity on both sides of the hop.
     """
@@ -1076,7 +1094,30 @@ class ImportRegistry:
         self._by_identity: dict[CanonicalIdentity, ImportedBuffer] = {}
         self._context = context
 
-    def materialize(self, desc: BufferDescriptor, domain_resolver=None) -> ImportedBuffer:
+    def register_borrowed(self, descriptor: BufferDescriptor, base: int) -> None:
+        """Bind an already granted device mapping without taking allocation ownership."""
+        if (
+            self._context.deployment not in (DEVICE_AICORE, DEVICE_AICPU)
+            or descriptor.address_space != AddressSpace.DEVICE
+            or descriptor.backend_kind != BackendKind.REMOTE_SIDECAR
+            or base <= 0
+        ):
+            raise ValueError("borrowed mapping requires a granted device reference and nonzero VA")
+        cached = self._by_identity.get(descriptor.identity)
+        if cached is not None:
+            if cached.descriptor != descriptor or cached.base != base:
+                raise ValueError("borrowed mapping conflicts with an existing import")
+            return
+        self._by_identity[descriptor.identity] = ImportedBuffer(
+            descriptor.identity,
+            base,
+            descriptor.nbytes,
+            descriptor.address_space,
+            descriptor=descriptor,
+            capabilities=capabilities_for_adapter(AdapterKind.DIRECT_MAP, descriptor.access),
+        )
+
+    def materialize(self, desc: BufferDescriptor) -> ImportedBuffer:
         """Map ``desc``'s backing into this process on first sight of its identity; reuse the
         cached ImportedBuffer thereafter (map-once).
 
@@ -1094,8 +1135,6 @@ class ImportRegistry:
         named mechanism out. Nothing after selection looks at ``backend_kind`` again. A mechanism
         that reaches the backing without producing an address is refused *here* rather than there --
         this returns a mapping, and that is the only narrowing it applies to the judgment.
-
-        Domain windows instead require an endpoint grant resolver on every call, including cache hits.
         """
         key = desc.identity
         cached = self._by_identity.get(key)
@@ -1110,21 +1149,7 @@ class ImportRegistry:
                     f"identity names one backing, so the mapping already handed out is kept and "
                     f"this is refused"
                 )
-            if desc.backend_kind != BackendKind.DOMAIN_WINDOW:
-                return cached
-        if desc.backend_kind == BackendKind.DOMAIN_WINDOW:
-            if domain_resolver is None or self._context.deployment not in (DEVICE_AICORE, DEVICE_AICPU):
-                raise ValueError("communication domain has no live grant at this endpoint")
-            imported = ImportedBuffer(
-                key,
-                domain_resolver(desc),
-                desc.nbytes,
-                desc.address_space,
-                descriptor=desc,
-                capabilities=capabilities_for_adapter(AdapterKind.DIRECT_MAP, desc.access),
-            )
-            self._by_identity[key] = imported
-            return imported
+            return cached
         kind, profile = select_adapter(desc, self._context)
         resolver = _RESOLVERS.get(profile)
         if resolver is None:
@@ -1150,13 +1175,13 @@ class ImportRegistry:
         self._by_identity[key] = imported
         return imported
 
-    def materialize_args(self, args, domain_resolver=None) -> dict[CanonicalIdentity, tuple[int, int]]:
+    def materialize_args(self, args) -> dict[CanonicalIdentity, tuple[int, int]]:
         """Materialize every embedded descriptor in a ``TaskArgs`` and return the resolved map:
         identity -> (local base, address_space), scoped to this call's own tensors."""
         resolved: dict[CanonicalIdentity, tuple[int, int]] = {}
         for i in range(args.tensor_count()):
             desc = args.tensor(i).buffer
-            imported = self.materialize(desc) if domain_resolver is None else self.materialize(desc, domain_resolver)
+            imported = self.materialize(desc)
             resolved[desc.identity] = (imported.base, int(imported.address_space))
         return resolved
 
@@ -1190,15 +1215,12 @@ class ImportRegistry:
         This is a pure lookup: it never maps as a side effect, so an identity this endpoint has not
         materialized raises ``KeyError``. Missing identity and insufficient capability are
         intentionally different failures so callers can choose between materializing the backing and
-        selecting a different operation adapter. Domain windows require fresh grant resolution through
-        ``materialize`` and cannot be retrieved by this cache-only lookup.
+        selecting a different operation adapter.
         """
 
         imported = self._by_identity.get(identity)
         if imported is None:
             raise KeyError(f"ImportRegistry: no buffer registered for {identity}")
-        if imported.descriptor is not None and imported.descriptor.backend_kind == BackendKind.DOMAIN_WINDOW:
-            raise ValueError("communication domain requires materialize() with a live grant resolver")
         if need is None:
             return imported
         try:

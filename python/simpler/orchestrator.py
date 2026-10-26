@@ -344,7 +344,6 @@ class Orchestrator:
                 raise TypeError("RemoteTensorRef is only supported for RemoteCallable NEXT_LEVEL submits")
             remote_sidecar = None
         _validate_remote_sidecar_access(c_args, remote_sidecar)
-        final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
         worker = self._worker
         # Provenance validation precedes run ownership publication. Once a remote
         # ref is published, only the run fence may release it because the native
@@ -356,6 +355,8 @@ class Orchestrator:
         with prov_guard:
             if needs_prov:
                 worker._child_prov_check_dispatch_locked(c_args, cpp_worker_id, api="submit_next_level")
+                remote_sidecar = worker._prepare_buffer_references(c_args, remote_sidecar, cpp_worker_id)
+            final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
             if worker is not None:
                 worker._adopt_remote_sidecar_refs((remote_sidecar,))
                 worker._record_touched_identities(c_args)
@@ -456,14 +457,20 @@ class Orchestrator:
         if worker is not None:
             for g, c_args in enumerate(c_args_list):
                 if worker._names_device_allocation(c_args):
-                    member_checks.append((worker_ids[g], c_args))
+                    member_checks.append((g, c_args))
         prov_guard: Any = (
             worker._child_prov_lock if (worker is not None and member_checks) else contextlib.nullcontext()
         )
         with prov_guard:
-            for target_worker_id, c_args in member_checks:
+            for index, c_args in member_checks:
                 assert worker is not None
-                worker._child_prov_check_dispatch_locked(c_args, target_worker_id, api="submit_next_level_group")
+                worker._child_prov_check_dispatch_locked(c_args, worker_ids[index], api="submit_next_level_group")
+                prepared = worker._prepare_buffer_references(
+                    c_args, remote_sidecars[index] if remote_sidecars is not None else None, worker_ids[index]
+                )
+                if remote_sidecars is not None:
+                    remote_sidecars[index] = prepared
+                    worker_id_sets[index] = _remote_data_eligible_worker_ids(prepared, eligible_worker_ids)
             if worker is not None and remote_sidecars is not None:
                 worker._adopt_remote_sidecar_refs(remote_sidecars)
             if worker is not None:
@@ -533,6 +540,9 @@ class Orchestrator:
         """Create a domain using L3 chip ids or L4 ``(node, chip)`` members.
 
         Creation is synchronous; L3 control must precede the first task submission.
+        Buffer ``nbytes`` must be caller-padded to a multiple of 64 bytes, and
+        ``window_size`` must be a multiple of 64 covering their sum.
+        No implicit padding is inserted.
         ``workers`` is the legacy L3 spelling; it cannot be combined with ``members``.
         Retained domains survive successful runs until explicit release or Worker.close().
         """
@@ -580,16 +590,6 @@ class Orchestrator:
             retain_after_run=retain_after_run,
             reuse=reuse,
             host_windows=host_windows,
-        )
-
-    def copy_domain(
-        self, dst: Buffer, src: Buffer, *, worker: int, nbytes: int, dst_offset: int = 0, src_offset: int = 0
-    ) -> None:
-        """Synchronously copy two granted windows through an explicit local domain chip."""
-        if self._worker is None:
-            raise RuntimeError("domain copy requires a bound Worker")
-        self._worker._copy_domain_windows(
-            dst, src, worker=worker, nbytes=nbytes, dst_offset=dst_offset, src_offset=src_offset
         )
 
     def get_domain(self, name: str | CommDomainRef) -> CommDomainHandle:
@@ -646,6 +646,16 @@ class Orchestrator:
         elif absolute > limit or nbytes > limit - absolute:
             raise ValueError("Global CommDomain copy exceeds the mapped window")
         return absolute
+
+    def copy_domain(
+        self, dst: Buffer, src: Buffer, *, worker: int, nbytes: int, dst_offset: int = 0, src_offset: int = 0
+    ) -> None:
+        """Synchronously copy two granted windows through an explicit local domain chip."""
+        if self._worker is None:
+            raise RuntimeError("domain copy requires a bound Worker")
+        self._worker._copy_domain_windows(
+            dst, src, worker=worker, nbytes=nbytes, dst_offset=dst_offset, src_offset=src_offset
+        )
 
     def copy_to_domain(
         self,

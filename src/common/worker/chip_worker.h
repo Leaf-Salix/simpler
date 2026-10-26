@@ -622,6 +622,7 @@ private:
     int destroy_comm_session(CommSession &session);
     uint64_t create_base_comm(int rank, int nranks, const std::string &rootinfo_path);
     void clear_comm_sessions();
+    void require_comm_reclamation_safe() const;
 
     std::shared_ptr<RuntimeModule> runtime_module_;
     CreateDeviceContextFn create_device_context_fn_ = nullptr;
@@ -803,7 +804,7 @@ private:
     void cleanup_native_runs_noexcept() noexcept;
     void clear_runtime_binding();
     void abandon_after_failed_teardown(std::exception_ptr error) noexcept;
-    /** How many runs a teardown sweep left behind, each of them not proved destroyed. */
+    /** How many runs remain tracked and not proved destroyed, including live runs. */
     size_t unproven_native_run_count() const noexcept;
     /**
      * Detach the run storage of every run not proved destroyed.
@@ -1003,6 +1004,7 @@ private:
     // neither creates nor tracks. Plain: written and read from the one thread
     // that drives this worker's control commands and its run lane.
     bool exported_device_regions_live_ = false;
+    bool comm_reclamation_unconfirmed_ = false;
     std::unique_ptr<ChipRunLane> run_lane_;
     // Names a successful binding or an init whose rollback still needs close.
     // Cleared only after successful teardown. Control calls run on the owning

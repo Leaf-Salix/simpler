@@ -110,7 +110,13 @@ def _verify(orch, domain, node, nodes):
 
 def node_orch(orch, args, cfg, chip_handle=None):
     phase, node, nodes, actor, target, write, serial = (int(args.scalar(i)) for i in range(7))
-    domain = orch.get_domain(CommDomainRef.from_tensor(args.tensor(0)))
+    domain = orch.get_domain(
+        CommDomainRef(
+            int(args.scalar(11)).to_bytes(8, "little"),
+            int(args.scalar(12)),
+            int(args.scalar(13)),
+        )
+    )
     if phase == 0:
         _reset(orch, domain, node, nodes)
         return
@@ -162,8 +168,8 @@ def node_orch(orch, args, cfg, chip_handle=None):
     orch.submit_next_level(chip_handle or get_inner_handle(digest.hex()), chip_args, cfg, worker=chip)
 
 
-def _build_kernel():
-    compiler = KernelCompiler(platform="a2a3")
+def _build_kernel(platform="a2a3"):
+    compiler = KernelCompiler(platform=platform)
     kernels = Path(__file__).resolve().parent / "kernels"
     includes = list(compiler.get_orchestration_include_dirs("tensormap_and_ringbuffer"))
     includes.append(str(compiler.project_root / "src" / "common"))
@@ -183,7 +189,15 @@ def _build_kernel():
         func_name="host_domain_copy",
         config_name="host_domain_copy_config",
         binary=orchestration,
-        children=[(0, CoreCallable.build(signature=signature, binary=extract_text_section(binary)))],
+        children=[
+            (
+                0,
+                CoreCallable.build(
+                    signature=signature,
+                    binary=binary if platform.endswith("sim") else extract_text_section(binary),
+                ),
+            )
+        ],
     )
 
 
@@ -240,6 +254,12 @@ def run_matrix(worker, nodes, kernel, route):
                         args.add_scalar(value)
                     for offset in range(0, 32, 8):
                         args.add_scalar(int.from_bytes(kernel.digest[offset : offset + 8], "little"))
+                    for value in (
+                        int.from_bytes(current.ref.owner_instance_id, "little"),
+                        current.ref.domain_id,
+                        current.ref.generation,
+                    ):
+                        args.add_scalar(value)
                     keepalive.append(args)
                     orch.submit_next_level(route, args, config, worker=node)
 

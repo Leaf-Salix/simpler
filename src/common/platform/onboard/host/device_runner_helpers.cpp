@@ -241,6 +241,47 @@ bool KernelArgsHelper::build_launch_package() {
     return true;
 }
 
+int KernelArgsHelper::prepare_kernel_invocation(const simpler::tmr::KernelCallableIdentity &identity) {
+    if (runtime_args_state_ != RuntimeArgsState::Prepared || !plan_.supported || slot_ == nullptr)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (!simpler::tmr::valid_kernel_identity(identity) || identity.tensor_count != plan_.tensor_count ||
+        identity.scalar_count != plan_.scalar_count)
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    using EntryStorage = std::decay_t<decltype(std::declval<const Runtime &>().get_orch_args())>;
+    EntryStorage storage{};
+    if (!runtime_image_.read(plan_.tensor_offset, storage.tensors_, plan_.tensor_count * sizeof(storage.tensors_[0])) ||
+        !runtime_image_.read(plan_.scalar_offset, storage.scalars_, plan_.scalar_count * sizeof(uint64_t)))
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    storage.tensor_count_ = static_cast<int32_t>(plan_.tensor_count);
+    storage.scalar_count_ = static_cast<int32_t>(plan_.scalar_count);
+    const size_t bytes = simpler::tmr::kernel_invocation_bytes(identity.tensor_count, identity.scalar_count);
+    std::vector<std::byte> packet(bytes);
+    if (!simpler::tmr::encode_kernel_invocation(
+            storage, identity, {reinterpret_cast<uint64_t>(args.runtime_args), args.run_result_epoch}, packet.data(),
+            packet.size()
+        ))
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    const size_t package_bytes = LAUNCH_ENVELOPE_HEADER_BYTES + bytes;
+    if (slot_->launch_package.size() < package_bytes) slot_->launch_package.resize(package_bytes);
+    kernel_invocation_ = std::move(packet);
+    return 0;
+}
+
+bool KernelArgsHelper::build_kernel_launch_package() {
+    const size_t bytes = LAUNCH_ENVELOPE_HEADER_BYTES + kernel_invocation_.size();
+    if (slot_->launch_package.size() < bytes) return false;
+    auto *package = slot_->launch_package.data();
+    std::memset(package + sizeof(KernelArgs), 0, LAUNCH_ENVELOPE_HEADER_BYTES - sizeof(KernelArgs));
+    std::memcpy(package + LAUNCH_ENVELOPE_HEADER_BYTES, kernel_invocation_.data(), kernel_invocation_.size());
+    args.entry_args_offset = static_cast<uint32_t>(LAUNCH_ENVELOPE_HEADER_BYTES);
+    args.entry_tensor_count = plan_.tensor_count;
+    args.entry_scalar_count = plan_.scalar_count;
+    args.entry_args_source = static_cast<uint32_t>(EntryArgsSource::KernelInvocation);
+    launch_payload_ = package;
+    launch_payload_bytes_ = bytes;
+    return true;
+}
+
 int stage_graph_section(SlotPersistentArgs &slot, const void *bytes, size_t length) {
     if (bytes == nullptr || length == 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     // `argsSize` is a uint32 at the launch boundary, so the whole package —
@@ -276,10 +317,15 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted, rtStream
 
     // The first publication onto a block sends the whole initialized prefix,
     // entry storage included, so its values are in the descriptor whether or
-    // not the launch could also have carried them. Routing it through the
-    // launch as well would send them twice.
+    // not the launch could also have carried them. Program calls keep those
+    // initial values on the descriptor; kernel calls also carry their validated
+    // packet because the registration and run binding belong to that format.
+    const bool kernel_route = !kernel_invocation_.empty();
+    if (kernel_route && !launch_route_permitted) return PTO_RUNTIME_ERR_UNSUPPORTED;
     const bool launch_route = launch_route_permitted && plan_.supported && initializing_slot_ == nullptr;
-    const EntryArgsSource source = launch_route ? EntryArgsSource::LaunchEnvelope : EntryArgsSource::Descriptor;
+    const EntryArgsSource source = kernel_route ? EntryArgsSource::KernelInvocation :
+                                   launch_route ? EntryArgsSource::LaunchEnvelope :
+                                                  EntryArgsSource::Descriptor;
 
     // The Graph Definition section, decided before anything is written, so a
     // refusal here leaves no half-formed payload behind. Its length is consumed
@@ -302,7 +348,7 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted, rtStream
         );
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    if (graph_bytes != 0 && launch_route) {
+    if (graph_bytes != 0 && (launch_route || kernel_route)) {
         LOG_ERROR("runtime metadata publication: a run carries both entry values and a Graph section");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -323,11 +369,12 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted, rtStream
 
     // The launch package is built before the copy, because publication consumes
     // the snapshot both read from.
-    if (launch_route && !build_launch_package()) {
+    if ((kernel_route && !build_kernel_launch_package()) ||
+        (!kernel_route && launch_route && !build_launch_package())) {
         LOG_ERROR("runtime metadata publication: the captured snapshot does not contain its entry values");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    if (!launch_route) {
+    if (!launch_route && !kernel_route) {
         args.entry_args_offset = 0;
         args.entry_tensor_count = 0;
         args.entry_scalar_count = 0;

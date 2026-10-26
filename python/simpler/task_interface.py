@@ -150,7 +150,7 @@ def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -
             raise ValueError(f"argument {i}: HOST/NONE Buffer grant does not cover callable direction {direction}")
 
 
-def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry, domain_resolver=None) -> ChipStorageTaskArgs:
+def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry) -> ChipStorageTaskArgs:
     """Resolve accepted argument descriptors into this process's chip-only POD.
 
     The caller owns submission/callable checks, backing retention and the registry's
@@ -159,7 +159,7 @@ def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry, domain
     """
     if not isinstance(args, TaskArgs):
         raise TypeError("chip argument materialization requires address-free TaskArgs")
-    resolved = registry.materialize_args(args, domain_resolver)
+    resolved = registry.materialize_args(args)
     return _ti_module.materialize_task_args(args, resolved)
 
 
@@ -1083,7 +1083,11 @@ def scalar_to_uint64(value) -> int:
 class CommBufferSpec:
     """A named slice of the per-rank communicator window.
 
-    Buffers are placed sequentially inside the window in declaration order.
+    Buffers are placed sequentially inside the window in declaration order,
+    without implicit padding. ``nbytes`` is the caller-padded physical size
+    and must be a positive multiple of 64 bytes. ``count`` may describe a
+    smaller logical extent. ``window_size`` must cover all physical sizes
+    and must also be a multiple of 64 bytes.
     The ``CommDomainHandle.contexts[chip_idx].buffers`` dict returned by
     ``Orchestrator.allocate_domain`` is keyed by ``CommBufferSpec.name``.
     """
@@ -1130,7 +1134,7 @@ class CommDomainHandle:
 
         live           — allocated, indexable, can be passed to submit_*
         released       — release() called; further indexing raises;
-                          physical reclamation is pending or unconfirmed
+                          backend memory still alive until Worker.run drain
         freed          — physical reclamation has been confirmed
 
     Most users only see ``released``; the ``live → released`` transition
@@ -1141,8 +1145,9 @@ class CommDomainHandle:
     Callers must treat handle attributes and context/buffer mappings as read-only
     metadata. Reassignment is unsupported; configure through allocation arguments
     and end ownership through ``release()``. Buffer contents remain writable.
-    Submitted Tensor identities register domain use in the current run, including
-    cached Tensors. Scalar-only use requires explicit lookup in that run. Retained
+    Tensor submissions register domain use in the current run, including cached
+    Tensors. Scalar-only use requires explicit lookup. Failed or unconfirmed
+    reclamation remains tracked and reported with ``freed=False``. Retained
     handles may be inspected and released serially after run completion.
     """
 
@@ -1189,7 +1194,6 @@ class CommDomainHandle:
         _domain_size: int | None = None,
         _domain_ranks: dict[int, int] | None = None,
         ref: CommDomainRef | None = None,
-        borrowed: bool = False,
         host_buffers=None,
         local_host_fn=None,
         requested_window_size: int | None = None,
@@ -1203,7 +1207,7 @@ class CommDomainHandle:
         self._domain_ranks = (
             {worker: rank for rank, worker in enumerate(self.workers)} if _domain_ranks is None else dict(_domain_ranks)
         )
-        self._release_fn = None if borrowed else _release_fn
+        self._release_fn = _release_fn
         self._release_scope = _release_scope
         self.members = tuple(members)
         self.buffers = tuple(buffers)
@@ -1228,8 +1232,8 @@ class CommDomainHandle:
         if self._released:
             raise RuntimeError(f"CommDomainHandle({self.name!r}) is already released")
 
-    def member(self, domain_rank: int) -> CommDomainMember:
-        """Return a member's topology and ordinary Buffers, indexed by domain rank."""
+    def member(self, domain_rank: int) -> GlobalDomainMember:
+        """Return rank-ordered topology and ordinary Buffer slices."""
         self._require_live()
         rank = int(domain_rank)
         if rank < 0 or rank >= len(self.members):
@@ -1258,6 +1262,7 @@ class CommDomainHandle:
 
     @property
     def ref(self) -> CommDomainRef:
+        """Return identity; scalar-only use still requires owner lookup in each run."""
         self._require_live()
         if self._ref is None:
             raise RuntimeError("domain has no exported reference")
@@ -1310,18 +1315,20 @@ class CommDomainHandle:
         a no-op, and the orch function must not pass it to further
         ``submit_*`` calls.
         """
-        if self._release_fn is None:
-            raise RuntimeError("borrowed communication domain cannot be released")
+        if self.borrowed:
+            raise RuntimeError("borrowed domain handles cannot release their owner")
         if self._released:
             return
         with self._release_scope(self):
-            if not self._released:
-                self._released = True
-                self._release_fn(self)
+            if self._released:
+                return
+            self._released = True
+            assert self._release_fn is not None
+            self._release_fn(self)
 
     def __enter__(self) -> CommDomainHandle:
         if self.borrowed:
-            raise RuntimeError("borrowed communication domain cannot enter a releasing context")
+            raise RuntimeError("borrowed domain handles cannot own a with scope")
         self._require_live()
         return self
 

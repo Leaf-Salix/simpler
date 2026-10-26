@@ -54,6 +54,7 @@ if sys.platform == "darwin":
 import pytest  # noqa: E402
 
 from simpler_setup import parallel_scheduler as _ps  # noqa: E402
+from simpler_setup import test_environments as _test_environments  # noqa: E402
 from simpler_setup.log_config import DEFAULT_LOG_LEVEL, configure_logging  # noqa: E402
 from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
 from simpler_setup.scene_test import SceneTestLevel, clear_compile_cache, is_manual_for_platform  # noqa: E402
@@ -143,6 +144,9 @@ def pytest_addoption(parser):
         help="Manual test handling: exclude (default), include, only",
     )
     parser.addoption("--runtime", action="store", default=None, help="Only run tests for this runtime")
+    parser.addoption(
+        "--test-environment", default="default", help="Registered dependency environment (default: default)"
+    )
     parser.addoption(
         "--resource-child",
         action="store_true",
@@ -535,6 +539,13 @@ def pytest_configure(config):
         "filtering so non-@scene_test tests only run under their matching runtime",
     )
 
+    config.addinivalue_line("markers", "test_environment(name): required registered test environment")
+    try:
+        _test_environments.select_environment([], config.getoption("--test-environment"))
+        _test_environments.validate_execution(config)
+    except ValueError as error:
+        raise pytest.UsageError(str(error)) from error
+
     _validate_level_filters(config)
     _validate_diagnostic_flags(config)
     _configure_sanitizer(config)
@@ -628,6 +639,14 @@ def _manual_marker_applies(marker, platform: str | None) -> bool:
     return is_manual_for_platform(platforms, platform)
 
 
+def pytest_itemcollected(item):
+    try:
+        _test_environments.environment_for_item(item)
+    except ValueError as error:
+        raise pytest.UsageError(str(error)) from error
+
+
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
     """Filter ST tests by --platform / --runtime / level axes; order L3 before L2.
 
@@ -649,10 +668,16 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
     exclude_level_filter = _normalize_cli_scene_level(config.getoption("--exclude-level"))
     manual_mode = config.getoption("--manual", default="exclude")
 
+    try:
+        environment_items, environment_deselected = _test_environments.select_environment(
+            items, config.getoption("--test-environment", default="default")
+        )
+    except ValueError as error:
+        raise pytest.UsageError(str(error)) from error
     keep: list = []
-    deselected: list = []
+    deselected: list = list(environment_deselected)
 
-    for item in items:
+    for item in environment_items:
         # Pre-existing skip markers (e.g. explicit ``@pytest.mark.skip``)
         # stay put — the user asked for a visible skip, not a silent drop.
         if any(m.name == "skip" for m in item.iter_markers()):
@@ -980,6 +1005,7 @@ def _resource_child_command(spec, device_ids, platform, manual_mode, cfg):
     if platform:
         command.extend(["--platform", platform])
     command.extend(["--manual", manual_mode])
+    command.extend(_test_environments.environment_argv(cfg))
     for selector in cfg.getoption("--case", default=None) or []:
         command.extend(["--case", str(selector)])
     command.extend(_resource_child_diagnostic_argv(cfg))
@@ -1397,6 +1423,12 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
     return True  # returning True prevents default runtestloop
 
 
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_collection_finish(session):
+    yield
+    _test_environments.prepare_session(session)
+
+
 def pytest_runtestloop(session):
     """Dispatch Resource + L2 + leftover phases unless caller is in child mode.
 
@@ -1448,6 +1480,7 @@ def pytest_runtestloop(session):
     return _dispatch_test_phases(session, resource_specs)
 
 
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
 def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
     """Drop session-lifetime nanobind references before interpreter shutdown.
 
@@ -1462,6 +1495,8 @@ def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
     available.
     """
     clear_compile_cache()
+    yield
+    _test_environments.finish_session(session)
 
 
 # ---------------------------------------------------------------------------

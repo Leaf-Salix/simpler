@@ -813,6 +813,11 @@ def _run_auto_prepare(arch, runtime, device):
         assert lib.finalize_device(ctx) == 0
         lib.destroy_device_context(ctx)
         contexts.close()
+        # This subprocess created the primary context with rtSetDevice above.
+        # Release it only after every borrowed-context assertion and cleanup.
+        lib.rtDeviceReset.argtypes = [ctypes.c_int]
+        lib.rtDeviceReset.restype = ctypes.c_int
+        assert lib.rtDeviceReset(device) == 0
 
 
 @pytest.mark.parametrize(
@@ -1330,6 +1335,8 @@ class _CallerContexts:
 
 
 def _native_run_storage(lib):
+    lib.simpler_register_callable.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p]
+    lib.simpler_register_callable.restype = ctypes.c_int
     for name in ("get_runtime_size", "get_runtime_alignment"):
         getattr(lib, name).restype = ctypes.c_size_t
     size, alignment = lib.get_runtime_size(), lib.get_runtime_alignment()
@@ -1399,7 +1406,10 @@ def _run_borrowed_prepare(arch, runtime, device, release_failure=False):  # noqa
             == 0
         )
         image = _prepared_callable_image(
-            arch, runtime, signature=[ArgDirection.INOUT], function="kernel_call_orchestration"
+            arch,
+            runtime,
+            signature=[ArgDirection.INOUT, ArgDirection.SCALAR, ArgDirection.SCALAR],
+            function="kernel_call_orchestration",
         )
         assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image)) == 0
         _storage, run = _native_run_storage(lib)
@@ -1455,6 +1465,19 @@ def _run_borrowed_prepare(arch, runtime, device, release_failure=False):  # noqa
             assert prepare(device_args) == 0
             prepared = True
             assert lib.finalize_device(ctx) != 0
+            committed = lib.committed_device_memory_ctx(ctx)
+            copies = faults.copy_call_count()
+            auto_id = ctypes.c_int32(99)
+            assert lib.simpler_register_callable(ctx, 1, image) == PTO_RUNTIME_ERR_INTERNAL
+            assert lib.simpler_kernel_mode_prepare_callable(ctx, 1, image, len(image)) == PTO_RUNTIME_ERR_INTERNAL
+            assert (
+                lib.simpler_register_callable_v2(ctx, image, len(image), ctypes.byref(auto_id))
+                == PTO_RUNTIME_ERR_INTERNAL
+            )
+            assert auto_id.value == -1
+            assert lib.simpler_unregister_callable(ctx, 0) == PTO_RUNTIME_ERR_INTERNAL
+            assert lib.committed_device_memory_ctx(ctx) == committed
+            assert faults.copy_call_count() == copies
             assert lib.simpler_launch_run(ctx, run) == PTO_RUNTIME_ERR_INVALID_STATE
             with contexts.other():
                 committed = lib.committed_device_memory_ctx(ctx)

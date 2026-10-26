@@ -118,36 +118,30 @@ CANN 对 VMM Device 间拷贝列出的接口采用此路径。
 ### 描述符与授权
 
 Host 配置只保存 owner node、NUMA、逻辑大小和 canonical identity；HBM、Host 共用一张有序 export descriptor 表，
-分别占 `[0,R)`、`[R,R+H)`，mapping size 与 Fabric token 只保存一次。`SDB3` 标记配置布局，旧布局明确拒绝。
+分别占 `[0,R)`、`[R,R+H)`，mapping size 与 Fabric token 只保存一次。`SDC1` 使用正式字段编码配置、backing 引用和 Host 窗口表，旧布局明确拒绝。
 Host 不占 NPU rank，不改固定 `CommContext` ABI。
 每个 Host pool 只有一个 canonical identity；各 chip VA 不同，但 backing 身份相同。
 
-`DOMAIN_WINDOW` body 保持 28 字节，原 `rank` 字段明确改为内存窗口槽位 `window_slot`：
+公共 Host Buffer 使用无地址的 `REMOTE_SIDECAR`，不增加 backend 或修改 Buffer ABI。
+域内 `[0,R)` 对应设备窗口，`[R,R+H)` 按规范化节点顺序对应 Host pool；这些槽位仅保存在私有域状态中。
+Host Buffer 的 `address_space=DEVICE` 描述 NPU 的访问视图；CPU 访问通过 `local_host()`，不公开 Device VA。
 
-```text
-domain_id:u64 | generation:u64 | window_slot:u32 | slice_offset:u64
-```
-
-域有 R 个设备窗口、H 个 Host 窗口时，`[0,R)` 仍对应 device rank，
-`[R,R+H)` 按规范化节点顺序对应 Host pool；NPU 成员表和 CommContext 仍只有 R 项。
-不增加 kind 字段、BackendKind 或 Buffer 总布局。槽位含义由同一份不可变域元数据确定。
-通用 codec 校验格式与最大槽位数；当前 H≤R≤64，最多 128 个槽位，端点再按实际 R+H 校验。
-字节数不变不代表语义兼容；通信版本、绑定一致性检查和旧端拒绝仍须更新。
-Host Buffer 的 `address_space=DEVICE` 描述 Tensor 的 Device 访问视图，物理归属由槽位元数据标明。
-
-每 chip 复用 `_L2GlobalDomain.buffers`，在 import/commit 时登记全部 HBM slice 和 Host Buffer，保留完整 descriptor。
-显式 copy 允许已授权的 peer HBM；Tensor 解析仍检查设备 slot 的目标 chip，peer kernel 继续用 CommContext。
-复用 ImportRegistry，包括缓存命中时的 grant 重验、完整 descriptor 比对、generation 和撤销检查。
+Host 域的 owner L3 在 PREPARE 为实际 HBM backing 创建唯一身份，L4 汇总地址无关引用后随 IMPORT 分发，
+各 owner 核对自己的原始 backing。普通 HBM 域沿用统一 Buffer 的 IMPORT/COMMIT 流程。
+每 chip 在现有 ImportRegistry 中预注册自己的 Host Device 映射，缓存精确匹配完整 descriptor；
+未知引用不能触发隐式映射。释放 views 前先撤销缓存，避免继续解析已释放映射。
+显式 copy 使用不可变身份到槽位的授权表；peer HBM 的 kernel 访问继续通过 CommContext。
+COMMIT 每个接收节点发布各 Host pool 一次；跨节点转发按接收 session 选择 locator，所有别名保持同一 canonical identity。
 Host Tensor 沿用普通 TaskArgs 与跨 run 登记。
 任何仅通过 Ref、闭包或 scalar 发起的后代访问，包括 CPU 字节操作、同步 copy 和 CommContext 使用，
 根 L4 callback 必须在提交后代前 `get_domain(ref)` 登记本 run；L3 借用 handle 本身不为 L4 owner 保活。
 
-配置阶段不分配 identity；创建事务分配一次 Host identity，各端按命令重建 slot 描述符，复用时不重新分配。
+配置阶段不分配 identity；创建事务分配一次 Host identity，各端按命令登记同一无地址引用，复用时不重新分配。
 `_GlobalNodeDomainState` 及现有清理 journal 持有 L3 native Host owner，后者保存 handle、CPU VA、实际大小和释放进度。
 chip 的 `DomainAllocation` 保存 imported views，`window_at(slot)` 从现有 view 取 VA，Python grant 与 native view 共用 slot 顺序。
 显式 copy 的本地控制请求只携带域身份、两端 Buffer identity、偏移和字节数；
 L2 查同一份已登记 Buffer 得出 slot、切片范围与权限，native 再按 slot 和映射范围检查，禁止请求直接提供 VA。
-不另建 owner/address registry、session、launcher、adapter 或 copy 专用命令快照；可从既有状态推导的字段不重复缓存。
+不另建 owner/address registry、session、launcher 或 adapter；可从既有状态推导的字段不重复缓存。
 不复用会搬运 payload 的 `COPY_TO_DOMAIN/COPY_FROM_DOMAIN` staging 命令冒充 Fabric copy。
 
 ```text

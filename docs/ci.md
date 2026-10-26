@@ -20,7 +20,7 @@ The complete test-type × hardware-tier matrix. Empty cells have no tests yet; o
 | Category | github-hosted (no hardware) | a2a3 runner | a5 runner |
 | -------- | --------------------------- | ----------- | --------- |
 | **ut** | `ut` (py + cpp) | `ut-a2a3` (py + cpp) | `ut-a5` (py) |
-| **st** | `st-sim-a2a3`, `st-sim-a5` | `st-onboard-a2a3`, `st-network1-onboard-a2a3`, `st-deepseek-onboard-a2a3` | `st-onboard-a5` |
+| **st** | `st-sim-a2a3`, `st-sim-a5` | `st-onboard-a2a3`, `st-network1-onboard-a2a3`, `st-deepseek-onboard-a2a3`, `st-framework-eager-a2a3` | `st-onboard-a5` |
 
 ## GitHub Actions Jobs
 
@@ -31,7 +31,7 @@ shape. The executable job bodies live in reusable workflows:
 `_packaging.yml`, `_profiling-flags-smoke.yml`, `_st-sim-a2a3.yml`,
 `_st-sim-a5.yml`, `_ut-npu-a2a3.yml`, `_ut-npu-a5.yml`,
 `_st-npu-a2a3.yml`, `_st-npu-a5.yml`, `_st-network1.yml`, and
-`_st-deepseek-a2a3.yml`. The scene-test and
+`_st-deepseek-a2a3.yml`, and `_st-framework-eager-a2a3.yml`. The scene-test and
 NPU unit-test bodies are split one workflow per architecture so each job
 renders only its own steps. Shared step scaffolding that is safe to run
 after checkout lives in composite actions under `.github/actions/`
@@ -287,7 +287,113 @@ not need `--max-parallel` manually.
 
   The arch flags subtract `NON_CODE` before deciding, so a non-code-only change already makes both `false`. An arch-gated job therefore needs no separate non-code check. See [`.claude/rules/ci-change-detection.md`](../.claude/rules/ci-change-detection.md) for the invariants these gates must keep.
 
-- **SDMA tests run in isolated tasks inside `st-onboard-a2a3`.** Three selections partition one corpus (`examples tests/st`): the ordinary sweep takes `-m "not sdma and not sdma_fault"` with `--exclude-level 4`, one queued task runs `-m "sdma and not sdma_fault"` for the demos, and a separate one-device task runs `-m sdma_fault` for the AICore fault-injection case. The three are disjoint and exhaustive over both markers, and all three name the same paths, so a case cannot land in two tasks or in none. Provisioning the SDMA workspace creates 48 device-only STARS streams that live in the device fault domain, and tearing them down once any AICore task has poisoned that card blocks minutes rather than milliseconds — whether the teardown is a device reset or an explicit stream destroy ([#1425](https://github.com/hw-native-sys/simpler/issues/1425)). The cost therefore falls on whichever process still holds those streams when the fault happens, which is why the fault-injection case gets a task containing nothing else. Separate `task-submit` tasks preserve that on every onboard runner, independent of pytest ordering. Network1 tests are selected by `--level 4` in `st-network1-onboard-a2a3` and explicitly excluded from ordinary onboard ST lanes.
+- **SDMA tests run in isolated tasks inside `st-onboard-a2a3`.** Within the default test environment, three selections partition the corpus (`examples tests/st`): the ordinary sweep takes `-m "not sdma and not sdma_fault"` with `--exclude-level 4`, one queued task runs `-m "sdma and not sdma_fault"` for the demos, and a separate one-device task runs `-m sdma_fault` for the AICore fault-injection case. The three are disjoint and exhaustive over both markers, and all three name the same paths, so a case cannot land in two tasks or in none. Provisioning the SDMA workspace creates 48 device-only STARS streams that live in the device fault domain, and tearing them down once any AICore task has poisoned that card blocks minutes rather than milliseconds — whether the teardown is a device reset or an explicit stream destroy ([#1425](https://github.com/hw-native-sys/simpler/issues/1425)). The cost therefore falls on whichever process still holds those streams when the fault happens, which is why the fault-injection case gets a task containing nothing else. Separate `task-submit` tasks preserve that on every onboard runner, independent of pytest ordering. Network1 tests are selected by `--level 4` in `st-network1-onboard-a2a3` and explicitly excluded from ordinary onboard ST lanes.
+
+### Framework eager qualification (a2a3)
+
+`st-framework-eager-a2a3` runs on every affected PR, in the emergency lane,
+and in Daily. Its PR gate is the same `a2a3_changed && st_affected` gate as the
+ordinary A3 scene tests. All three callers reuse `_st-framework-eager-a2a3.yml`.
+Tests declare `@pytest.mark.test_environment("torch_npu")`. The job discovers
+them across `examples tests/st` with `--test-environment torch_npu`; it does
+not enumerate directories or cases. Ordinary sweeps and compile warm-up select
+the implicit `default` environment, including in Daily. Framework dependencies
+live only in `.venv-framework`, separate from the Program/fork sweep's `.venv`.
+Environment selection is independent of `manual`. The reusable job accepts the
+same `manual_mode` contract as other scene-test jobs: Per-PR and emergency
+callers default to `exclude`, while Daily passes `include`. The existing
+framework cases are automated, but a future manual case in this environment is
+discovered and included by Daily without another workflow edit.
+
+The dedicated environment uses `--system-site-packages` and installs local,
+pinned wheels for CPU Torch 2.7.1 and torch_npu 2.7.1.post4. The pins constrain
+subsequent test/SDK installation too. The profile selects an already installed
+toolkit by its actual manifest. Selector and preflight share a minimum CANN
+version line of 9.0, comparing numeric major/minor values without an architecture
+allowlist. Separated release/build labels are opaque: 9.0.RC1, 9.1.T500,
+9.2.0-beta.2, 9.10 and 10.0 meet the minimum. Missing or malformed versions and
+version lines below 9.0 are rejected. This is an admission policy, not a claim
+that all admitted releases and hardware combinations have been tested.
+
+CANN 9.0.0 on x86_64 has framework CI coverage. CANN 9.2.0-beta.2 passed the
+[ARM64 A3 framework experiment](https://github.com/hw-native-sys/simpler/actions/runs/40190729557/job/121165491940)
+with these unchanged Torch pins. Those execution results remain the measured
+compatibility evidence; other admitted combinations need their own validation.
+
+An already active toolkit meeting the minimum is preferred. Otherwise setup scans its
+existing roots in deterministic order, without using directory names as version
+claims. The selected `set_env.sh` is used for installation, compilation and inside
+the exclusive task; the system default symlink is not changed. If no installation meeting the minimum
+exists, setup fails with the inspected toolkit inventory and required
+minimum version line. Preflight checks the actual active manifest against
+the same rule. Unknown versions, missing dependencies, and failed imports are
+errors rather than skipped qualification. Runner labels alone do not establish
+this compatibility. Setup prints Python, host architecture, CANN manifest,
+distribution versions and module locations; backend imports happen inside the
+exclusive device task with automatic backend loading disabled beforehand.
+
+The ScopeStats consumer adds four queued calls with off/on/on/off selection
+and independent output prefixes. TMR checks nested scope records and allocation
+frontiers; HBG checks metadata only. Those cases enter the same collection plan
+without a workflow case list.
+
+The diagnostic-selection consumer queues four calls on one Worker: diagnostics
+off, swimlane level 1 / PMU event 2, level 3 / event 4, then off again. It changes
+the original CallConfig selectors and output prefixes after each accepted submit,
+then checks the submitted selections, original export destinations and per-run
+attribution. PMU and swimlane collection can wait; this does not qualify other
+DFX collectors or claim overlapping execution.
+
+One `task-submit` allocation of one device runs the selected consumers serially
+for TMR/HBG × `TASK_QUEUE_ENABLE=0/1`. Same-stream and cross-stream consumers
+perform three calls; the alias consumer performs three updates for each of
+its full-alias and partial-overlap modes. Callback-failure recovery checks three
+accepted runs, including the run whose Python callback reports an error, before
+init-thread close without individual waits. Public L2 close uses the common
+accepted-handle drain before workspace teardown, preserving late close-only
+lane errors and retryable cleanup. Typed-value consumers perform three
+DEVICE calls, plus three explicit HOST/NONE-control calls on HBG; TMR checks
+clean HOST refusal followed by valid DEVICE work. Persistent-state consumers
+perform twelve DEVICE cursor/count-controlled weighted updates to one cache,
+including zero acceptance and revisited rows. Framework snapshots check the
+entire backing against an independent multi-step reference, guards and unchanged
+weights. No host control readback decides later kernel work. A session-scoped fixture
+compiles the shared host bridge once. Argument-capture cases queue four
+OFF/FULL/HYBRID/OFF calls, each with two dependent tasks and a runtime-owned
+intermediate. They verify exact task-time payloads, materialized geometry and
+per-call export ownership as well as Torch outputs and guards; they enter the
+same dynamic plan without a workflow case list. The client wait is bounded at 15 minutes,
+including queueing; the execution watchdog is also 15 minutes. Individual
+subprocess timeouts do not reserve additional aggregate execution time.
+
+Pre-admission recovery consumers check stale Buffer registration and wrong
+caller context refusals. Each refusal is followed by healthy work on the same
+Worker; the wrong-context callback restores the caller context before its
+healthy submit, and a third healthy request follows. Final stream reuse is
+also checked. These are pre-admission checks, not native partial launch or
+device-fault recovery.
+
+The final pytest collection freezes a nonempty source/environment/nodeid plan
+next to the JUnit file. Every case carries its original nodeid and plan/source
+identity into JUnit. One shared verifier requires exactly that selected set to
+pass, with no duplicates, foreign cases, skips, errors or failures. A new test
+declaring the same environment automatically enters the plan. This verifies
+execution of the selected set; the tests themselves declare the qualification
+matrix. Strict receipts currently support direct pytest execution only; a
+profile selecting resource-dispatched, SceneTestCase or xdist execution fails
+explicitly rather than accepting incomplete child results. The default
+environment retains its existing dispatcher and does not claim this strict
+JUnit aggregation. Logs contain the
+source/native build identities, runtime and framework module hashes, compiled
+bridge identity and consumer results; `framework-eager-a2a3-*` artifacts retain
+JUnit and per-case logs even on failure. This qualifies the reference
+consumers' same-stream and cross-stream eager ordering, caller-owned lifetimes,
+bounded aliased INOUT assertions, ordinary callback-error recovery and per-call
+value semantics and bounded DEVICE-controlled persistent cache state. It does
+not qualify native failed-drain recovery, pending
+framework-callback close or early HOST-backing release. It does not establish
+overlap, arbitrary strides/cross-tile aliasing, PyPTO dispatch, A5 or
+capture/replay.
 
 ### CPU emergency lane (`ci-self-cpu.yml`) and the `/run-cpu` button
 

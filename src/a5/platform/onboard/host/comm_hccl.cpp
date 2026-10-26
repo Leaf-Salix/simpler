@@ -100,6 +100,7 @@ struct DomainAllocation {
     std::unique_ptr<pto::comm::rdma::RdmaWorkspaceManager> rdma_workspace;
 #endif
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
+    size_t mapping_size = 0;
 };
 
 struct CommHandle_ {
@@ -1355,7 +1356,7 @@ static bool init_rdma_workspace(
 // the peer imports live on `out->peer_windows` for comm_release_domain_windows.
 static int domain_alloc_via_ipc(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    uint64_t win_size, DomainAllocation *out, size_t *actual_window_size_out
+    uint64_t win_size, DomainAllocation *out
 ) {
     (void)rank_ids;
     const std::string &rootinfo = h->rootinfo_path;
@@ -1700,7 +1701,7 @@ static int domain_alloc_via_ipc(
         return -1;
     }
     out->device_ctx = reinterpret_cast<CommContext *>(newDevMem);
-    *actual_window_size_out = aligned_size;
+    out->mapping_size = aligned_size;
     return 0;
 }
 
@@ -1886,13 +1887,12 @@ extern "C" int comm_alloc_domain_windows(
     }
 
     auto alloc = std::make_unique<DomainAllocation>();
-    int rc = domain_alloc_via_ipc(
-        h, allocation_id, rank_ids, rank_count, domain_rank, window_size, alloc.get(), actual_window_size_out
-    );
+    int rc = domain_alloc_via_ipc(h, allocation_id, rank_ids, rank_count, domain_rank, window_size, alloc.get());
     if (rc != 0) return rc;
 
     *device_ctx_out = reinterpret_cast<uint64_t>(alloc->device_ctx);
     *local_window_base_out = reinterpret_cast<uint64_t>(alloc->local_buf);
+    *actual_window_size_out = alloc->mapping_size;
     h->domain_allocations.emplace(allocation_id, std::move(alloc));
     return 0;
 } catch (const std::exception &e) {

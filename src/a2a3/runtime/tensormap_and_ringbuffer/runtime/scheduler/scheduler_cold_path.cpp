@@ -475,11 +475,7 @@ int32_t SchedulerContext::handle_timeout_exit(
                 [this, thread_idx](const ChipTaskSlotState &slot_state) {
                     dump_args_for_task<SUBTASK_SLOT_COUNT>(
                         thread_idx, *slot_state.task, *slot_state.payload, slot_state.active_mask,
-                        ArgsDumpStage::AFTER_COMPLETION,
-                        [](ActiveMask active_mask, int raw_subtask_id) {
-                            return active_mask.subtask_active(static_cast<SubtaskSlot>(raw_subtask_id));
-                        },
-                        [this](int32_t func_id) {
+                        ArgsDumpStage::AFTER_COMPLETION, [this](int32_t func_id) {
                             return get_function_bin_addr(func_id);
                         }
                     );
@@ -1116,7 +1112,7 @@ void SchedulerContext::post_handshake_profiling_init(Runtime *runtime) {
     (void)runtime;
 #if SIMPLER_DFX
     if (is_dump_args_enabled()) {
-        dump_args_init(active_sched_threads_);
+        dump_args_init(active_sched_threads_, static_cast<DumpArgsLevel>(runtime->dev.dump_args_level));
     }
     if (is_pmu_enabled()) {
         pmu_aicpu_init(physical_core_ids_, cores_total_num_, static_cast<PmuEventType>(runtime->dev.pmu_event_type));
@@ -1374,7 +1370,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     // orchestrator thread (see aicpu_executor.cpp).
 #if SIMPLER_DFX
     if (is_dump_args_enabled()) {
-        dump_args_init(active_sched_threads_);
+        dump_args_init(active_sched_threads_, static_cast<DumpArgsLevel>(runtime->dev.dump_args_level));
     }
     if (is_pmu_enabled()) {
         pmu_aicpu_init(physical_core_ids_, cores_total_num_, static_cast<PmuEventType>(runtime->dev.pmu_event_type));

@@ -11,17 +11,11 @@
 from __future__ import annotations
 
 import operator
-import struct
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING
 
-from .buffer import AccessMode, AddressSpace, BackendKind, Buffer, CanonicalIdentity
-
 if TYPE_CHECKING:
     from .task_interface import CommBufferSpec
-
-
-_DOMAIN_SLICE = struct.Struct("<QQIQ")
 
 
 @dataclass(frozen=True)
@@ -41,7 +35,7 @@ class HostWindowSpec:
 
 @dataclass(frozen=True)
 class CommDomainRef:
-    """Immutable identity; access requires an existing grant on the receiving node."""
+    """Creator identity and generation of an already established domain."""
 
     owner_instance_id: bytes
     domain_id: int
@@ -52,59 +46,6 @@ class CommDomainRef:
             raise ValueError("domain creator must be an 8-byte instance identity")
         if not any(self.owner_instance_id) or not 0 <= self.domain_id < 2**64 or not 0 < self.generation < 2**64:
             raise ValueError("invalid communication domain reference")
-
-    @classmethod
-    def from_tensor(cls, tensor):
-        desc = tensor.buffer
-        if desc.backend_kind != BackendKind.DOMAIN_WINDOW:
-            raise ValueError("Tensor does not carry a communication domain reference")
-        domain_id, generation, _slot, _offset = _DOMAIN_SLICE.unpack(desc.body)
-        return cls(bytes(desc.identity.owner_instance_id), domain_id, generation)
-
-
-def _window_buffer(command, slot, buffer_id, nbytes, *, offset=0, base=0, worker_id=0) -> Buffer:
-    return Buffer(
-        identity=CanonicalIdentity(command.owner_instance_id, buffer_id, 1),
-        address_space=AddressSpace.DEVICE,
-        access=AccessMode.READWRITE,
-        backend_kind=BackendKind.DOMAIN_WINDOW,
-        nbytes=nbytes,
-        body=_DOMAIN_SLICE.pack(command.domain_id, command.generation, slot, offset),
-        base=base + offset if base else 0,
-        owner_worker_id=worker_id,
-    )
-
-
-def domain_buffers(command, rank: int, *, base: int = 0, worker_id: int = 0) -> dict[str, Buffer]:
-    """Reconstruct the same granted slice descriptors at every forwarding endpoint."""
-    result = {}
-    offset = 0
-    for index, spec in enumerate(command.buffers):
-        result[spec.name] = _window_buffer(
-            command,
-            rank,
-            command.buffer_ids[rank * len(command.buffers) + index],
-            spec.nbytes,
-            offset=offset,
-            base=base,
-            worker_id=worker_id,
-        )
-        offset += spec.nbytes
-    return result
-
-
-def host_buffer(command, node_worker_id: int, *, base: int = 0, worker_id: int = 0) -> Buffer:
-    for index, window in enumerate(command.host_windows):
-        if window.node_worker_id == node_worker_id:
-            return _window_buffer(
-                command,
-                len(command.members) + index,
-                window.buffer_id,
-                window.spec.nbytes,
-                base=base,
-                worker_id=worker_id,
-            )
-    raise KeyError(f"domain has no Host window for node {node_worker_id}")
 
 
 @dataclass(frozen=True)
@@ -135,8 +76,16 @@ class DomainConfig:
             raise ValueError("domain members must contain 1 to 64 distinct chips")
         if window_size <= 0:
             raise ValueError("domain window_size must be positive")
+        if window_size % 64:
+            raise ValueError("domain window_size must be a multiple of 64 bytes")
         if len({b[0] for b in snapshot}) != len(snapshot) or any(not b[0] or b[3] <= 0 for b in snapshot):
             raise ValueError("domain buffers require unique names and positive nbytes")
+        for name, _dtype, _count, nbytes, _load_from_host, _store_to_host in snapshot:
+            if nbytes % 64:
+                raise ValueError(
+                    f"domain buffer {name!r}: nbytes={nbytes} must be a multiple of 64 bytes; "
+                    "the caller must pad the physical buffer size and include it in window_size"
+                )
         if sum(b[3] for b in snapshot) > window_size:
             raise ValueError("domain buffers exceed window_size")
         hosts = tuple(sorted((operator.index(node), spec) for node, spec in (host_windows or {}).items()))

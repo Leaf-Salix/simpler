@@ -667,3 +667,25 @@ instant the submission is accepted, and the transaction grades a later failure
 
 Simulation records no events: its submit callbacks take the sink and ignore it,
 and its grading is unchanged.
+
+## Borrowed TMR eager invocation ownership
+
+Borrowed TMR eager calls use the existing native-run lane, caller ordering and
+completion fence. Their launch package carries a 40-byte invocation header,
+the device Runtime address and nonzero run epoch, followed by DEVICE Tensor
+descriptors and scalar values. The callable occupancy generation is allocated
+by the runner's registry and recorded independently by AICPU registration.
+ID reuse gets a new generation.
+
+The Host packet is a snapshot of the prepared Runtime image. It survives until
+RTS copies the launch package. AICPU checks framing, registered counts and
+generation, the run binding and Tensor geometry before materializing argument
+storage owned by the executor. Orchestration borrows that storage through the
+same completion and teardown path as a program call; cleanup drops the
+orchestration view before clearing the storage.
+
+The first descriptor publication still initializes its complete handshake
+prefix. Program descriptor and launch-envelope routes retain their behavior;
+kernel packets require permitted launch transport and cannot silently fall back
+to unvalidated descriptor values. Active capture remains rejected by the eager
+entry. These per-run resources do not provide captured-graph lifetime.

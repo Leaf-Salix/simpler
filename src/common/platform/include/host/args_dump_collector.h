@@ -236,34 +236,29 @@ public:
      * @param free_cb           Memory free callback
      * @param user_data         Opaque pointer forwarded to callbacks
      * @param output_prefix     Per-task directory; args_dump/ subdir lands here
-     * @param dump_args_level OFF / PARTIAL (only Arg::dump()-marked args) /
-     *                          FULL / HYBRID (every task's metadata,
-     *                          with Arg::dump()-marked tensor payload). Written
-     *                          to DumpDataHeader so the AICPU latches the mode
-     *                          before any dispatch.
+     * @param dump_args_level Host export selection: OFF / PARTIAL (marked args) /
+     *                        HYBRID (all metadata, marked payload) / FULL (all args)
      * @return 0 on success, error code on failure
      */
     // Allocates the device-side resources: header, per-thread DumpBufferStates,
     // DumpMetaBuffers and payload arenas.
     //
-    // The level is taken here because it is written into DumpDataHeader with the
-    // rest of the layout. The prefix is bound by begin_run(), which runs once per
-    // run and may run either side of this.
+    // The level configures host export; device selection belongs to the run's
+    // Runtime descriptor. The prefix is bound by begin_run(), which may run
+    // either side of initialization.
     int initialize(
         int num_dump_threads, int device_id, DumpArgsLevel dump_args_level, const DumpAllocCallback &alloc_cb,
         DumpRegisterCallback register_cb, const DumpFreeCallback &free_cb,
         DumpUnregisterCallback unregister_cb = nullptr
     );
 
-    // Start a run's collection window: bind its artifact configuration, drop the
-    // previous run's shard state and counters, and — once the region exists —
-    // republish the level the device reads. The prefix is read when the writer
-    // thread starts lazily on the first collected buffer.
-    //
-    // The collector initializes once and serves every run, so this is the only
-    // point at which a run's collected records, dropped/truncated counts and
-    // device level are established; initialize() establishes none of them.
-    void begin_run(const std::string &output_prefix, DumpArgsLevel dump_args_level);
+    // Bind the single-run artifact configuration and reset only its host
+    // shard/counter window. Device transport cursors remain monotonic.
+    // The prefix is read when the writer starts on the first buffer. Ordinary
+    // recovery and arena credits require this exact initialized device epoch.
+    // Device selection is published separately in the invocation descriptor;
+    // retained runs use run_begin() and preserve their monotonic counters.
+    void begin_run(const std::string &output_prefix, DumpArgsLevel dump_args_level, uint64_t run_epoch);
 
     void start(const profiling_common::ThreadFactory &thread_factory);
 
@@ -283,12 +278,19 @@ public:
     int export_dump_files();
 
     /**
-     * After stop():
+     * A completed execution or joined producer supplies the stop proof.
+     * Without it, host readers retire before export and producer-held buffers
+     * stay on the device. Closes only the ordinary single-run artifact window.
+     */
+    int close_ordinary_run(bool producer_stop_proved);
+
+    /**
+     * After producer stop and host transport quiescence:
      *   - Recover records from any non-empty DumpBufferState::current_buf_ptr
      *     left behind by abnormal exit before device-side flush ran.
-     *   - Accumulate device-side dropped_record_count into
+     *   - Snapshot device-side run_dropped_record_count into
      *     total_dropped_record_count_ for the final anomaly report.
-     * Must be called after stop().
+     * Joining host threads alone does not prove the device producer stopped.
      */
     void reconcile_counters();
 
@@ -327,8 +329,8 @@ public:
      * are occupied, when the destination is owned by an open epoch or still
      * holds a failed run's preserved temporary manifest, when no exclusive
      * output token is available, when the path exceeds the allowance, when the
-     * fixed charge is refused, when the device did not take this run's dump
-     * level, or when the collector is fatal. A refusal must fail the run:
+     * fixed charge is refused, or when the collector is fatal. A refusal must
+     * fail the run:
      * falling back to `begin_run` would reset counters a predecessor's writer
      * is still acknowledging against.
      *
@@ -610,6 +612,7 @@ private:
     // thread builds run_dir_ = output_prefix_ / "args_dump" lazily on the
     // first on_buffer_collected.
     std::string output_prefix_;
+    uint64_t run_epoch_{0};
 
     // Per-thread arena pointers (device + host shadow)
     struct ArenaInfo {
@@ -630,6 +633,13 @@ private:
 
     // Stats
     std::atomic<uint32_t> total_dropped_record_count_{0};
+    bool dropped_records_complete_{false};
+    bool ordinary_drain_loss_{false};
+    struct RecoveredCurrentBuffer {
+        uint64_t dev_buffer_ptr{0};
+        uint32_t buffer_seq{0};
+    };
+    std::vector<RecoveredCurrentBuffer> recovered_current_buffers_;
     std::atomic<uint32_t> total_truncated_count_{0};
     std::array<std::atomic<uint64_t>, PLATFORM_MAX_AICPU_THREADS> written_payload_counts_{};
 
@@ -869,7 +879,6 @@ private:
      */
     bool retained_read_terminal_from_bank(RetainedEpoch &epoch);
     void retained_decide_leftovers(RetainedEpoch &epoch);
-    bool retained_publish_level(DumpArgsLevel level);
     /**
      * Append one received record to its run's bucket, committing a payload's
      * offset and its queue node together.

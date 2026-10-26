@@ -19,6 +19,7 @@
 using namespace launch_entry_args_test;
 // Everything below is about values only this runtime's descriptor carries.
 #include "tensormap_and_ringbuffer/entry_args.h"
+#include "tensormap_and_ringbuffer/kernel_launch_admission.h"
 
 namespace {
 // A run's entry values, as a caller's ChipStorageTaskArgs would supply them.
@@ -34,6 +35,60 @@ ChipStorageTaskArgs entry_args(int32_t tensors, int32_t scalars, uint64_t scalar
     return args;
 }
 }  // namespace
+
+TEST_F(LaunchEntryArgs, KernelPacketPreservesFirstInitializationAndUsesRunOwnedArguments) {
+    auto args = entry_args(0, 1, 0x1111);
+    runtime.set_active_callable_id(3);
+    runtime.set_orch_args(args);
+    helper.args.run_result_epoch = 19;
+    ASSERT_EQ(prepare(), 0);
+    const simpler::tmr::KernelCallableIdentity registered{3, 7, 0, 1};
+    ASSERT_EQ(helper.prepare_kernel_invocation(registered), 0);
+    runtime.set_orch_args(entry_args(0, 1, 0x2222));
+    ASSERT_EQ(publish(true), 0);
+    EXPECT_TRUE(slot.workers_initialized);
+    EXPECT_EQ(rts.last_copy_bytes, runtime_device_initialized_prefix_size(runtime));
+    KernelArgs header{};
+    std::memcpy(&header, helper.launch_payload(), sizeof(header));
+    EXPECT_EQ(header.entry_args_source, static_cast<uint32_t>(EntryArgsSource::KernelInvocation));
+    PlatformEntryArgs view{
+        helper.launch_payload(), header.entry_args_offset, header.entry_tensor_count, header.entry_scalar_count,
+        header.entry_args_source
+    };
+    const auto *resident = reinterpret_cast<const Runtime *>(slot.runtime_args);
+    simpler::tmr::EntryArgsStorage decoded{};
+    ASSERT_TRUE(simpler::tmr::admit_kernel_launch_entry(*resident, view, registered, 19, &decoded));
+    EXPECT_EQ(decoded.scalar(0), 0x1111U);
+    auto next_occupant = registered;
+    ++next_occupant.generation;
+    EXPECT_FALSE(simpler::tmr::admit_kernel_launch_entry(*resident, view, next_occupant, 19, &decoded));
+    EXPECT_FALSE(simpler::tmr::admit_kernel_launch_entry(*resident, view, registered, 20, &decoded));
+    EXPECT_EQ(decoded.scalar(0), 0x1111U);
+}
+
+TEST_F(LaunchEntryArgs, KernelPacketRejectsUndeclaredScalarBeforePublication) {
+    runtime.set_active_callable_id(3);
+    runtime.set_orch_args(entry_args(0, 1, 73));
+    helper.args.run_result_epoch = 19;
+    ASSERT_EQ(prepare(), 0);
+    EXPECT_EQ(helper.prepare_kernel_invocation({3, 7, 0, 0}), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(rts.copies, 0);
+    ASSERT_EQ(helper.prepare_kernel_invocation({3, 7, 0, 1}), 0);
+    EXPECT_EQ(publish(true), 0);
+}
+
+TEST_F(LaunchEntryArgs, KernelPacketCannotSilentlyFallBackWhenLaunchTransportIsRefused) {
+    runtime.set_active_callable_id(3);
+    runtime.set_orch_args(entry_args(0, 1, 0x3333));
+    helper.args.run_result_epoch = 21;
+    ASSERT_EQ(prepare(), 0);
+    ASSERT_EQ(helper.prepare_kernel_invocation({3, 8, 0, 1}), 0);
+    EXPECT_EQ(publish(false), PTO_RUNTIME_ERR_UNSUPPORTED);
+    EXPECT_EQ(rts.copies, 0);
+    EXPECT_FALSE(helper.runtime_args_published());
+    EXPECT_EQ(helper.launch_payload(), nullptr);
+    EXPECT_EQ(publish(true), 0);
+}
 
 // The published values are the ones prepare captured. A successor's prepare
 // refills the source between this run's prepare and its publication, which is
@@ -162,6 +217,7 @@ TEST_F(LaunchEntryArgs, TheDescriptorsWireOffsetsAreFixed) {
     EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, entry_args_source_), 132U);
     EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, chip_swimlane_level), 136U);
     EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, pmu_event_type), 140U);
+    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, dump_args_level), 144U);
     EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, orch_args_storage_), 192U);
     EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, workers), 34048U)
         << "the handshake region's address is what the first publication's length and the device both depend on";
