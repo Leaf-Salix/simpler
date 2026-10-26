@@ -98,7 +98,7 @@ struct AicpuExecutor {
     // ===== Methods =====
     int32_t init(Runtime *runtime);
     int32_t run(Runtime *runtime, bool restored_graph);
-    void deinit(Runtime *runtime);
+    void deinit(Runtime *runtime, bool restored_graph);
 };
 
 static AicpuExecutor g_aicpu_executor;
@@ -388,11 +388,15 @@ int32_t AicpuExecutor::run(Runtime *runtime, bool restored_graph) {
     return run_rc;
 }
 
-void AicpuExecutor::deinit(Runtime *runtime) {
-    // 1. Invalidate AICPU cache for Runtime address range.
-    //    Next round's Host DMA (rtMemcpy) writes fresh Runtime to HBM but
-    //    bypasses this cache. Invalidating now ensures next round reads from HBM.
-    cache_invalidate_range(runtime, sizeof(Runtime));
+void AicpuExecutor::deinit(Runtime *runtime, bool restored_graph) {
+    // Kernel replay keeps this Runtime resident; only prelaunch, worker and
+    // teardown rows change after entry publication. Program launch replaces
+    // the whole Runtime image.
+    const auto *begin = reinterpret_cast<const uint8_t *>(runtime);
+    const auto *end = restored_graph ?
+                          reinterpret_cast<const uint8_t *>(runtime->get_teardown_gates() + RUNTIME_MAX_WORKER) :
+                          begin + sizeof(Runtime);
+    cache_invalidate_range(begin, static_cast<size_t>(end - begin));
 
     // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();
@@ -472,7 +476,7 @@ static int32_t execute_graph_runtime(Runtime *runtime, bool restored_graph) {
     // The finalizer publishes cleanup eligibility only after runtime destruction.
     if (g_aicpu_executor.completion_gate_.claim_cleanup()) {
         LOG_INFO("aicpu_execute: All threads finished, cleaning up");
-        g_aicpu_executor.deinit(runtime);
+        g_aicpu_executor.deinit(runtime, restored_graph);
     }
 
     if (runtime_rc != 0) {
