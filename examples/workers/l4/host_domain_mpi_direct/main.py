@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 
 from simpler.comm_domain import CommDomainRef
-from simpler.comm_region import RegionPartSpan
+from simpler.comm_endpoints import AdapterKind, AdapterProfile
 from simpler.mpi_direct_supervisor import run_supervisor
 from simpler.remote_l3_session import get_inner_handle
 from simpler.task_interface import (
@@ -65,6 +65,17 @@ def _copy(orch, dst, src, chip, nbytes, dst_offset=0, src_offset=0):
 
 
 def _reset(orch, domain, node, nodes):
+    view = orch.get_global_domain(domain.domain_id)
+    row = tuple(a for a in domain.attachments if a.node_worker_id == node)
+    assert view.committed and view.attachments == row and len(row) == len(domain.members)
+    assert all(
+        (a.adapter_kind, a.adapter_profile)
+        in {
+            (AdapterKind.OWNER_DELEGATED_COPY, AdapterProfile.HOST_VMM_COPY),
+            (AdapterKind.EXPLICIT_TRANSFER, AdapterProfile.REMOTE_COPY),
+        }
+        for a in row
+    )
     _EXPECTED.clear()
     pools = _pools(domain)
     for index in range(len(pools)):
@@ -128,20 +139,23 @@ def node_orch(orch, args, cfg, chip_handle=None):
     pools = _pools(domain)
     part = domain.local_host()
     local = domain.host(node)
-    if write and (actor >= nodes or target == node):
+    if write:
         part.write(SOURCE, _pattern(100 + serial, SPAN))
     if actor < nodes:
-        payload = (
-            orch.domain_payload(pools[target])
-            if target == node
-            else orch.domain_payload(pools[target], worker=0, staging=RegionPartSpan(SOURCE if write else RESULT, SPAN))
-        )
-        if write:
-            payload.write(TARGET, _pattern(100 + serial, SPAN))
-        else:
+        if target == node:
             data = bytearray(SPAN)
-            payload.read(TARGET, data)
-            part.write(RESULT, data)
+            part.read(SOURCE if write else TARGET, data)
+            part.write(TARGET if write else RESULT, data)
+        else:
+            _copy(
+                orch,
+                pools[target] if write else local,
+                local if write else pools[target],
+                0,
+                SPAN,
+                TARGET if write else RESULT,
+                SOURCE if write else TARGET,
+            )
         return
     rank = actor - nodes
     chip = domain.member(rank).local_worker_id
@@ -233,6 +247,10 @@ def run_matrix(worker, nodes, kernel, route):
             if len({pool.identity for pool in _pools(domain)}) != 3 * nodes:
                 raise AssertionError("domain pool identities are not distinct")
             saved.append(domain)
+            for node in range(nodes):
+                row = tuple(a for a in domain.attachments if a.node_worker_id == node)
+                remote = sum(a.adapter_profile is AdapterProfile.REMOTE_COPY for a in row)
+                print(f"ATTACHMENT_PLAN node={node} remote={remote}", flush=True)
 
         worker.run(allocate, config=cfg)
         domain = saved[0]
