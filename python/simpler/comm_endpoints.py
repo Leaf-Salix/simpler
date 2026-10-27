@@ -831,9 +831,7 @@ class DefaultRegionAccessService:
                 query,
                 candidate,
             )
-        # Mechanisms that dereference a peer's memory. Whether one works is a platform fact that
-        # would have to be probed, and no probe exists — nor does a materializer that could carry
-        # either of them out, so admitting one would produce a plan nothing can honour.
+        # Direct maps require a scoped execution service with a matching materializer.
         if candidate.profile in (AdapterProfile.HOST_SVM_MAP, AdapterProfile.DEVICE_VMM_PEER_IMPORT):
             return _region_access_unsupported(
                 RegionAccessReasonCode.NO_IMPLEMENTED_DIRECT_MAP_PROBE,
@@ -1134,7 +1132,7 @@ def _device_consumer_candidates(
                 _AdapterCandidate(
                     AdapterKind.DEVICE_PEER,
                     AdapterProfile.DEVICE_VMM_PEER_IMPORT,
-                    unsupported_reason="device VMM peer import materializer is not implemented yet",
+                    unsupported_reason="device VMM peer import requires a scoped materializer",
                 ),
             )
         return (

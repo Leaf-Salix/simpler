@@ -101,12 +101,9 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     _mailbox_store_u64,
     _MpiDirectTransportHub,
     _read_control_copy_request,
-    _region_vmm_granularity,
     _set_host_span_level_prefix,
     _snapshot_local_task_args,
     _worker_host_mapped_region_ack_cleanup_error,
-    _worker_host_mapped_region_import_onboard,
-    _worker_host_mapped_region_import_sim,
     _worker_host_mapped_region_peek_cleanup_error,
     get_element_size,
     read_args_from_blob,
@@ -195,10 +192,6 @@ from .comm_provider import (
     RegionControlErrorKind,
     RegionEnvironmentKind,
     RegionPartKind,
-    _align_up,
-    _posix_object_size,
-    _posix_token_from_descriptor,
-    _vmm_shareable_facts,
 )
 from .comm_provider_control import (
     RELEASE_REPLY_BYTES,
@@ -225,9 +218,19 @@ from .comm_region import (
     RegionInstanceRegistry,
     RegionInstanceState,
     RegionPartSpan,
+    _RegionPartAttachment,
     materialize_region_instance,
     project_region_allocation_spec,
+    validate_executable_region_plan,
     validate_single_owner_region_shape,
+)
+from .comm_region_peer import (
+    _PEER_ENABLE,
+    CTRL_REGION_PEER,
+    PeerRegionImports,
+    PeerRegionLease,
+    import_region_part,
+    region_binding_prefix,
 )
 from .global_comm_domain import (
     CTRL_GLOBAL_DOMAIN_COPY_FROM,
@@ -1267,6 +1270,25 @@ class _RemoteSession:
     health_host: str
     health_port: int
     pid: int
+
+
+class _WorkerRegionAccessService(DefaultRegionAccessService):
+    def __init__(self, worker):
+        self.worker = worker
+
+    def evaluate_buffer_access(self, query, candidate):
+        if (
+            self.worker.level == 3
+            and self.worker._config.get("platform") in ("a2a3", "a2a3sim")
+            and query.backend_kind is BackendKind.VMM_SHAREABLE
+            and query.consumer_deployment is DEVICE_AICPU
+            and query.same_node
+            and not query.same_endpoint
+            and candidate.kind is AdapterKind.DEVICE_PEER
+            and candidate.profile is AdapterProfile.DEVICE_VMM_PEER_IMPORT
+        ):
+            return _region_access_supported(query, candidate)
+        return super().evaluate_buffer_access(query, candidate)
 
 
 class _GlobalDomainRegionAccessService:
@@ -3608,8 +3630,11 @@ def _teardown_chip_process_resources(
     cw: _ChipWorker,
     global_domain_store: _L2GlobalDomainStore,
     provider_region_store: ProviderRegionStore,
+    peer_imports: PeerRegionImports | None = None,
 ) -> None:
     errors: list[BaseException] = []
+    if peer_imports is not None:
+        peer_imports.close()
     try:
         import_registry.close()
     except BaseException as exc:  # noqa: BLE001
@@ -3716,6 +3741,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         )
     )
     global_domain_store = _L2GlobalDomainStore()
+    peer_imports = PeerRegionImports(device_id, chip_platform, owner_instance_id.hex())
 
     base_comm_handle = 0
     diagnostic_capture_index = 0
@@ -3807,6 +3833,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             args_ptr = task_addr + _OFF_TASK_ARGS_BLOB
             args = read_args_from_blob(args_ptr, _MAILBOX_ARGS_CAPACITY)
             _validate_host_control_access(registry.get(cid), args)
+            peer_imports.validate_args(args, provider_region_store)
             chip_args = _materialize_chip_task_args(args, import_registry)
             # The acceptance flag lives in the mailbox, not in the materialized args, so
             # the fence still publishes through the address the parent polls.
@@ -3945,6 +3972,13 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 base_comm_handle = _handle_ctrl_comm_init(cw, buf)
             elif sub_cmd == _CTRL_DELEGATED_REGION:
                 _handle_ctrl_delegated_region_terminal(buf, provider_transaction_table, provider_region_store)
+            elif sub_cmd == CTRL_REGION_PEER:
+                staged, payload, size = _open_ctrl_payload(buf, what="Region peer")
+                view = payload[:size]
+                try:
+                    peer_imports.handle(view)
+                finally:
+                    _release_ctrl_payload(staged, payload, view)
             elif sub_cmd == _CTRL_COMMITTED_DEVICE_MEMORY:
                 struct.pack_into("Q", buf, _CTRL_OFF_RESULT, cw.committed_device_memory)
             elif sub_cmd == _CTRL_DEVICE_MEMORY_INFO:
@@ -4008,7 +4042,9 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             # whose debt keeps the resource — and the query is non-mutating, so asking costs the
             # error path nothing and changes nothing about it.
             try:
-                cw.set_exported_device_regions_live(provider_region_store.holds_resources)
+                cw.set_exported_device_regions_live(
+                    provider_region_store.holds_resources or peer_imports.holds_resources
+                )
             except Exception as flag_error:  # noqa: BLE001
                 # The flag could not be refreshed, so what this worker owns is unknown. Declare a
                 # region live: withholding every join is the answer that cannot be unsafe.
@@ -4204,6 +4240,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             # its own storage, so this POD need not outlive the call.
             args = staged.pending_args  # type: ignore[attr-defined]
             _validate_host_control_access(registry.get(staged.cid), args)
+            peer_imports.validate_args(args, provider_region_store)
             chip_args = _materialize_chip_task_args(args, import_registry)
             if staged.config.output_prefix:
                 _bind_host_log_session_directory()
@@ -4445,7 +4482,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         else:
             _run_mailbox_loop(buf, state_addr, handle_task=handle_task, handle_control=handle_control)
     finally:
-        _teardown_chip_process_resources(import_registry, cw, global_domain_store, provider_region_store)
+        _teardown_chip_process_resources(import_registry, cw, global_domain_store, provider_region_store, peer_imports)
 
 
 def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins, identity tables, log config, prewarm sizing) must cross the fork as explicit COW args; the child cannot read parent state after os.fork
@@ -4779,7 +4816,11 @@ def _child_worker_loop(
             # pure forwarding to L2 carries no map cost.
             args = _reexport_args_from_mailbox(task_buf, inner_worker)
             cfg = _read_config_from_mailbox(task_buf, level_worker=inner_worker)
-            inner_worker.run(orch_fn, args, cfg)
+            inner_worker._forwarded_region_binding = region_binding_prefix(args)
+            try:
+                inner_worker.run(orch_fn, args, cfg)
+            finally:
+                inner_worker._forwarded_region_binding = None
         except Exception as e:  # noqa: BLE001
             return 1, _format_exc(f"child_worker level={inner_worker.level}", e)
         return 0, ""
@@ -5828,6 +5869,7 @@ class Worker:
     ) -> None:
         self.level = level
         self._delegated_control_path = _format_worker_path(int(level))
+        self._forwarded_region_binding: tuple[int, ...] | None = None
         self._delegated_session_fatal: BaseException | None = None
         # Rebound from the level in `init()`; the default matches the C++ table's
         # so a span emitted before init names L3 rather than nothing.
@@ -8186,12 +8228,14 @@ class Worker:
         self._validate_endpoint_registry(registry, resolved.members)
         plan = BackendResolver(registry, self._get_region_access_service()).plan(resolved, layout)
         self._validate_endpoint_registry(registry, resolved.members)
-        return plan
+        return validate_executable_region_plan(
+            MaterializationContext(worker=self, registry=registry, plan=plan, layout=layout)
+        )
 
     def _get_region_access_service(self) -> RegionAccessService:
         service = self._region_access_service
         if service is None:
-            service = DefaultRegionAccessService()
+            service = _WorkerRegionAccessService(self)
             self._region_access_service = service
         return service
 
@@ -10427,42 +10471,17 @@ class Worker:
         worker_id: int = 0,
         expected_device_id: int | None = None,
     ):
-        expected = self._provider_import_backend_kind()
-        if descriptor.backend_kind is not expected:
-            raise RuntimeError("create_worker_chip_region: unsupported import backend")
-        selected = None if part is None else RegionPartKind(part)
-        if expected is BackendKind.POSIX_SHM:
-            token = _posix_token_from_descriptor(descriptor)
-            mapping_bytes = _posix_object_size(token)
-            if mapping_bytes < int(descriptor.nbytes):
-                raise RuntimeError("POSIX shm object is shorter than the descriptor logical bytes")
-            if selected is RegionPartKind.COUNTER and mapping_bytes < _align_up(int(descriptor.nbytes), 64):
-                raise RuntimeError("COUNTER POSIX shm object is shorter than the 64-byte padded span")
-            return _worker_host_mapped_region_import_sim(token, int(mapping_bytes), self._owner_id)
-        if expected is BackendKind.VMM_SHAREABLE:
-            device_id, shareable_handle, mapping_bytes = _vmm_shareable_facts(descriptor)
-            namespace_id = (
-                int(expected_device_id)
-                if expected_device_id is not None
-                else int(self._provider_import_device_id(int(worker_id)))
-            )
-            if int(device_id) != int(namespace_id):
-                raise RuntimeError("committed VMM device_id is outside this worker's device namespace")
-            try:
-                granularity = int(_region_vmm_granularity(int(device_id)))
-            except Exception as exc:
-                raise RuntimeError(str(exc) or "VMM granularity query failed") from exc
-            if granularity < 1 or int(mapping_bytes) % granularity != 0:
-                raise RuntimeError("VMM mapping_bytes must be a positive multiple of runtime granularity")
-            if selected is RegionPartKind.COUNTER and int(mapping_bytes) < _align_up(int(descriptor.nbytes), 64):
-                raise RuntimeError("COUNTER VMM mapping_bytes must cover 64-byte alignment")
-            return _worker_host_mapped_region_import_onboard(
-                int(device_id),
-                int(shareable_handle),
-                int(mapping_bytes),
-                self._owner_id,
-            )
-        raise RuntimeError("create_worker_chip_region: unsupported import backend")
+        owner_device_id = (
+            int(expected_device_id) if expected_device_id is not None else self._provider_import_device_id(worker_id)
+        )
+        return import_region_part(
+            descriptor,
+            part=part,
+            expected=self._provider_import_backend_kind(),
+            owner_device_id=owner_device_id,
+            target_device_id=owner_device_id,
+            owner_token=self._owner_id,
+        )
 
     def _provider_import_backend_kind(self) -> BackendKind:
         platform = str(self._config.get("platform", ""))
@@ -10492,7 +10511,62 @@ class Worker:
             expected_device_id=expected_device_id,
         )
 
-    def _create_worker_chip_region(self, worker_id: int, payload_bytes: int, counter_bytes: int):
+    def _import_peer_region_part_lease(self, instance, descriptor, *, part, consumer_worker_id, expected_device_id):
+        self._region_instance_registry._require_tracked(instance)
+        if self._worker is None:
+            raise RuntimeError("Region peer import requires an initialized Worker")
+        lease = PeerRegionLease(self, instance, descriptor, part, consumer_worker_id, expected_device_id)
+        attachment = _RegionPartAttachment(part, descriptor, lease)
+        if part is RegionPartKind.PAYLOAD:
+            instance._payload_attachment = attachment
+        else:
+            instance._counter_attachment = attachment
+        if part is RegionPartKind.PAYLOAD:
+            enable = bytearray(lease.frame)
+            target = self._provider_import_device_id(consumer_worker_id)
+            struct.pack_into("<III", enable, 28, target, expected_device_id, _PEER_ENABLE)
+            self._worker.control_payload(
+                WorkerType.NEXT_LEVEL, instance.worker_id, CTRL_REGION_PEER, enable, self._py_control_timeout_s
+            )
+        lease.mapped_base = lease.exchange(0)
+        if lease.mapped_base <= 0:
+            raise RuntimeError("Region peer import returned no local mapping")
+        return lease
+
+    def _validate_region_binding(self, args, worker_id):
+        binding = region_binding_prefix(args)
+        if binding is None:
+            return
+        instances = self._region_instance_registry._iter_run(self._building_run_resources)
+        for instance in instances:
+            if instance._state is not RegionInstanceState.LIVE or instance.data_plane_error is not None:
+                continue
+            if worker_id == instance.worker_id:
+                views = instance._provider_payload_view, instance._provider_counter_view
+            elif worker_id == instance.consumer_worker_id:
+                views = instance.local_view(RegionPartKind.PAYLOAD), instance.local_view(RegionPartKind.COUNTER)
+            else:
+                continue
+            payload, counter = views
+            if (
+                payload is not None
+                and counter is not None
+                and binding
+                == tuple(
+                    worker_chip_orch_region_desc_from_local_views(
+                        instance.provider_resource_id, payload, counter
+                    ).scalars()
+                )
+            ):
+                return
+        # Intermediate Workers forward only the parent-admitted binding; the leaf checks its local views.
+        if binding == self._forwarded_region_binding and _callback_frame_for(self) is not None:
+            return
+        raise ValueError("Region binding is expired or does not belong to the submitted chip")
+
+    def _create_worker_chip_region(
+        self, worker_id: int, payload_bytes: int, counter_bytes: int, consumer_worker_id: int | None = None
+    ):
         if payload_bytes <= 0:
             raise ValueError("create_worker_chip_region: payload_bytes must be positive")
         if counter_bytes <= 0 or counter_bytes % 4 != 0:
@@ -10507,7 +10581,11 @@ class Worker:
             provider_path = _format_worker_path(2, parent_path=root_path, index=int(worker_id))
             provider = at(provider_path, DEVICE_AICPU)
             layout = RegionLayoutSpec(payload_bytes=int(payload_bytes), counter_bytes=int(counter_bytes))
-            members = (at(root_path, HOST_CPU), provider)
+            consumer = at(root_path, HOST_CPU)
+            if consumer_worker_id is not None:
+                self._validate_worker_chip_id(consumer_worker_id)
+                consumer = at(_format_worker_path(2, parent_path=root_path, index=consumer_worker_id), DEVICE_AICPU)
+            members = (consumer, provider)
             topology = SingleOwner(provider=provider)
             instance = self._materialize_region_instance(members, topology, layout)
             payload_view = instance.local_view(RegionPartKind.PAYLOAD)

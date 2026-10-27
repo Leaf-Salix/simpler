@@ -24,7 +24,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from simpler import comm_endpoints as ce
-from simpler import comm_region, worker_chip_orch_comm
+from simpler import comm_region, comm_region_peer, worker_chip_orch_comm
 from simpler import worker as worker_module
 from simpler.buffer import (
     AccessMode,
@@ -73,7 +73,7 @@ _FAKE_POSIX_OBJECT_SIZES: dict[str, int] = {}
 
 @pytest.fixture(autouse=True)
 def _fake_region_runtime_facts(monkeypatch):
-    real_posix_object_size = worker_module._posix_object_size
+    real_posix_object_size = comm_region_peer._posix_object_size
 
     def _posix_object_size(token: str) -> int:
         recorded = _FAKE_POSIX_OBJECT_SIZES.get(str(token))
@@ -81,8 +81,8 @@ def _fake_region_runtime_facts(monkeypatch):
             return int(recorded)
         return real_posix_object_size(token)
 
-    monkeypatch.setattr(worker_module, "_posix_object_size", _posix_object_size)
-    monkeypatch.setattr(worker_module, "_region_vmm_granularity", lambda _device_id: 1)
+    monkeypatch.setattr(comm_region_peer, "_posix_object_size", _posix_object_size)
+    monkeypatch.setattr(comm_region_peer, "_region_vmm_granularity", lambda _device_id: 1)
     monkeypatch.setattr(comm_region, "_worker_host_mapped_region_mapped_base", lambda _handle: 0)
 
 
@@ -393,7 +393,7 @@ def test_sim_direct_region_uses_lifecycle_control_and_worker_host_metadata(monke
     calls: list[tuple] = []
     try:
         monkeypatch.setattr(
-            worker_module,
+            comm_region_peer,
             "_worker_host_mapped_region_import_sim",
             lambda token, mapping_bytes, owner_token: calls.append(("import", token, mapping_bytes, owner_token)) or 99,
         )
@@ -452,7 +452,7 @@ def test_onboard_direct_region_imports_vmm_shareable_handle_and_uses_worker_host
     calls: list[tuple] = []
     try:
         monkeypatch.setattr(
-            worker_module,
+            comm_region_peer,
             "_worker_host_mapped_region_import_onboard",
             lambda device_id, shareable_handle, mapping_bytes, owner_token: calls.append(
                 ("import_onboard", device_id, shareable_handle, mapping_bytes, owner_token)
@@ -487,7 +487,7 @@ def test_sim_direct_create_sends_projected_vmm_window_spec(monkeypatch):
     worker, shm, fake_c_worker = _make_started_sim_worker()
     try:
         monkeypatch.setattr(
-            worker_module,
+            comm_region_peer,
             "_worker_host_mapped_region_import_sim",
             lambda _token, _mapping_bytes, _owner_token: 99,
         )
@@ -511,7 +511,7 @@ def test_sim_direct_create_import_failure_rolls_back_l2_host_region(monkeypatch)
     worker, shm, fake_c_worker = _make_started_sim_worker()
     try:
         monkeypatch.setattr(
-            worker_module,
+            comm_region_peer,
             "_worker_host_mapped_region_import_sim",
             lambda _token, _mapping_bytes, _owner_token: (_ for _ in ()).throw(RuntimeError("import failed")),
         )
@@ -587,7 +587,7 @@ def test_onboard_direct_mapping_bytes_cover_each_independent_part(monkeypatch):
     calls: list[tuple] = []
     try:
         monkeypatch.setattr(
-            worker_module,
+            comm_region_peer,
             "_worker_host_mapped_region_import_onboard",
             lambda *args: calls.append(args) or 123,
         )
@@ -613,7 +613,7 @@ def test_onboard_direct_mapping_allows_granularity_aligned_mapping(monkeypatch):
     calls: list[tuple] = []
     try:
         monkeypatch.setattr(
-            worker_module,
+            comm_region_peer,
             "_worker_host_mapped_region_import_onboard",
             lambda *args: calls.append(args) or 123,
         )
@@ -638,7 +638,9 @@ def test_direct_region_create_rolls_back_when_compat_wrapper_fails(monkeypatch):
     resources = worker_module._RunResources()
     worker._building_run_resources = resources
     close_calls: list[int] = []
-    monkeypatch.setattr(worker_module, "_worker_host_mapped_region_import_sim", lambda _token, _size, _owner_token: 55)
+    monkeypatch.setattr(
+        comm_region_peer, "_worker_host_mapped_region_import_sim", lambda _token, _size, _owner_token: 55
+    )
     monkeypatch.setattr(
         comm_region,
         "_worker_host_mapped_region_close",
@@ -667,7 +669,9 @@ def test_direct_region_create_rolls_back_when_compat_wrapper_fails(monkeypatch):
 
 def test_direct_region_create_mapping_rollback_failure_poisons_worker(monkeypatch):
     worker, shm, fake_c_worker = _make_started_sim_worker()
-    monkeypatch.setattr(worker_module, "_worker_host_mapped_region_import_sim", lambda _token, _size, _owner_token: 55)
+    monkeypatch.setattr(
+        comm_region_peer, "_worker_host_mapped_region_import_sim", lambda _token, _size, _owner_token: 55
+    )
     monkeypatch.setattr(
         comm_region,
         "_worker_host_mapped_region_close",
@@ -684,12 +688,13 @@ def test_direct_region_create_mapping_rollback_failure_poisons_worker(monkeypatc
             worker._create_worker_chip_region(0, 64, 128)
 
         assert isinstance(excinfo.value.__cause__, RuntimeError)
-        assert fake_c_worker.release_calls == [(0, 1)]
-        assert worker._region_instance_registry._instances == {}
+        assert fake_c_worker.release_calls == []
+        assert len(worker._region_instance_registry._instances) == 1
         with pytest.raises(RuntimeError, match="no further work is admitted"):
             worker._require_no_ordered_cleanup_failure("submit")
     finally:
-        worker._close_worker_chip_orch_comm()
+        with pytest.raises(RuntimeError, match="mapping close failed"):
+            worker._close_worker_chip_orch_comm()
         shm.close()
         shm.unlink()
 
@@ -711,7 +716,7 @@ def test_unadopted_native_mapping_cleanup_failure_poisons_worker(monkeypatch):
         lambda owner_token, observed: acknowledgements.append((owner_token, observed)),
     )
     monkeypatch.setattr(
-        worker_module,
+        comm_region_peer,
         "_worker_host_mapped_region_import_sim",
         lambda _token, _size, _owner_token: (_ for _ in ()).throw(KeyboardInterrupt("interrupted native adoption")),
     )
@@ -750,7 +755,7 @@ def test_interrupted_cleanup_ack_happens_after_region_rollback(monkeypatch):
 
     monkeypatch.setattr(worker_module, "_worker_host_mapped_region_ack_cleanup_error", interrupt_ack)
     monkeypatch.setattr(
-        worker_module,
+        comm_region_peer,
         "_worker_host_mapped_region_import_sim",
         lambda _token, _size, _owner_token: (_ for _ in ()).throw(KeyboardInterrupt("interrupted native adoption")),
     )
@@ -1003,7 +1008,7 @@ def test_close_replay_does_not_double_release_worker_chip_region_after_mapping_c
     worker._init_owner_thread = threading.current_thread()
     handles = iter((77, 78))
     monkeypatch.setattr(
-        worker_module,
+        comm_region_peer,
         "_worker_host_mapped_region_import_sim",
         lambda _token, _size, _owner_token: next(handles),
     )
@@ -1025,14 +1030,15 @@ def test_close_replay_does_not_double_release_worker_chip_region_after_mapping_c
             worker.close()
 
         assert close_calls == [77, 78]
-        assert fake_c_worker.release_calls == [(0, 1)]
-        assert worker._region_instance_registry._instances == {}
+        assert fake_c_worker.release_calls == []
+        assert len(worker._region_instance_registry._instances) == 1
         assert region.expired
 
-        worker.close()
+        with pytest.raises(RuntimeError, match="mapping close failed"):
+            worker.close()
 
         assert close_calls == [77, 78]
-        assert fake_c_worker.release_calls == [(0, 1)]
+        assert fake_c_worker.release_calls == []
     finally:
         with contextlib.suppress(FileNotFoundError):
             shm.close()
@@ -1665,7 +1671,7 @@ def test_sim_direct_transfer_failure_poisons_only_region(monkeypatch):
     worker, shm, _fake_c_worker = _make_started_sim_worker()
     try:
         monkeypatch.setattr(
-            worker_module, "_worker_host_mapped_region_import_sim", lambda _token, _size, _owner_token: 55
+            comm_region_peer, "_worker_host_mapped_region_import_sim", lambda _token, _size, _owner_token: 55
         )
         monkeypatch.setattr(
             comm_region,
@@ -1690,7 +1696,7 @@ def test_sim_direct_counter_failure_poisons_only_region(monkeypatch):
     worker, shm, _fake_c_worker = _make_started_sim_worker()
     try:
         monkeypatch.setattr(
-            worker_module, "_worker_host_mapped_region_import_sim", lambda _token, _size, _owner_token: 55
+            comm_region_peer, "_worker_host_mapped_region_import_sim", lambda _token, _size, _owner_token: 55
         )
         monkeypatch.setattr(
             comm_region,
@@ -1726,7 +1732,7 @@ def test_sim_direct_cleanup_closes_worker_host_mapping_before_l2_host_release(mo
     try:
         fake_c_worker.control_payload = payload
         monkeypatch.setattr(
-            worker_module, "_worker_host_mapped_region_import_sim", lambda _token, _size, _owner_token: 77
+            comm_region_peer, "_worker_host_mapped_region_import_sim", lambda _token, _size, _owner_token: 77
         )
         monkeypatch.setattr(
             comm_region,
@@ -1754,7 +1760,7 @@ def test_compat_wrapper_expires_after_run_cleanup(monkeypatch):
     worker._building_run_resources = resources
     try:
         monkeypatch.setattr(
-            worker_module, "_worker_host_mapped_region_import_sim", lambda _token, _size, _owner_token: 55
+            comm_region_peer, "_worker_host_mapped_region_import_sim", lambda _token, _size, _owner_token: 55
         )
         region = worker._create_worker_chip_region(0, 64, 128)
         assert region.expired is False
@@ -1776,7 +1782,7 @@ def test_compat_free_is_logical_and_keeps_region_instance_live(monkeypatch):
     worker, shm, fake_c_worker = _make_started_sim_worker()
     try:
         monkeypatch.setattr(
-            worker_module, "_worker_host_mapped_region_import_sim", lambda _token, _size, _owner_token: 55
+            comm_region_peer, "_worker_host_mapped_region_import_sim", lambda _token, _size, _owner_token: 55
         )
         region = worker._create_worker_chip_region(0, 64, 128)
         instance = region._instance
@@ -1800,7 +1806,7 @@ def test_compat_descriptor_uses_independent_local_views_and_bumped_magic(monkeyp
     fake_c_worker.counter_base = 0x9000
     try:
         monkeypatch.setattr(
-            worker_module, "_worker_host_mapped_region_import_sim", lambda _token, _size, _owner_token: 55
+            comm_region_peer, "_worker_host_mapped_region_import_sim", lambda _token, _size, _owner_token: 55
         )
         region = worker._create_worker_chip_region(0, 64, 128)
         scalars = region.descriptor_scalars()
@@ -1825,7 +1831,7 @@ def test_public_create_worker_chip_region_uses_admitted_w2_plan_and_two_imports(
     worker, shm, fake_c_worker = _make_started_sim_worker()
     imports: list[tuple[str, int]] = []
     monkeypatch.setattr(
-        worker_module,
+        comm_region_peer,
         "_worker_host_mapped_region_import_sim",
         lambda token, mapping_bytes, owner_token: imports.append((str(token), int(mapping_bytes)))
         or (100 + len(imports)),
@@ -1942,13 +1948,13 @@ def test_sim_public_api_two_shm_objects_and_two_consecutive_lifecycles(platform,
         pytest.skip(f"{platform} runtime binaries unavailable: {e}")
 
     imports: list[tuple[str, int]] = []
-    original_import = worker_module._worker_host_mapped_region_import_sim
+    original_import = comm_region_peer._worker_host_mapped_region_import_sim
 
     def spy_import(token, mapping_bytes, owner_token):
         imports.append((str(token), int(mapping_bytes)))
         return original_import(token, mapping_bytes, owner_token)
 
-    monkeypatch.setattr(worker_module, "_worker_host_mapped_region_import_sim", spy_import)
+    monkeypatch.setattr(comm_region_peer, "_worker_host_mapped_region_import_sim", spy_import)
 
     worker = Worker(
         level=3,

@@ -87,6 +87,13 @@ payloads, not as the primary large-output path. Payload access is not PTO-ISA
 `TLOAD` or `TSTORE`; typed tensor/tile operations remain wrapper or AICore
 concerns.
 
+For a same-node device consumer, `consumer_worker_id` selects the importing
+chip. `descriptor_scalars(worker_id=...)` selects the provider or consumer
+binding; the default selects the consumer. See the
+[Host domain design](zh-cn/host-comm-domain-design.md) for its supported
+scope and lifetime contract. The six descriptor scalars must be the TaskArgs
+scalar prefix when submitting through the Python Orchestrator.
+
 ## 2. Region Descriptor
 
 The descriptor is byte-oriented and is encoded as six `uint64_t` scalar slots:

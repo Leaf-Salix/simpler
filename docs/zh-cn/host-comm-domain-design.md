@@ -245,3 +245,29 @@ MPI Abort/进程退出可能回收内存，本提案不保证失联 owner 留存
 
 若需要别名，逐个登记其 lease 与清理责任，不增加物理 payload 副本。
 每处新状态须有唯一写入者、使用者和撤销点；测试复用既有 fixture 与参数化流程。
+
+通用 Region 的最终规划复用与物化相同的 shape/layout 检查，单条 adapter 可用不等于整个 Region 可执行。
+当前支持 root Host consumer 与 AICPU provider，以及 A3 同节点 L3 下两个不同 chip 的 AICPU provider/consumer；
+payload、counter 均为正数。其余形状在资源分配前拒绝，不把实现缺失表述为硬件不支持。
+额外受管 Host 的跨节点访问继续使用前述 endpoint/attachment 与域内 copy，域专用能力不提升为全局默认能力。
+
+同节点 peer 复用现有 Region 接口：
+
+```python
+region = orch.create_worker_chip_region(
+    worker_id=0, consumer_worker_id=1, payload_bytes=512, counter_bytes=128,
+)
+owner_binding = region.descriptor_scalars(worker_id=0)
+peer_binding = region.descriptor_scalars()  # consumer chip 的地址
+```
+
+两组 binding 都沿用六 scalar ABI，作为对应 chip 的 TaskArgs scalar 前缀；Host 侧的
+`payload_read/write/counter` 不适用于这个 device consumer 形状。每个 chip 校验本地完整 binding，
+父级还核对当前 run 与提交目标；跨任务访问通过显式依赖或已有 counter 协议排序。
+数值相同且指向同一 backing 的合法本地 binding 不因进程不同而被拒绝；裸 scalar 不是安全隔离机制。
+不增加新的 Region facade，也不引入 HIXL。生产后端使用 CANN VMM，仿真使用共享 POSIX backing。
+
+peer 的 payload/counter 都在实际消费 chip 进程中导入，设备间 peer-access 状态必须确认后才能发布 view。
+Region 复用既有 run 清理：所有 view 成功撤销后才释放 provider；部分导入失败、回收失败或确认未知
+保留清理记录并阻止新准入及正常 Worker teardown，后续 close 不能把遗留失败当成功。
+这条同节点 VMM 路径与跨节点 Host copy 分别验收，不将仿真通过解释为硬件链路证明。

@@ -358,6 +358,7 @@ class Orchestrator:
                 remote_sidecar = worker._prepare_buffer_references(c_args, remote_sidecar, cpp_worker_id)
             final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
             if worker is not None:
+                worker._validate_region_binding(c_args, cpp_worker_id)
                 worker._adopt_remote_sidecar_refs((remote_sidecar,))
                 worker._record_touched_identities(c_args)
             _admit_task_submission(self._worker)
@@ -456,6 +457,7 @@ class Orchestrator:
         member_checks: list[tuple[int, TaskArgs]] = []
         if worker is not None:
             for g, c_args in enumerate(c_args_list):
+                worker._validate_region_binding(c_args, worker_ids[g])
                 if worker._names_device_allocation(c_args):
                     member_checks.append((g, c_args))
         prov_guard: Any = (
@@ -772,12 +774,16 @@ class Orchestrator:
                 with self._worker._registry_lock:
                     self._worker._buffers.pop(int(host.identity.buffer_id), None)
 
-    def create_worker_chip_region(self, *, worker_id: int, payload_bytes: int, counter_bytes: int):
+    def create_worker_chip_region(
+        self, *, worker_id: int, payload_bytes: int, counter_bytes: int, consumer_worker_id: int | None = None
+    ):
         """Create an L3-L2 communication region on one NEXT_LEVEL chip worker."""
         if self._worker is None:
             raise RuntimeError("create_worker_chip_region requires an Orchestrator bound to a Worker")
         with self._control_admission("create_worker_chip_region"):
-            return self._worker._create_worker_chip_region(int(worker_id), int(payload_bytes), int(counter_bytes))
+            return self._worker._create_worker_chip_region(
+                int(worker_id), int(payload_bytes), int(counter_bytes), consumer_worker_id=consumer_worker_id
+            )
 
     def create_worker_chip_queue(
         self, *, worker_id: object, depth: object, input_arena_bytes: object, output_arena_bytes: object

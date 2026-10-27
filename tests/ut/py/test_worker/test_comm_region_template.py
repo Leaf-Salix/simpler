@@ -1286,7 +1286,12 @@ def test_coordinator_generic_cleanup_failure_keeps_first_error(region_worker):
         )
     assert str(excinfo.value) == "injected generic bind failure"
     assert worker._ordered_cleanup_error is not None
-    assert any(item[0] == "release" for item in calls)
+    assert not any(item[0] == "release" for item in calls)
+    (instance,) = worker._region_instance_registry._instances.values()
+    assert instance._delegated_release_edge
+    with pytest.raises(RuntimeError) as cleanup:
+        worker._region_instance_registry.sweep()
+    assert cleanup.value is instance._cleanup_error
 
 
 def test_coordinator_spsc_role_mismatch_consumes_plan_and_rolls_back(region_worker):
@@ -1462,3 +1467,17 @@ def test_signed_int32_counter_operands_cross_bit31_and_wrap_to_zero():
     with pytest.raises(TimeoutError, match="timed out"):
         queue.output.peek(0.01)
     assert queue._state is _SpscQueueState.LIVE
+
+
+def test_queue_bind_refuses_device_initiator():
+    session, _host, provider, initiator, registry = _endpoint_bundle()
+    plan = _SpscQueueTemplate().plan(_SpscQueueConfig(4, 128, 192))
+    members = registry.resolve_members((at(initiator.path, DEVICE_AICPU), at(provider.path, DEVICE_AICPU)))
+    slots = _resolve_template_slots(
+        registry, members, _queue_placement(initiator, provider).slot_bindings, _SpscQueueTemplate.required_slots
+    )
+    region = _MemoryRegion(
+        layout=plan.region_layout, consumer=initiator, provider=provider, session=session, transaction_id=42
+    )
+    with pytest.raises(ValueError, match="HOST_CPU initiator"):
+        plan._bind(region, slots)

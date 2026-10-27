@@ -47,6 +47,7 @@ from simpler.comm_region import (
     _RegionPartAttachment,
     materialize_region_instance,
     project_region_allocation_spec,
+    validate_executable_region_plan,
     validate_single_owner_region_shape,
 )
 from simpler.orchestrator import _callback_frame_for, _callback_run
@@ -824,7 +825,7 @@ def test_region_instance_close_failure_marks_failed_and_poisons_worker(region_wo
             instance.close()
 
     assert instance.state is RegionInstanceState.CLOSE_FAILED
-    assert _tracked(worker) == ()
+    assert _tracked(worker) == (instance,)
     with pytest.raises(RuntimeError, match="no further work is admitted"):
         worker._require_no_ordered_cleanup_failure("test")
     with pytest.raises(RuntimeError, match="not live"):
@@ -837,8 +838,10 @@ def test_region_instance_close_failure_marks_failed_and_poisons_worker(region_wo
         ("import", "counter", 128, RegionPartKind.COUNTER),
         ("mapping_close", "payload"),
         ("mapping_close", "counter"),
-        ("release", 1, 42),
     ]
+    assert instance._delegated_release_edge
+    assert instance._payload_attachment is not None
+    assert not instance._payload_attachment._closed
 
 
 def test_region_instance_close_failure_replays_cached_error(region_worker):
@@ -852,7 +855,7 @@ def test_region_instance_close_failure_replays_cached_error(region_worker):
             instance.close()
 
     assert instance.state is RegionInstanceState.CLOSE_FAILED
-    assert _tracked(worker) == ()
+    assert _tracked(worker) == (instance,)
     assert second_excinfo.value is first_excinfo.value
     assert calls == [
         ("allocate", 64, 128),
@@ -860,8 +863,10 @@ def test_region_instance_close_failure_replays_cached_error(region_worker):
         ("import", "counter", 128, RegionPartKind.COUNTER),
         ("mapping_close", "payload"),
         ("mapping_close", "counter"),
-        ("release", 1, 42),
     ]
+    assert instance._delegated_release_edge
+    assert instance._payload_attachment is not None
+    assert not instance._payload_attachment._closed
 
 
 def test_callback_region_close_before_submit_retired_from_run_cleanup(region_worker):
@@ -1186,7 +1191,7 @@ def test_registry_run_cleanup_closes_live_instances(region_worker):
     ]
 
 
-def test_allocation_error_with_debt_survives_run_cleanup_until_sweep_without_release(region_worker):
+def test_allocation_error_with_debt_survives_run_cleanup_and_sweep_without_release(region_worker):
     from simpler.comm_provider import RegionAllocationError, RegionControlErrorKind, RegionOperationKind, RegionPartKind
 
     error = RegionAllocationError(
@@ -1216,12 +1221,14 @@ def test_allocation_error_with_debt_survives_run_cleanup_until_sweep_without_rel
     worker._region_instance_registry.cleanup_run(resources)
     assert _tracked(worker) == (instance,)
     assert calls == [("allocate", 64, 128)]
-    worker._region_instance_registry.sweep()
-    assert _tracked(worker) == ()
+    with pytest.raises(RuntimeError) as cleanup:
+        worker._region_instance_registry.sweep()
+    assert cleanup.value is instance._cleanup_error
+    assert _tracked(worker) == (instance,)
     assert calls == [("allocate", 64, 128)]
 
 
-def test_provider_release_failure_keeps_diagnostic_until_sweep(region_worker):
+def test_provider_release_failure_keeps_diagnostic_after_sweep(region_worker):
     worker, calls, _leases = region_worker(fail_release=True)
     instance = _materialize_default_region(worker)
     with worker._control_reservation("test_region_instance"):
@@ -1234,12 +1241,14 @@ def test_provider_release_failure_keeps_diagnostic_until_sweep(region_worker):
     assert _tracked(worker) == (instance,)
     release_calls = [item for item in calls if item[0] == "release"]
     assert release_calls == [("release", 1, 42)]
-    worker._region_instance_registry.sweep()
-    assert _tracked(worker) == ()
+    with pytest.raises(RuntimeError) as cleanup:
+        worker._region_instance_registry.sweep()
+    assert cleanup.value is instance._cleanup_error
+    assert _tracked(worker) == (instance,)
     assert [item for item in calls if item[0] == "release"] == release_calls
 
 
-def test_unpublished_close_failed_survives_cleanup_run_until_sweep(region_worker):
+def test_unpublished_close_failed_survives_cleanup_run_and_sweep(region_worker):
     worker, calls, _leases = region_worker(fail_second_import=True, fail_release=True)
     resources = _RunResources()
     worker._building_run_resources = resources
@@ -1256,8 +1265,10 @@ def test_unpublished_close_failed_survives_cleanup_run_until_sweep(region_worker
     worker._region_instance_registry.cleanup_run(resources)
     assert _tracked(worker) == (instance,)
     assert calls.count(("release", 1, 42)) == 1
-    worker._region_instance_registry.sweep()
-    assert _tracked(worker) == ()
+    with pytest.raises(RuntimeError) as cleanup:
+        worker._region_instance_registry.sweep()
+    assert cleanup.value is instance._cleanup_error
+    assert _tracked(worker) == (instance,)
     assert calls.count(("release", 1, 42)) == 1
 
 
@@ -1291,16 +1302,20 @@ def test_payload_validation_close_failure_keeps_primary_and_poisons(region_worke
         ("allocate", 64, 128),
         ("import", "payload", 64, RegionPartKind.PAYLOAD),
         ("mapping_close", "payload"),
-        ("release", 1, 42),
     ]
     with pytest.raises(RuntimeError, match="no further work is admitted"):
         worker._require_no_ordered_cleanup_failure("test")
-    worker._region_instance_registry.sweep()
-    assert _tracked(worker) == ()
-    assert calls.count(("release", 1, 42)) == 1
+    with pytest.raises(RuntimeError) as cleanup:
+        worker._region_instance_registry.sweep()
+    assert cleanup.value is instance._cleanup_error
+    assert _tracked(worker) == (instance,)
+    assert calls.count(("release", 1, 42)) == 0
+    assert instance._delegated_release_edge
+    assert instance._payload_attachment is not None
+    assert not instance._payload_attachment._closed
 
 
-def test_counter_validation_both_close_failures_keep_primary_order_and_release_once(region_worker, monkeypatch):
+def test_counter_validation_close_failures_keep_primary_order_and_retain_provider(region_worker, monkeypatch):
     worker, calls, leases = region_worker(fail_mapping_close=True)
     primary = MaterializationError("counter runtime validation failed")
     _raise_on_part_validation(monkeypatch, RegionPartKind.COUNTER, primary)
@@ -1316,18 +1331,22 @@ def test_counter_validation_both_close_failures_keep_primary_order_and_release_o
     assert [item for item in calls if item[0] in ("mapping_close", "release")] == [
         ("mapping_close", "counter"),
         ("mapping_close", "payload"),
-        ("release", 1, 42),
     ]
     assert leases[0].closed is True
     assert leases[1].closed is True
     with pytest.raises(RuntimeError, match="no further work is admitted"):
         worker._require_no_ordered_cleanup_failure("test")
     worker._region_instance_registry.cleanup_run(None)
-    worker._region_instance_registry.sweep()
-    assert _tracked(worker) == ()
-    assert calls.count(("release", 1, 42)) == 1
+    with pytest.raises(RuntimeError) as cleanup:
+        worker._region_instance_registry.sweep()
+    assert cleanup.value is instance._cleanup_error
+    assert _tracked(worker) == (instance,)
+    assert calls.count(("release", 1, 42)) == 0
     assert calls.count(("mapping_close", "counter")) == 1
     assert calls.count(("mapping_close", "payload")) == 1
+    assert instance._delegated_release_edge
+    assert instance._payload_attachment is not None
+    assert not instance._payload_attachment._closed
 
 
 def test_clean_partial_import_rollback_closes_and_does_not_poison(region_worker, monkeypatch):
@@ -1369,8 +1388,10 @@ def test_partial_import_provider_release_failure_poisons_without_retry(region_wo
         worker._require_no_ordered_cleanup_failure("test")
     worker._region_instance_registry.cleanup_run(resources)
     assert _tracked(worker) == (instance,)
-    worker._region_instance_registry.sweep()
-    assert _tracked(worker) == ()
+    with pytest.raises(RuntimeError) as cleanup:
+        worker._region_instance_registry.sweep()
+    assert cleanup.value is instance._cleanup_error
+    assert _tracked(worker) == (instance,)
     assert calls.count(("release", 1, 42)) == 1
 
 
@@ -1476,9 +1497,14 @@ def test_counter_mapped_base_getter_failure_with_close_diagnostic_poisons(region
     assert primary is not instance._cleanup_error
     with pytest.raises(RuntimeError, match="no further work is admitted"):
         worker._require_no_ordered_cleanup_failure("test")
-    assert calls.count(("release", 1, 42)) == 1
-    worker._region_instance_registry.sweep()
-    assert calls.count(("release", 1, 42)) == 1
+    assert calls.count(("release", 1, 42)) == 0
+    with pytest.raises(RuntimeError) as cleanup:
+        worker._region_instance_registry.sweep()
+    assert cleanup.value is instance._cleanup_error
+    assert calls.count(("release", 1, 42)) == 0
+    assert instance._delegated_release_edge
+    assert instance._payload_attachment is not None
+    assert not instance._payload_attachment._closed
 
 
 def test_data_plane_does_not_consult_registry(region_worker, monkeypatch):
@@ -2402,7 +2428,7 @@ def test_delegated_identity_requires_track_and_skips_uncertainty_release():
     assert instance._provider_resource_id == 0
 
 
-def test_committed_allocated_installs_release_edge_and_close_sends_once():
+def test_committed_allocation_retains_release_edge_after_view_close_failure():
     ctx = _accepted_context()
     shape = validate_single_owner_region_shape(ctx)
     instance = RegionInstance.planned(ctx, shape)
@@ -2429,16 +2455,12 @@ def test_committed_allocated_installs_release_edge_and_close_sends_once():
     with pytest.raises(RuntimeError, match="payload mapping close failed"):
         instance._close_owned(poison_on_error=False)
     assert mapping_calls == ["payload", "counter"]
-    assert releases == [
-        {
-            "session_instance_id": _DELEGATED_SESSION_A,
-            "transaction_id": 4,
-            "provider_path": b"L3/L2[1]",
-        }
-    ]
+    assert releases == []
+    assert instance._delegated_release_edge
+    assert instance._payload_attachment is not None
     with pytest.raises(RuntimeError, match="payload mapping close failed"):
         instance._close_owned(poison_on_error=False)
-    assert len(releases) == 1
+    assert releases == []
 
 
 def test_delegated_shape_accepts_l3_and_l4():
@@ -2466,7 +2488,7 @@ def test_delegated_shape_accepts_l3_and_l4():
 
 
 def test_l4_onboard_import_uses_provider_device_id_not_local_device_list(monkeypatch):
-    from simpler import worker as worker_mod
+    from simpler import comm_region_peer as worker_mod
 
     worker = _l4_with_local_l3(device_ids=[4])
     worker._config = {**worker._config, "platform": "a2a3", "device_ids": []}
@@ -2927,3 +2949,120 @@ def test_typed_attachment_keeps_provider_identity(region_worker):
     assert instance._payload_attachment.native_lease is leases[0]
     assert not hasattr(instance, "_payload_mapping")
     assert not hasattr(instance, "_counter_mapping")
+
+
+def _peer_context(worker):
+    registry = worker._get_endpoint_registry()
+    provider = registry._by_key[("L3/L2[1]", ce.DEVICE_AICPU)]
+    consumer = registry._by_key[("L3/L2[0]", ce.DEVICE_AICPU)]
+    ctx = _manual_two_member_context(worker, provider=provider, consumer=consumer)
+    attachments = tuple(
+        dataclasses.replace(
+            attachment,
+            adapter_kind=ce.AdapterKind.DEVICE_PEER,
+            adapter_profile=ce.AdapterProfile.DEVICE_VMM_PEER_IMPORT,
+        )
+        if attachment.role is ce.AttachmentRole.CONSUMER
+        else attachment
+        for attachment in ctx.plan.payload.attachments
+    )
+    plan = dataclasses.replace(
+        ctx.plan,
+        payload=dataclasses.replace(ctx.plan.payload, attachments=attachments),
+        counter=dataclasses.replace(ctx.plan.counter, attachments=attachments),
+    )
+    return dataclasses.replace(ctx, registry=registry, plan=plan)
+
+
+def test_device_peer_uses_consumer_spans_and_closes_views_before_provider(region_worker, monkeypatch):
+    worker, calls, _leases = region_worker()
+    ctx = _peer_context(worker)
+    imports = []
+
+    def import_peer(instance, descriptor, *, part, consumer_worker_id, expected_device_id):
+        assert instance.worker_id == 1
+        assert consumer_worker_id == 0
+        assert expected_device_id == 9
+        imports.append(part)
+        return _FakeLease(calls, part.name, handle=0, mapped_base=0x4000 + int(part) * 0x1000)
+
+    monkeypatch.setattr(worker, "_import_peer_region_part_lease", import_peer)
+    assert validate_executable_region_plan(ctx) is ctx.plan
+    instance = materialize_region_instance(ctx)
+    assert imports == [RegionPartKind.PAYLOAD, RegionPartKind.COUNTER]
+    assert instance.consumer_worker_id == 0
+    for part in imports:
+        view = instance.local_view(part)
+        assert view is not None
+        assert view.local_base == 0x4000 + int(part) * 0x1000
+    with worker._control_reservation("test"):
+        with pytest.raises(MaterializationError, match="consumer chip"):
+            instance.payload_read(0, bytearray(64))
+        instance.close()
+    assert calls[-3:] == [("mapping_close", "PAYLOAD"), ("mapping_close", "COUNTER"), ("release", 1, 42)]
+
+
+@pytest.mark.parametrize("part", [RegionPartKind.PAYLOAD, RegionPartKind.COUNTER])
+def test_unconfirmed_peer_import_retains_owner_until_view_closed(region_worker, monkeypatch, part):
+    worker, calls, _leases = region_worker()
+    ctx = _peer_context(worker)
+
+    def import_peer(instance, descriptor, *, part, **_kwargs):
+        lease = _FakeLease(calls, part.name, handle=0, mapped_base=0x4000 + int(part) * 0x1000, fail_close=True)
+        setattr(
+            instance,
+            "_payload_attachment" if part is RegionPartKind.PAYLOAD else "_counter_attachment",
+            _RegionPartAttachment(part, descriptor, lease),
+        )
+        if part is failure_part:
+            raise RuntimeError("import completion unknown")
+        return lease
+
+    failure_part = part
+    monkeypatch.setattr(worker, "_import_peer_region_part_lease", import_peer)
+    with pytest.raises(RuntimeError, match="import completion unknown"):
+        materialize_region_instance(ctx)
+    (instance,) = _tracked(worker)
+    assert instance.state is RegionInstanceState.CLOSE_FAILED
+    assert instance._delegated_release_edge
+    assert not any(call[0] == "release" for call in calls)
+    with pytest.raises(RuntimeError) as cleanup:
+        worker._region_instance_registry.sweep()
+    assert cleanup.value is instance._cleanup_error
+    assert _tracked(worker) == (instance,)
+    assert instance._payload_attachment is not None
+
+
+@pytest.mark.parametrize("payload,counter", [(0, 128), (64, 0), (64, 3)])
+def test_executable_plan_rejects_invalid_layout_before_allocate(region_worker, payload, counter):
+    worker, calls, _leases = region_worker()
+    ctx = dataclasses.replace(_accepted_context(worker), layout=ce.RegionLayoutSpec(payload, counter))
+    assert isinstance(validate_executable_region_plan(ctx), ce.UnsupportedRegionPlan)
+    assert calls == []
+
+
+def test_device_peer_rejects_duplicate_physical_device(region_worker):
+    worker, calls, _leases = region_worker(device_ids=(9, 9))
+    ctx = _peer_context(worker)
+    plan = validate_executable_region_plan(ctx)
+    assert isinstance(plan, ce.UnsupportedRegionPlan)
+    assert "distinct chips" in plan.message
+    assert calls == []
+
+
+def test_final_plan_rejects_materializer_shapes_accepted_by_edge_planner(region_worker):
+    worker, calls, _leases = region_worker()
+    worker._config["num_sub_workers"] = 1
+    host = ce.at("L3", ce.HOST_CPU)
+    sub = ce.at("L3/SUB[0]", ce.HOST_CPU)
+    aicore = ce.at("L3/L2[1]", ce.DEVICE_AICORE)
+    for provider, members in ((host, (host, sub)), (aicore, (host, aicore))):
+        ctx = _context(worker, members, ce.SingleOwner(provider=provider))
+        assert isinstance(ctx.plan, ce.BackendPlan)
+        result = validate_executable_region_plan(ctx)
+        assert isinstance(result, ce.UnsupportedRegionPlan)
+        assert "DEVICE_AICPU providers" in result.message
+        assert isinstance(
+            worker._plan_region(members, ce.SingleOwner(provider=provider), ctx.layout), ce.UnsupportedRegionPlan
+        )
+    assert calls == []

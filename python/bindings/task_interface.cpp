@@ -318,6 +318,31 @@ public:
         acl_check(export_handle(handle, 1, 2, token), "aclrtMemExportToShareableHandleV2");
     }
 
+    void enable_peer_access_with_check(int device_id, int peer_device_id) const {
+        if (device_id < 0 || peer_device_id < 0 || device_id == peer_device_id) {
+            throw std::invalid_argument("Region peer access requires distinct nonnegative device ids");
+        }
+        using Enable = int (*)(int32_t, uint32_t);
+        using Status = int (*)(int32_t, int32_t, int32_t *);
+        auto enable = reinterpret_cast<Enable>(resolve_symbol("aclrtDeviceEnablePeerAccess"));
+        auto status = reinterpret_cast<Status>(resolve_symbol("aclrtDevicePeerAccessStatus"));
+        bind_device_with_check(device_id);
+        int32_t enabled = 0;
+        acl_check(status(device_id, peer_device_id, &enabled), "aclrtDevicePeerAccessStatus");
+        if (enabled == 1) return;
+        int enable_rc = enable(peer_device_id, 0);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (true) {
+            acl_check(status(device_id, peer_device_id, &enabled), "aclrtDevicePeerAccessStatus");
+            if (enabled == 1) return;
+            acl_check(enable_rc, "aclrtDeviceEnablePeerAccess");
+            if (std::chrono::steady_clock::now() >= deadline) {
+                throw std::runtime_error("Region peer access remained unconfirmed");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
 private:
     static constexpr int kAclSuccess = 0;
     static constexpr int kAclMemcpyHostToDevice = 1;
@@ -4654,6 +4679,14 @@ NB_MODULE(_task_interface, m) {
         },
         nb::arg("handle"), nb::arg("counter_offset"), nb::arg("operand"), nb::arg("cmp"), nb::arg("timeout_ns"),
         nb::call_guard<nb::gil_scoped_release>(), "Poll one L3 Host-side L3-L2 signal counter until match or timeout."
+    );
+    m.def(
+        "_region_enable_peer_access",
+        [](int device_id, int peer_device_id) {
+            acl_api().enable_peer_access_with_check(device_id, peer_device_id);
+        },
+        nb::arg("device_id"), nb::arg("peer_device_id"), nb::call_guard<nb::gil_scoped_release>(),
+        "Enable and confirm one device's access to a peer before Region import."
     );
     m.def(
         "_region_vmm_granularity",

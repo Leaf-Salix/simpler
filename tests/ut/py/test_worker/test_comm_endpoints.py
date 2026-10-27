@@ -112,10 +112,10 @@ def _supported_parts(
 def _plan(worker: Worker, members, topology=None, access=None):
     if access is not None:
         worker._region_access_service = ce.StaticRegionAccessService(access)
-    return worker._plan_region(
-        members,
-        topology or ce.SingleOwner(),
-        ce.RegionLayoutSpec(payload_bytes=64, counter_bytes=8),
+    registry = worker._get_endpoint_registry()
+    resolved = registry.resolve_region_spec(members, topology or ce.SingleOwner())
+    return ce.BackendResolver(registry, worker._get_region_access_service()).plan(
+        resolved, ce.RegionLayoutSpec(payload_bytes=64, counter_bytes=8)
     )
 
 

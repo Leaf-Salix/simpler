@@ -1451,3 +1451,20 @@ def test_l3_compatibility_cases_declare_required_platforms():
         text = path.read_text(encoding="utf-8")
         for platform in platforms:
             assert f'"{platform}"' in text, f"{relative} missing {platform}"
+
+
+def test_device_peer_allocate_round_trip_requires_both_peer_profiles():
+    request = dataclasses.replace(
+        _allocate_request(),
+        initiator_path=b"L3/L2[0]",
+        initiator_deployment=EndpointDeploymentKind.DEVICE_AICPU,
+        payload_consumer_adapter_kind=AdapterKind.DEVICE_PEER,
+        payload_consumer_adapter_profile=AdapterProfile.DEVICE_VMM_PEER_IMPORT,
+        counter_consumer_adapter_kind=AdapterKind.DEVICE_PEER,
+        counter_consumer_adapter_profile=AdapterProfile.DEVICE_VMM_PEER_IMPORT,
+    )
+    assert parse_request(encode_request(request, staged_capacity=ALLOCATE_REPLY_BYTES)).decode_terminal() == request
+    for part in ("payload", "counter"):
+        malformed = dataclasses.replace(request, **{f"{part}_consumer_adapter_profile": AdapterProfile.HOST_VMM_COPY})
+        with pytest.raises(RegionControlError, match="consumer adapter"):
+            parse_request(encode_request(malformed, staged_capacity=ALLOCATE_REPLY_BYTES)).decode_terminal()

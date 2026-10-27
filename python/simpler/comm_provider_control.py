@@ -580,7 +580,7 @@ def _inspect_delegated_route(current_path: str, provider_path: bytes) -> _Delega
         )
     hop = provider_parsed.segments[len(current.segments)]
     remainder = provider_parsed.segments[len(current.segments) + 1 :]
-    if hop.index is None:
+    if hop.index is None or hop.level is None:
         raise RegionControlError(RegionControlErrorKind.INVALID_FIELD_VALUE, "next hop must include a child index")
     if hop.level == 2 and remainder:
         raise RegionControlError(
@@ -768,8 +768,12 @@ def _decode_release_request(envelope: DelegatedRegionRequestEnvelope) -> Delegat
 def _require_first_shape_fields(request: DelegatedAllocateRequest) -> None:
     if request.topology is not RegionTopologyKind.SINGLE_OWNER:
         raise RegionControlError(RegionControlErrorKind.INVALID_FIELD_VALUE, "topology must be SINGLE_OWNER")
-    if request.initiator_deployment is not EndpointDeploymentKind.HOST_CPU:
-        raise RegionControlError(RegionControlErrorKind.INVALID_FIELD_VALUE, "initiator_deployment must be HOST_CPU")
+    if request.initiator_deployment is EndpointDeploymentKind.HOST_CPU:
+        adapter, profile = AdapterKind.OWNER_DELEGATED_COPY, AdapterProfile.HOST_VMM_COPY
+    elif request.initiator_deployment is EndpointDeploymentKind.DEVICE_AICPU:
+        adapter, profile = AdapterKind.DEVICE_PEER, AdapterProfile.DEVICE_VMM_PEER_IMPORT
+    else:
+        raise RegionControlError(RegionControlErrorKind.INVALID_FIELD_VALUE, "unsupported initiator_deployment")
     if request.provider_deployment is not EndpointDeploymentKind.DEVICE_AICPU:
         raise RegionControlError(RegionControlErrorKind.INVALID_FIELD_VALUE, "provider_deployment must be DEVICE_AICPU")
     if request.payload_backend_kind is not BackendKind.VMM_SHAREABLE:
@@ -780,26 +784,15 @@ def _require_first_shape_fields(request: DelegatedAllocateRequest) -> None:
         raise RegionControlError(
             RegionControlErrorKind.INVALID_FIELD_VALUE, "COUNTER backend_kind must be VMM_SHAREABLE"
         )
-    if request.payload_consumer_adapter_kind is not AdapterKind.OWNER_DELEGATED_COPY:
-        raise RegionControlError(
-            RegionControlErrorKind.INVALID_FIELD_VALUE,
-            "PAYLOAD consumer_adapter_kind must be OWNER_DELEGATED_COPY",
-        )
-    if request.counter_consumer_adapter_kind is not AdapterKind.OWNER_DELEGATED_COPY:
-        raise RegionControlError(
-            RegionControlErrorKind.INVALID_FIELD_VALUE,
-            "COUNTER consumer_adapter_kind must be OWNER_DELEGATED_COPY",
-        )
-    if request.payload_consumer_adapter_profile is not AdapterProfile.HOST_VMM_COPY:
-        raise RegionControlError(
-            RegionControlErrorKind.INVALID_FIELD_VALUE,
-            "PAYLOAD consumer_adapter_profile must be HOST_VMM_COPY",
-        )
-    if request.counter_consumer_adapter_profile is not AdapterProfile.HOST_VMM_COPY:
-        raise RegionControlError(
-            RegionControlErrorKind.INVALID_FIELD_VALUE,
-            "COUNTER consumer_adapter_profile must be HOST_VMM_COPY",
-        )
+    for part in ("payload", "counter"):
+        if (
+            getattr(request, f"{part}_consumer_adapter_kind") is not adapter
+            or getattr(request, f"{part}_consumer_adapter_profile") is not profile
+        ):
+            raise RegionControlError(
+                RegionControlErrorKind.INVALID_FIELD_VALUE,
+                f"{part.upper()} consumer adapter must be {adapter.name}/{profile.name}",
+            )
 
 
 def _require_wire_enum(enum_cls: type[_IntEnumT], value: int, name: str) -> _IntEnumT:

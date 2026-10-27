@@ -120,9 +120,16 @@ class WorkerChipOrchRegion:
     def _validate_host_buffer(self, buffer: Any) -> None:
         self._owner._validate_worker_chip_orch_comm_host_buffer(buffer)
 
-    def descriptor_scalars(self) -> list[int]:
+    def descriptor_scalars(self, *, worker_id: int | None = None) -> list[int]:
         self._ensure_live()
-        return self._descriptor.scalars()
+        instance = self._instance
+        if worker_id is None or worker_id == instance.consumer_worker_id:
+            return self._descriptor.scalars()
+        if worker_id != instance.worker_id:
+            raise ValueError("Region binding target is not a member")
+        return worker_chip_orch_region_desc_from_local_views(
+            instance.provider_resource_id, instance._provider_payload_view, instance._provider_counter_view
+        ).scalars()
 
     def payload_write(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
         self._ensure_live()

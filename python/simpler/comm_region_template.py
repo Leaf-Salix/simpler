@@ -20,6 +20,7 @@ from enum import Enum, IntEnum
 from typing import Any, NoReturn, Protocol, TypeVar
 
 from .comm_endpoints import (
+    HOST_CPU,
     BackendPlan,
     BackendResolver,
     EndpointRecord,
@@ -37,6 +38,7 @@ from .comm_region import (
     RegionInstanceState,
     WaitCmp,
     materialize_region_instance,
+    validate_executable_region_plan,
 )
 
 _UINT64_MAX = (1 << 64) - 1
@@ -466,6 +468,8 @@ class _SpscQueuePlan:
             raise ValueError("INITIATOR slot does not match the materialized consumer access endpoint")
         if instance.provider.identity != peer.identity:
             raise ValueError("PEER slot does not match the materialized provider-local view endpoint")
+        if initiator.deployment is not HOST_CPU:
+            raise ValueError("SPSC queue requires a HOST_CPU initiator")
         payload_view = instance.local_view(RegionPartKind.PAYLOAD)
         counter_view = instance.local_view(RegionPartKind.COUNTER)
         if payload_view is None or counter_view is None:
@@ -542,6 +546,9 @@ class _RegionTemplateCoordinator:
             )
             backend_plan = BackendResolver(registry, worker._get_region_access_service()).plan(
                 resolved_region, plan.region_layout
+            )
+            backend_plan = validate_executable_region_plan(
+                MaterializationContext(worker=worker, registry=registry, plan=backend_plan, layout=plan.region_layout)
             )
             if isinstance(backend_plan, UnsupportedRegionPlan):
                 raise MaterializationRefusal(RefusalReason.UNSUPPORTED_PLAN, backend_plan.message)

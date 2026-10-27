@@ -39,6 +39,7 @@ from .comm_endpoints import (
     AdapterProfile,
     AttachmentRole,
     BackendPlan,
+    BackendUnsupportedReason,
     EndpointDeploymentKind,
     EndpointRecord,
     EndpointRegistry,
@@ -94,15 +95,8 @@ class _RegionPartAttachment:
     def close(self) -> None:
         if self._closed:
             return
+        _close_native_lease(self.native_lease)
         self._closed = True
-        lease = self.native_lease
-        if lease is None:
-            return
-        closer = getattr(lease, "close", None)
-        if closer is not None:
-            closer()
-            return
-        _worker_host_mapped_region_close(int(lease))
 
 
 _GENERATION_COUNTER = itertools.count(1)
@@ -363,6 +357,7 @@ class DelegatedSingleOwnerRegionShape:
     provider_path: bytes
     first_hop_child_id: int
     provider_device_id: int
+    consumer_worker_id: int | None = None
 
     @property
     def worker_id(self) -> int:
@@ -475,7 +470,9 @@ class RegionInstanceRegistry:
                     instance._close_owned(poison_on_error=True)
                 except BaseException as exc:  # noqa: BLE001
                     errors.append(exc)
-            self._retire(id(instance))
+            elif instance._state is RegionInstanceState.CLOSE_FAILED:
+                errors.append(instance._cleanup_error or MaterializationError("region cleanup remains unconfirmed"))
+            self._settle(instance)
         if errors:
             raise errors[0]
 
@@ -539,6 +536,7 @@ class RegionInstance:
         self.provider = shape.provider
         self.consumer = shape.consumer
         self.worker_id = int(shape.worker_id)
+        self.consumer_worker_id: int | None = None
         self.generation = next(_GENERATION_COUNTER)
         self.diagnostic_label = (
             f"{self.consumer.path} {self.consumer.deployment.value} -> "
@@ -553,6 +551,8 @@ class RegionInstance:
         self._counter_part: CounterPart | None = None
         self._payload_local_view: RegionPartLocalView | None = None
         self._counter_local_view: RegionPartLocalView | None = None
+        self._provider_payload_view: RegionPartLocalView | None = None
+        self._provider_counter_view: RegionPartLocalView | None = None
         self._provider_resource_id = 0
         self._delegated_session_instance_id: bytes | None = None
         self._delegated_transaction_id: int = 0
@@ -615,6 +615,7 @@ class RegionInstance:
                 ),
             )
             instance._delegated_provider_device_id = int(shape.provider_device_id)
+            instance.consumer_worker_id = shape.consumer_worker_id
             return instance
         return cls(ctx, shape)
 
@@ -622,21 +623,24 @@ class RegionInstance:
         self._ensure_live()
         self._worker._require_region_control_context("region_instance.payload_write")
         payload_part = self._payload_part
-        assert payload_part is not None
+        if payload_part is None:
+            raise MaterializationError("device peer region requires access from its consumer chip")
         payload_part.write(offset, host_buffer, nbytes)
 
     def payload_read(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
         self._ensure_live()
         self._worker._require_region_control_context("region_instance.payload_read")
         payload_part = self._payload_part
-        assert payload_part is not None
+        if payload_part is None:
+            raise MaterializationError("device peer region requires access from its consumer chip")
         payload_part.read(offset, host_buffer, nbytes)
 
     def counter(self, offset: int):
         self._ensure_live()
         self._worker._require_region_control_context("region_instance.counter")
         counter_part = self._counter_part
-        assert counter_part is not None
+        if counter_part is None:
+            raise MaterializationError("device peer region requires access from its consumer chip")
         return counter_part.counter(offset)
 
     def close(self) -> None:
@@ -717,15 +721,17 @@ class RegionInstance:
 
     def _close_mapping_leases(self) -> list[BaseException]:
         errors: list[BaseException] = []
-        for attachment in (self._payload_attachment, self._counter_attachment):
+        attrs = ("_payload_attachment", "_counter_attachment")
+        for attr in attrs if self._state is RegionInstanceState.CLOSING else reversed(attrs):
+            attachment = getattr(self, attr)
             if attachment is None:
                 continue
             try:
                 attachment.close()
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
-        self._payload_attachment = None
-        self._counter_attachment = None
+            else:
+                setattr(self, attr, None)
         return errors
 
     def _release_provider_resource(self) -> BaseException | None:
@@ -788,9 +794,10 @@ class RegionInstance:
             self._state = RegionInstanceState.CLOSING
         errors = list(prior_cleanup_errors)
         errors.extend(self._close_mapping_leases())
-        release_error = self._release_provider_resource()
-        if release_error is not None:
-            errors.append(release_error)
+        if not errors:
+            release_error = self._release_provider_resource()
+            if release_error is not None:
+                errors.append(release_error)
         if not errors:
             self._state = RegionInstanceState.CLOSED
             return
@@ -858,15 +865,23 @@ def validate_single_owner_region_shape(ctx: MaterializationContext) -> Delegated
     if len(member_records) != 2:
         raise MaterializationRefusal(
             RefusalReason.UNSUPPORTED_MEMBER_SHAPE,
-            "Only one host consumer and one device provider are supported",
+            "Only one consumer and one device provider are supported",
         )
-    host_consumers = [member for member in member_records if member.deployment is HOST_CPU]
-    if len(host_consumers) != 1 or host_consumers[0].path != root_path:
+    consumers = [member for member in member_records if member.identity != provider.identity]
+    if len(consumers) != 1:
+        raise MaterializationRefusal(RefusalReason.UNSUPPORTED_MEMBER_SHAPE, "Exactly one consumer is required")
+    consumer = consumers[0]
+    consumer_worker_id = None
+    if consumer.deployment is DEVICE_AICPU and int(ctx.registry.root_level) == 3:
+        consumer_worker_id, consumer_device_id = _resolve_delegated_provider_route(ctx.worker, consumer.path)
+        _, provider_device_id = _resolve_delegated_provider_route(ctx.worker, provider.path)
+        if consumer_device_id == provider_device_id:
+            raise MaterializationRefusal(RefusalReason.UNSUPPORTED_MEMBER_SHAPE, "Device peer requires distinct chips")
+    elif consumer.deployment is not HOST_CPU or consumer.path != root_path:
         raise MaterializationRefusal(
             RefusalReason.UNSUPPORTED_MEMBER_SHAPE,
-            "The current registry-root HOST_CPU endpoint must be the only consumer",
+            "Consumer must be the registry-root HOST_CPU or a local L3/L2 DEVICE_AICPU peer",
         )
-    consumer = host_consumers[0]
     if provider.identity not in plan.ordered_members or consumer.identity not in plan.ordered_members:
         raise MaterializationRefusal(
             RefusalReason.UNSUPPORTED_MEMBER_SHAPE,
@@ -887,7 +902,24 @@ def validate_single_owner_region_shape(ctx: MaterializationContext) -> Delegated
         provider_path=provider.path.encode("ascii"),
         first_hop_child_id=first_hop_child_id,
         provider_device_id=provider_device_id,
+        consumer_worker_id=consumer_worker_id,
     )
+
+
+def validate_executable_region_plan(ctx: MaterializationContext) -> BackendPlan | UnsupportedRegionPlan:
+    if isinstance(ctx.plan, UnsupportedRegionPlan):
+        return ctx.plan
+    try:
+        shape = validate_single_owner_region_shape(ctx)
+        project_region_allocation_spec(ctx.plan, ctx.layout)
+        if ctx.registry._buffer_identity_allocator_state(shape.provider) is not True:
+            raise MaterializationRefusal(
+                RefusalReason.UNSUPPORTED_PROVIDER_DEPLOYMENT,
+                "Provider endpoint does not have a Buffer identity allocator",
+            )
+    except (MaterializationRefusal, TypeError, ValueError) as exc:
+        return UnsupportedRegionPlan(BackendUnsupportedReason.ADAPTER_UNSUPPORTED, str(exc))
+    return ctx.plan
 
 
 def _resolve_delegated_provider_route(worker: Any, provider_path: str) -> tuple[int, int]:
@@ -942,7 +974,7 @@ def _resolve_delegated_provider_route(worker: Any, provider_path: str) -> tuple[
     child_root = f"L{int(child.level)}"
     remainder = [child_root]
     for segment in parsed.segments[2:]:
-        if segment.index is None:
+        if segment.index is None or segment.level is None:
             raise MaterializationRefusal(
                 RefusalReason.UNSUPPORTED_MEMBER_SHAPE,
                 "child provider path segments must include an index",
@@ -1067,80 +1099,55 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance: 
                 ctx.worker._latch_delegated_session_fatal(exc)
                 raise
             instance._commit_delegated_allocation(int(outcome.result.provider_resource_id))
+            instance._provider_payload_view = outcome.payload_view
+            instance._provider_counter_view = outcome.counter_view
             payload_desc = outcome.result.export_descriptor.payload
             counter_desc = outcome.result.export_descriptor.counter
-            payload_lease = None
-            counter_lease = None
-            try:
-                _validate_registry_matches_worker(ctx)
-                payload_lease = ctx.worker._import_region_part_lease(
-                    instance.worker_id,
-                    instance._provider_resource_id,
-                    payload_desc,
-                    part=RegionPartKind.PAYLOAD,
-                    expected_device_id=int(shape.provider_device_id),
+            _validate_registry_matches_worker(ctx)
+            peer = instance.consumer_worker_id is not None
+            views = []
+            for part, descriptor, attr, local_view in (
+                (RegionPartKind.PAYLOAD, payload_desc, "_payload_attachment", outcome.payload_view),
+                (RegionPartKind.COUNTER, counter_desc, "_counter_attachment", outcome.counter_view),
+            ):
+                if peer:
+                    lease = ctx.worker._import_peer_region_part_lease(
+                        instance,
+                        descriptor,
+                        part=part,
+                        consumer_worker_id=instance.consumer_worker_id,
+                        expected_device_id=int(shape.provider_device_id),
+                    )
+                else:
+                    lease = ctx.worker._import_region_part_lease(
+                        instance.worker_id,
+                        instance._provider_resource_id,
+                        descriptor,
+                        part=part,
+                        expected_device_id=int(shape.provider_device_id),
+                    )
+                setattr(instance, attr, _RegionPartAttachment(part, descriptor, lease))
+                _validate_imported_lease(descriptor, lease, part=part, expected_backend_kind=expected_backend)
+                views.append(
+                    RegionPartLocalView(part, _require_imported_lease_base(lease), int(descriptor.nbytes))
+                    if peer
+                    else local_view
                 )
-                _validate_imported_lease(
-                    payload_desc,
-                    payload_lease,
-                    part=RegionPartKind.PAYLOAD,
-                    expected_backend_kind=expected_backend,
+            instance._payload_local_view, instance._counter_local_view = validate_independent_local_views(*views)
+            if not peer:
+                instance._payload_part = PayloadPart(
+                    RegionPartSpan(offset=0, nbytes=int(spec.payload.logical_bytes)),
+                    _select_host_vmm_copy_access(
+                        ctx.plan.payload, instance.provider, instance.consumer, instance._payload_attachment
+                    ),
                 )
-                instance._payload_attachment = _RegionPartAttachment(
-                    RegionPartKind.PAYLOAD, payload_desc, payload_lease
+                instance._counter_part = CounterPart(
+                    RegionPartSpan(offset=0, nbytes=int(spec.counter.logical_bytes)),
+                    _select_host_vmm_copy_access(
+                        ctx.plan.counter, instance.provider, instance.consumer, instance._counter_attachment
+                    ),
                 )
-                payload_lease = None
-                counter_lease = ctx.worker._import_region_part_lease(
-                    instance.worker_id,
-                    instance._provider_resource_id,
-                    counter_desc,
-                    part=RegionPartKind.COUNTER,
-                    expected_device_id=int(shape.provider_device_id),
-                )
-                _validate_imported_lease(
-                    counter_desc,
-                    counter_lease,
-                    part=RegionPartKind.COUNTER,
-                    expected_backend_kind=expected_backend,
-                )
-                instance._counter_attachment = _RegionPartAttachment(
-                    RegionPartKind.COUNTER, counter_desc, counter_lease
-                )
-                counter_lease = None
-                _validate_registry_matches_worker(ctx)
-            except BaseException as primary:
-                cleanup_errors: list[BaseException] = []
-                if counter_lease is not None:
-                    error = _attempt_close_native_lease(counter_lease)
-                    counter_lease = None
-                    if error is not None:
-                        cleanup_errors.append(error)
-                if instance._payload_attachment is not None:
-                    cleanup_errors.extend(instance._close_mapping_leases())
-                elif payload_lease is not None:
-                    error = _attempt_close_native_lease(payload_lease)
-                    payload_lease = None
-                    if error is not None:
-                        cleanup_errors.append(error)
-                instance._abort_materialization(
-                    primary,
-                    prior_cleanup_errors=tuple(cleanup_errors),
-                )
-                raise
-            instance._payload_part = PayloadPart(
-                RegionPartSpan(offset=0, nbytes=int(spec.payload.logical_bytes)),
-                _select_host_vmm_copy_access(
-                    ctx.plan.payload, instance.provider, instance.consumer, instance._payload_attachment
-                ),
-            )
-            instance._counter_part = CounterPart(
-                RegionPartSpan(offset=0, nbytes=int(spec.counter.logical_bytes)),
-                _select_host_vmm_copy_access(
-                    ctx.plan.counter, instance.provider, instance.consumer, instance._counter_attachment
-                ),
-            )
-            instance._payload_local_view = outcome.payload_view
-            instance._counter_local_view = outcome.counter_view
+            _validate_registry_matches_worker(ctx)
             instance._ever_live = True
             instance._state = RegionInstanceState.LIVE
             return instance
@@ -1176,14 +1183,6 @@ def _close_native_lease(lease: Any) -> None:
     _worker_host_mapped_region_close(int(lease))
 
 
-def _attempt_close_native_lease(lease: Any) -> BaseException | None:
-    try:
-        _close_native_lease(lease)
-    except BaseException as exc:  # noqa: BLE001
-        return exc
-    return None
-
-
 def _require_imported_lease_base(lease: Any) -> int:
     try:
         mapped = getattr(lease, "mapped_base", None)
@@ -1192,7 +1191,7 @@ def _require_imported_lease_base(lease: Any) -> int:
         handle = getattr(lease, "handle", lease)
         return int(_worker_host_mapped_region_mapped_base(int(handle)))
     except Exception as exc:
-        raise MaterializationError("COUNTER imported mapping base is unavailable") from exc
+        raise MaterializationError("Imported mapping base is unavailable") from exc
 
 
 def _validate_imported_lease(
@@ -1370,7 +1369,7 @@ def _validate_part(part: RegionPartPlan, provider: EndpointRecord, consumer: End
             "Part attachments must match exactly the provider and host consumer",
         )
     _validate_provider_attachment(attachments[provider.identity])
-    _validate_consumer_attachment(attachments[consumer.identity])
+    _validate_consumer_attachment(attachments[consumer.identity], consumer.deployment)
 
 
 def _validate_provider_attachment(attachment: MemberAttachmentPlan) -> None:
@@ -1385,13 +1384,18 @@ def _validate_provider_attachment(attachment: MemberAttachmentPlan) -> None:
         )
 
 
-def _validate_consumer_attachment(attachment: MemberAttachmentPlan) -> None:
+def _validate_consumer_attachment(attachment: MemberAttachmentPlan, deployment=HOST_CPU) -> None:
+    kind, profile = (
+        (AdapterKind.DEVICE_PEER, AdapterProfile.DEVICE_VMM_PEER_IMPORT)
+        if deployment is DEVICE_AICPU
+        else (AdapterKind.OWNER_DELEGATED_COPY, AdapterProfile.HOST_VMM_COPY)
+    )
     if (
         attachment.role is not AttachmentRole.CONSUMER
-        or attachment.adapter_kind is not AdapterKind.OWNER_DELEGATED_COPY
-        or attachment.adapter_profile is not AdapterProfile.HOST_VMM_COPY
+        or attachment.adapter_kind is not kind
+        or attachment.adapter_profile is not profile
     ):
         raise MaterializationRefusal(
             RefusalReason.UNSUPPORTED_ATTACHMENT,
-            "Host consumer attachment must use OWNER_DELEGATED_COPY/HOST_VMM_COPY",
+            f"Consumer attachment must use {kind.name}/{profile.name}",
         )
