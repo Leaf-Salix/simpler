@@ -84,6 +84,30 @@ CPU 读远端时传输到本机 Host pool 后 `local_host().read(...)`，写远�
 HBM 使用已有 member Buffer，Host 使用 `host(node)`；不增加公开 stream、异步 ticket 或通用 Remote COPY 框架。
 同物理池重叠范围拒绝，按 pool 与绝对偏移判断，不能只比较命名 Buffer identity。
 
+Host 应用可通过 `Worker.domain_payload` 或同名 Orchestrator 代理，借用统一的 `PayloadPart`：
+
+```python
+from simpler.comm_region import RegionPartSpan
+
+local = orch.domain_payload(domain.host(node_a))
+remote = orch.domain_payload(
+    domain.host(node_b), worker=0, staging=RegionPartSpan(scratch_offset, N)
+)
+remote.write(0, source_bytes)
+remote.read(0, destination_bytearray)
+```
+
+目标也可以是 `domain.member(rank).buffers[name]`。本节点 owner DRAM 直接访问，不接受
+`worker/staging`；其他池必须指定本地参与 chip 和本节点 Host pool 内的暂存范围。
+调用者独占借用这段暂存区，禁止其他 CPU、kernel 或远端访问与之并发；内容会被覆盖，不自动恢复。
+单次请求必须放得下，容量不足拒绝，不自动分块或分配。接口只供所属 L3 使用。
+
+返回对象不拥有或延长域的生命周期。每次操作重验完整 grant、generation、权限与范围，
+通过后才执行 CPU→SDMA 或 SDMA→CPU。整个操作与本地 grant 撤销互斥，完成未知沿用域的保留策略。
+同一 Worker 的这些访问在 provenance 锁下串行；这不建立跨节点数据互斥或 CPU 原生远端映射。
+仍须遵守 callback 首次 submit 前、或 callback 外无在途 run 的控制准入限制。
+该接口复用既有域的 backing，不创建 `RegionInstance`，也不开放通用 Region 的远端物化或 counter。
+
 ## 3. 内存与现有实现的接入点
 
 ### ACL 路径

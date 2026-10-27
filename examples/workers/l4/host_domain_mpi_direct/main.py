@@ -18,6 +18,7 @@ import tempfile
 from pathlib import Path
 
 from simpler.comm_domain import CommDomainRef
+from simpler.comm_region import RegionPartSpan
 from simpler.mpi_direct_supervisor import run_supervisor
 from simpler.remote_l3_session import get_inner_handle
 from simpler.task_interface import (
@@ -127,23 +128,20 @@ def node_orch(orch, args, cfg, chip_handle=None):
     pools = _pools(domain)
     part = domain.local_host()
     local = domain.host(node)
-    if write:
+    if write and (actor >= nodes or target == node):
         part.write(SOURCE, _pattern(100 + serial, SPAN))
     if actor < nodes:
-        if target == node:
-            data = bytearray(SPAN)
-            part.read(SOURCE if write else TARGET, data)
-            part.write(TARGET if write else RESULT, data)
+        payload = (
+            orch.domain_payload(pools[target])
+            if target == node
+            else orch.domain_payload(pools[target], worker=0, staging=RegionPartSpan(SOURCE if write else RESULT, SPAN))
+        )
+        if write:
+            payload.write(TARGET, _pattern(100 + serial, SPAN))
         else:
-            _copy(
-                orch,
-                pools[target] if write else local,
-                local if write else pools[target],
-                0,
-                SPAN,
-                TARGET if write else RESULT,
-                SOURCE if write else TARGET,
-            )
+            data = bytearray(SPAN)
+            payload.read(TARGET, data)
+            part.write(RESULT, data)
         return
     rank = actor - nodes
     chip = domain.member(rank).local_worker_id
