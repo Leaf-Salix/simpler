@@ -18,7 +18,11 @@ constexpr int DLOG_INFO = 1;
 constexpr int DLOG_WARN = 2;
 constexpr int DLOG_ERROR = 3;
 
-inline bool CheckLogLevel(int /* module */, int /* level */) { return true; }
+namespace dlog_stub {
+inline bool warn_enabled = true;
+}
+
+inline bool CheckLogLevel(int /* module */, int level) { return level != DLOG_WARN || dlog_stub::warn_enabled; }
 
 inline void dlog_debug(int /* module */, const char * /* fmt */, ...) {}
 inline void dlog_info(int /* module */, const char * /* fmt */, ...) {}

@@ -176,11 +176,11 @@ platform_single_case(test_run_terminal_record.cpp
 platform_single_case(test_orch_so_file.cpp
     SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/aicpu/orch_so_file.cpp)
 
-# Onboard uses CANN for DEBUG/INFO/WARN/ERROR but keeps TIMING on simpler's
-# finer threshold. The dlog stub makes the CANN levels available without SDK
-# headers or hardware.
+# Onboard TIMING requires both simpler's threshold and CANN WARN. The dlog
+# stub makes the CANN levels available without SDK headers or hardware.
 platform_single_case(test_onboard_device_log_level.cpp
     SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/aicpu/device_log.cpp
+            ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/unified_log_device.cpp
     INCLUDES ${CMAKE_SOURCE_DIR}/support)
 
 # ---------------------------------------------------------------------------
