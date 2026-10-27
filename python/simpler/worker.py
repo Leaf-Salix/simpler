@@ -1296,6 +1296,15 @@ def _domain_buffer_slots(command):
     return result
 
 
+def _domain_buffer_grants(state):
+    grants = _domain_buffer_slots(state.command)
+    for context in state.contexts.values():
+        for buffer in context.buffers.values():
+            _, slot, offset = grants[buffer.identity]
+            grants[buffer.identity] = (buffer.to_descriptor(), slot, offset)
+    return grants
+
+
 def _release_domain_host_owner(state):
     if state.command.profile == "sim":
         state.host_owner.close()
@@ -1328,6 +1337,18 @@ class _DomainHostAccess:
         if worker is None:
             raise RuntimeError("Host domain Worker no longer exists")
         worker._host_domain_bytes(self._ref, offset, pointer, nbytes, writing=writing)
+
+
+class _DomainPayloadAccess(_DomainHostAccess):
+    def __init__(self, owner, ref, target, worker, staging):
+        super().__init__(owner, ref)
+        self.target, self.worker, self.staging = target, worker, staging
+
+    def _copy(self, offset, pointer, nbytes, *, writing):
+        owner = self._owner()
+        if owner is None:
+            raise RuntimeError("Host domain Worker no longer exists")
+        owner._domain_payload_bytes(self, offset, pointer, nbytes, writing=writing)
 
 
 @dataclass(frozen=True)
@@ -11679,20 +11700,110 @@ class Worker:
             self._control_admission("Host domain access"),
         ):
             self._require_region_control_before_submit("Host domain access")
-            state = self._domain_state(ref)
-            if state.host_owner is None:
-                raise RuntimeError("this node has no Host DRAM owner")
-            host = next(h for h in state.command.host_windows if h.node_worker_id == state.node_worker_id)
-            RegionPartSpan(0, host.spec.nbytes).validate_range(offset, nbytes, "Host domain access")
-            if state.command.profile == "sim":
-                view = state.host_owner.buf
-                assert view is not None
-                owner_ptr = ctypes.addressof(ctypes.c_char.from_buffer(view, offset))
-                ctypes.memmove(owner_ptr if writing else pointer, pointer if writing else owner_ptr, nbytes)
-            elif writing:
-                state.host_owner.write_bytes(offset, pointer, nbytes)
-            else:
-                state.host_owner.read_bytes(offset, pointer, nbytes)
+            with self._child_prov_lock:
+                self._host_domain_bytes_locked(self._domain_state(ref), offset, pointer, nbytes, writing=writing)
+
+    @staticmethod
+    def _host_domain_bytes_locked(state, offset, pointer, nbytes, *, writing):
+        if state.host_owner is None:
+            raise RuntimeError("this node has no Host DRAM owner")
+        host = next(h for h in state.command.host_windows if h.node_worker_id == state.node_worker_id)
+        RegionPartSpan(0, host.spec.nbytes).validate_range(offset, nbytes, "Host domain access")
+        if state.command.profile == "sim":
+            view = state.host_owner.buf
+            assert view is not None
+            owner_ptr = ctypes.addressof(ctypes.c_char.from_buffer(view, offset))
+            ctypes.memmove(owner_ptr if writing else pointer, pointer if writing else owner_ptr, nbytes)
+        elif writing:
+            state.host_owner.write_bytes(offset, pointer, nbytes)
+        else:
+            state.host_owner.read_bytes(offset, pointer, nbytes)
+
+    def domain_payload(
+        self, target: Buffer, *, worker: int | None = None, staging: RegionPartSpan | None = None
+    ) -> PayloadPart:
+        """Borrow synchronous Host access to a granted DRAM/HBM pool in an existing domain.
+
+        The local Host pool needs neither worker nor staging. Other pools require a local
+        participating chip and an explicit range in this node's Host pool. The caller reserves
+        that range against all other CPU/kernel/remote accesses; its contents are overwritten.
+        Transfers must fit the range. The returned part neither owns nor extends the domain.
+        Access has the same before-submit/control-admission rules as copy_domain.
+        """
+        if self.level != 3:
+            raise RuntimeError("domain_payload requires an owning L3 execution node")
+        descriptor = target.to_descriptor()
+        worker = None if worker is None else operator.index(worker)
+        if staging is not None:
+            staging = RegionPartSpan(operator.index(staging.offset), operator.index(staging.nbytes))
+        with self._operation_lease("domain_payload", allow_continuation=True), self._child_prov_lock:
+            state = next(
+                (
+                    state
+                    for state in self._global_node_domains.values()
+                    if state.phase is GlobalDomainPhase.COMMIT
+                    and state.command.host_windows
+                    and descriptor.identity in _domain_buffer_slots(state.command)
+                ),
+                None,
+            )
+            if state is None:
+                raise ValueError("domain_payload requires a Buffer from a live Host domain")
+            command = state.command
+            ref = CommDomainRef(command.owner_instance_id, command.domain_id, command.generation)
+            access = _DomainPayloadAccess(self, ref, descriptor, worker, staging)
+            self._domain_payload_route(access)
+            return PayloadPart(RegionPartSpan(0, descriptor.nbytes), access)
+
+    def _domain_payload_route(self, access):
+        """Resolve a borrowed access under the provenance/revocation lock."""
+        state = self._domain_state(access._ref)
+        grants = _domain_buffer_grants(state)
+        grant = grants.get(access.target.identity)
+        if grant is None or grant[0] != access.target:
+            raise ValueError("domain payload target does not match its granted Buffer")
+        if state.host_owner is None:
+            raise RuntimeError("this node has no Host DRAM owner")
+        local = state.host_buffers[state.node_worker_id].to_descriptor()
+        if access.target.identity == local.identity:
+            if access.worker is not None or access.staging is not None:
+                raise ValueError("local Host payload requires neither worker nor staging")
+        else:
+            if access.worker is None or access.worker not in state.contexts or access.staging is None:
+                raise ValueError("remote payload requires a local domain worker and Host staging range")
+            RegionPartSpan(0, local.nbytes).validate_range(access.staging.offset, access.staging.nbytes, "Host staging")
+        return state, local, grants
+
+    def _domain_payload_bytes(self, access, offset, pointer, nbytes, *, writing):
+        with (
+            self._operation_lease("domain payload", allow_continuation=True),
+            self._control_admission("domain payload"),
+        ):
+            self._require_region_control_before_submit("domain payload")
+            chip_lock = (
+                contextlib.nullcontext() if access.worker is None else self._child_prov_worker_lock(access.worker)
+            )
+            # Grant revocation precedes native view/owner release. This lock covers both legs,
+            # including the CPU access after SDMA; no public locking copy entry is called here.
+            with chip_lock, self._child_prov_lock:
+                state, local, grants = self._domain_payload_route(access)
+                RegionPartSpan(0, access.target.nbytes).validate_range(offset, nbytes, "domain payload")
+                needed = AccessMode.WRITE if writing else AccessMode.READ
+                if access.target.access not in (needed, AccessMode.READWRITE):
+                    raise ValueError(f"domain payload requires {needed.name} access")
+                if access.target.identity == local.identity:
+                    self._host_domain_bytes_locked(state, offset, pointer, nbytes, writing=writing)
+                    return
+                scratch = access.staging
+                scratch.validate_range(0, nbytes, "Host staging")
+                descriptors = (access.target, local) if writing else (local, access.target)
+                offsets = (offset, scratch.offset) if writing else (scratch.offset, offset)
+                _domain_copy_ranges(grants, descriptors, offsets, nbytes)
+                if writing:
+                    self._host_domain_bytes_locked(state, scratch.offset, pointer, nbytes, writing=True)
+                self._copy_domain_locked(state, access.worker, descriptors, offsets, nbytes)
+                if not writing:
+                    self._host_domain_bytes_locked(state, scratch.offset, pointer, nbytes, writing=False)
 
     def copy_domain(
         self, dst: Buffer, src: Buffer, *, worker: int, nbytes: int, dst_offset: int = 0, src_offset: int = 0
@@ -11717,30 +11828,30 @@ class Worker:
             if state is None or worker not in state.contexts:
                 raise ValueError("copy_domain requires Buffers from one participating live Host domain")
             command = state.command
-            domain_id, generation = command.domain_id, command.generation
             with self._child_prov_worker_lock(worker), self._child_prov_lock:
-                grants = _domain_buffer_slots(command)
-                for context in state.contexts.values():
-                    for buffer in context.buffers.values():
-                        _, slot, offset = grants[buffer.identity]
-                        grants[buffer.identity] = (buffer.to_descriptor(), slot, offset)
-                _domain_copy_ranges(grants, descriptors, (dst_offset, src_offset), nbytes)
-                payload = LOCAL_POOL_COPY.pack(
-                    LOCAL_DOMAIN_MAGIC, GLOBAL_DOMAIN_VERSION, domain_id, generation, dst_offset, src_offset, nbytes
-                )
-                payload += b"".join(_pack_identity_wire(d.identity) for d in descriptors)
-                try:
-                    self._worker.control_payload(
-                        WorkerType.NEXT_LEVEL,
-                        worker,
-                        CTRL_GLOBAL_DOMAIN_POOL_COPY,
-                        bytearray(payload),
-                        self._py_control_timeout_s,
-                    )
-                except BaseException as exc:
-                    state.phase = GlobalDomainPhase.ABORT
-                    self._record_unreclaimable("Host domain copy completion is unconfirmed", exc, keep_transport=True)
-                    raise
+                self._domain_state(CommDomainRef(command.owner_instance_id, command.domain_id, command.generation))
+                self._copy_domain_locked(state, worker, descriptors, (dst_offset, src_offset), nbytes)
+
+    def _copy_domain_locked(self, state, worker, descriptors, offsets, nbytes):
+        assert self._worker is not None
+        _domain_copy_ranges(_domain_buffer_grants(state), descriptors, offsets, nbytes)
+        command = state.command
+        payload = LOCAL_POOL_COPY.pack(
+            LOCAL_DOMAIN_MAGIC, GLOBAL_DOMAIN_VERSION, command.domain_id, command.generation, *offsets, nbytes
+        )
+        payload += b"".join(_pack_identity_wire(d.identity) for d in descriptors)
+        try:
+            self._worker.control_payload(
+                WorkerType.NEXT_LEVEL,
+                worker,
+                CTRL_GLOBAL_DOMAIN_POOL_COPY,
+                bytearray(payload),
+                self._py_control_timeout_s,
+            )
+        except BaseException as exc:
+            state.phase = GlobalDomainPhase.ABORT
+            self._record_unreclaimable("Host domain copy completion is unconfirmed", exc, keep_transport=True)
+            raise
 
     def _copy_global_domain_node(self, command: GlobalDomainCopyCommand, *, copy_to_device: bool) -> bytes:
         state = self._global_node_domains.get(command.domain_id)
