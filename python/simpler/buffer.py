@@ -219,6 +219,7 @@ class _DeviceBufferSource:
         self._pid = os.getpid()
         self._lock = threading.Lock()
         self._records: dict[CanonicalIdentity, _SourceBufferRecord] = {}
+        self._retirement_epoch = 0
 
     def _check_process(self) -> None:
         # A mutex inherited while locked cannot be acquired in the forked child.
@@ -296,10 +297,12 @@ class _DeviceBufferSource:
             for identity in identities:
                 self._records[identity].uses -= 1
 
-    def live(self, identity: CanonicalIdentity) -> bool:
+    def retired_since(self, epoch: int, attached: set[CanonicalIdentity]) -> tuple[int, tuple[CanonicalIdentity, ...]]:
         self._check_process()
         with self._lock:
-            return identity in self._records
+            if epoch == self._retirement_epoch:
+                return epoch, ()
+            return self._retirement_epoch, tuple(identity for identity in attached if identity not in self._records)
 
     def close(self, identity: CanonicalIdentity) -> None:
         self._check_process()
@@ -309,6 +312,8 @@ class _DeviceBufferSource:
                 return
             if record.uses:
                 raise RuntimeError("Buffer has in-flight or unproven device uses; close is not a device fence")
+            # Invalidate before removal so interruption cannot hide a retired identity.
+            self._retirement_epoch += 1
             del self._records[identity]
 
 

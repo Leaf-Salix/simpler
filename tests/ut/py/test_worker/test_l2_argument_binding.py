@@ -566,17 +566,102 @@ def test_cached_source_closed_before_reservation_cannot_submit(l2, monkeypatch):
     handle = worker._submit_l2_locked(3, args, CallConfig())
     worker._finalize_run_handle(handle, handle._run_id, None)
     source = worker._device_buffer_source
-    original = source.live
+    original = source.retired_since
 
-    def close_after_cache_check(identity):
-        was_live = original(identity)
+    def close_after_cache_check(epoch, attached):
+        snapshot = original(epoch, attached)
         backing.close()
-        return was_live
+        return snapshot
 
-    monkeypatch.setattr(source, "live", close_after_cache_check)
+    monkeypatch.setattr(source, "retired_since", close_after_cache_check)
     with pytest.raises(ValueError, match="released|not a live"):
         worker._submit_l2_locked(3, args, CallConfig())
     assert len(calls) == 1
+    replacement = Buffer.wrap(address=backing.base, nbytes=64, location=worker.device_location)
+    handle = worker._submit_l2_locked(3, arguments(replacement), CallConfig())
+    worker._finalize_run_handle(handle, handle._run_id, None)
+    replacement.close()
+    assert len(calls) == 2
+
+
+def test_source_closed_after_retirement_snapshot_is_cleaned_on_next_submit(l2, monkeypatch):
+    worker, calls, _ = l2
+    current = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
+    other = Buffer.wrap(address=0x9000, nbytes=64, location=worker.device_location)
+    for backing in (current, other):
+        handle = worker._submit_l2_locked(3, arguments(backing), CallConfig())
+        worker._finalize_run_handle(handle, handle._run_id, None)
+    source = worker._device_buffer_source
+    original = source.retired_since
+
+    def close_after_snapshot(epoch, attached):
+        snapshot = original(epoch, attached)
+        other.close()
+        return snapshot
+
+    monkeypatch.setattr(source, "retired_since", close_after_snapshot)
+    handle = worker._submit_l2_locked(3, arguments(current), CallConfig())
+    worker._finalize_run_handle(handle, handle._run_id, None)
+    replacement = Buffer.wrap(address=other.base, nbytes=64, location=worker.device_location)
+    handle = worker._submit_l2_locked(3, arguments(replacement), CallConfig())
+    worker._finalize_run_handle(handle, handle._run_id, None)
+    assert other.identity not in worker._source_attachments
+    assert worker._child_alloc.get(other.identity) is None
+    assert worker._child_alloc.get(replacement.identity) is not None
+    assert len(calls) == 4
+    current.close()
+    replacement.close()
+
+
+def test_unchanged_sources_do_not_recheck_unused_registrations(l2, monkeypatch):
+    worker, _, _ = l2
+    backings = [Buffer.wrap(address=0x8000 + i * 128, nbytes=64, location=worker.device_location) for i in range(32)]
+    for backing in backings:
+        handle = worker._submit_l2_locked(3, arguments(backing), CallConfig())
+        worker._finalize_run_handle(handle, handle._run_id, None)
+    checked = []
+
+    class ObservedRecords(dict):
+        def __contains__(self, identity):
+            checked.append(identity)
+            return super().__contains__(identity)
+
+    source = worker._device_buffer_source
+    monkeypatch.setattr(source, "_records", ObservedRecords(source._records))
+    handle = worker._submit_l2_locked(3, arguments(backings[-1]), CallConfig())
+    worker._finalize_run_handle(handle, handle._run_id, None)
+    for backing in backings:
+        backing.close()
+    assert all(identity == backings[-1].identity for identity in checked), len(checked)
+
+
+@pytest.mark.parametrize("after_revoke", [False, True])
+def test_interrupted_source_retirement_is_retried_before_address_reuse(l2, monkeypatch, after_revoke):
+    worker, calls, _ = l2
+    backing = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
+    handle = worker._submit_l2_locked(3, arguments(backing), CallConfig())
+    worker._finalize_run_handle(handle, handle._run_id, None)
+    backing.close()
+    replacement = Buffer.wrap(address=backing.base, nbytes=64, location=worker.device_location)
+    original = worker._drop_device_alloc
+
+    def interrupted(identity):
+        if after_revoke:
+            original(identity)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(worker, "_drop_device_alloc", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        worker._submit_l2_locked(3, arguments(replacement), CallConfig())
+    assert len(calls) == 1
+    monkeypatch.setattr(worker, "_drop_device_alloc", original)
+    handle = worker._submit_l2_locked(3, arguments(replacement), CallConfig())
+    worker._finalize_run_handle(handle, handle._run_id, None)
+    assert backing.identity not in worker._source_attachments
+    assert worker._child_alloc.get(backing.identity) is None
+    assert worker._child_alloc.get(replacement.identity) is not None
+    replacement.close()
+    assert len(calls) == 2
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
@@ -592,6 +677,7 @@ def test_source_inherited_with_locked_mutex_rejects_before_locking(l2):
                 lambda: Buffer.wrap(address=0x9000, nbytes=64, location=location),
                 backing.to_descriptor,
                 backing.close,
+                lambda: location._source.retired_since(0, set()),
             ]
             for operation in operations:
                 try:

@@ -11959,6 +11959,7 @@ class Worker:
         self._device_buffer_source: _DeviceBufferSource | None = None
         self._source_context_failed = False
         self._source_attachments: set[CanonicalIdentity] = set()
+        self._source_retirement_epoch = 0
         self._chip_source_uses: dict[int, tuple[CanonicalIdentity, ...]] = {}
         # Which identities each CommDomain allocation minted, so its release revokes them together.
         self._domain_members: dict[int, set[CanonicalIdentity]] = {}
@@ -12014,10 +12015,12 @@ class Worker:
         if source is None:
             self._child_prov_check_dispatch_locked(args, 0, api="submit")
             return ()
-        for identity in tuple(self._source_attachments):
-            if not source.live(identity):
-                self._drop_device_alloc(identity)
-                self._source_attachments.remove(identity)
+        epoch, retired = source.retired_since(self._source_retirement_epoch, self._source_attachments)
+        for identity in retired:
+            self._drop_device_alloc(identity)
+            self._source_attachments.remove(identity)
+        # A failed cleanup must retry, and a later close must remain observable.
+        self._source_retirement_epoch = epoch
         snapshots = source.acquire(args, self._source_attachments)
         identities = tuple(buffer.identity for buffer in snapshots)
         added = []
@@ -12332,6 +12335,7 @@ class Worker:
         with self._child_prov_lock:
             self._child_alloc.clear()
             self._source_attachments.clear()
+            self._source_retirement_epoch = 0
             self._domain_members.clear()
 
     def _check_chip_worker_id(self, worker_id: int) -> None:
