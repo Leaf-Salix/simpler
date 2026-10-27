@@ -958,9 +958,10 @@ extern "C" int comm_global_domain_release(uint64_t domain_id, uint32_t stage) tr
 }
 
 static std::pair<void *, size_t> global_window(GlobalDomainAllocation &a, uint32_t slot) {
-    if (slot < a.nranks && a.host_ctx) return {reinterpret_cast<void *>(a.host_ctx->windowsIn[slot]), a.mapping_size};
+    if (!a.host_ctx) return {nullptr, 0};
+    if (slot < a.nranks) return {reinterpret_cast<void *>(a.host_ctx->windowsIn[slot]), a.mapping_size};
     const size_t index = slot - 1;
-    if (slot < a.nranks || index >= a.peer_mappings.size()) return {nullptr, 0};
+    if (index >= a.peer_mappings.size()) return {nullptr, 0};
     return {a.peer_mappings[index].base, a.peer_mappings[index].size};
 }
 

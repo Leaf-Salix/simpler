@@ -332,6 +332,62 @@ def test_native_host_views_copy_and_two_stage_release(arch, runtime, oversized):
         owner.unlink()
 
 
+@pytest.mark.parametrize("arch", ["a2a3", "a5"])
+@pytest.mark.parametrize("runtime", ["host_build_graph", "tensormap_and_ringbuffer"])
+def test_native_partial_import_keeps_views_unpublished_until_release(arch, runtime):
+    root = Path(__file__).resolve().parents[3] / "build/lib"
+    ctypes.CDLL(str(root / "libcpu_sim_context.so"), mode=ctypes.RTLD_GLOBAL)
+    lib = ctypes.CDLL(str(root / arch / "sim" / runtime / "libhost_runtime.so"))
+    u64, u32, size, ptr = ctypes.c_uint64, ctypes.c_uint32, ctypes.c_size_t, ctypes.c_void_p
+    for name, args in {
+        "prepare": [u64, u32, u32, size, u32, u32, ptr, ptr],
+        "import": [u64, ptr, size, ptr],
+        "window": [u64, u32, ptr, ptr],
+        "copy": [u64, u32, size, u32, size, size, ptr],
+        "release": [u64, u32],
+    }.items():
+        function = getattr(lib, "comm_global_domain_" + name)
+        function.argtypes, function.restype = args, ctypes.c_int
+    domain_ids = tuple(int.from_bytes(os.urandom(8), "little") or 1 for _ in range(2))
+    owner = SharedMemory(create=True, size=128)
+    try:
+        assert owner.buf is not None
+        expected = bytes(range(128))
+        owner.buf[:128] = expected
+        descriptors, local_bases = [], []
+        for rank, domain_id in enumerate(domain_ids):
+            descriptor, base = ctypes.create_string_buffer(288), u64()
+            assert lib.comm_global_domain_prepare(domain_id, rank, 2, 128, 1, 1, descriptor, ctypes.byref(base)) == 0
+            descriptors.append(descriptor.raw)
+            local_bases.append(base.value)
+        host = GlobalDomainDescriptor(GLOBAL_DOMAIN_VERSION, 1, 2, 2, 128, ("/" + owner.name).encode())
+        missing = replace(host, domain_rank=3, handle=("/missing_" + os.urandom(8).hex()).encode())
+        table = ctypes.create_string_buffer(b"".join(descriptors) + host.encode() + missing.encode())
+        context = u64()
+        assert getattr(lib, "comm_global_domain_import")(domain_ids[0], table, 4, ctypes.byref(context)) != 0
+        assert context.value == 0
+        assert getattr(lib, "comm_global_domain_import")(domain_ids[0], table, 4, ctypes.byref(context)) != 0
+        for slot in range(4):
+            mapped, mapped_size = u64(), size()
+            assert (
+                lib.comm_global_domain_window(domain_ids[0], slot, ctypes.byref(mapped), ctypes.byref(mapped_size)) != 0
+            )
+        assert lib.comm_global_domain_copy(domain_ids[0], 2, 32, 2, 0, 16, None) != 0
+        assert lib.comm_global_domain_copy(domain_ids[0], 0, 32, 2, 0, 16, None) != 0
+        assert bytes(owner.buf[:128]) == expected
+        assert lib.comm_global_domain_release(domain_ids[0], 2) != 0
+        assert lib.comm_global_domain_release(domain_ids[0], 1) == 0
+        assert ctypes.string_at(local_bases[0], 128) == bytes(128)
+        assert bytes(owner.buf[:128]) == expected
+        assert lib.comm_global_domain_release(domain_ids[0], 2) == 0
+    finally:
+        for domain_id in domain_ids:
+            lib.comm_global_domain_release(domain_id, 1)
+            lib.comm_global_domain_release(domain_id, 2)
+        owner.close()
+        owner.unlink()
+
+
 def test_two_node_host_cpu_copy_reuse_and_stale_access():
     from simpler.comm_domain import CommDomainRef  # noqa: PLC0415
     from simpler.task_interface import CommBufferSpec, DataType, TaskArgs  # noqa: PLC0415
@@ -1033,3 +1089,70 @@ def test_concurrent_domain_revocations_both_drain_an_authorized_hbm_copy(monkeyp
     assert not errors
     assert all(not thread.is_alive() for thread in threads)
     assert sorted(completed) == ["first-drop", "second-drop"]
+
+
+@pytest.mark.parametrize("mutation", ["valid", "changed-identity", "changed-base"])
+def test_import_preserves_reserved_hbm_identity_and_backing(mutation):
+    import simpler.worker as module  # noqa: PLC0415
+
+    worker = module.Worker(level=3, device_ids=(0,), num_sub_workers=0)
+    identity = worker._burn_buffer_identity()
+    command = _exported_command()
+    local = module._domain_backing_descriptor(identity, command.buffers[0].nbytes)
+    command = replace(command, backing_refs=(local, command.backing_refs[1]))
+    state = module._GlobalNodeDomainState(
+        command=replace(command, phase=GlobalDomainPhase.PREPARE_EXPORT, descriptors=(), backing_refs=()),
+        prepared_domain_ranks={0},
+        descriptors={0: command.descriptors[0], 2: command.descriptors[2]},
+        local_window_bases={0: 4096},
+        mapping_sizes={0: 4096},
+        node_worker_id=2,
+        backing_ids={0: (identity,)},
+    )
+    worker._global_node_domains[7] = state
+    calls = []
+
+    class Chip:
+        def control_payload(self, _kind, chip, control, _payload, _timeout):
+            calls.append((chip, control))
+            assert control == module.CTRL_GLOBAL_DOMAIN_IMPORT
+            return module.LOCAL_IMPORT_REPLY.pack(
+                module.LOCAL_DOMAIN_MAGIC,
+                GLOBAL_DOMAIN_VERSION,
+                7,
+                3,
+                123,
+                8192 if mutation == "changed-base" else 4096,
+                4096,
+            )
+
+    worker._worker = Chip()
+    try:
+        if mutation == "changed-identity":
+            command = replace(
+                command,
+                backing_refs=(
+                    replace(buffer_reference(local), identity=worker._burn_buffer_identity()).to_descriptor(),
+                    command.backing_refs[1],
+                ),
+            )
+            with pytest.raises(ValueError, match="backing references"):
+                worker._import_global_domain_node(command, 2)
+            assert not calls
+        elif mutation == "changed-base":
+            with pytest.raises(RuntimeError, match="local backing mismatch"):
+                worker._import_global_domain_node(command, 2)
+            assert not state.contexts
+        else:
+            for _ in range(2):
+                worker._import_global_domain_node(command, 2)
+            buffer = state.contexts[0].buffers["payload"]
+            assert buffer.identity == identity and buffer.base == 4096
+            assert buffer.backend_kind == BackendKind.VMM_WINDOW
+            assert len(calls) == 1
+    finally:
+        # Synthetic grants only; no native owner or child process was created.
+        worker._worker = None
+        worker._global_node_domains.clear()
+        worker._clear_child_prov()
+        worker.close()

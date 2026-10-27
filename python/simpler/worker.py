@@ -1261,7 +1261,7 @@ class _GlobalNodeDomainState:
     host_owner: Any = None
     node_worker_id: int = -1
     views_released: bool = False
-    local_buffers: dict[int, dict[str, Buffer]] = field(default_factory=dict)
+    backing_ids: dict[int, tuple[CanonicalIdentity, ...]] = field(default_factory=dict)
     host_buffers: dict[int, Buffer] = field(default_factory=dict)
 
 
@@ -1277,6 +1277,10 @@ def _host_domain_buffers(command):
         )
         for window in command.host_windows
     }
+
+
+def _domain_backing_descriptor(identity, nbytes):
+    return BufferDescriptor(identity, AddressSpace.DEVICE, AccessMode.READWRITE, BackendKind.REMOTE_SIDECAR, nbytes)
 
 
 def _domain_buffer_slots(command):
@@ -3178,13 +3182,6 @@ def _handle_ctrl_global_domain_prepare(cw: _ChipWorker, buf: memoryview, store: 
             local_base = prior.local_window_base
             mapping_size = prior.mapping_size
         else:
-            prepare_args = (
-                int(domain_id),
-                int(domain_rank),
-                int(rank_count),
-                int(window_size),
-                int(profile_id),
-            )
             store.domains[int(domain_id)] = _L2GlobalDomain(
                 int(domain_id),
                 int(generation),
@@ -3197,7 +3194,12 @@ def _handle_ctrl_global_domain_prepare(cw: _ChipWorker, buf: memoryview, store: 
                 host_enabled=bool(host_enabled),
             )
             descriptor_bytes, local_base, mapping_size = cw.comm_global_domain_prepare(
-                *prepare_args, *([True] if host_enabled else [])
+                int(domain_id),
+                int(domain_rank),
+                int(rank_count),
+                int(window_size),
+                int(profile_id),
+                *([True] if host_enabled else []),
             )
             descriptor = GlobalDomainDescriptor.decode(bytes(descriptor_bytes))
             if (
@@ -3263,9 +3265,7 @@ def _handle_ctrl_global_domain_import(
             raise ValueError("Global CommDomain import command conflicts with the prepared window")
         if descriptors[entry.domain_rank] != entry.descriptor:
             raise RuntimeError("Global CommDomain import table does not contain the local exported descriptor")
-        host_bytes = b"".join(d.encode() for d in command.descriptors[entry.rank_count :])
-        descriptor_bytes = b"".join(descriptor.encode() for descriptor in descriptors)
-        table = descriptor_bytes + host_bytes
+        table = b"".join(descriptor.encode() for descriptor in command.descriptors)
         if bool(command.host_windows) != entry.host_enabled or (
             entry.descriptor_table and entry.descriptor_table != table
         ):
@@ -11366,9 +11366,7 @@ class Worker:
                 state.local_window_bases[member.local_worker_id] = int(local_base)
                 state.mapping_sizes[member.local_worker_id] = int(mapping_size)
                 if command.host_windows:
-                    state.local_buffers[member.domain_rank] = self._make_domain_buffers(
-                        command, member, int(local_base)
-                    )
+                    state.backing_ids[member.domain_rank] = tuple(self._burn_buffer_identity() for _ in command.buffers)
             return tuple(state.descriptors[rank] for rank in sorted(state.descriptors))
         except BaseException:
             if not command.host_windows:
@@ -11377,23 +11375,6 @@ class Worker:
                 )
             raise
 
-    def _make_domain_buffers(self, command, member, base):
-        buffers = {}
-        offset = 0
-        for spec in command.buffers:
-            identity = self._burn_buffer_identity()
-            buffers[spec.name] = wrap_vmm_window(
-                base + offset,
-                spec.nbytes,
-                bytes(identity.owner_instance_id),
-                int(identity.buffer_id),
-                f"L{self.level}",
-                generation=int(identity.generation),
-                owner_worker_id=member.local_worker_id,
-            )
-            offset += spec.nbytes
-        return buffers
-
     def _prepare_global_domain_reply(self, command, node_worker_id) -> bytes:
         exports = encode_descriptor_table(self._prepare_global_domain_node(command, node_worker_id))
         if not command.host_windows:
@@ -11401,10 +11382,10 @@ class Worker:
         state = self._global_node_domains[command.domain_id]
         return exports + encode_domain_buffer_refs(
             tuple(
-                (buffer_reference(buffer).to_descriptor(), 0, 0)
+                (_domain_backing_descriptor(identity, spec.nbytes), 0, 0)
                 for member in command.members
                 if member.node_worker_id == node_worker_id
-                for buffer in state.local_buffers[member.domain_rank].values()
+                for identity, spec in zip(state.backing_ids[member.domain_rank], command.buffers)
             )
         )
 
@@ -11443,8 +11424,8 @@ class Worker:
         if command.host_windows:
             for member in local_members:
                 expected = tuple(
-                    buffer_reference(buffer).to_descriptor()
-                    for buffer in state.local_buffers[member.domain_rank].values()
+                    _domain_backing_descriptor(identity, spec.nbytes)
+                    for identity, spec in zip(state.backing_ids[member.domain_rank], command.buffers)
                 )
                 start = member.domain_rank * len(command.buffers)
                 if command.backing_refs[start : start + len(command.buffers)] != expected:
@@ -11481,9 +11462,24 @@ class Worker:
                     raise RuntimeError("Global CommDomain import reply identity mismatch")
                 if mapping_size != command.descriptors[member.domain_rank].mapping_size:
                     raise RuntimeError("Global CommDomain import reply mapping size mismatch")
-                domain_buffers = state.local_buffers.get(member.domain_rank)
-                if domain_buffers is None:
-                    domain_buffers = self._make_domain_buffers(command, member, int(local_base))
+                if command.host_windows and local_base != state.local_window_bases[member.local_worker_id]:
+                    raise RuntimeError("Global CommDomain import reply local backing mismatch")
+                identities = iter(state.backing_ids.get(member.domain_rank, ()))
+                offset = 0
+                domain_buffers: dict[str, Buffer] = {}
+                for buffer in command.buffers:
+                    base = int(local_base) + offset
+                    identity = next(identities) if command.host_windows else self._burn_buffer_identity()
+                    domain_buffers[buffer.name] = wrap_vmm_window(
+                        base,
+                        int(buffer.nbytes),
+                        bytes(identity.owner_instance_id),
+                        int(identity.buffer_id),
+                        f"L{self.level}",
+                        generation=int(identity.generation),
+                        owner_worker_id=int(member.local_worker_id),
+                    )
+                    offset += buffer.nbytes
                 state.contexts[member.local_worker_id] = ChipDomainContext(
                     name=command.name,
                     domain_rank=member.domain_rank,
