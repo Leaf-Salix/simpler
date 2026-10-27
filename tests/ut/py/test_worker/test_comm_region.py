@@ -1573,9 +1573,24 @@ def test_local_view_returns_completed_materialization_only(region_worker):
     assert payload is instance._payload_local_view
     assert counter is instance._counter_local_view
     assert payload is not None and counter is not None
+    instance.consumer_worker_id = 0
+    for part, consumer, provider in (
+        (RegionPartKind.PAYLOAD, payload, instance._provider_payload_view),
+        (RegionPartKind.COUNTER, counter, instance._provider_counter_view),
+    ):
+        assert provider is not None
+        assert instance.local_view(part, worker_id=0) is consumer
+        assert instance.local_view(part, worker_id=instance.worker_id) is provider
+        with pytest.raises(ValueError, match="not a member"):
+            instance.local_view(part, worker_id=99)
+    for worker_id in (None, 0, instance.worker_id):
+        with pytest.raises(ValueError, match="PAYLOAD or COUNTER"):
+            instance.local_view(RegionPartKind.INVALID, worker_id=worker_id)
     instance._state = RegionInstanceState.CLOSED
     assert instance.local_view(RegionPartKind.PAYLOAD) is None
     assert instance.local_view(RegionPartKind.COUNTER) is None
+    assert instance.local_view(RegionPartKind.PAYLOAD, worker_id=instance.worker_id) is None
+    assert instance.local_view(RegionPartKind.COUNTER, worker_id=0) is None
 
 
 def test_live_resource_inventory_reports_registry_instance_count(region_worker):
@@ -2974,24 +2989,55 @@ def _peer_context(worker):
     return dataclasses.replace(ctx, registry=registry, plan=plan)
 
 
+def _install_peer_control(worker, calls, monkeypatch, *, fail_import=None, fail_close=False, lost_reply=False):
+    from simpler import comm_region_peer as peer
+
+    registry = peer.PeerRegionImports(8, "a2a3sim", "peer-test")
+    owner_registry = peer.PeerRegionImports(9, "a2a3sim", "peer-owner")
+    original = worker._worker.control_payload
+
+    def control(worker_type, worker_id, command, frame, timeout):
+        if command != peer.CTRL_REGION_PEER:
+            return original(worker_type, worker_id, command, frame, timeout)
+        (instance,) = _tracked(worker)
+        assert instance._payload_attachment is not None and instance._counter_attachment is not None
+        assert instance._payload_attachment.native_lease is instance._counter_attachment.native_lease
+        operation = peer._PEER_HEADER.unpack_from(frame)[-1]
+        calls.append(("peer_control", worker_id, operation))
+        (owner_registry if worker_id == 1 else registry).handle(frame)
+        if lost_reply and operation == peer._PEER_IMPORT:
+            raise RuntimeError("import completion unknown")
+        return bytes(frame)
+
+    def import_part(_descriptor, *, part, **_kwargs):
+        if part is fail_import:
+            raise RuntimeError("import failed")
+        calls.append(("peer_import", part))
+        return 0x4000 + int(part) * 0x1000
+
+    def close(handle):
+        calls.append(("mapping_close", handle))
+        if fail_close:
+            raise RuntimeError("mapping close failed")
+
+    monkeypatch.setattr(worker._worker, "control_payload", control)
+    monkeypatch.setattr(peer, "import_region_part", import_part)
+    monkeypatch.setattr(peer, "_worker_host_mapped_region_mapped_base", int)
+    monkeypatch.setattr(peer, "_worker_host_mapped_region_peek_cleanup_error", lambda _token: "")
+    monkeypatch.setattr(peer, "_close_native_lease", close)
+    return registry
+
+
 def test_device_peer_uses_consumer_spans_and_closes_views_before_provider(region_worker, monkeypatch):
+    from simpler import comm_region_peer as peer
+
     worker, calls, _leases = region_worker()
     ctx = _peer_context(worker)
-    imports = []
-
-    def import_peer(instance, descriptor, *, part, consumer_worker_id, expected_device_id):
-        assert instance.worker_id == 1
-        assert consumer_worker_id == 0
-        assert expected_device_id == 9
-        imports.append(part)
-        return _FakeLease(calls, part.name, handle=0, mapped_base=0x4000 + int(part) * 0x1000)
-
-    monkeypatch.setattr(worker, "_import_peer_region_part_lease", import_peer)
+    registry = _install_peer_control(worker, calls, monkeypatch)
     assert validate_executable_region_plan(ctx) is ctx.plan
     instance = materialize_region_instance(ctx)
-    assert imports == [RegionPartKind.PAYLOAD, RegionPartKind.COUNTER]
     assert instance.consumer_worker_id == 0
-    for part in imports:
+    for part in (RegionPartKind.PAYLOAD, RegionPartKind.COUNTER):
         view = instance.local_view(part)
         assert view is not None
         assert view.local_base == 0x4000 + int(part) * 0x1000
@@ -2999,36 +3045,74 @@ def test_device_peer_uses_consumer_spans_and_closes_views_before_provider(region
         with pytest.raises(MaterializationError, match="consumer chip"):
             instance.payload_read(0, bytearray(64))
         instance.close()
-    assert calls[-3:] == [("mapping_close", "PAYLOAD"), ("mapping_close", "COUNTER"), ("release", 1, 42)]
+    assert [call for call in calls if call[0] == "peer_control"] == [
+        ("peer_control", 1, peer._PEER_ENABLE),
+        ("peer_control", 0, peer._PEER_IMPORT),
+        ("peer_control", 0, peer._PEER_CLOSE),
+    ]
+    assert calls[-3:] == [("mapping_close", 0x5000), ("mapping_close", 0x6000), ("release", 1, 42)]
+    assert not registry.holds_resources
 
 
 @pytest.mark.parametrize("part", [RegionPartKind.PAYLOAD, RegionPartKind.COUNTER])
-def test_unconfirmed_peer_import_retains_owner_until_view_closed(region_worker, monkeypatch, part):
+def test_peer_partial_import_failure_closes_views_before_releasing_owner(region_worker, monkeypatch, part):
     worker, calls, _leases = region_worker()
-    ctx = _peer_context(worker)
+    registry = _install_peer_control(worker, calls, monkeypatch, fail_import=part)
+    with pytest.raises(RuntimeError, match="import failed"):
+        materialize_region_instance(_peer_context(worker))
+    assert not registry.holds_resources
+    assert _tracked(worker) == ()
+    assert calls[-1] == ("release", 1, 42)
+    if part is RegionPartKind.COUNTER:
+        assert calls[-2] == ("mapping_close", 0x5000)
 
-    def import_peer(instance, descriptor, *, part, **_kwargs):
-        lease = _FakeLease(calls, part.name, handle=0, mapped_base=0x4000 + int(part) * 0x1000, fail_close=True)
-        setattr(
-            instance,
-            "_payload_attachment" if part is RegionPartKind.PAYLOAD else "_counter_attachment",
-            _RegionPartAttachment(part, descriptor, lease),
-        )
-        if part is failure_part:
-            raise RuntimeError("import completion unknown")
-        return lease
 
-    failure_part = part
-    monkeypatch.setattr(worker, "_import_peer_region_part_lease", import_peer)
+@pytest.mark.parametrize("part", [RegionPartKind.PAYLOAD, RegionPartKind.COUNTER])
+def test_peer_native_cleanup_debt_retains_owner_after_known_views_close(region_worker, monkeypatch, part):
+    from simpler import comm_region_peer as peer
+
+    worker, calls, _leases = region_worker()
+    registry = _install_peer_control(worker, calls, monkeypatch, fail_import=part)
+    monkeypatch.setattr(peer, "_worker_host_mapped_region_peek_cleanup_error", lambda _token: "cleanup unknown")
+    with pytest.raises(RuntimeError, match="import failed"):
+        materialize_region_instance(_peer_context(worker))
+    (instance,) = _tracked(worker)
+    assert instance.state is RegionInstanceState.CLOSE_FAILED
+    assert instance._delegated_release_edge
+    assert instance._payload_attachment is not None and instance._counter_attachment is not None
+    assert instance._payload_attachment.native_lease is instance._counter_attachment.native_lease
+    assert not any(call[0] == "release" for call in calls)
+    assert [call for call in calls if call[0] == "mapping_close"] == (
+        [("mapping_close", 0x5000)] if part is RegionPartKind.COUNTER else []
+    )
+    before_sweep = list(calls)
+    with pytest.raises(RuntimeError) as cleanup:
+        worker._region_instance_registry.sweep()
+    assert cleanup.value is instance._cleanup_error
+    assert calls == before_sweep
+    assert registry.holds_resources
+    assert _tracked(worker) == (instance,)
+
+
+def test_unconfirmed_peer_import_retains_owner_until_views_closed(region_worker, monkeypatch):
+    worker, calls, _leases = region_worker()
+    registry = _install_peer_control(worker, calls, monkeypatch, fail_close=True, lost_reply=True)
     with pytest.raises(RuntimeError, match="import completion unknown"):
-        materialize_region_instance(ctx)
+        materialize_region_instance(_peer_context(worker))
     (instance,) = _tracked(worker)
     assert instance.state is RegionInstanceState.CLOSE_FAILED
     assert instance._delegated_release_edge
     assert not any(call[0] == "release" for call in calls)
+    assert [call for call in calls if call[0] == "mapping_close"] == [
+        ("mapping_close", 0x5000),
+        ("mapping_close", 0x6000),
+    ]
+    before_sweep = list(calls)
     with pytest.raises(RuntimeError) as cleanup:
         worker._region_instance_registry.sweep()
     assert cleanup.value is instance._cleanup_error
+    assert calls == before_sweep
+    assert registry.holds_resources
     assert _tracked(worker) == (instance,)
     assert instance._payload_attachment is not None
 

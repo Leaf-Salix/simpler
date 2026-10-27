@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .comm_provider import RegionPartLocalView, validate_independent_local_views
+from .comm_provider import RegionPartKind, RegionPartLocalView, validate_independent_local_views
 from .comm_region import (
     MaterializationError,
     NotifyOp,
@@ -123,12 +123,10 @@ class WorkerChipOrchRegion:
     def descriptor_scalars(self, *, worker_id: int | None = None) -> list[int]:
         self._ensure_live()
         instance = self._instance
-        if worker_id is None or worker_id == instance.consumer_worker_id:
-            return self._descriptor.scalars()
-        if worker_id != instance.worker_id:
-            raise ValueError("Region binding target is not a member")
         return worker_chip_orch_region_desc_from_local_views(
-            instance.provider_resource_id, instance._provider_payload_view, instance._provider_counter_view
+            instance.provider_resource_id,
+            instance.local_view(RegionPartKind.PAYLOAD, worker_id=worker_id),
+            instance.local_view(RegionPartKind.COUNTER, worker_id=worker_id),
         ).scalars()
 
     def payload_write(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:

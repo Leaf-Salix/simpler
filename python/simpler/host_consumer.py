@@ -102,13 +102,11 @@ class _Channel:
         self.send(data)
 
 
-def _validate_io(op, offset, size, nbytes, capacity, access):
+def _validate_io(writing, offset, size, nbytes, capacity, access):
     RegionPartSpan(0, nbytes).validate_range(offset, size, "Host payload")
     if size > capacity:
         raise ValueError("Host payload request exceeds staging capacity")
-    if (op == _READ and access not in (AccessMode.READ, AccessMode.READWRITE)) or (
-        op == _WRITE and access not in (AccessMode.WRITE, AccessMode.READWRITE)
-    ):
+    if access not in (AccessMode.WRITE if writing else AccessMode.READ, AccessMode.READWRITE):
         raise PermissionError("Host payload access is not granted")
 
 
@@ -122,7 +120,7 @@ def _serve(channel, transfer, *, nbytes, capacity, access, request_limit, finish
         try:
             if op not in (_READ, _WRITE) or seq > request_limit:
                 raise ValueError("Host payload request is not admitted")
-            _validate_io(op, offset, size, nbytes, capacity, access)
+            _validate_io(op == _WRITE, offset, size, nbytes, capacity, access)
             value = channel.recv(size) if op == _WRITE else size
             if finished.is_set():
                 raise RuntimeError("Host control finished before its payload transfer")
@@ -210,7 +208,7 @@ class _PayloadAccess:
     def exchange(self, op, offset, pointer, size):
         if not self.live or threading.get_ident() != self.thread_id:
             raise RuntimeError("Host payload is only valid on its active call thread")
-        _validate_io(op, offset, size, self.nbytes, self.capacity, self.access)
+        _validate_io(op == _WRITE, offset, size, self.nbytes, self.capacity, self.access)
         if self.seq >= self.request_limit:
             raise ValueError("Host payload request limit exceeded")
         self.seq += 1

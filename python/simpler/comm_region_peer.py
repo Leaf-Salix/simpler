@@ -11,11 +11,10 @@
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from _task_interface import (
-    AccessMode,
     WorkerType,
     _decode_buffer_descriptor_wire,
     _encode_buffer_descriptor_wire,
@@ -29,18 +28,22 @@ from _task_interface import (
 
 from .buffer import BackendKind
 from .comm_provider import (
+    RegionExportDescriptor,
     RegionPartKind,
+    RegionPartLocalView,
     _align_up,
     _posix_object_size,
     _posix_token_from_descriptor,
     _vmm_shareable_facts,
 )
+from .comm_provider_control import _validate_decoded_descriptor_pair
 from .comm_region import _close_native_lease
 from .worker_chip_orch_comm import _REGION_MAGIC_VERSION, worker_chip_orch_region_desc_from_local_views
 
 CTRL_REGION_PEER = 29
-# session, transaction, resource, part, owner device, target device, operation, local VA
-_PEER_HEADER = struct.Struct("<8sQQIIIIQ")
+# session, transaction, resource, owner device, target device, operation
+_PEER_HEADER = struct.Struct("<8sQQIII")
+_PEER_BASES = struct.Struct("<QQ")
 _PEER_IMPORT, _PEER_CLOSE, _PEER_ENABLE = range(3)
 _DESCRIPTOR_BYTES = 88
 
@@ -90,23 +93,24 @@ def region_binding_prefix(args):
 @dataclass
 class _PeerImport:
     request: bytes
-    lease: Any = None
+    leases: list[Any] = field(default_factory=list)
+    binding: tuple | None = None
     error: BaseException | None = None
     closed: bool = False
-    base: int = 0
+    close_attempted: bool = False
 
     def close(self):
+        if not self.close_attempted:
+            self.close_attempted = True
+            for lease in self.leases:
+                try:
+                    _close_native_lease(lease)
+                except BaseException as exc:
+                    self.error = self.error or exc
         if self.error is not None:
             raise self.error
-        if not self.closed:
-            try:
-                if self.lease is not None:
-                    _close_native_lease(self.lease)
-            except BaseException as exc:
-                self.error = exc
-                raise
-            self.closed = True
-            self.lease = None
+        self.closed = True
+        self.leases.clear()
 
 
 class PeerRegionImports:
@@ -121,97 +125,74 @@ class PeerRegionImports:
         return any(not record.closed for record in self.records.values())
 
     def handle(self, frame):
-        if len(frame) != _PEER_HEADER.size + _DESCRIPTOR_BYTES:
+        if len(frame) != _PEER_HEADER.size + 2 * _DESCRIPTOR_BYTES + _PEER_BASES.size:
             raise ValueError("invalid Region peer control frame size")
-        session, transaction, resource, part, owner, target, operation, base = _PEER_HEADER.unpack_from(frame)
-        if target != self.device_id or owner == target or transaction == 0 or resource == 0 or base != 0:
+        session, transaction, resource, owner, target, operation = _PEER_HEADER.unpack_from(frame)
+        if target != self.device_id or owner == target or transaction == 0 or resource == 0:
             raise ValueError("invalid Region peer target or allocation identity")
-        RegionPartKind(part)
+        if any(_PEER_BASES.unpack_from(frame, len(frame) - _PEER_BASES.size)):
+            raise ValueError("Region peer request must not contain local addresses")
         if operation == _PEER_ENABLE:
             self._enable(owner)
             return
-        key = session, transaction, part
-        request = bytes(frame[_PEER_HEADER.size :])
-        identity = _PEER_HEADER.pack(session, transaction, resource, part, owner, target, _PEER_IMPORT, 0) + request
+        key = session, transaction
+        request = bytes(frame[_PEER_HEADER.size : -_PEER_BASES.size])
+        identity = _PEER_HEADER.pack(session, transaction, resource, owner, target, _PEER_IMPORT) + request
         record = self.records.get(key)
-        self._validate_import_identity(key, identity, resource, owner, target, request)
+        if record is not None and record.request != identity:
+            raise ValueError("Region peer allocation conflicts with existing import")
         if operation == _PEER_CLOSE:
-            if record is None:
-                record = self.records[key] = _PeerImport(identity)
-            record.close()
+            self.records.setdefault(key, _PeerImport(identity)).close()
             return
         if operation != _PEER_IMPORT:
             raise ValueError("invalid Region peer operation")
         if record is not None:
             if record.error is not None:
                 raise record.error
-            if record.closed:
-                raise ValueError("Region peer import is already closed")
+            if record.closed or record.binding is None:
+                raise ValueError("Region peer import is closed or incomplete")
         else:
-            descriptor = _decode_buffer_descriptor_wire(request)
-            if descriptor.access is not AccessMode.READWRITE or int(descriptor.identity.generation) != 1:
-                raise ValueError("Region peer descriptor requires READWRITE and generation one")
+            descriptor = RegionExportDescriptor(
+                _decode_buffer_descriptor_wire(request[:_DESCRIPTOR_BYTES]),
+                _decode_buffer_descriptor_wire(request[_DESCRIPTOR_BYTES:]),
+            )
+            _validate_decoded_descriptor_pair(descriptor)
             record = self.records[key] = _PeerImport(identity)
             try:
                 self._enable(owner)
-                record.lease = import_region_part(
-                    descriptor,
-                    part=part,
-                    expected=BackendKind.POSIX_SHM if self.platform.endswith("sim") else BackendKind.VMM_SHAREABLE,
-                    owner_device_id=owner,
-                    target_device_id=target,
-                    owner_token=self.owner_token,
-                )
-                record.base = int(_worker_host_mapped_region_mapped_base(int(record.lease)))
-            except BaseException as exc:
-                debt = _worker_host_mapped_region_peek_cleanup_error(self.owner_token)
-                if debt or record.lease is not None:
-                    record.error = exc
-                else:
-                    record.closed = True
-                raise
-        struct.pack_into("<Q", frame, _PEER_HEADER.size - 8, record.base)
-
-    def _validate_import_identity(self, key, identity, resource, owner, target, request):
-        session, transaction, part = key
-        record = self.records.get(key)
-        for (other_session, other_transaction, other_part), other in self.records.items():
-            if (other_session, other_transaction) == (session, transaction) and other_part != part:
-                fields = _PEER_HEADER.unpack_from(other.request)
-                if (fields[2], fields[4], fields[5]) != (resource, owner, target):
-                    raise ValueError("Region peer parts name different allocations")
-                if (
-                    _decode_buffer_descriptor_wire(other.request[_PEER_HEADER.size :]).identity.owner_instance_id
-                    != _decode_buffer_descriptor_wire(request).identity.owner_instance_id
+                views = []
+                for part, desc in (
+                    (RegionPartKind.PAYLOAD, descriptor.payload),
+                    (RegionPartKind.COUNTER, descriptor.counter),
                 ):
-                    raise ValueError("Region peer parts name different owners")
-        if record is not None and record.request != identity:
-            raise ValueError("Region peer allocation conflicts with existing import")
+                    lease = import_region_part(
+                        desc,
+                        part=part,
+                        expected=BackendKind.POSIX_SHM if self.platform.endswith("sim") else BackendKind.VMM_SHAREABLE,
+                        owner_device_id=owner,
+                        target_device_id=target,
+                        owner_token=self.owner_token,
+                    )
+                    record.leases.append(lease)
+                    base = int(_worker_host_mapped_region_mapped_base(int(lease)))
+                    if base <= 0:
+                        raise RuntimeError("Region peer import returned no local mapping")
+                    views.append(RegionPartLocalView(part, base, int(desc.nbytes)))
+                record.binding = tuple(worker_chip_orch_region_desc_from_local_views(resource, *views).scalars())
+            except BaseException as exc:
+                if _worker_host_mapped_region_peek_cleanup_error(self.owner_token):
+                    record.error = exc
+                raise
+        _PEER_BASES.pack_into(frame, len(frame) - _PEER_BASES.size, record.binding[2], record.binding[4])
 
     def _enable(self, owner):
         if not self.platform.endswith("sim"):
             _region_enable_peer_access(self.device_id, owner)
 
     def validates(self, binding):
-        for (session, transaction, part), record in self.records.items():
-            if part != int(RegionPartKind.PAYLOAD) or record.closed or record.error is not None:
-                continue
-            counter = self.records.get((session, transaction, int(RegionPartKind.COUNTER)))
-            if counter is None or counter.closed or counter.error is not None:
-                continue
-            resource = _PEER_HEADER.unpack_from(record.request)[2]
-            payload_desc = _decode_buffer_descriptor_wire(record.request[_PEER_HEADER.size :])
-            counter_desc = _decode_buffer_descriptor_wire(counter.request[_PEER_HEADER.size :])
-            if binding == (
-                _REGION_MAGIC_VERSION,
-                resource,
-                record.base,
-                payload_desc.nbytes,
-                counter.base,
-                counter_desc.nbytes,
-            ):
-                return True
-        return False
+        return any(
+            not record.closed and record.error is None and record.binding == binding for record in self.records.values()
+        )
 
     def validate_args(self, args, provider_store):
         binding = region_binding_prefix(args)
@@ -235,37 +216,47 @@ class PeerRegionImports:
 
 
 class PeerRegionLease:
-    def __init__(self, worker, instance, descriptor, part, consumer_worker_id, owner_device_id):
+    def __init__(self, worker, instance, descriptor, consumer_worker_id, owner_device_id):
         self.worker = worker
+        self.owner_worker_id = instance.worker_id
+        self.descriptor = descriptor
         self.consumer_worker_id = consumer_worker_id
-        self.mapped_base = 0
         self.closed = False
         self.error = None
         target = worker._provider_import_device_id(consumer_worker_id)
         session, transaction = instance._allocation_identity
-        self.frame = _PEER_HEADER.pack(
-            session, transaction, instance.provider_resource_id, int(part), owner_device_id, target, _PEER_IMPORT, 0
-        ) + bytes(_encode_buffer_descriptor_wire(descriptor))
+        self.header = (session, transaction, instance.provider_resource_id, owner_device_id, target)
+        self.descriptors = bytes(_encode_buffer_descriptor_wire(descriptor.payload)) + bytes(
+            _encode_buffer_descriptor_wire(descriptor.counter)
+        )
 
     def exchange(self, operation):
-        frame = bytearray(self.frame)
-        struct.pack_into("<I", frame, _PEER_HEADER.size - 12, operation)
+        session, transaction, resource, owner, target = self.header
+        worker_id = self.consumer_worker_id
+        if operation == _PEER_ENABLE:
+            owner, target = target, owner
+            worker_id = self.owner_worker_id
+        frame = bytearray(_PEER_HEADER.pack(session, transaction, resource, owner, target, operation))
+        frame += self.descriptors + bytes(_PEER_BASES.size)
+        expected_prefix = bytes(frame[: -_PEER_BASES.size])
         reply = bytes(
             self.worker._worker.control_payload(
-                WorkerType.NEXT_LEVEL,
-                self.consumer_worker_id,
-                CTRL_REGION_PEER,
-                frame,
-                self.worker._py_control_timeout_s,
+                WorkerType.NEXT_LEVEL, worker_id, CTRL_REGION_PEER, frame, self.worker._py_control_timeout_s
             )
         )
-        if (
-            len(reply) != len(frame)
-            or reply[: -_DESCRIPTOR_BYTES - 8] != frame[: -_DESCRIPTOR_BYTES - 8]
-            or reply[-_DESCRIPTOR_BYTES:] != frame[-_DESCRIPTOR_BYTES:]
-        ):
+        if len(reply) != len(frame) or reply[: -_PEER_BASES.size] != expected_prefix:
             raise RuntimeError("Region peer reply identity mismatch")
-        return struct.unpack_from("<Q", reply, _PEER_HEADER.size - 8)[0]
+        return _PEER_BASES.unpack_from(reply, len(reply) - _PEER_BASES.size)
+
+    def import_views(self):
+        self.exchange(_PEER_ENABLE)
+        bases = self.exchange(_PEER_IMPORT)
+        if any(base <= 0 for base in bases):
+            raise RuntimeError("Region peer import returned no local mapping")
+        return (
+            RegionPartLocalView(RegionPartKind.PAYLOAD, bases[0], int(self.descriptor.payload.nbytes)),
+            RegionPartLocalView(RegionPartKind.COUNTER, bases[1], int(self.descriptor.counter.nbytes)),
+        )
 
     def close(self):
         if self.error is not None:

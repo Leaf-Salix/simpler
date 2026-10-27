@@ -225,7 +225,6 @@ from .comm_region import (
     validate_single_owner_region_shape,
 )
 from .comm_region_peer import (
-    _PEER_ENABLE,
     CTRL_REGION_PEER,
     PeerRegionImports,
     PeerRegionLease,
@@ -10511,27 +10510,14 @@ class Worker:
             expected_device_id=expected_device_id,
         )
 
-    def _import_peer_region_part_lease(self, instance, descriptor, *, part, consumer_worker_id, expected_device_id):
+    def _import_peer_region_lease(self, instance, descriptor, *, consumer_worker_id, expected_device_id):
         self._region_instance_registry._require_tracked(instance)
         if self._worker is None:
             raise RuntimeError("Region peer import requires an initialized Worker")
-        lease = PeerRegionLease(self, instance, descriptor, part, consumer_worker_id, expected_device_id)
-        attachment = _RegionPartAttachment(part, descriptor, lease)
-        if part is RegionPartKind.PAYLOAD:
-            instance._payload_attachment = attachment
-        else:
-            instance._counter_attachment = attachment
-        if part is RegionPartKind.PAYLOAD:
-            enable = bytearray(lease.frame)
-            target = self._provider_import_device_id(consumer_worker_id)
-            struct.pack_into("<III", enable, 28, target, expected_device_id, _PEER_ENABLE)
-            self._worker.control_payload(
-                WorkerType.NEXT_LEVEL, instance.worker_id, CTRL_REGION_PEER, enable, self._py_control_timeout_s
-            )
-        lease.mapped_base = lease.exchange(0)
-        if lease.mapped_base <= 0:
-            raise RuntimeError("Region peer import returned no local mapping")
-        return lease
+        lease = PeerRegionLease(self, instance, descriptor, consumer_worker_id, expected_device_id)
+        instance._payload_attachment = _RegionPartAttachment(RegionPartKind.PAYLOAD, descriptor.payload, lease)
+        instance._counter_attachment = _RegionPartAttachment(RegionPartKind.COUNTER, descriptor.counter, lease)
+        return lease.import_views()
 
     def _validate_region_binding(self, args, worker_id):
         binding = region_binding_prefix(args)
@@ -10541,13 +10527,10 @@ class Worker:
         for instance in instances:
             if instance._state is not RegionInstanceState.LIVE or instance.data_plane_error is not None:
                 continue
-            if worker_id == instance.worker_id:
-                views = instance._provider_payload_view, instance._provider_counter_view
-            elif worker_id == instance.consumer_worker_id:
-                views = instance.local_view(RegionPartKind.PAYLOAD), instance.local_view(RegionPartKind.COUNTER)
-            else:
+            if worker_id not in (instance.worker_id, instance.consumer_worker_id):
                 continue
-            payload, counter = views
+            payload = instance.local_view(RegionPartKind.PAYLOAD, worker_id=worker_id)
+            counter = instance.local_view(RegionPartKind.COUNTER, worker_id=worker_id)
             if (
                 payload is not None
                 and counter is not None
@@ -11558,42 +11541,23 @@ class Worker:
                 )
         return tuple(attachments)
 
-    def _global_host_consumer_attachments(self, members, host_nodes, profile, window_size):
+    def _global_host_consumer_attachments(self, command):
         if self.level != 4:
             return ()
         registry = self._get_endpoint_registry()
-        service = self._get_region_access_service()
-        resolver = BackendResolver(
-            registry, service, payload_access=_GlobalDomainRegionAccessService(service, profile=profile)
-        )
         grants = []
-        for node in host_nodes:
+        for host in command.host_windows:
+            node = host.node_worker_id
+            row = command.attachments_for_node(node)
             prefix = f"L{self.level}/L3[{node}]/SUB["
             for consumer in registry.records:
                 if not consumer.path.startswith(prefix) or consumer.deployment is not HOST_CPU:
                     continue
                 slot = int(consumer.path.rsplit("[", 1)[1][:-1])
-                for member in members:
-                    provider = at(
-                        f"L{self.level}/L3[{member.node_worker_id}]/L2[{member.local_worker_id}]", DEVICE_AICORE
-                    )
-                    resolved = registry.resolve_region_spec(
-                        (provider, at(consumer.path, HOST_CPU)), SingleOwner(provider=provider)
-                    )
-                    plan = resolver.plan(resolved, RegionLayoutSpec(payload_bytes=window_size, counter_bytes=0))
-                    if isinstance(plan, UnsupportedRegionPlan):
-                        continue
-                    attachment = next(a for a in plan.payload.attachments if a.role is AttachmentRole.CONSUMER)
-                    grants.append(
-                        GlobalDomainHostConsumerAttachment(
-                            node,
-                            slot,
-                            consumer.path,
-                            member.domain_rank,
-                            plan.topology_plan.provider_endpoint,
-                            attachment,
-                        )
-                    )
+                # SUB and its L3 Host have the same deployment and node scope.
+                ranks = tuple(rank for rank, adapter in enumerate(row) if adapter.adapter_kind is not None)
+                if ranks:
+                    grants.append(GlobalDomainHostConsumerAttachment(node, slot, consumer.identity, ranks))
         return tuple(grants)
 
     @staticmethod
@@ -12168,7 +12132,7 @@ class Worker:
         The callable receives a copy-backed PayloadPart valid only for this call.
         The supplied Host pool range is exclusive scratch storage for its requests.
         """
-        from .host_consumer import HostCallUnsettledError, serve_host_call  # noqa: PLC0415
+        from .host_consumer import HostCallUnsettledError, _validate_io, serve_host_call  # noqa: PLC0415
 
         sub_worker, worker, staging_offset, staging_nbytes, request_limit = map(
             operator.index, (sub_worker, worker, staging_offset, staging_nbytes, request_limit)
@@ -12190,8 +12154,22 @@ class Worker:
                     raise ValueError("Host consumer requires an imported local chip")
                 grants = _domain_buffer_slots(state.command)
                 target = grants.get(descriptor.identity)
-                if target is None or target[0] != descriptor or target[1] >= len(state.command.members):
+                copy_descriptor = next(
+                    (
+                        b.to_descriptor()
+                        for ctx in state.contexts.values()
+                        for b in ctx.buffers.values()
+                        if b.identity == descriptor.identity
+                    ),
+                    target[0] if target is not None else None,
+                )
+                if (
+                    target is None
+                    or target[1] >= len(state.command.members)
+                    or descriptor not in (target[0], copy_descriptor)
+                ):
                     raise ValueError("Host consumer requires an exact domain HBM Buffer grant")
+                descriptor = target[0]
                 if access not in (AccessMode.READ, AccessMode.WRITE, AccessMode.READWRITE) or (
                     descriptor.access not in (AccessMode.READWRITE, access)
                 ):
@@ -12202,11 +12180,11 @@ class Worker:
                         for g in state.command.host_consumer_attachments
                         if g.node_worker_id == state.node_worker_id
                         and g.sub_worker_id == sub_worker
-                        and g.provider_rank == target[1]
+                        and target[1] in g.provider_ranks
                     ),
                     None,
                 )
-                if grant is None or grant.attachment.adapter_kind is None:
+                if grant is None:
                     raise ValueError("Host consumer has no materialized endpoint attachment")
                 self._validate_domain_host_attachments(state, state.command.attachments_for_node(state.node_worker_id))
                 host = state.host_buffers[state.node_worker_id]
@@ -12249,22 +12227,27 @@ class Worker:
             def transfer(writing, offset, data):
                 with self._child_prov_worker_lock(worker), self._child_prov_lock:
                     current = self._domain_state(domain)
-                    if current is not state or grant not in current.command.host_consumer_attachments:
+                    if current is not state or not any(
+                        g.node_worker_id == grant.node_worker_id
+                        and g.sub_worker_id == grant.sub_worker_id
+                        and g.consumer == grant.consumer
+                        and target[1] in g.provider_ranks
+                        for g in current.command.host_consumer_attachments
+                    ):
                         raise ValueError("Host consumer attachment is no longer live")
                     nbytes = len(data) if writing else int(data)
-                    RegionPartSpan(0, descriptor.nbytes).validate_range(offset, nbytes, "Host consumer")
-                    if (
-                        nbytes > staging_nbytes
-                        or (writing and access == AccessMode.READ)
-                        or (not writing and access == AccessMode.WRITE)
-                    ):
-                        raise ValueError("Host consumer request exceeds its access grant")
+                    try:
+                        _validate_io(writing, offset, nbytes, descriptor.nbytes, staging_nbytes, access)
+                    except PermissionError as exc:
+                        raise ValueError("Host consumer request exceeds its access grant") from exc
                     remaining = deadline - _monotonic()
                     if remaining <= 0:
                         raise TimeoutError("Host consumer request deadline expired")
                     storage = ctypes.create_string_buffer(data if writing else nbytes)
                     pointer = ctypes.addressof(storage)
-                    pair = [descriptor, host.to_descriptor()] if writing else [host.to_descriptor(), descriptor]
+                    pair = (
+                        [copy_descriptor, host.to_descriptor()] if writing else [host.to_descriptor(), copy_descriptor]
+                    )
                     offsets = (offset, staging_offset) if writing else (staging_offset, offset)
                     if writing:
                         self._host_domain_bytes_locked(state, staging_offset, pointer, nbytes, writing=True)
@@ -12656,9 +12639,6 @@ class Worker:
             members=domain_members_tuple,
             buffers=global_buffers,
             attachments=attachment_matrix,
-            host_consumer_attachments=self._global_host_consumer_attachments(
-                domain_members_tuple, tuple(node for node, _ in host_windows), profile, int(window_size)
-            ),
             owner_instance_id=self._owner_instance_id,
             retain_after_run=bool(retain_after_run),
             host_windows=tuple(
@@ -12667,6 +12647,9 @@ class Worker:
             ),
         )
 
+        base_command = replace(
+            base_command, host_consumer_attachments=self._global_host_consumer_attachments(base_command)
+        )
         prepared_nodes: list[int] = []
         mpi_group: _MpiL3GroupRuntime | None = None
         handle: CommDomainHandle | None = None

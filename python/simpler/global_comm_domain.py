@@ -36,7 +36,6 @@ from .comm_endpoints import (
     EndpointDeployment,
     EndpointIdentity,
     EndpointRecord,
-    MemberAttachmentPlan,
     _backend_kind_for_provider,
     buffer_adapter_candidates,
 )
@@ -78,7 +77,7 @@ GLOBAL_DOMAIN_PROFILE_IDS = {
 GLOBAL_DOMAIN_MAX_STRING_BYTES = 1024
 GLOBAL_DOMAIN_MAX_COPY_BYTES = 8 * 1024 * 1024
 GLOBAL_DOMAIN_BUFFER_REF_BYTES = 104
-_DOMAIN_COMMAND_MAGIC = b"SDC2"
+_DOMAIN_COMMAND_MAGIC = b"SDC3"
 _HOST_WINDOW = struct.Struct("<iiQQ")
 _ENDPOINT_IDENTITY = struct.Struct("<8sQI")
 
@@ -143,10 +142,8 @@ class GlobalDomainAttachment:
 class GlobalDomainHostConsumerAttachment:
     node_worker_id: int
     sub_worker_id: int
-    consumer_path: str
-    provider_rank: int
-    provider: EndpointIdentity
-    attachment: MemberAttachmentPlan
+    consumer: EndpointIdentity
+    provider_ranks: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -631,106 +628,80 @@ def _validate_host_consumer_attachments(command: GlobalDomainCommand) -> None:
     if len(grants) > GLOBAL_DOMAIN_MAX_ATTACHMENTS:
         raise ValueError("Host consumer attachment count exceeds maximum")
     host_nodes = {host.node_worker_id for host in command.host_windows}
-    keys = set()
-    identities: dict[EndpointIdentity, tuple] = {}
-    consumers = {}
-    providers = {}
-    epoch = grants[0].provider.registry_epoch
+    slots, identities = set(), set()
+    epoch = grants[0].consumer.registry_epoch
+    count = 0
     for grant in grants:
         for value, limit in ((grant.node_worker_id, 2**31), (grant.sub_worker_id, 2**32)):
             if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value < limit:
                 raise ValueError("Host consumer worker index is invalid")
         if grant.node_worker_id not in host_nodes:
             raise ValueError("Host consumer requires a participating Host window")
+        ranks = grant.provider_ranks
         if (
-            not isinstance(grant.provider_rank, int)
-            or isinstance(grant.provider_rank, bool)
-            or not 0 <= grant.provider_rank < len(command.members)
+            not isinstance(ranks, tuple)
+            or not ranks
+            or any(
+                not isinstance(rank, int) or isinstance(rank, bool) or not 0 <= rank < len(command.members)
+                for rank in ranks
+            )
         ):
-            raise ValueError("Host consumer provider rank is invalid")
-        if grant.consumer_path != f"L4/L3[{grant.node_worker_id}]/SUB[{grant.sub_worker_id}]":
-            raise ValueError("Host consumer path does not match its node and SUB slot")
-        key = (grant.node_worker_id, grant.sub_worker_id, grant.provider_rank)
-        if key in keys:
-            raise ValueError("duplicate Host consumer attachment")
-        keys.add(key)
-        attachment = grant.attachment
+            raise ValueError("Host consumer provider ranks are invalid")
+        if len(set(ranks)) != len(ranks):
+            raise ValueError("duplicate Host consumer provider rank")
+        count += len(ranks)
+        if count > GLOBAL_DOMAIN_MAX_ATTACHMENTS:
+            raise ValueError("Host consumer attachment count exceeds maximum")
+        slot = (grant.node_worker_id, grant.sub_worker_id)
+        identity = grant.consumer
+        if (
+            not isinstance(identity.session_instance_id, bytes)
+            or len(identity.session_instance_id) != 8
+            or not any(identity.session_instance_id)
+            or identity.session_instance_id != command.owner_instance_id
+            or not isinstance(identity.registry_epoch, int)
+            or isinstance(identity.registry_epoch, bool)
+            or not 0 <= identity.registry_epoch < 2**64
+            or identity.registry_epoch != epoch
+            or not isinstance(identity.endpoint_id, int)
+            or isinstance(identity.endpoint_id, bool)
+            or not 0 <= identity.endpoint_id < 2**32
+        ):
+            raise ValueError("Host consumer endpoint identity is invalid or belongs to another registry")
+        if slot in slots or identity in identities:
+            raise ValueError("duplicate Host consumer slot or endpoint identity")
+        slots.add(slot)
+        identities.add(identity)
+        row = command.attachments_for_node(grant.node_worker_id)
         implemented = {
             (AdapterKind.OWNER_DELEGATED_COPY, AdapterProfile.HOST_VMM_COPY),
             (AdapterKind.EXPLICIT_TRANSFER, AdapterProfile.REMOTE_COPY),
         }
-        if (
-            attachment.role is not AttachmentRole.CONSUMER
-            or (
-                attachment.adapter_kind,
-                attachment.adapter_profile,
-            )
-            not in implemented
+        if not row or any(
+            row[rank].address_space is not AddressSpace.HOST
+            or row[rank].role is not AttachmentRole.CONSUMER
+            or (row[rank].adapter_kind, row[rank].adapter_profile) not in implemented
+            for rank in ranks
         ):
             raise ValueError("Host consumer attachment has no implemented adapter")
-        slot = (grant.node_worker_id, grant.sub_worker_id)
-        for identity, role in (
-            (attachment.member, ("consumer", *slot)),
-            (grant.provider, ("provider", grant.provider_rank)),
-        ):
-            if (
-                not isinstance(identity.session_instance_id, bytes)
-                or len(identity.session_instance_id) != 8
-                or not any(identity.session_instance_id)
-                or identity.session_instance_id != command.owner_instance_id
-                or not isinstance(identity.registry_epoch, int)
-                or isinstance(identity.registry_epoch, bool)
-                or not 0 <= identity.registry_epoch < 2**64
-                or identity.registry_epoch != epoch
-                or not isinstance(identity.endpoint_id, int)
-                or isinstance(identity.endpoint_id, bool)
-                or not 0 <= identity.endpoint_id < 2**32
-            ):
-                raise ValueError("Host consumer endpoint identity is invalid or belongs to another registry")
-            if identities.setdefault(identity, role) != role:
-                raise ValueError("Host consumer endpoint identity has conflicting roles or slots")
-        if (
-            consumers.setdefault(slot, attachment.member) != attachment.member
-            or providers.setdefault(grant.provider_rank, grant.provider) != grant.provider
-        ):
-            raise ValueError("Host consumer slot or provider rank has conflicting endpoint identities")
 
 
 def _put_host_consumer_attachment(out: bytearray, grant: GlobalDomainHostConsumerAttachment) -> None:
-    out.extend(struct.pack("<iII", grant.node_worker_id, grant.sub_worker_id, grant.provider_rank))
-    _put_string(out, grant.consumer_path, "Host consumer path")
-    for identity in (grant.provider, grant.attachment.member):
-        out.extend(_ENDPOINT_IDENTITY.pack(identity.session_instance_id, identity.registry_epoch, identity.endpoint_id))
-    out.extend(
-        struct.pack(
-            "<III",
-            _attachment_role_id(grant.attachment.role),
-            _adapter_kind_id(grant.attachment.adapter_kind),
-            _adapter_profile_id(grant.attachment.adapter_profile),
-        )
-    )
+    out.extend(struct.pack("<iI", grant.node_worker_id, grant.sub_worker_id))
+    identity = grant.consumer
+    out.extend(_ENDPOINT_IDENTITY.pack(identity.session_instance_id, identity.registry_epoch, identity.endpoint_id))
+    out.extend(struct.pack("<I", len(grant.provider_ranks)))
+    for rank in grant.provider_ranks:
+        out.extend(struct.pack("<I", rank))
 
 
 def _read_host_consumer_attachment(reader: _Reader) -> GlobalDomainHostConsumerAttachment:
-    node, sub, rank = reader.i32(), reader.u32(), reader.u32()
-    path = reader.string("Host consumer path")
-    provider, consumer = (
-        EndpointIdentity(*_ENDPOINT_IDENTITY.unpack(reader.fixed(_ENDPOINT_IDENTITY.size, "endpoint identity")))
-        for _ in range(2)
-    )
-    return GlobalDomainHostConsumerAttachment(
-        node,
-        sub,
-        path,
-        rank,
-        provider,
-        MemberAttachmentPlan(
-            consumer,
-            _attachment_role_from_id(reader.u32()),
-            _adapter_kind_from_id(reader.u32()),
-            _adapter_profile_from_id(reader.u32()),
-        ),
-    )
+    node, sub = reader.i32(), reader.u32()
+    consumer = EndpointIdentity(*_ENDPOINT_IDENTITY.unpack(reader.fixed(_ENDPOINT_IDENTITY.size, "endpoint identity")))
+    count = reader.u32()
+    if count > GLOBAL_DOMAIN_MAX_RANKS:
+        raise ValueError("Host consumer provider rank count exceeds maximum")
+    return GlobalDomainHostConsumerAttachment(node, sub, consumer, tuple(reader.u32() for _ in range(count)))
 
 
 def encode_comm_init(command: GlobalCommInitCommand) -> bytes:

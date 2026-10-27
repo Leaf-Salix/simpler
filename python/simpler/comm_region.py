@@ -591,14 +591,17 @@ class RegionInstance:
     def data_plane_error(self) -> BaseException | None:
         return self._data_plane_error
 
-    def local_view(self, part: RegionPartKind) -> RegionPartLocalView | None:
+    def local_view(self, part: RegionPartKind, *, worker_id: int | None = None) -> RegionPartLocalView | None:
         if self._state is not RegionInstanceState.LIVE:
             return None
         selected = RegionPartKind(part)
+        provider = worker_id is not None and worker_id != self.consumer_worker_id
+        if provider and worker_id != self.worker_id:
+            raise ValueError("Region binding target is not a member")
         if selected is RegionPartKind.PAYLOAD:
-            return self._payload_local_view
+            return self._provider_payload_view if provider else self._payload_local_view
         if selected is RegionPartKind.COUNTER:
-            return self._counter_local_view
+            return self._provider_counter_view if provider else self._counter_local_view
         raise ValueError("region part must be PAYLOAD or COUNTER")
 
     @classmethod
@@ -1105,20 +1108,19 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance: 
             counter_desc = outcome.result.export_descriptor.counter
             _validate_registry_matches_worker(ctx)
             peer = instance.consumer_worker_id is not None
-            views = []
-            for part, descriptor, attr, local_view in (
-                (RegionPartKind.PAYLOAD, payload_desc, "_payload_attachment", outcome.payload_view),
-                (RegionPartKind.COUNTER, counter_desc, "_counter_attachment", outcome.counter_view),
-            ):
-                if peer:
-                    lease = ctx.worker._import_peer_region_part_lease(
-                        instance,
-                        descriptor,
-                        part=part,
-                        consumer_worker_id=instance.consumer_worker_id,
-                        expected_device_id=int(shape.provider_device_id),
-                    )
-                else:
+            if peer:
+                views = ctx.worker._import_peer_region_lease(
+                    instance,
+                    outcome.result.export_descriptor,
+                    consumer_worker_id=instance.consumer_worker_id,
+                    expected_device_id=int(shape.provider_device_id),
+                )
+            else:
+                views = (outcome.payload_view, outcome.counter_view)
+                for part, descriptor, attr in (
+                    (RegionPartKind.PAYLOAD, payload_desc, "_payload_attachment"),
+                    (RegionPartKind.COUNTER, counter_desc, "_counter_attachment"),
+                ):
                     lease = ctx.worker._import_region_part_lease(
                         instance.worker_id,
                         instance._provider_resource_id,
@@ -1126,13 +1128,8 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance: 
                         part=part,
                         expected_device_id=int(shape.provider_device_id),
                     )
-                setattr(instance, attr, _RegionPartAttachment(part, descriptor, lease))
-                _validate_imported_lease(descriptor, lease, part=part, expected_backend_kind=expected_backend)
-                views.append(
-                    RegionPartLocalView(part, _require_imported_lease_base(lease), int(descriptor.nbytes))
-                    if peer
-                    else local_view
-                )
+                    setattr(instance, attr, _RegionPartAttachment(part, descriptor, lease))
+                    _validate_imported_lease(descriptor, lease, part=part, expected_backend_kind=expected_backend)
             instance._payload_local_view, instance._counter_local_view = validate_independent_local_views(*views)
             if not peer:
                 instance._payload_part = PayloadPart(

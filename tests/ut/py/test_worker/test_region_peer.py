@@ -17,7 +17,7 @@ from typing import Any, cast
 import pytest
 from simpler import comm_region_peer as peer
 from simpler.buffer import AccessMode, AddressSpace, BackendKind, BufferDescriptor, CanonicalIdentity
-from simpler.comm_provider import RegionPartKind, RegionPartLocalView
+from simpler.comm_provider import RegionControlError, RegionExportDescriptor, RegionPartKind, RegionPartLocalView
 from simpler.comm_region import RegionInstanceState
 from simpler.orchestrator import _callback_run
 from simpler.task_interface import TaskArgs
@@ -40,7 +40,6 @@ class _Lease:
 
 
 def _frame(
-    part,
     *,
     operation=peer._PEER_IMPORT,
     target=1,
@@ -49,27 +48,28 @@ def _frame(
     generation=1,
     owner=0,
     owner_nonce=b"owner123",
+    counter_nonce=None,
+    counter_id=int(RegionPartKind.COUNTER),
+    counter_access=AccessMode.READWRITE,
 ):
-    descriptor = BufferDescriptor(
-        CanonicalIdentity(owner_nonce, int(part), generation),
-        AddressSpace.HOST,
-        AccessMode.READWRITE,
-        BackendKind.POSIX_SHM,
-        128,
-        f"peer-test-{int(part)}".encode(),
-    )
-    return bytearray(
-        peer._PEER_HEADER.pack(
-            b"session1",
-            transaction,
-            resource,
-            int(part),
-            owner,
-            target,
-            operation,
-            0,
+    descriptors = [
+        BufferDescriptor(
+            CanonicalIdentity(nonce, buffer_id, generation),
+            AddressSpace.HOST,
+            access,
+            BackendKind.POSIX_SHM,
+            128,
+            f"peer-test-{buffer_id}".encode(),
         )
-        + bytes(peer._encode_buffer_descriptor_wire(descriptor))
+        for nonce, buffer_id, access in (
+            (owner_nonce, int(RegionPartKind.PAYLOAD), AccessMode.READWRITE),
+            (counter_nonce or owner_nonce, counter_id, counter_access),
+        )
+    ]
+    return bytearray(
+        peer._PEER_HEADER.pack(b"session1", transaction, resource, owner, target, operation)
+        + b"".join(bytes(peer._encode_buffer_descriptor_wire(descriptor)) for descriptor in descriptors)
+        + bytes(peer._PEER_BASES.size)
     )
 
 
@@ -94,50 +94,68 @@ def _binding():
 
 def test_peer_import_retry_binding_and_tombstone(imports):
     registry, leases = imports
-    registry.handle(_frame(RegionPartKind.PAYLOAD))
-    assert not registry.validates(_binding())
-    registry.handle(_frame(RegionPartKind.PAYLOAD))
-    registry.handle(_frame(RegionPartKind.COUNTER))
+    frame = _frame()
+    registry.handle(frame)
+    assert peer._PEER_BASES.unpack_from(frame, len(frame) - peer._PEER_BASES.size) == (0x1000, 0x2000)
+    registry.handle(_frame())
     assert len(leases) == 2
     assert registry.validates(_binding())
     for index in range(6):
         altered: list[int] = list(_binding())
         altered[index] += 1
         assert not registry.validates(tuple(altered))
-    registry.handle(_frame(RegionPartKind.PAYLOAD, operation=peer._PEER_CLOSE))
+    registry.handle(_frame(operation=peer._PEER_CLOSE))
     assert not registry.validates(_binding())
     registry.close()
     registry.close()
     assert [lease.close_count for lease in leases] == [1, 1]
     assert not registry.holds_resources
     with pytest.raises(ValueError, match="closed"):
-        registry.handle(_frame(RegionPartKind.PAYLOAD))
+        registry.handle(_frame())
 
 
-@pytest.mark.parametrize(
-    "changed", [{"target": 0}, {"target": 2}, {"transaction": 0}, {"resource": 0}, {"generation": 2}]
-)
+@pytest.mark.parametrize("changed", [{"target": 0}, {"target": 2}, {"transaction": 0}, {"resource": 0}])
 def test_peer_refuses_invalid_target_or_identity_before_import(imports, changed):
     registry, leases = imports
-    with pytest.raises(ValueError, match="target|identity|generation"):
-        registry.handle(_frame(RegionPartKind.PAYLOAD, **changed))
+    with pytest.raises(ValueError, match="target|identity"):
+        registry.handle(_frame(**changed))
     assert leases == []
 
 
-def test_peer_duplicate_conflicting_descriptor_is_rejected(imports):
+@pytest.mark.parametrize(
+    "changed,message",
+    [
+        ({"generation": 2}, "generation"),
+        ({"counter_nonce": b"owner456"}, "owner nonce"),
+        ({"counter_id": int(RegionPartKind.PAYLOAD)}, "identities must differ"),
+        ({"counter_access": AccessMode.READ}, "READWRITE"),
+    ],
+)
+def test_peer_checks_descriptor_pair_before_either_import(imports, changed, message):
     registry, leases = imports
-    registry.handle(_frame(RegionPartKind.PAYLOAD))
+    with pytest.raises(RegionControlError, match=message):
+        registry.handle(_frame(**changed))
+    assert leases == []
+    assert not registry.holds_resources
+
+
+@pytest.mark.parametrize("changed", [{"resource": 8}, {"owner": 2}, {"owner_nonce": b"owner456"}])
+def test_peer_duplicate_conflicting_descriptor_is_rejected(imports, changed):
+    registry, leases = imports
+    registry.handle(_frame())
     with pytest.raises(ValueError, match="conflict"):
-        registry.handle(_frame(RegionPartKind.PAYLOAD, resource=8))
-    assert len(leases) == 1
+        registry.handle(_frame(**changed))
+    assert len(leases) == 2
+    assert registry.validates(_binding())
     registry.close()
 
 
-def test_peer_failed_close_keeps_debt_and_revokes_binding(imports):
+@pytest.mark.parametrize("failed_parts", [(0,), (1,), (0, 1)])
+def test_peer_failed_close_attempts_both_views_and_keeps_debt(imports, failed_parts):
     registry, leases = imports
-    registry.handle(_frame(RegionPartKind.PAYLOAD))
-    registry.handle(_frame(RegionPartKind.COUNTER))
-    leases[0].failure = RuntimeError("unmap failed")
+    registry.handle(_frame())
+    for index in failed_parts:
+        leases[index].failure = RuntimeError("unmap failed")
     for _ in range(2):
         with pytest.raises(RuntimeError, match="unmap failed"):
             registry.close()
@@ -146,21 +164,92 @@ def test_peer_failed_close_keeps_debt_and_revokes_binding(imports):
     assert [lease.close_count for lease in leases] == [1, 1]
 
 
-def test_peer_counter_import_failure_never_publishes_binding(imports, monkeypatch):
+@pytest.mark.parametrize("failure_part", [RegionPartKind.PAYLOAD, RegionPartKind.COUNTER])
+def test_peer_partial_import_failure_never_publishes_binding(imports, monkeypatch, failure_part):
     registry, leases = imports
-    registry.handle(_frame(RegionPartKind.PAYLOAD))
+    allocate = peer.import_region_part
 
-    def fail(_descriptor, **_kwargs):
-        raise RuntimeError("counter import failed")
+    def fail(descriptor, **kwargs):
+        if kwargs["part"] is failure_part:
+            raise RuntimeError("import failed")
+        return allocate(descriptor, **kwargs)
 
     monkeypatch.setattr(peer, "import_region_part", fail)
-    with pytest.raises(RuntimeError, match="counter import failed"):
-        registry.handle(_frame(RegionPartKind.COUNTER))
+    with pytest.raises(RuntimeError, match="import failed"):
+        registry.handle(_frame())
     assert not registry.validates(_binding())
-    assert registry.holds_resources
-    registry.close()
+    with pytest.raises(ValueError, match="incomplete"):
+        registry.handle(_frame())
+    registry.handle(_frame(operation=peer._PEER_CLOSE))
     assert not registry.holds_resources
-    assert leases[0].close_count == 1
+    assert [lease.close_count for lease in leases] == ([1] if failure_part is RegionPartKind.COUNTER else [])
+
+
+def test_peer_import_native_cleanup_debt_keeps_owner_retained(imports, monkeypatch):
+    registry, leases = imports
+    allocate = peer.import_region_part
+
+    def fail(descriptor, **kwargs):
+        if kwargs["part"] is RegionPartKind.COUNTER:
+            raise RuntimeError("import cleanup unknown")
+        return allocate(descriptor, **kwargs)
+
+    monkeypatch.setattr(peer, "import_region_part", fail)
+    monkeypatch.setattr(peer, "_worker_host_mapped_region_peek_cleanup_error", lambda _token: "cleanup unknown")
+    for operation in (peer._PEER_IMPORT, peer._PEER_IMPORT, peer._PEER_CLOSE):
+        with pytest.raises(RuntimeError, match="cleanup unknown"):
+            registry.handle(_frame(operation=operation))
+    assert registry.holds_resources
+    assert not registry.validates(_binding())
+    assert [lease.close_count for lease in leases] == [1]
+
+
+def test_peer_close_before_import_blocks_late_request(imports):
+    registry, leases = imports
+    registry.handle(_frame(operation=peer._PEER_CLOSE))
+    with pytest.raises(ValueError, match="closed"):
+        registry.handle(_frame())
+    with pytest.raises(ValueError, match="conflict"):
+        registry.handle(_frame(resource=8))
+    assert leases == []
+    assert not registry.holds_resources
+
+
+@pytest.mark.parametrize("bases", [(0, 0x2000), (0x1000, 0x1000), (0x1000, 0x2001)])
+def test_peer_invalid_local_pair_is_not_published_and_can_be_closed(imports, monkeypatch, bases):
+    registry, leases = imports
+    iterator = iter(bases)
+    monkeypatch.setattr(peer, "_worker_host_mapped_region_mapped_base", lambda _handle: next(iterator))
+    with pytest.raises((ValueError, RuntimeError), match="mapping|overlap|aligned"):
+        registry.handle(_frame())
+    assert not registry.validates(_binding())
+    registry.handle(_frame(operation=peer._PEER_CLOSE))
+    assert all(lease.close_count == 1 for lease in leases)
+    assert not registry.holds_resources
+
+
+@pytest.mark.parametrize("in_place", [False, True])
+def test_peer_lease_rejects_changed_reply_identity(in_place):
+    def control(_kind, _worker, _command, frame, _timeout):
+        reply = frame if in_place else bytearray(frame)
+        reply[0] ^= 1
+        return reply
+
+    worker = SimpleNamespace(
+        _provider_import_device_id=lambda worker_id: worker_id,
+        _worker=SimpleNamespace(control_payload=control),
+        _py_control_timeout_s=1.0,
+    )
+    instance = SimpleNamespace(_allocation_identity=(b"session1", 3), provider_resource_id=7, worker_id=0)
+    frame = _frame()
+    descriptors = frame[peer._PEER_HEADER.size : -peer._PEER_BASES.size]
+    descriptor = RegionExportDescriptor(
+        peer._decode_buffer_descriptor_wire(bytes(descriptors[: peer._DESCRIPTOR_BYTES])),
+        peer._decode_buffer_descriptor_wire(bytes(descriptors[peer._DESCRIPTOR_BYTES :])),
+    )
+    lease = peer.PeerRegionLease(worker, instance, descriptor, 1, 0)
+    with pytest.raises(RuntimeError, match="identity mismatch"):
+        lease.import_views()
 
 
 def test_region_binding_prefix_is_exact_and_requires_complete_descriptor():
@@ -175,17 +264,6 @@ def test_region_binding_prefix_is_exact_and_requires_complete_descriptor():
         args.add_scalar(value)
     args.add_scalar(99)
     assert peer.region_binding_prefix(args) == _binding()
-
-
-@pytest.mark.parametrize("changed", [{"resource": 8}, {"owner": 2}, {"owner_nonce": b"owner456"}])
-def test_peer_parts_must_name_the_same_allocation(imports, changed):
-    registry, leases = imports
-    registry.handle(_frame(RegionPartKind.PAYLOAD))
-    with pytest.raises(ValueError, match="different allocations|different owners"):
-        registry.handle(_frame(RegionPartKind.COUNTER, **changed))
-    assert len(leases) == 1
-    assert not registry.validates(_binding())
-    registry.close()
 
 
 def test_parent_binding_requires_current_live_region_and_exact_target():
@@ -207,7 +285,9 @@ def test_parent_binding_requires_current_live_region_and_exact_target():
         provider_resource_id=7,
         _provider_payload_view=owner_views[0],
         _provider_counter_view=owner_views[1],
-        local_view=peer_views.get,
+        local_view=lambda part, *, worker_id=None: (
+            owner_views[int(part) - 1] if worker_id == 0 else peer_views.get(part)
+        ),
     )
     registry = worker._region_instance_registry
     registry._instances[id(instance)] = cast(Any, instance)
@@ -273,8 +353,7 @@ def test_chip_checks_binding_against_its_own_views(imports):
     )
     with pytest.raises(ValueError, match="this chip"):
         registry.validate_args(args, store)
-    registry.handle(_frame(RegionPartKind.PAYLOAD))
-    registry.handle(_frame(RegionPartKind.COUNTER))
+    registry.handle(_frame())
     registry.validate_args(args, store)
     registry.close()
     with pytest.raises(ValueError, match="this chip"):

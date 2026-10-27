@@ -161,7 +161,7 @@ CANN 对 VMM Device 间拷贝列出的接口采用此路径。
 ### 描述符与授权
 
 Host 配置只保存 owner node、NUMA、逻辑大小和 canonical identity；HBM、Host 共用一张有序 export descriptor 表，
-分别占 `[0,R)`、`[R,R+H)`，mapping size 与 Fabric token 只保存一次。`SDC2` 编码配置、backing 引用、Host 窗口与额外 consumer attachment；旧布局明确拒绝，各参与进程须使用同版本。
+分别占 `[0,R)`、`[R,R+H)`，mapping size 与 Fabric token 只保存一次。`SDC3` 编码配置、backing 引用、Host 窗口与额外 consumer 授权（每个 SUB 的 endpoint 身份和逐 rank 授权集合）；旧布局明确拒绝，各参与进程须使用同版本。
 Host 不占 NPU rank，不改固定 `CommContext` ABI。
 每个 Host pool 只有一个 canonical identity；各 chip VA 不同，但 backing 身份相同。
 
