@@ -216,7 +216,6 @@ struct GlobalDomainAllocation {
     bool host_enabled = false;
     bool import_started = false;
     bool views_released = false;
-    std::vector<GlobalPeerMapping> host_mappings;
     std::string shm_name;
     void *local_base = nullptr;
     size_t mapping_size = 0;
@@ -845,8 +844,7 @@ extern "C" int comm_global_domain_prepare(
 }
 
 extern "C" int comm_global_domain_import(
-    uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count,
-    const CommGlobalDomainDescriptor *hosts, size_t host_count, uint64_t *device_ctx_out
+    uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count, uint64_t *device_ctx_out
 ) try {
     std::scoped_lock lock(global_domain_allocations_mutex);
     auto it = global_domain_allocations.find(domain_id);
@@ -854,14 +852,16 @@ extern "C" int comm_global_domain_import(
         return -1;
     }
     auto &allocation = it->second;
-    if (descriptor_count != allocation->nranks || allocation->host_ctx != nullptr || allocation->import_started ||
-        allocation->views_released) {
+    const size_t rank_count = allocation->nranks;
+    if (rank_count == 0 || descriptor_count < rank_count || descriptor_count > 2 * rank_count ||
+        (descriptor_count > rank_count) != allocation->host_enabled || allocation->host_ctx != nullptr ||
+        allocation->import_started || allocation->views_released) {
         return -1;
     }
 
     allocation->import_started = true;
-    std::vector<const CommGlobalDomainDescriptor *> rank_order(descriptor_count, nullptr);
-    for (size_t i = 0; i < descriptor_count; ++i) {
+    std::vector<const CommGlobalDomainDescriptor *> rank_order(rank_count, nullptr);
+    for (size_t i = 0; i < rank_count; ++i) {
         const auto &descriptor = descriptors[i];
         if (descriptor.version != COMM_GLOBAL_DOMAIN_VERSION ||
             descriptor.profile != COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM || descriptor.rank_count != allocation->nranks ||
@@ -877,8 +877,8 @@ extern "C" int comm_global_domain_import(
     ctx->rankId = allocation->rank;
     ctx->rankNum = allocation->nranks;
     ctx->winSize = allocation->mapping_size;
-    std::vector<GlobalPeerMapping> peer_mappings;
-    peer_mappings.reserve(allocation->nranks - 1);
+    auto &peer_mappings = allocation->peer_mappings;
+    peer_mappings.reserve(descriptor_count - 1);
     for (uint32_t rank = 0; rank < allocation->nranks; ++rank) {
         const auto *descriptor = rank_order[rank];
         if (descriptor == nullptr) {
@@ -904,13 +904,11 @@ extern "C" int comm_global_domain_import(
         ctx->windowsOut[rank] = reinterpret_cast<uint64_t>(base);
     }
 
-    if ((host_count != 0) != allocation->host_enabled || host_count > descriptor_count || (host_count && !hosts))
-        return -1;
-    for (size_t i = allocation->host_mappings.size(); i < host_count; ++i) {
-        const auto &host = hosts[i];
+    for (size_t i = rank_count; i < descriptor_count; ++i) {
+        const auto &host = descriptors[i];
         if (host.version != COMM_GLOBAL_DOMAIN_VERSION || host.profile != COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM ||
-            host.domain_rank != descriptor_count + i || host.rank_count != descriptor_count || !host.mapping_size ||
-            !host.handle_size || host.handle_size > COMM_GLOBAL_DOMAIN_HANDLE_BYTES)
+            host.domain_rank != i || host.rank_count != rank_count || !host.mapping_size || !host.handle_size ||
+            host.handle_size > COMM_GLOBAL_DOMAIN_HANDLE_BYTES)
             return -1;
         std::string name(reinterpret_cast<const char *>(host.handle), host.handle_size);
         int fd = shm_open(name.c_str(), O_RDWR, 0600);
@@ -924,9 +922,8 @@ extern "C" int comm_global_domain_import(
         void *base = mmap(nullptr, host.mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         close(fd);
         if (base == MAP_FAILED) return -1;
-        allocation->host_mappings.emplace_back(base, host.mapping_size);
+        peer_mappings.emplace_back(base, host.mapping_size);
     }
-    allocation->peer_mappings = std::move(peer_mappings);
     *device_ctx_out = reinterpret_cast<uint64_t>(ctx.get());
     allocation->host_ctx = std::move(ctx);
     return 0;
@@ -948,7 +945,6 @@ extern "C" int comm_global_domain_release(uint64_t domain_id, uint32_t stage) tr
     if (stage > 2 || (a.host_enabled && stage == 0) || (stage == 2 && !a.views_released)) return -1;
     a.host_ctx.reset();
     a.peer_mappings.clear();
-    a.host_mappings.clear();
     a.views_released = true;
     if (stage == 1) return 0;
     global_domain_allocations.erase(it);
@@ -963,9 +959,9 @@ extern "C" int comm_global_domain_release(uint64_t domain_id, uint32_t stage) tr
 
 static std::pair<void *, size_t> global_window(GlobalDomainAllocation &a, uint32_t slot) {
     if (slot < a.nranks && a.host_ctx) return {reinterpret_cast<void *>(a.host_ctx->windowsIn[slot]), a.mapping_size};
-    const size_t index = slot - a.nranks;
-    if (slot < a.nranks || index >= a.host_mappings.size()) return {nullptr, 0};
-    return {a.host_mappings[index].base, a.host_mappings[index].size};
+    const size_t index = slot - 1;
+    if (slot < a.nranks || index >= a.peer_mappings.size()) return {nullptr, 0};
+    return {a.peer_mappings[index].base, a.peer_mappings[index].size};
 }
 
 extern "C" int comm_global_domain_window(uint64_t id, uint32_t slot, uint64_t *base, size_t *size) {

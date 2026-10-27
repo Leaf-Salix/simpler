@@ -78,6 +78,7 @@ GLOBAL_DOMAIN_MAX_STRING_BYTES = 1024
 GLOBAL_DOMAIN_MAX_COPY_BYTES = 8 * 1024 * 1024
 GLOBAL_DOMAIN_BUFFER_REF_BYTES = 104
 _DOMAIN_COMMAND_MAGIC = b"SDC1"
+_HOST_WINDOW = struct.Struct("<iiQQ")
 
 CTRL_GLOBAL_DOMAIN_PREPARE = 19
 CTRL_GLOBAL_DOMAIN_IMPORT = 20
@@ -729,28 +730,6 @@ def _validate_backing_refs(command: GlobalDomainCommand) -> None:
         identities.add(key)
 
 
-def _put_host_windows(out: bytearray, hosts: tuple[GlobalDomainHostWindow, ...]) -> None:
-    if len(hosts) > GLOBAL_DOMAIN_MAX_RANKS:
-        raise ValueError("Host window count exceeds maximum")
-    out.extend(struct.pack("<I", len(hosts)))
-    for host in hosts:
-        out.extend(struct.pack("<iiQQ", host.node_worker_id, host.spec.numa_id, host.spec.nbytes, host.buffer_id))
-
-
-def _read_host_windows(reader: _Reader) -> tuple[GlobalDomainHostWindow, ...]:
-    count = reader.u32()
-    if count > GLOBAL_DOMAIN_MAX_RANKS:
-        raise ValueError("Host window count exceeds maximum")
-    return tuple(
-        GlobalDomainHostWindow(
-            reader.i32(),
-            HostWindowSpec(reader.i32(), reader.u64()),
-            reader.u64(),
-        )
-        for _ in range(count)
-    )
-
-
 def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR0912 -- wire validation keeps phase rules adjacent to encoding
     validate_member_table(command.members)
     validate_attachment_table(command.attachments, command.members)
@@ -824,7 +803,9 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
     out.extend(struct.pack("<I", len(command.descriptors)))
     for descriptor in command.descriptors:
         out.extend(descriptor.encode())
-    _put_host_windows(out, command.host_windows)
+    out.extend(struct.pack("<I", len(command.host_windows)))
+    for host in command.host_windows:
+        out.extend(_HOST_WINDOW.pack(host.node_worker_id, host.spec.numa_id, host.spec.nbytes, host.buffer_id))
     out.extend(struct.pack("<I", len(command.backing_refs)))
     out.extend(encode_domain_buffer_refs(tuple((descriptor, 0, 0) for descriptor in command.backing_refs)))
     return bytes(out)
@@ -876,7 +857,15 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
         GlobalDomainDescriptor.decode(reader.fixed(GLOBAL_DOMAIN_DESCRIPTOR_BYTES, "descriptor"))
         for _ in range(descriptor_count)
     )
-    host_windows = _read_host_windows(reader)
+    host_count = reader.u32()
+    if host_count > GLOBAL_DOMAIN_MAX_RANKS:
+        raise ValueError("Host window count exceeds maximum")
+    host_windows = tuple(
+        GlobalDomainHostWindow(node, HostWindowSpec(numa, nbytes), buffer_id)
+        for node, numa, nbytes, buffer_id in _HOST_WINDOW.iter_unpack(
+            reader.fixed(host_count * _HOST_WINDOW.size, "Host windows")
+        )
+    )
     backing_count = reader.u32()
     if backing_count > GLOBAL_DOMAIN_MAX_RANKS * GLOBAL_DOMAIN_MAX_BUFFERS:
         raise ValueError("global domain backing reference count exceeds maximum")

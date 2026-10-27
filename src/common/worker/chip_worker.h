@@ -403,9 +403,7 @@ public:
         uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
         bool host_enabled = false
     );
-    uint64_t comm_global_domain_import(
-        uint64_t domain_id, const std::vector<uint8_t> &descriptors, const std::vector<uint8_t> &hosts = {}
-    );
+    uint64_t comm_global_domain_import(uint64_t domain_id, const std::vector<uint8_t> &descriptors);
     void comm_global_domain_release(uint64_t domain_id, uint32_t stage = 0);
     std::pair<uint64_t, size_t> comm_global_domain_window(uint64_t domain_id, uint32_t slot);
     void comm_global_domain_copy(
@@ -593,9 +591,7 @@ private:
     using CommReleaseDomainWindowsFn = int (*)(void *, uint64_t, size_t, uint32_t);
     using CommGlobalDomainPrepareFn =
         int (*)(uint64_t, uint32_t, uint32_t, size_t, uint32_t, uint32_t, CommGlobalDomainDescriptor *, uint64_t *);
-    using CommGlobalDomainImportFn = int (*)(
-        uint64_t, const CommGlobalDomainDescriptor *, size_t, const CommGlobalDomainDescriptor *, size_t, uint64_t *
-    );
+    using CommGlobalDomainImportFn = int (*)(uint64_t, const CommGlobalDomainDescriptor *, size_t, uint64_t *);
     using CommGlobalDomainReleaseFn = int (*)(uint64_t, uint32_t);
     using CommGlobalDomainWindowFn = decltype(&::comm_global_domain_window);
     using CommGlobalDomainCopyFn = decltype(&::comm_global_domain_copy);

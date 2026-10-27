@@ -166,8 +166,7 @@ int comm_global_domain_prepare(
 }
 
 int comm_global_domain_import(
-    uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count,
-    const CommGlobalDomainDescriptor *hosts, size_t host_count, uint64_t *device_ctx_out
+    uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count, uint64_t *device_ctx_out
 ) {
     return PTO_RUNTIME_ERR_INTERNAL;
 }

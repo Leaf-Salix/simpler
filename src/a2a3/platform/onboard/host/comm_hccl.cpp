@@ -93,7 +93,6 @@ struct DomainAllocation {
     bool import_started = false;
     bool views_released = false;
     bool completion_unknown = false;
-    std::vector<VmmWindow> host_windows;
     VmmWindow local_window;
     std::vector<VmmWindow> peer_windows;
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
@@ -286,8 +285,6 @@ static aclError reserve_no_uc_address(uint64_t size, VmmWindow *window) {
     for (const auto &entry : global_domain_allocations) {
         add(entry.second->local_window);
         for (const auto &view : entry.second->peer_windows)
-            add(view);
-        for (const auto &view : entry.second->host_windows)
             add(view);
     }
     std::sort(occupied.begin(), occupied.end());
@@ -1666,8 +1663,7 @@ extern "C" int comm_global_domain_prepare(
 }
 
 extern "C" int comm_global_domain_import(
-    uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count,
-    const CommGlobalDomainDescriptor *hosts, size_t host_count, uint64_t *device_ctx_out
+    uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count, uint64_t *device_ctx_out
 ) try {
     std::lock_guard<std::mutex> lock(global_domain_allocations_mutex);
     auto it = global_domain_allocations.find(domain_id);
@@ -1675,14 +1671,16 @@ extern "C" int comm_global_domain_import(
         return -1;
     }
     auto &allocation = it->second;
-    if (descriptor_count != static_cast<size_t>(allocation->nranks) || allocation->device_ctx != nullptr ||
+    const size_t rank_count = static_cast<size_t>(allocation->nranks);
+    if (rank_count == 0 || descriptor_count < rank_count || descriptor_count > 2 * rank_count ||
+        (descriptor_count > rank_count) != allocation->host_enabled || allocation->device_ctx != nullptr ||
         allocation->import_started || allocation->views_released) {
         return -1;
     }
 
     allocation->import_started = true;
-    std::vector<const CommGlobalDomainDescriptor *> rank_order(descriptor_count, nullptr);
-    for (size_t i = 0; i < descriptor_count; ++i) {
+    std::vector<const CommGlobalDomainDescriptor *> rank_order(rank_count, nullptr);
+    for (size_t i = 0; i < rank_count; ++i) {
         const auto &descriptor = descriptors[i];
         if (descriptor.version != COMM_GLOBAL_DOMAIN_VERSION ||
             descriptor.profile != COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC ||
@@ -1732,19 +1730,16 @@ extern "C" int comm_global_domain_import(
         ctx.windowsOut[rank] = window_addr;
     }
 
-    if ((host_count != 0) != allocation->host_enabled || host_count > descriptor_count || (host_count && !hosts))
-        return -1;
-    // Retain each successful import immediately, including a partial IMPORT failure.
-    for (size_t i = allocation->host_windows.size(); i < host_count; ++i) {
-        const auto &host = hosts[i];
+    for (size_t i = rank_count; i < descriptor_count; ++i) {
+        const auto &host = descriptors[i];
         if (host.version != COMM_GLOBAL_DOMAIN_VERSION || host.profile != COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC ||
-            host.domain_rank != descriptor_count + i || host.rank_count != descriptor_count || !host.mapping_size ||
+            host.domain_rank != i || host.rank_count != rank_count || !host.mapping_size ||
             host.handle_size != sizeof(aclrtMemFabricHandle))
             return -1;
         aclrtMemFabricHandle token{};
         std::memcpy(&token, host.handle, sizeof(token));
-        allocation->host_windows.emplace_back();
-        auto &view = allocation->host_windows.back();
+        peer_windows.emplace_back();
+        auto &view = peer_windows.back();
         if (import_fabric_window(device_id, token, host.mapping_size, &view, true) != ACL_SUCCESS) return -1;
     }
     void *device_ctx = nullptr;
@@ -1770,12 +1765,8 @@ extern "C" int comm_global_domain_import(
 
 static VmmWindow *global_window(DomainAllocation &a, uint32_t slot) {
     if (slot == static_cast<uint32_t>(a.rank)) return &a.local_window;
-    if (slot < static_cast<uint32_t>(a.nranks)) {
-        const size_t index = slot < static_cast<uint32_t>(a.rank) ? slot : slot - 1;
-        return index < a.peer_windows.size() ? &a.peer_windows[index] : nullptr;
-    }
-    const size_t index = slot - a.nranks;
-    return index < a.host_windows.size() ? &a.host_windows[index] : nullptr;
+    const size_t index = slot < static_cast<uint32_t>(a.rank) ? slot : slot - 1;
+    return index < a.peer_windows.size() ? &a.peer_windows[index] : nullptr;
 }
 
 extern "C" int comm_global_domain_window(uint64_t id, uint32_t slot, uint64_t *base, size_t *size) {
@@ -1830,7 +1821,6 @@ extern "C" int comm_global_domain_release(uint64_t domain_id, uint32_t stage) tr
             if (status == ACL_SUCCESS) a.device_ctx = nullptr;
         }
         // A failed release is terminal: neither retry nor destructor may claim success.
-        if (status == ACL_SUCCESS) status = release_vmm_windows(&a.host_windows);
         if (status == ACL_SUCCESS) status = release_vmm_windows(&a.peer_windows);
         if (status != ACL_SUCCESS) {
             a.release_failed = true;

@@ -1966,9 +1966,7 @@ extern "C" int comm_global_domain_prepare(
     return -1;
 }
 
-extern "C" int comm_global_domain_import(
-    uint64_t, const CommGlobalDomainDescriptor *, size_t, const CommGlobalDomainDescriptor *, size_t, uint64_t *
-) {
+extern "C" int comm_global_domain_import(uint64_t, const CommGlobalDomainDescriptor *, size_t, uint64_t *) {
     LOG_ERROR("[comm] Global CommDomain is not supported by the a5 backend");
     return -1;
 }

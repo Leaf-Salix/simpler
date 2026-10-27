@@ -1,7 +1,7 @@
 # Host 接入通信域：双机 ACL 设计
 
 基于 [#2668](https://github.com/hw-native-sys/simpler/pull/2668)
-的 `1251133c07adfd25610614821a8bf80d45dc5235`，复用其 Buffer/Tensor、grant 和跨 run 使用追踪。
+的 `d4a77803bf1fa132b1eee8adda089fc533784c38`，复用其 Buffer/Tensor、grant 和跨 run 使用追踪。
 本文描述实现契约；既有接口见[通信域文档](../comm-domain.md)。
 
 ## 1. 目标与边界

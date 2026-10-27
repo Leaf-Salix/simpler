@@ -2320,22 +2320,17 @@ std::tuple<std::vector<uint8_t>, uint64_t, size_t> ChipWorker::comm_global_domai
     return {std::move(descriptor_bytes), local_window_base, static_cast<size_t>(descriptor.mapping_size)};
 }
 
-uint64_t ChipWorker::comm_global_domain_import(
-    uint64_t domain_id, const std::vector<uint8_t> &descriptors, const std::vector<uint8_t> &hosts
-) {
+uint64_t ChipWorker::comm_global_domain_import(uint64_t domain_id, const std::vector<uint8_t> &descriptors) {
     if (comm_global_domain_import_fn_ == nullptr) {
         throw std::runtime_error("comm_global_domain_import is not supported by this runtime");
     }
-    if (descriptors.empty() || descriptors.size() % sizeof(CommGlobalDomainDescriptor) != 0 ||
-        hosts.size() % sizeof(CommGlobalDomainDescriptor) != 0) {
+    if (descriptors.empty() || descriptors.size() % sizeof(CommGlobalDomainDescriptor) != 0) {
         throw std::runtime_error("comm_global_domain_import descriptor table size is invalid");
     }
     uint64_t device_ctx = 0;
     int rc = comm_global_domain_import_fn_(
         domain_id, reinterpret_cast<const CommGlobalDomainDescriptor *>(descriptors.data()),
-        descriptors.size() / sizeof(CommGlobalDomainDescriptor),
-        reinterpret_cast<const CommGlobalDomainDescriptor *>(hosts.data()),
-        hosts.size() / sizeof(CommGlobalDomainDescriptor), &device_ctx
+        descriptors.size() / sizeof(CommGlobalDomainDescriptor), &device_ctx
     );
     if (rc != 0) {
         throw std::runtime_error("comm_global_domain_import failed with code " + std::to_string(rc));

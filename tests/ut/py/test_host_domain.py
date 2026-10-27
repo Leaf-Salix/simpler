@@ -272,7 +272,7 @@ def test_native_host_views_copy_and_two_stage_release(arch, runtime, oversized):
     u64, u32, size, ptr = ctypes.c_uint64, ctypes.c_uint32, ctypes.c_size_t, ctypes.c_void_p
     signatures = {
         "prepare": [u64, u32, u32, size, u32, u32, ptr, ptr],
-        "import": [u64, ptr, size, ptr, size, ptr],
+        "import": [u64, ptr, size, ptr],
         "window": [u64, u32, ptr, ptr],
         "copy": [u64, u32, size, u32, size, size, ptr],
         "release": [u64, u32],
@@ -300,7 +300,8 @@ def test_native_host_views_copy_and_two_stage_release(arch, runtime, oversized):
             token,
         )
         context = u64()
-        rc = getattr(lib, "comm_global_domain_import")(domain_id, descriptor, 1, host, 1, ctypes.byref(context))
+        table = ctypes.create_string_buffer(descriptor.raw + host)
+        rc = getattr(lib, "comm_global_domain_import")(domain_id, table, 2, ctypes.byref(context))
         if oversized:
             assert rc != 0
             return
@@ -584,8 +585,7 @@ def test_pool_copy_reuses_grants_and_revokes_unknown_completion(monkeypatch, mut
         4096,
         device_ctx=123,
         host_enabled=True,
-        buffers={host.identity: host, peer.identity: peer},
-        slots={identity: grant[1:] for identity, grant in slots.items()},
+        grants={identity: slots[identity] for identity in (host.identity, peer.identity)},
     )
     store = module._L2GlobalDomainStore({7: entry})
     dst, src, offset = host, peer, 8
@@ -604,7 +604,7 @@ def test_pool_copy_reuses_grants_and_revokes_unknown_completion(monkeypatch, mut
     elif mutation == "range":
         offset = host.nbytes
     elif mutation == "read-only":
-        entry.buffers[host.identity] = replace(host, access=AccessMode.READ)
+        entry.grants[host.identity] = (replace(host, access=AccessMode.READ).to_descriptor(), *slots[host.identity][1:])
     elif mutation == "revoked":
         entry.revoked = True
     elif mutation == "generation":
@@ -688,24 +688,18 @@ def test_commit_freezes_complete_host_exports(field, value):
 
 
 def test_shared_host_targets_preserve_exact_descriptor_and_hbm_chip_checks():
-    from simpler.task_interface import ChipDomainContext, DataType, TaskArgs  # noqa: PLC0415
-    from simpler.worker import Worker, _GlobalNodeDomainState  # noqa: PLC0415
+    from simpler.task_interface import DataType, TaskArgs  # noqa: PLC0415
+    from simpler.worker import Worker  # noqa: PLC0415
 
     worker = Worker(level=3, num_sub_workers=0)
     command = _exported_command()
     host = _host_domain_buffers(command)[2]
-    worker._global_node_domains[7] = _GlobalNodeDomainState(
-        command,
-        phase=GlobalDomainPhase.COMMIT,
-        contexts={
-            target: ChipDomainContext("mixed", rank, 2, 123, 4096, 4096, {}) for rank, target in enumerate((2, 5))
-        },
-        host_buffers={2: host},
-    )
-    hbm = buffer_reference(_exported_command().backing_refs[0], owner_worker_id=2)
+    hbm = buffer_reference(command.backing_refs[0], owner_worker_id=2)
     try:
         with worker._child_prov_lock:
-            worker._record_device_alloc(host, targets=(2, 5))
+            worker._record_device_alloc(host)
+            for target in (2, 5):
+                worker._domain_buffer_routes[(host.identity, target)] = buffer_reference(host, owner_worker_id=target)
             worker._record_device_alloc(hbm)
             args = TaskArgs()
             args.add_tensor(host.tensor([8], DataType.UINT8))
@@ -724,7 +718,6 @@ def test_shared_host_targets_preserve_exact_descriptor_and_hbm_chip_checks():
         with pytest.raises(ValueError, match="explicit copy_domain"):
             worker._device_worker_for(host.identity, api="test")
     finally:
-        worker._global_node_domains.clear()
         worker._clear_child_prov()
         worker.close()
 
@@ -816,7 +809,7 @@ def test_shared_host_reference_uses_each_receiving_session_locator():
     sidecar = _RemoteTaskArgsSidecar((None,), b"")
     try:
         with worker._child_prov_lock:
-            worker._record_device_alloc(public, targets=(2, 5))
+            worker._record_device_alloc(public)
             for target, locator in ((2, (41, 3)), (5, (62, 4))):
                 worker._domain_buffer_routes[(public.identity, target)] = buffer_reference(
                     public, owner_worker_id=target, remote_ref=locator
@@ -938,15 +931,35 @@ def test_host_import_leaves_local_hbm_for_ordinary_vmm_materialization(monkeypat
     payload += encode_domain_command(command)
     monkeypatch.setattr(module, "_open_global_domain_payload", lambda _buf: _control_payload(payload))
 
+    calls = []
+
     class Chip:
-        def comm_global_domain_import(self, *_args):
+        def comm_global_domain_import(self, domain_id, table):
+            calls.append((domain_id, table))
             return 123
 
         def comm_global_domain_window(self, _domain_id, slot):
             return 4096 * (slot + 1), command.descriptors[slot].mapping_size
 
     try:
-        module._handle_ctrl_global_domain_import(Chip(), memoryview(bytearray()), store, registry)
+        for _ in range(2):
+            module._handle_ctrl_global_domain_import(Chip(), memoryview(bytearray()), store, registry)
+        assert calls == [(7, b"".join(descriptor.encode() for descriptor in command.descriptors))]
+        assert entry.grants == module._domain_buffer_slots(command)
+        changed = replace(
+            command,
+            backing_refs=(
+                replace(
+                    buffer_reference(command.backing_refs[0]), identity=CanonicalIdentity(b"changed1", 99, 1)
+                ).to_descriptor(),
+                command.backing_refs[1],
+            ),
+        )
+        payload = module.LOCAL_IMPORT_REQUEST.pack(module.LOCAL_DOMAIN_MAGIC, GLOBAL_DOMAIN_VERSION, 7, 3, 4)
+        payload += encode_domain_command(changed)
+        with pytest.raises(ValueError, match="changes its slice grants"):
+            module._handle_ctrl_global_domain_import(Chip(), memoryview(bytearray()), store, registry)
+        assert entry.grants == module._domain_buffer_slots(command) and len(calls) == 1
         for descriptor in command.backing_refs:
             with pytest.raises(KeyError, match="no buffer registered"):
                 registry.require(descriptor.identity)
@@ -961,3 +974,62 @@ def test_host_import_leaves_local_hbm_for_ordinary_vmm_materialization(monkeypat
         assert registry.require(local_hbm.identity).descriptor == local_hbm
     finally:
         registry.close()
+
+
+def test_concurrent_domain_revocations_both_drain_an_authorized_hbm_copy(monkeypatch):
+    from contextlib import contextmanager  # noqa: PLC0415
+
+    from simpler.buffer import BufferCapability, wrap_vmm_window  # noqa: PLC0415
+    from simpler.worker import Worker  # noqa: PLC0415
+
+    worker = Worker(level=3, num_sub_workers=0)
+    hbm = wrap_vmm_window(4096, 64, worker._owner_instance_id, 41, owner_worker_id=0)
+    with worker._child_prov_lock:
+        worker._record_device_alloc(hbm, domain_allocation_id=7)
+    fence = worker._child_prov_worker_lock(0)
+    attempts = {name: threading.Event() for name in ("first-drop", "second-drop")}
+    second_boundary = threading.Event()
+    completed, errors = [], []
+
+    @contextmanager
+    def observed_fence(target):
+        assert target == 0
+        name = threading.current_thread().name
+        attempts[name].set()
+        if name == "second-drop":
+            second_boundary.set()
+        with fence:
+            yield
+
+    def revoke():
+        try:
+            worker._drop_domain_allocs(7)
+            completed.append(threading.current_thread().name)
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+        finally:
+            if threading.current_thread().name == "second-drop":
+                second_boundary.set()
+
+    fence.acquire()
+    with worker._child_prov_lock:
+        worker._require_device_capability_locked(hbm.identity, BufferCapability.COPY_TO, 64, api="copy_to")
+    monkeypatch.setattr(worker, "_child_prov_worker_lock", observed_fence)
+    threads = [threading.Thread(target=revoke, name=name, daemon=True) for name in attempts]
+    try:
+        threads[0].start()
+        assert attempts["first-drop"].wait(3)
+        threads[1].start()
+        assert second_boundary.wait(3)
+        assert attempts["second-drop"].is_set(), "a second revoke bypassed the authorized copy's fence"
+        assert not completed
+    finally:
+        fence.release()
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join(3)
+        worker._clear_child_prov()
+        worker.close()
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(completed) == ["first-drop", "second-drop"]

@@ -2006,7 +2006,6 @@ uint64_t encode_scalar(nb::handle value) {
 struct ProvenanceEntry {
     BufferDescriptor descriptor;
     int32_t owner_worker_id;
-    std::vector<int32_t> targets;
 };
 
 struct ProvenanceTable {
@@ -3052,11 +3051,10 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "insert",
-            [](ProvenanceTable &self, const BufferDescriptor &descriptor, int32_t owner_worker_id,
-               const std::vector<int32_t> &targets) {
-                self.entries[descriptor.identity] = ProvenanceEntry{descriptor, owner_worker_id, targets};
+            [](ProvenanceTable &self, const BufferDescriptor &descriptor, int32_t owner_worker_id) {
+                self.entries[descriptor.identity] = ProvenanceEntry{descriptor, owner_worker_id};
             },
-            nb::arg("descriptor"), nb::arg("owner_worker_id"), nb::arg("targets") = std::vector<int32_t>{},
+            nb::arg("descriptor"), nb::arg("owner_worker_id"),
             "Register one allocation, keyed by its descriptor's identity."
         )
 
@@ -3098,11 +3096,7 @@ NB_MODULE(_task_interface, m) {
                     const auto backend = static_cast<BackendKind>(d.backend_kind);
                     if (backend != BackendKind::DEVICE_MALLOC && backend != BackendKind::VMM_WINDOW) continue;
                     auto it = self.entries.find(d.identity);
-                    if (it == self.entries.end() ||
-                        (it->second.targets.empty() ?
-                             it->second.owner_worker_id != target_worker_id :
-                             std::find(it->second.targets.begin(), it->second.targets.end(), target_worker_id) ==
-                                 it->second.targets.end())) {
+                    if (it == self.entries.end() || it->second.owner_worker_id != target_worker_id) {
                         return nb::make_tuple(i, PROV_NOT_LIVE);
                     }
                     // Authorization and execution consume the same Buffer, so a same-identity
@@ -4225,18 +4219,14 @@ NB_MODULE(_task_interface, m) {
         )
         .def(
             "comm_global_domain_import",
-            [](ChipWorker &self, uint64_t domain_id, nb::bytes descriptors, nb::bytes hosts) {
+            [](ChipWorker &self, uint64_t domain_id, nb::bytes descriptors) {
                 std::vector<uint8_t> descriptor_bytes(
                     reinterpret_cast<const uint8_t *>(descriptors.c_str()),
                     reinterpret_cast<const uint8_t *>(descriptors.c_str()) + descriptors.size()
                 );
-                std::vector<uint8_t> host_bytes(
-                    reinterpret_cast<const uint8_t *>(hosts.c_str()),
-                    reinterpret_cast<const uint8_t *>(hosts.c_str()) + hosts.size()
-                );
-                return self.comm_global_domain_import(domain_id, descriptor_bytes, host_bytes);
+                return self.comm_global_domain_import(domain_id, descriptor_bytes);
             },
-            nb::arg("domain_id"), nb::arg("descriptors"), nb::arg("hosts") = nb::bytes("", 0),
+            nb::arg("domain_id"), nb::arg("descriptors"),
             "Import a rank-ordered Global CommDomain descriptor table and return the device context."
         )
         .def(

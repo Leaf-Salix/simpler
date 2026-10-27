@@ -302,14 +302,14 @@ int comm_global_domain_prepare(
  * Import every peer descriptor and publish a device CommContext.
  *
  * descriptors must contain exactly one entry
- * for every dense domain rank.
+ * for every dense domain rank. HBM descriptors lead the table; optional Host
+ * descriptors follow in pool-slot order.
  * The returned context and all imported mappings remain live until
  *
  * comm_global_domain_release().
  */
 int comm_global_domain_import(
-    uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count,
-    const CommGlobalDomainDescriptor *hosts, size_t host_count, uint64_t *device_ctx_out
+    uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count, uint64_t *device_ctx_out
 );
 
 /**
