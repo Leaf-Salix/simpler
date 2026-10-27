@@ -44,7 +44,6 @@ from _task_interface import _Orchestrator as _COrchestrator  # pyright: ignore[r
 
 from .buffer import AccessMode, BackendKind, Buffer, wrap_fork_inherited
 from .callable_identity import CallableHandle
-from .comm_region import PayloadPart, RegionPartSpan
 from .task_interface import (
     CallConfig,
     ChipCallable,
@@ -647,14 +646,6 @@ class Orchestrator:
         elif absolute > limit or nbytes > limit - absolute:
             raise ValueError("Global CommDomain copy exceeds the mapped window")
         return absolute
-
-    def domain_payload(
-        self, target: Buffer, *, worker: int | None = None, staging: RegionPartSpan | None = None
-    ) -> PayloadPart:
-        """Borrow Host payload access; see Worker.domain_payload for staging and lifetime rules."""
-        if self._worker is None:
-            raise RuntimeError("domain payload requires a bound Worker")
-        return self._worker.domain_payload(target, worker=worker, staging=staging)
 
     def copy_domain(
         self, dst: Buffer, src: Buffer, *, worker: int, nbytes: int, dst_offset: int = 0, src_offset: int = 0

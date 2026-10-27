@@ -828,9 +828,12 @@ class BackendResolver:
         self,
         registry: EndpointRegistry,
         region_access: RegionAccessService,
+        *,
+        payload_access: RegionAccessService | None = None,
     ) -> None:
         self._registry = registry
         self._region_access = region_access
+        self._payload_access = region_access if payload_access is None else payload_access
 
     def plan(self, resolved: ResolvedRegionSpec, layout: RegionLayoutSpec) -> BackendPlan | UnsupportedRegionPlan:
         self._validate_layout(layout)
@@ -893,6 +896,9 @@ class BackendResolver:
         members: Sequence[EndpointRecord],
         layout: RegionLayoutSpec,
     ) -> RegionPartPlan | UnsupportedRegionPlan:
+        nbytes = layout.payload_bytes if part is RegionPartKind.PAYLOAD else layout.counter_bytes
+        if not nbytes:
+            return RegionPartPlan(part=part, backend_kind=backend_kind, attachments=())
         attachments: list[MemberAttachmentPlan] = []
         for member in members:
             if member.identity == provider.identity:
@@ -929,8 +935,9 @@ class BackendResolver:
             # needs either a peer/map/copy edge rather than the Buffer-local mechanism.
             same_endpoint=False,
         )
+        service = self._payload_access if part is RegionPartKind.PAYLOAD else self._region_access
         for candidate in buffer_adapter_candidates(query):
-            decision = self._region_access.evaluate_buffer_access(query, candidate)
+            decision = service.evaluate_buffer_access(query, candidate)
             if decision.diagnostics is not None:
                 decision = replace(
                     decision,

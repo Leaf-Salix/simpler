@@ -1158,6 +1158,7 @@ def test_import_preserves_reserved_hbm_identity_and_backing(mutation):
         mapping_sizes={0: 4096},
         node_worker_id=2,
         backing_ids={0: (identity,)},
+        host_owner=object(),
     )
     worker._global_node_domains[7] = state
     calls = []
