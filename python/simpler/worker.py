@@ -11687,16 +11687,17 @@ class Worker:
             if state.command.profile == "sim":
                 view = state.host_owner.buf
                 assert view is not None
-                if writing:
-                    view[offset : offset + nbytes] = ctypes.string_at(pointer, nbytes)
-                else:
-                    ctypes.memmove(pointer, bytes(view[offset : offset + nbytes]), nbytes)
+                owner_ptr = ctypes.addressof(ctypes.c_char.from_buffer(view, offset))
+                ctypes.memmove(owner_ptr if writing else pointer, pointer if writing else owner_ptr, nbytes)
             elif writing:
-                state.host_owner.write(offset, ctypes.string_at(pointer, nbytes))
+                state.host_owner.write_bytes(offset, pointer, nbytes)
             else:
-                ctypes.memmove(pointer, state.host_owner.read(offset, nbytes), nbytes)
+                state.host_owner.read_bytes(offset, pointer, nbytes)
 
-    def _copy_domain_windows(self, dst, src, *, worker, nbytes, dst_offset=0, src_offset=0):
+    def copy_domain(
+        self, dst: Buffer, src: Buffer, *, worker: int, nbytes: int, dst_offset: int = 0, src_offset: int = 0
+    ) -> None:
+        """Synchronously copy two granted windows through an explicit local domain chip."""
         worker, nbytes, dst_offset, src_offset = map(operator.index, (worker, nbytes, dst_offset, src_offset))
         if self.level != 3 or self._worker is None:
             raise RuntimeError("copy_domain requires an owning L3 execution node")

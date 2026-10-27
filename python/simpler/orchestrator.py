@@ -653,9 +653,7 @@ class Orchestrator:
         """Synchronously copy two granted windows through an explicit local domain chip."""
         if self._worker is None:
             raise RuntimeError("domain copy requires a bound Worker")
-        self._worker._copy_domain_windows(
-            dst, src, worker=worker, nbytes=nbytes, dst_offset=dst_offset, src_offset=src_offset
-        )
+        self._worker.copy_domain(dst, src, worker=worker, nbytes=nbytes, dst_offset=dst_offset, src_offset=src_offset)
 
     def copy_to_domain(
         self,

@@ -392,13 +392,19 @@ public:
         api.export_fabric(handle_, token_.data());
         return nb::make_tuple(size_, nb::bytes(reinterpret_cast<const char *>(token_.data()), token_.size()));
     }
-    nb::bytes read(uint64_t offset, uint64_t bytes) const {
+    void read_bytes(uint64_t offset, uint64_t host_ptr, uint64_t bytes) const {
         bounds(offset, bytes);
-        return nb::bytes(static_cast<const char *>(base_) + offset, bytes);
+        if (!host_ptr) throw std::invalid_argument("Host read destination must be nonzero");
+        std::memmove(
+            reinterpret_cast<void *>(static_cast<uintptr_t>(host_ptr)), static_cast<const char *>(base_) + offset, bytes
+        );
     }
-    void write(uint64_t offset, const nb::bytes &data) {
-        bounds(offset, data.size());
-        std::memcpy(static_cast<char *>(base_) + offset, data.c_str(), data.size());
+    void write_bytes(uint64_t offset, uint64_t host_ptr, uint64_t bytes) {
+        bounds(offset, bytes);
+        if (!host_ptr) throw std::invalid_argument("Host write source must be nonzero");
+        std::memmove(
+            static_cast<char *>(base_) + offset, reinterpret_cast<const void *>(static_cast<uintptr_t>(host_ptr)), bytes
+        );
     }
     void release() {
         if (!base_ && !handle_) return;
@@ -2122,8 +2128,8 @@ NB_MODULE(_task_interface, m) {
     nb::class_<DomainHostMemory>(m, "_DomainHostMemory")
         .def(nb::init<>())
         .def("allocate", &DomainHostMemory::allocate)
-        .def("read", &DomainHostMemory::read)
-        .def("write", &DomainHostMemory::write)
+        .def("read_bytes", &DomainHostMemory::read_bytes)
+        .def("write_bytes", &DomainHostMemory::write_bytes)
         .def("release", &DomainHostMemory::release);
     m.doc() = "Nanobind bindings for task_interface (DataType, Buffer/Tensor wire ABI, ChipTensor, TaskArgs variants)";
 

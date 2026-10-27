@@ -413,7 +413,9 @@ def test_two_node_host_cpu_copy_reuse_and_stale_access():
             part.write(0, data)
             for member in domain.members:
                 if member.node_worker_id == node:
-                    orch.copy_domain(member.buffers["payload"], local, worker=member.local_worker_id, nbytes=512)
+                    orch._worker.copy_domain(
+                        member.buffers["payload"], local, worker=member.local_worker_id, nbytes=512
+                    )
             return
         pools = [(domain.host(n), n) for n in nodes]
         pools += [(member.buffers["payload"], member.node_worker_id) for member in domain.members]
@@ -920,14 +922,29 @@ def test_exports_collector_preserves_rank_order_and_rejects_conflicting_referenc
         worker.close()
 
 
-def test_borrowed_host_access_outside_callback_does_not_reenter_serializer():
+@pytest.mark.parametrize("profile", ["sim", "a3-fabric-v1"])
+def test_borrowed_host_access_outside_callback_does_not_reenter_serializer(monkeypatch, profile):
     import simpler.worker as module  # noqa: PLC0415
     from simpler.comm_domain import CommDomainRef  # noqa: PLC0415
     from simpler.task_interface import GlobalCommDomainView  # noqa: PLC0415
 
-    command = _exported_command()
+    command = replace(_exported_command(), profile=profile)
     worker = module.Worker(level=3, num_sub_workers=0)
     owner = SharedMemory(create=True, size=96)
+    assert owner.buf is not None
+    owner.buf[:] = bytes(len(owner.buf))
+    base = ctypes.addressof(ctypes.c_char.from_buffer(owner.buf))
+    calls = []
+
+    class HostOwner:
+        def write_bytes(self, offset, pointer, nbytes):
+            calls.append(("write", offset, pointer, nbytes))
+            ctypes.memmove(base + offset, pointer, nbytes)
+
+        def read_bytes(self, offset, pointer, nbytes):
+            calls.append(("read", offset, pointer, nbytes))
+            ctypes.memmove(pointer, base + offset, nbytes)
+
     view = GlobalCommDomainView(
         name=command.name, members=command.members, contexts={}, domain_id=7, generation=3, mapping_size=4096
     )
@@ -935,7 +952,7 @@ def test_borrowed_host_access_outside_callback_does_not_reenter_serializer():
         command,
         phase=GlobalDomainPhase.COMMIT,
         view=view,
-        host_owner=owner,
+        host_owner=owner if profile == "sim" else HostOwner(),
         node_worker_id=2,
         host_buffers=_host_domain_buffers(command),
     )
@@ -943,6 +960,11 @@ def test_borrowed_host_access_outside_callback_does_not_reenter_serializer():
     worker._lifecycle = module._Lifecycle.READY
     errors = []
     completed = []
+    memmove = ctypes.memmove
+
+    def direct_copy(dst, src, size):
+        assert isinstance(dst, int) and isinstance(src, int)
+        return memmove(dst, src, size)
 
     def access():
         try:
@@ -951,10 +973,30 @@ def test_borrowed_host_access_outside_callback_does_not_reenter_serializer():
             handle = worker._get_domain(ref)
             assert handle.borrowed and worker._get_domain(ref) is handle
             part = handle.local_host()
-            part.write(0, bytes(range(96)))
-            result = bytearray(96)
-            part.read(0, result)
-            assert result == bytes(range(96))
+            source = bytearray(b"head" + bytes(range(96)) + b"tail")
+            result = bytearray([0xCC] * 80)
+            with monkeypatch.context() as copy_patch:
+                copy_patch.setattr(module.ctypes, "memmove", direct_copy)
+                copy_patch.setattr(module.ctypes, "string_at", lambda *_: pytest.fail("unexpected bytes staging"))
+                part.write(8, memoryview(source)[4:-4], 64)
+                part.read(8, memoryview(result)[8:72])
+                with pytest.raises(ValueError, match="exceeds part"):
+                    part.write(80, source, 32)
+                with pytest.raises(ValueError, match="writable"):
+                    part.read(0, bytes(4))
+            assert result == bytes([0xCC] * 8) + bytes(range(64)) + bytes([0xCC] * 8)
+            assert source == b"head" + bytes(range(96)) + b"tail"
+            assert owner.buf is not None
+            assert bytes(owner.buf[:96]) == bytes(8) + bytes(range(64)) + bytes(24)
+            assert not any(owner.buf[96:])
+            assert calls == (
+                []
+                if profile == "sim"
+                else [
+                    ("write", 8, ctypes.addressof(ctypes.c_char.from_buffer(source, 4)), 64),
+                    ("read", 8, ctypes.addressof(ctypes.c_char.from_buffer(result, 8)), 64),
+                ]
+            )
             assert worker._get_domain(ref).host(2).identity == state.host_buffers[2].identity
             completed.append(True)
         except BaseException as error:  # noqa: BLE001
@@ -974,6 +1016,14 @@ def test_borrowed_host_access_outside_callback_does_not_reenter_serializer():
             worker.close()
         owner.close()
         owner.unlink()
+
+
+@pytest.mark.parametrize("method", ["read_bytes", "write_bytes"])
+def test_native_host_owner_rejects_access_without_a_live_mapping(method):
+    from _task_interface import _DomainHostMemory  # noqa: PLC0415
+
+    with pytest.raises(ValueError, match="live logical window"):
+        getattr(_DomainHostMemory(), method)(0, 0, 1)
 
 
 def test_host_import_leaves_local_hbm_for_ordinary_vmm_materialization(monkeypatch):
