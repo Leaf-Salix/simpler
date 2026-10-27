@@ -100,6 +100,33 @@ L3 只有在 Host owner 和全部本地 chip views 导入成功后才绑定 atta
 这覆盖现有参与节点的 Host consumer→跨节点 HBM attachment；不增加纯 CPU 节点、任意独立进程，
 也不扩展通用 `RegionInstance` 分配器。对应 roadmap 4.1、4.2、4.7 的这一限定组合，不能据此关闭整项。
 
+### 参与节点内的额外 Host 进程
+
+配置的 `num_sub_workers` 以 `L4/L3[node]/SUB[slot]` 注册真实 Host endpoint。
+L4 使用同一 registry 和 planner 生成 SUB→HBM 的 attachment，随 PREPARE 保存，
+IMPORT/COMMIT 复用同一授权；未实现的 adapter 不生成 grant。
+
+所属 L3 在控制回调首次 submit 前调用：
+
+```python
+orch.call_host(
+    consume, domain.member(remote_rank).buffers["payload"], domain=domain.ref,
+    staging_offset=offset, staging_nbytes=capacity, sub_worker=0, worker=0,
+)
+```
+
+`consume(payload)` 在选定 SUB 进程执行，主动使用现有 `PayloadPart.read/write`。
+每次请求不得超过预留 staging 容量；调用方须独占本节点 Host pool 的该区间。
+SUB 经临时本地通道请求 L3，原回调线程在现有锁内完成 staging 与 ACL copy，
+读结果在解锁前取出；跨节点数据继续经过参与 NPU 的现有 copy 后端。
+默认权限为 READWRITE，可用 `access` 缩小权限；默认超时 30 秒、最多 64 次 IO。
+临时通道使用单次 nonce，Linux 还核对实际 SUB 的 PID/UID。
+调用结束撤销 payload，禁止跨调用或跨线程使用；未知 copy/control 完成状态保留资源并阻止继续使用。
+
+这使上述限定组合包含实际额外进程的同步访问，不只是 endpoint 标签。
+当前只接受同一域的精确 HBM Buffer，不支持任意进程接入、CPU-only 节点、
+运行中 SUB task 的随时访问、远端 CPU 直接 load/store 或通用 Region 分配。
+
 ## 3. 内存与现有实现的接入点
 
 ### ACL 路径
@@ -134,7 +161,7 @@ CANN 对 VMM Device 间拷贝列出的接口采用此路径。
 ### 描述符与授权
 
 Host 配置只保存 owner node、NUMA、逻辑大小和 canonical identity；HBM、Host 共用一张有序 export descriptor 表，
-分别占 `[0,R)`、`[R,R+H)`，mapping size 与 Fabric token 只保存一次。`SDC1` 使用正式字段编码配置、backing 引用和 Host 窗口表，旧布局明确拒绝。
+分别占 `[0,R)`、`[R,R+H)`，mapping size 与 Fabric token 只保存一次。`SDC2` 编码配置、backing 引用、Host 窗口与额外 consumer attachment；旧布局明确拒绝，各参与进程须使用同版本。
 Host 不占 NPU rank，不改固定 `CommContext` ABI。
 每个 Host pool 只有一个 canonical identity；各 chip VA 不同，但 backing 身份相同。
 

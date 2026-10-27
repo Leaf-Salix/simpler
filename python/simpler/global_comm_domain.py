@@ -36,6 +36,7 @@ from .comm_endpoints import (
     EndpointDeployment,
     EndpointIdentity,
     EndpointRecord,
+    MemberAttachmentPlan,
     _backend_kind_for_provider,
     buffer_adapter_candidates,
 )
@@ -77,8 +78,9 @@ GLOBAL_DOMAIN_PROFILE_IDS = {
 GLOBAL_DOMAIN_MAX_STRING_BYTES = 1024
 GLOBAL_DOMAIN_MAX_COPY_BYTES = 8 * 1024 * 1024
 GLOBAL_DOMAIN_BUFFER_REF_BYTES = 104
-_DOMAIN_COMMAND_MAGIC = b"SDC1"
+_DOMAIN_COMMAND_MAGIC = b"SDC2"
 _HOST_WINDOW = struct.Struct("<iiQQ")
+_ENDPOINT_IDENTITY = struct.Struct("<8sQI")
 
 CTRL_GLOBAL_DOMAIN_PREPARE = 19
 CTRL_GLOBAL_DOMAIN_IMPORT = 20
@@ -135,6 +137,16 @@ class GlobalDomainAttachment:
     role: AttachmentRole
     adapter_kind: AdapterKind | None
     adapter_profile: AdapterProfile | None
+
+
+@dataclass(frozen=True)
+class GlobalDomainHostConsumerAttachment:
+    node_worker_id: int
+    sub_worker_id: int
+    consumer_path: str
+    provider_rank: int
+    provider: EndpointIdentity
+    attachment: MemberAttachmentPlan
 
 
 @dataclass(frozen=True)
@@ -253,6 +265,7 @@ class GlobalDomainCommand:
     retain_after_run: bool = False
     host_windows: tuple[GlobalDomainHostWindow, ...] = ()
     backing_refs: tuple[BufferDescriptor, ...] = ()
+    host_consumer_attachments: tuple[GlobalDomainHostConsumerAttachment, ...] = ()
 
     def attachments_for_node(self, node_worker_id: int) -> tuple[GlobalDomainAttachment, ...]:
         """Return the row addressed to one receiving L3 node.
@@ -609,6 +622,117 @@ def _read_attachment(reader: _Reader) -> GlobalDomainAttachment:
     return _normalize_attachment(attachment)
 
 
+def _validate_host_consumer_attachments(command: GlobalDomainCommand) -> None:
+    grants = command.host_consumer_attachments
+    if not grants:
+        return
+    if command.phase is not GlobalDomainPhase.PREPARE_EXPORT:
+        raise ValueError("Host consumer attachments are only carried by PREPARE_EXPORT")
+    if len(grants) > GLOBAL_DOMAIN_MAX_ATTACHMENTS:
+        raise ValueError("Host consumer attachment count exceeds maximum")
+    host_nodes = {host.node_worker_id for host in command.host_windows}
+    keys = set()
+    identities: dict[EndpointIdentity, tuple] = {}
+    consumers = {}
+    providers = {}
+    epoch = grants[0].provider.registry_epoch
+    for grant in grants:
+        for value, limit in ((grant.node_worker_id, 2**31), (grant.sub_worker_id, 2**32)):
+            if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value < limit:
+                raise ValueError("Host consumer worker index is invalid")
+        if grant.node_worker_id not in host_nodes:
+            raise ValueError("Host consumer requires a participating Host window")
+        if (
+            not isinstance(grant.provider_rank, int)
+            or isinstance(grant.provider_rank, bool)
+            or not 0 <= grant.provider_rank < len(command.members)
+        ):
+            raise ValueError("Host consumer provider rank is invalid")
+        if grant.consumer_path != f"L4/L3[{grant.node_worker_id}]/SUB[{grant.sub_worker_id}]":
+            raise ValueError("Host consumer path does not match its node and SUB slot")
+        key = (grant.node_worker_id, grant.sub_worker_id, grant.provider_rank)
+        if key in keys:
+            raise ValueError("duplicate Host consumer attachment")
+        keys.add(key)
+        attachment = grant.attachment
+        implemented = {
+            (AdapterKind.OWNER_DELEGATED_COPY, AdapterProfile.HOST_VMM_COPY),
+            (AdapterKind.EXPLICIT_TRANSFER, AdapterProfile.REMOTE_COPY),
+        }
+        if (
+            attachment.role is not AttachmentRole.CONSUMER
+            or (
+                attachment.adapter_kind,
+                attachment.adapter_profile,
+            )
+            not in implemented
+        ):
+            raise ValueError("Host consumer attachment has no implemented adapter")
+        slot = (grant.node_worker_id, grant.sub_worker_id)
+        for identity, role in (
+            (attachment.member, ("consumer", *slot)),
+            (grant.provider, ("provider", grant.provider_rank)),
+        ):
+            if (
+                not isinstance(identity.session_instance_id, bytes)
+                or len(identity.session_instance_id) != 8
+                or not any(identity.session_instance_id)
+                or identity.session_instance_id != command.owner_instance_id
+                or not isinstance(identity.registry_epoch, int)
+                or isinstance(identity.registry_epoch, bool)
+                or not 0 <= identity.registry_epoch < 2**64
+                or identity.registry_epoch != epoch
+                or not isinstance(identity.endpoint_id, int)
+                or isinstance(identity.endpoint_id, bool)
+                or not 0 <= identity.endpoint_id < 2**32
+            ):
+                raise ValueError("Host consumer endpoint identity is invalid or belongs to another registry")
+            if identities.setdefault(identity, role) != role:
+                raise ValueError("Host consumer endpoint identity has conflicting roles or slots")
+        if (
+            consumers.setdefault(slot, attachment.member) != attachment.member
+            or providers.setdefault(grant.provider_rank, grant.provider) != grant.provider
+        ):
+            raise ValueError("Host consumer slot or provider rank has conflicting endpoint identities")
+
+
+def _put_host_consumer_attachment(out: bytearray, grant: GlobalDomainHostConsumerAttachment) -> None:
+    out.extend(struct.pack("<iII", grant.node_worker_id, grant.sub_worker_id, grant.provider_rank))
+    _put_string(out, grant.consumer_path, "Host consumer path")
+    for identity in (grant.provider, grant.attachment.member):
+        out.extend(_ENDPOINT_IDENTITY.pack(identity.session_instance_id, identity.registry_epoch, identity.endpoint_id))
+    out.extend(
+        struct.pack(
+            "<III",
+            _attachment_role_id(grant.attachment.role),
+            _adapter_kind_id(grant.attachment.adapter_kind),
+            _adapter_profile_id(grant.attachment.adapter_profile),
+        )
+    )
+
+
+def _read_host_consumer_attachment(reader: _Reader) -> GlobalDomainHostConsumerAttachment:
+    node, sub, rank = reader.i32(), reader.u32(), reader.u32()
+    path = reader.string("Host consumer path")
+    provider, consumer = (
+        EndpointIdentity(*_ENDPOINT_IDENTITY.unpack(reader.fixed(_ENDPOINT_IDENTITY.size, "endpoint identity")))
+        for _ in range(2)
+    )
+    return GlobalDomainHostConsumerAttachment(
+        node,
+        sub,
+        path,
+        rank,
+        provider,
+        MemberAttachmentPlan(
+            consumer,
+            _attachment_role_from_id(reader.u32()),
+            _adapter_kind_from_id(reader.u32()),
+            _adapter_profile_from_id(reader.u32()),
+        ),
+    )
+
+
 def encode_comm_init(command: GlobalCommInitCommand) -> bytes:
     validate_member_table(command.members)
     if not command.cluster_id or not command.topology_hash:
@@ -735,6 +859,7 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
     validate_attachment_table(command.attachments, command.members)
     _validate_host_windows(command)
     _validate_backing_refs(command)
+    _validate_host_consumer_attachments(command)
     if command.phase is not GlobalDomainPhase.PREPARE_EXPORT and command.attachments:
         raise ValueError("global domain attachments are only carried by PREPARE_EXPORT")
     if not 0 < command.domain_id < 2**64 or not 0 < command.generation < 2**64 or not 0 < command.window_size < 2**64:
@@ -808,6 +933,9 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
         out.extend(_HOST_WINDOW.pack(host.node_worker_id, host.spec.numa_id, host.spec.nbytes, host.buffer_id))
     out.extend(struct.pack("<I", len(command.backing_refs)))
     out.extend(encode_domain_buffer_refs(tuple((descriptor, 0, 0) for descriptor in command.backing_refs)))
+    out.extend(struct.pack("<I", len(command.host_consumer_attachments)))
+    for grant in command.host_consumer_attachments:
+        _put_host_consumer_attachment(out, grant)
     return bytes(out)
 
 
@@ -874,6 +1002,10 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
     )
     if any(reference_id or generation for _, reference_id, generation in records):
         raise ValueError("global domain backing references must not contain session locators")
+    host_consumer_count = reader.u32()
+    if host_consumer_count > GLOBAL_DOMAIN_MAX_ATTACHMENTS:
+        raise ValueError("Host consumer attachment count exceeds maximum")
+    host_consumer_attachments = tuple(_read_host_consumer_attachment(reader) for _ in range(host_consumer_count))
     reader.done("ALLOC_DOMAIN")
     command = GlobalDomainCommand(
         phase=phase,
@@ -890,6 +1022,7 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
         retain_after_run=retention == b"\x01",
         host_windows=host_windows,
         backing_refs=tuple(descriptor for descriptor, _, _ in records),
+        host_consumer_attachments=host_consumer_attachments,
     )
     encode_domain_command(command)
     return command

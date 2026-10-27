@@ -167,7 +167,7 @@ def test_release_stage_and_old_wire_are_strict():
         decode_release_command(struct.pack("<QQI", 7, 3, 99))
     encoded = encode_domain_command(_command())
     with pytest.raises(ValueError, match="format"):
-        decode_domain_command(encoded.replace(b"SDC1", b"SDC2"))
+        decode_domain_command(encoded.replace(b"SDC2", b"SDC9"))
     with pytest.raises(ValueError, match="trailing"):
         decode_domain_command(encoded + b"x")
 

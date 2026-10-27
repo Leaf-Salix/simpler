@@ -655,6 +655,36 @@ class Orchestrator:
             raise RuntimeError("domain copy requires a bound Worker")
         self._worker.copy_domain(dst, src, worker=worker, nbytes=nbytes, dst_offset=dst_offset, src_offset=src_offset)
 
+    def call_host(
+        self,
+        callable,
+        buffer: Buffer,
+        *,
+        domain: CommDomainRef,
+        staging_offset: int,
+        staging_nbytes: int,
+        sub_worker: int = 0,
+        worker: int = 0,
+        access: AccessMode = AccessMode.READWRITE,
+        timeout_s: float = 30,
+        request_limit: int = 64,
+    ) -> None:
+        """Synchronously run a Host payload consumer before the first task submission."""
+        if self._worker is None:
+            raise RuntimeError("call_host requires a bound Worker")
+        self._worker.call_host(
+            callable,
+            buffer,
+            domain=domain,
+            staging_offset=staging_offset,
+            staging_nbytes=staging_nbytes,
+            sub_worker=sub_worker,
+            worker=worker,
+            access=access,
+            timeout_s=timeout_s,
+            request_limit=request_limit,
+        )
+
     def copy_to_domain(
         self,
         handle: CommDomainHandle,

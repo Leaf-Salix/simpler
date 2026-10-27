@@ -103,7 +103,7 @@ def _normalize_selector_values(
 
 @dataclass(frozen=True)
 class EndpointPathSegment:
-    level: int
+    level: int | None
     index: int | None = None
 
 
@@ -114,10 +114,14 @@ class ParsedEndpointPath:
 
     @property
     def sort_key(self) -> tuple[tuple[int, int], ...]:
-        return tuple((segment.level, -1 if segment.index is None else segment.index) for segment in self.segments)
+        return tuple(
+            (-1 if segment.level is None else segment.level, -1 if segment.index is None else segment.index)
+            for segment in self.segments
+        )
 
 
 _PATH_SEGMENT_RE = re.compile(r"^L(?P<level>[0-9]+)(?:\[(?P<index>[0-9]+)\])?$")
+_SUB_PATH_SEGMENT_RE = re.compile(r"^SUB\[(?P<index>[0-9]+)\]$")
 
 
 def parse_endpoint_path(path: str, *, root_level: int) -> ParsedEndpointPath:
@@ -128,6 +132,12 @@ def parse_endpoint_path(path: str, *, root_level: int) -> ParsedEndpointPath:
         raise ValueError(f"invalid endpoint path {path!r}: empty segment")
     segments: list[EndpointPathSegment] = []
     for i, raw in enumerate(raw_segments):
+        sub = _SUB_PATH_SEGMENT_RE.fullmatch(raw)
+        if sub is not None:
+            if i == 0 or i != len(raw_segments) - 1:
+                raise ValueError("SUB endpoint must be a terminal child path segment")
+            segments.append(EndpointPathSegment(level=None, index=int(sub.group("index"))))
+            continue
         match = _PATH_SEGMENT_RE.match(raw)
         if match is None:
             raise ValueError(f"invalid endpoint path segment {raw!r} in {path!r}")
@@ -297,6 +307,11 @@ class EndpointRegistry:
         self._by_key = {(record.path, record.deployment): record for record in self._records}
         self._known_paths = {record.path for record in self._records}
         self._parsed_paths = {path: self._parse(path) for path in self._known_paths}
+        if any(
+            self._parsed_paths[record.path].segments[-1].level is None and record.deployment is not HOST_CPU
+            for record in self._records
+        ):
+            raise ValueError("SUB endpoints require HOST_CPU deployment")
         self._by_owner_instance_id = {
             bytes(nonce): self._by_id[endpoint_id] for nonce, endpoint_id in owner_bindings.items()
         }

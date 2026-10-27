@@ -259,6 +259,7 @@ from .global_comm_domain import (
     GlobalDomainCommand,
     GlobalDomainCopyCommand,
     GlobalDomainDescriptor,
+    GlobalDomainHostConsumerAttachment,
     GlobalDomainHostWindow,
     GlobalDomainMember,
     GlobalDomainPhase,
@@ -899,6 +900,8 @@ _CTRL_DEVICE_MEMORY_INFO = 25
 _CTRL_OP_NAMES[_CTRL_DEVICE_MEMORY_INFO] = "device_memory_info"
 # Publish every diagnostic run this chip child has closed. 26 is the delegated
 # region control; 27 mirrors worker_manager.h::CTRL_DFX_FLUSH.
+_CTRL_HOST_ACCESS = 28
+_HOST_ACCESS_HEADER = struct.Struct("<32s16sQQIdI")
 _CTRL_DFX_FLUSH = 27
 _CTRL_OP_NAMES[_CTRL_DFX_FLUSH] = "flush_diagnostics"
 # The native flush wait takes a millisecond count in a C `int`. The wire field
@@ -2931,7 +2934,33 @@ def _sub_worker_loop(
 
     def handle_control(sub_cmd: int) -> tuple[int, str]:
         try:
-            if sub_cmd == _CTRL_IMPORT_RELEASE:
+            if sub_cmd == _CTRL_HOST_ACCESS:
+                from .host_consumer import run_host_call  # noqa: PLC0415
+
+                staged, payload, size = _open_ctrl_payload(buf, what="Host consumer")
+                try:
+                    if size <= _HOST_ACCESS_HEADER.size or size > _HOST_ACCESS_HEADER.size + 104:
+                        raise ValueError("Host consumer control size mismatch")
+                    digest, nonce, nbytes, capacity, access, timeout, limit = _HOST_ACCESS_HEADER.unpack_from(payload)
+                    address = bytes(payload[_HOST_ACCESS_HEADER.size : size]).decode()
+                    cid = identity_table.get(digest)
+                    fn = registry.get(cid) if cid is not None else None
+                    if fn is None:
+                        raise ValueError("Host consumer callable is not registered")
+                    run_host_call(
+                        address,
+                        nonce,
+                        fn,
+                        nbytes=nbytes,
+                        capacity=capacity,
+                        access=AccessMode(access),
+                        timeout_s=timeout,
+                        request_limit=limit,
+                    )
+                finally:
+                    payload.release()
+                    staged.close()
+            elif sub_cmd == _CTRL_IMPORT_RELEASE:
                 import_registry.unregister(_unpack_identity_wire(_read_control_digest(buf)))
             else:
                 _handle_py_callable_control(
@@ -7955,6 +7984,7 @@ class Worker:
                     True,
                 )
             )
+        self._append_host_consumer_topology(entries, path, node_identity, worker._config.get("num_sub_workers", 0))
         if int(worker.level) == 3:
             self._append_device_endpoint_topology(
                 entries,
@@ -7970,6 +8000,7 @@ class Worker:
             remote_path = _format_worker_path(3, parent_path=path, index=int(child_index))
             remote_node_identity = self._node_identity_from_remote_endpoint(spec.endpoint)
             entries.append(_EndpointTopologyEntry(remote_path, HOST_CPU, remote_node_identity))
+            self._append_host_consumer_topology(entries, remote_path, remote_node_identity, spec.num_sub_workers)
             self._append_device_endpoint_topology(entries, remote_path, spec.device_ids, remote_node_identity)
         mpi_groups = {group.group_id: group for group in worker._mpi_l3_groups}
         for child_index in worker._mpi_worker_ids:
@@ -7978,6 +8009,7 @@ class Worker:
             mpi_node_identity = _normalize_node_identity(group.spec.hosts[rank.rank])
             mpi_path = _format_worker_path(3, parent_path=path, index=int(child_index))
             entries.append(_EndpointTopologyEntry(mpi_path, HOST_CPU, mpi_node_identity))
+            self._append_host_consumer_topology(entries, mpi_path, mpi_node_identity, rank.spec.num_sub_workers)
             self._append_device_endpoint_topology(entries, mpi_path, rank.spec.device_ids, mpi_node_identity)
         for spec in worker._mpi_direct_worker_specs:
             session = worker._mpi_direct_session
@@ -7997,9 +8029,22 @@ class Worker:
             mpi_node_identity = _normalize_node_identity(spec.host)
             mpi_path = _format_worker_path(3, parent_path=path, index=int(spec.worker_id))
             entries.append(_EndpointTopologyEntry(mpi_path, HOST_CPU, mpi_node_identity, mpi_session=view))
+            self._append_host_consumer_topology(
+                entries, mpi_path, mpi_node_identity, spec.num_sub_workers, mpi_session=view
+            )
             self._append_device_endpoint_topology(
                 entries, mpi_path, spec.device_ids, mpi_node_identity, mpi_session=view
             )
+
+    @staticmethod
+    def _append_host_consumer_topology(entries, path, node_identity, count, *, mpi_session=None):
+        entries.extend(
+            _EndpointTopologyEntry(
+                f"{path}/SUB[{index}]", HOST_CPU, node_identity,
+                has_buffer_identity_allocator=False, mpi_session=mpi_session,
+            )
+            for index in range(count)
+        )
 
     def _append_device_endpoint_topology(
         self,
@@ -11356,6 +11401,7 @@ class Worker:
             command.members,
             command.buffers,
             command.attachments,
+            command.host_consumer_attachments,
             command.owner_instance_id,
             command.retain_after_run,
             command.host_windows,
@@ -11434,6 +11480,44 @@ class Worker:
                 )
         return tuple(attachments)
 
+    def _global_host_consumer_attachments(self, members, host_nodes, profile, window_size):
+        if self.level != 4:
+            return ()
+        registry = self._get_endpoint_registry()
+        service = self._get_region_access_service()
+        resolver = BackendResolver(
+            registry, service, payload_access=_GlobalDomainRegionAccessService(service, profile=profile)
+        )
+        grants = []
+        for node in host_nodes:
+            prefix = f"L{self.level}/L3[{node}]/SUB["
+            for consumer in registry.records:
+                if not consumer.path.startswith(prefix) or consumer.deployment is not HOST_CPU:
+                    continue
+                slot = int(consumer.path.rsplit("[", 1)[1][:-1])
+                for member in members:
+                    provider = at(
+                        f"L{self.level}/L3[{member.node_worker_id}]/L2[{member.local_worker_id}]", DEVICE_AICORE
+                    )
+                    resolved = registry.resolve_region_spec(
+                        (provider, at(consumer.path, HOST_CPU)), SingleOwner(provider=provider)
+                    )
+                    plan = resolver.plan(resolved, RegionLayoutSpec(payload_bytes=window_size, counter_bytes=0))
+                    if isinstance(plan, UnsupportedRegionPlan):
+                        continue
+                    attachment = next(a for a in plan.payload.attachments if a.role is AttachmentRole.CONSUMER)
+                    grants.append(
+                        GlobalDomainHostConsumerAttachment(
+                            node,
+                            slot,
+                            consumer.path,
+                            member.domain_rank,
+                            plan.topology_plan.provider_endpoint,
+                            attachment,
+                        )
+                    )
+        return tuple(grants)
+
     @staticmethod
     def _global_domain_provenance_id(domain_id: int) -> int:
         # Local CommDomain allocation ids are positive. Keep remote Global
@@ -11463,6 +11547,9 @@ class Worker:
         # PREPARE_EXPORT is where the row is stored for IMPORT and COMMIT to reuse, so a table this
         # node has no row in is rejected here rather than at the first phase that reads one.
         _ = command.attachments_for_node(node_worker_id)
+        for grant in command.host_consumer_attachments:
+            if grant.node_worker_id == node_worker_id and grant.sub_worker_id >= len(self._sub_pids):
+                raise ValueError("Host consumer grant has no configured local process")
         prior = self._global_node_domains.get(command.domain_id)
         if prior is not None:
             if self._global_domain_command_identity(prior.command) != self._global_domain_command_identity(command):
@@ -11564,6 +11651,12 @@ class Worker:
         state = self._global_node_domains.get(command.domain_id)
         if state is None or state.command.generation != command.generation:
             raise RuntimeError("Global CommDomain import requires a matching prepared domain")
+        if (
+            command.host_consumer_attachments
+            and command.host_consumer_attachments != state.command.host_consumer_attachments
+        ):
+            raise RuntimeError("Global CommDomain import Host consumer grants conflict with prepare")
+        command = replace(command, host_consumer_attachments=state.command.host_consumer_attachments)
         if command.attachments:
             if command.attachments != state.command.attachments:
                 raise RuntimeError("Global CommDomain import attachments conflict with prepare")
@@ -11597,7 +11690,7 @@ class Worker:
                 start = member.domain_rank * len(command.buffers)
                 if command.backing_refs[start : start + len(command.buffers)] != expected:
                     raise ValueError("Global CommDomain import changes this node's backing references")
-        import_command = encode_domain_command(replace(command, attachments=()))
+        import_command = encode_domain_command(replace(command, attachments=(), host_consumer_attachments=()))
         request_size = LOCAL_IMPORT_REQUEST.size + len(import_command)
         capacity = max(request_size, LOCAL_IMPORT_REPLY.size)
         try:
@@ -11694,6 +11787,12 @@ class Worker:
         state = self._global_node_domains.get(command.domain_id)
         if state is None or state.command.generation != command.generation:
             raise RuntimeError("Global CommDomain commit requires a matching imported domain")
+        if (
+            command.host_consumer_attachments
+            and command.host_consumer_attachments != state.command.host_consumer_attachments
+        ):
+            raise RuntimeError("Global CommDomain commit Host consumer grants conflict with prepare")
+        command = replace(command, host_consumer_attachments=state.command.host_consumer_attachments)
         if command.attachments:
             if command.attachments != state.command.attachments:
                 raise RuntimeError("Global CommDomain commit attachments conflict with prepare")
@@ -11850,19 +11949,23 @@ class Worker:
         ):
             self._require_region_control_before_submit("Host domain access")
             state = self._domain_state(ref)
-            if state.host_owner is None:
-                raise RuntimeError("this node has no Host DRAM owner")
-            host = next(h for h in state.command.host_windows if h.node_worker_id == state.node_worker_id)
-            RegionPartSpan(0, host.spec.nbytes).validate_range(offset, nbytes, "Host domain access")
-            if state.command.profile == "sim":
-                view = state.host_owner.buf
-                assert view is not None
-                owner_ptr = ctypes.addressof(ctypes.c_char.from_buffer(view, offset))
-                ctypes.memmove(owner_ptr if writing else pointer, pointer if writing else owner_ptr, nbytes)
-            elif writing:
-                state.host_owner.write_bytes(offset, pointer, nbytes)
-            else:
-                state.host_owner.read_bytes(offset, pointer, nbytes)
+            self._host_domain_bytes_locked(state, offset, pointer, nbytes, writing=writing)
+
+    @staticmethod
+    def _host_domain_bytes_locked(state, offset, pointer, nbytes, *, writing):
+        if state.host_owner is None:
+            raise RuntimeError("this node has no Host DRAM owner")
+        host = next(h for h in state.command.host_windows if h.node_worker_id == state.node_worker_id)
+        RegionPartSpan(0, host.spec.nbytes).validate_range(offset, nbytes, "Host domain access")
+        if state.command.profile == "sim":
+            view = state.host_owner.buf
+            assert view is not None
+            owner_ptr = ctypes.addressof(ctypes.c_char.from_buffer(view, offset))
+            ctypes.memmove(owner_ptr if writing else pointer, pointer if writing else owner_ptr, nbytes)
+        elif writing:
+            state.host_owner.write_bytes(offset, pointer, nbytes)
+        else:
+            state.host_owner.read_bytes(offset, pointer, nbytes)
 
     @staticmethod
     def _validate_domain_host_attachments(state, attachments):
@@ -11936,33 +12039,191 @@ class Worker:
             )
             if state is None or worker not in state.contexts:
                 raise ValueError("copy_domain requires Buffers from one participating live Host domain")
-            command = state.command
-            domain_id, generation = command.domain_id, command.generation
             with self._child_prov_worker_lock(worker), self._child_prov_lock:
-                self._domain_state(CommDomainRef(command.owner_instance_id, command.domain_id, command.generation))
-                grants = _domain_buffer_slots(command)
-                for context in state.contexts.values():
-                    for buffer in context.buffers.values():
-                        _, slot, offset = grants[buffer.identity]
-                        grants[buffer.identity] = (buffer.to_descriptor(), slot, offset)
-                _domain_copy_ranges(grants, descriptors, (dst_offset, src_offset), nbytes)
-                self._require_domain_host_attachment(state, grants, descriptors)
-                payload = LOCAL_POOL_COPY.pack(
-                    LOCAL_DOMAIN_MAGIC, GLOBAL_DOMAIN_VERSION, domain_id, generation, dst_offset, src_offset, nbytes
+                self._copy_domain_locked(state, descriptors, worker, dst_offset, src_offset, nbytes)
+
+    def _copy_domain_locked(self, state, descriptors, worker, dst_offset, src_offset, nbytes, *, timeout_s=None):
+        assert self._worker is not None
+        command = state.command
+        domain_id, generation = command.domain_id, command.generation
+        self._domain_state(CommDomainRef(command.owner_instance_id, domain_id, generation))
+        grants = _domain_buffer_slots(command)
+        for context in state.contexts.values():
+            for buffer in context.buffers.values():
+                _, slot, offset = grants[buffer.identity]
+                grants[buffer.identity] = (buffer.to_descriptor(), slot, offset)
+        _domain_copy_ranges(grants, descriptors, (dst_offset, src_offset), nbytes)
+        self._require_domain_host_attachment(state, grants, descriptors)
+        payload = LOCAL_POOL_COPY.pack(
+            LOCAL_DOMAIN_MAGIC, GLOBAL_DOMAIN_VERSION, domain_id, generation, dst_offset, src_offset, nbytes
+        )
+        payload += b"".join(_pack_identity_wire(d.identity) for d in descriptors)
+        try:
+            self._worker.control_payload(
+                WorkerType.NEXT_LEVEL,
+                worker,
+                CTRL_GLOBAL_DOMAIN_POOL_COPY,
+                bytearray(payload),
+                self._py_control_timeout_s if timeout_s is None else timeout_s,
+            )
+        except BaseException as exc:
+            state.phase = GlobalDomainPhase.ABORT
+            self._record_unreclaimable("Host domain copy completion is unconfirmed", exc, keep_transport=True)
+            raise
+
+    def call_host(
+        self,
+        callable,
+        buffer: Buffer,
+        *,
+        domain: CommDomainRef,
+        staging_offset: int,
+        staging_nbytes: int,
+        sub_worker: int = 0,
+        worker: int = 0,
+        access: AccessMode = AccessMode.READWRITE,
+        timeout_s: float = 30,
+        request_limit: int = 64,
+    ) -> None:
+        """Run a Host consumer synchronously before this callback's first submission.
+
+        The callable receives a copy-backed PayloadPart valid only for this call.
+        The supplied Host pool range is exclusive scratch storage for its requests.
+        """
+        from .host_consumer import HostCallUnsettledError, serve_host_call  # noqa: PLC0415
+
+        sub_worker, worker, staging_offset, staging_nbytes, request_limit = map(
+            operator.index, (sub_worker, worker, staging_offset, staging_nbytes, request_limit)
+        )
+        access = AccessMode(access)
+        if self.level != 3 or self._worker is None or _callback_frame_for(self) is None:
+            raise RuntimeError("call_host requires an owning L3 orchestration callback")
+        native_worker = self._worker
+        if not 0 <= sub_worker < len(self._sub_pids) or staging_nbytes <= 0 or request_limit <= 0:
+            raise ValueError("call_host requires a live SUB and positive staging/request capacity")
+        if not 0 < timeout_s < float("inf"):
+            raise ValueError("call_host timeout must be finite and positive")
+        with self._operation_lease("call_host", allow_continuation=True), self._control_admission("call_host"):
+            self._require_region_control_before_submit("call_host")
+            descriptor = buffer.to_descriptor()
+            with self._child_prov_worker_lock(worker), self._child_prov_lock:
+                state = self._domain_state(domain)
+                if worker not in state.contexts:
+                    raise ValueError("Host consumer requires an imported local chip")
+                grants = _domain_buffer_slots(state.command)
+                target = grants.get(descriptor.identity)
+                if target is None or target[0] != descriptor or target[1] >= len(state.command.members):
+                    raise ValueError("Host consumer requires an exact domain HBM Buffer grant")
+                if access not in (AccessMode.READ, AccessMode.WRITE, AccessMode.READWRITE) or (
+                    descriptor.access not in (AccessMode.READWRITE, access)
+                ):
+                    raise ValueError("Host consumer access exceeds its Buffer grant")
+                grant = next(
+                    (
+                        g
+                        for g in state.command.host_consumer_attachments
+                        if g.node_worker_id == state.node_worker_id
+                        and g.sub_worker_id == sub_worker
+                        and g.provider_rank == target[1]
+                    ),
+                    None,
                 )
-                payload += b"".join(_pack_identity_wire(d.identity) for d in descriptors)
-                try:
-                    self._worker.control_payload(
-                        WorkerType.NEXT_LEVEL,
-                        worker,
-                        CTRL_GLOBAL_DOMAIN_POOL_COPY,
-                        bytearray(payload),
-                        self._py_control_timeout_s,
+                if grant is None or grant.attachment.adapter_kind is None:
+                    raise ValueError("Host consumer has no materialized endpoint attachment")
+                self._validate_domain_host_attachments(state, state.command.attachments_for_node(state.node_worker_id))
+                host = state.host_buffers[state.node_worker_id]
+                RegionPartSpan(0, host.nbytes).validate_range(staging_offset, staging_nbytes, "Host staging")
+            created = not isinstance(callable, CallableHandle)
+            if created and isinstance(callable, (ChipCallable, RemoteCallable)):
+                raise TypeError("call_host requires a Python callable or a local Python handle")
+            handle = self.register(callable) if created else callable
+            registered = self._resolve_handle(handle, expected_namespace="LOCAL_PYTHON")
+            control_confirmed = True
+            primary_error = None
+            deadline = _monotonic() + float(timeout_s)
+
+            def control(address, nonce):
+                nonlocal control_confirmed
+                payload = (
+                    _HOST_ACCESS_HEADER.pack(
+                        registered.digest,
+                        nonce,
+                        descriptor.nbytes,
+                        staging_nbytes,
+                        int(access),
+                        float(timeout_s),
+                        request_limit,
                     )
-                except BaseException as exc:
-                    state.phase = GlobalDomainPhase.ABORT
-                    self._record_unreclaimable("Host domain copy completion is unconfirmed", exc, keep_transport=True)
+                    + address.encode()
+                )
+                control_confirmed = False
+                try:
+                    native_worker.control_payload(
+                        WorkerType.SUB, sub_worker, _CTRL_HOST_ACCESS, bytearray(payload), float(timeout_s)
+                    )
+                except RuntimeError as exc:
+                    # The endpoint resets IDLE only after a child acknowledged its error.
+                    control_confirmed = str(exc).startswith("control_generic failed on child:")
                     raise
+                else:
+                    control_confirmed = True
+
+            def transfer(writing, offset, data):
+                with self._child_prov_worker_lock(worker), self._child_prov_lock:
+                    current = self._domain_state(domain)
+                    if current is not state or grant not in current.command.host_consumer_attachments:
+                        raise ValueError("Host consumer attachment is no longer live")
+                    nbytes = len(data) if writing else int(data)
+                    RegionPartSpan(0, descriptor.nbytes).validate_range(offset, nbytes, "Host consumer")
+                    if (
+                        nbytes > staging_nbytes
+                        or (writing and access == AccessMode.READ)
+                        or (not writing and access == AccessMode.WRITE)
+                    ):
+                        raise ValueError("Host consumer request exceeds its access grant")
+                    remaining = deadline - _monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Host consumer request deadline expired")
+                    storage = ctypes.create_string_buffer(data if writing else nbytes)
+                    pointer = ctypes.addressof(storage)
+                    pair = [descriptor, host.to_descriptor()] if writing else [host.to_descriptor(), descriptor]
+                    offsets = (offset, staging_offset) if writing else (staging_offset, offset)
+                    if writing:
+                        self._host_domain_bytes_locked(state, staging_offset, pointer, nbytes, writing=True)
+                    self._copy_domain_locked(state, pair, worker, *offsets, nbytes, timeout_s=remaining)
+                    if not writing:
+                        self._host_domain_bytes_locked(state, staging_offset, pointer, nbytes, writing=False)
+                    return b"" if writing else storage.raw[:nbytes]
+
+            try:
+                serve_host_call(
+                    control,
+                    transfer,
+                    nbytes=descriptor.nbytes,
+                    capacity=staging_nbytes,
+                    access=access,
+                    timeout_s=timeout_s,
+                    request_limit=request_limit,
+                    expected_pid=self._sub_pids[sub_worker],
+                )
+            except BaseException as exc:
+                primary_error = exc
+                if isinstance(exc, HostCallUnsettledError) or not control_confirmed:
+                    control_confirmed = False
+                    self._record_unreclaimable(
+                        "Host consumer control completion is unconfirmed", exc, keep_transport=True
+                    )
+                raise
+            finally:
+                if created and control_confirmed:
+                    try:
+                        self.unregister(handle)
+                    except BaseException as cleanup:
+                        if primary_error is None:
+                            raise
+                        self._record_unreclaimable(
+                            "Host consumer callable cleanup failed", cleanup, keep_transport=True
+                        )
 
     def _copy_global_domain_node(self, command: GlobalDomainCopyCommand, *, copy_to_device: bool) -> bytes:
         state = self._global_node_domains.get(command.domain_id)
@@ -12317,6 +12578,9 @@ class Worker:
             members=domain_members_tuple,
             buffers=global_buffers,
             attachments=attachment_matrix,
+            host_consumer_attachments=self._global_host_consumer_attachments(
+                domain_members_tuple, tuple(node for node, _ in host_windows), profile, int(window_size)
+            ),
             owner_instance_id=self._owner_instance_id,
             retain_after_run=bool(retain_after_run),
             host_windows=tuple(
