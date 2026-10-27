@@ -11892,7 +11892,7 @@ class Worker:
             ):
                 raise RuntimeError("Host attachment has no implemented domain copy backend")
 
-    def _require_domain_host_attachment(self, state, grants, descriptors, worker):
+    def _require_domain_host_attachment(self, state, grants, descriptors):
         local = _host_domain_buffers(state.command)[state.node_worker_id]
         if local.identity not in {descriptor.identity for descriptor in descriptors}:
             return
@@ -11911,14 +11911,6 @@ class Worker:
         ):
             raise RuntimeError("Host copy requires a materialized domain attachment")
         self._validate_domain_host_attachments(state, row)
-        context = state.contexts[worker]
-        if not any(
-            m.node_worker_id == state.node_worker_id
-            and m.local_worker_id == worker
-            and m.domain_rank == context.domain_rank
-            for m in state.command.members
-        ):
-            raise RuntimeError("Host copy chip is not an imported local domain member")
         if any(row[rank].adapter_kind is None for rank in ranks):
             raise RuntimeError("Host copy attachment has no implemented adapter")
 
@@ -11954,7 +11946,7 @@ class Worker:
                         _, slot, offset = grants[buffer.identity]
                         grants[buffer.identity] = (buffer.to_descriptor(), slot, offset)
                 _domain_copy_ranges(grants, descriptors, (dst_offset, src_offset), nbytes)
-                self._require_domain_host_attachment(state, grants, descriptors, worker)
+                self._require_domain_host_attachment(state, grants, descriptors)
                 payload = LOCAL_POOL_COPY.pack(
                     LOCAL_DOMAIN_MAGIC, GLOBAL_DOMAIN_VERSION, domain_id, generation, dst_offset, src_offset, nbytes
                 )

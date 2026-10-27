@@ -23,6 +23,8 @@ from simpler.global_comm_domain import (
     GlobalDomainHostWindow,
     GlobalDomainMember,
     GlobalDomainPhase,
+    GlobalDomainReleaseCommand,
+    GlobalDomainReleaseStage,
     decode_domain_command,
     encode_domain_command,
 )
@@ -158,8 +160,8 @@ def test_scoped_payload_service_refuses_other_endpoint_relations(wrong):
 
 
 @pytest.fixture
-def imported(planner):
-    worker = wm.Worker(level=3, device_ids=(0,), num_sub_workers=0)
+def imported(planner, request):
+    worker = wm.Worker(level=3, device_ids=getattr(request, "param", (0,)), num_sub_workers=0)
     worker._lifecycle = wm._Lifecycle.READY
     identity = worker._burn_buffer_identity()
     command = GlobalDomainCommand(
@@ -372,3 +374,84 @@ def test_unknown_copy_completion_revokes_attachment_and_blocks_retry(imported, m
     with pytest.raises(RuntimeError, match="cleanup failed"):
         worker.copy_domain(peer, local, worker=0, nbytes=16)
     assert calls == [wm.CTRL_GLOBAL_DOMAIN_IMPORT, wm.CTRL_GLOBAL_DOMAIN_POOL_COPY]
+
+
+def test_planner_refusal_survives_import_and_commit_without_native_copy(imported, planner):
+    worker, state, command, calls, pools = imported
+    planner._region_access_service = ce.StaticRegionAccessService({})
+    command = replace(command, attachments=_matrix(planner))
+    assert command.attachments_for_node(0)[1].adapter_kind is None
+    state.command = replace(state.command, attachments=command.attachments)
+    _commit((worker, state, command, calls, pools))
+    assert state.view.attachments == command.attachments_for_node(0)
+    before = {identity: bytes(data) for identity, data in pools.items()}
+    with pytest.raises(RuntimeError, match="no implemented adapter"):
+        worker.copy_domain(buffer_reference(command.backing_refs[1]), state.host_buffers[0], worker=0, nbytes=16)
+    assert calls == [wm.CTRL_GLOBAL_DOMAIN_IMPORT]
+    assert {identity: bytes(data) for identity, data in pools.items()} == before
+
+
+@pytest.mark.parametrize("imported", [(0, 1)], indirect=True)
+def test_partial_two_chip_import_retains_owners_until_all_views_release(imported, monkeypatch):
+    worker, state, command, events, _ = imported
+    identity = worker._burn_buffer_identity()
+    command = replace(
+        command,
+        members=(command.members[0], GlobalDomainMember(0, 1, 1, 1)),
+        attachments=command.attachments_for_node(0),
+        host_windows=command.host_windows[:1],
+        descriptors=command.descriptors[:3],
+        backing_refs=(command.backing_refs[0], wm._domain_backing_descriptor(identity, 64)),
+    )
+    state.command = replace(command, phase=GlobalDomainPhase.PREPARE_EXPORT, descriptors=(), backing_refs=())
+    state.prepared_domain_ranks.add(1)
+    state.descriptors[1] = command.descriptors[1]
+    state.local_window_bases[1] = 8192
+    state.mapping_sizes[1] = 4096
+    state.backing_ids[1] = (identity,)
+    owner = SimpleNamespace(close=lambda: events.append("host-close"), unlink=lambda: events.append("host-unlink"))
+    state.host_owner = owner
+
+    def control(_kind, chip, operation, payload, _timeout):
+        if operation == wm.CTRL_GLOBAL_DOMAIN_IMPORT:
+            events.append(("import", chip))
+            if chip == 1:
+                raise RuntimeError("second chip import failed")
+            return wm.LOCAL_IMPORT_REPLY.pack(wm.LOCAL_DOMAIN_MAGIC, GLOBAL_DOMAIN_VERSION, 7, 3, 123, 4096, 4096)
+        assert operation == wm.CTRL_GLOBAL_DOMAIN_RELEASE
+        stage = GlobalDomainReleaseStage(wm.LOCAL_RELEASE_REQUEST.unpack(payload)[-1])
+        events.append((stage, chip))
+        assert state.host_owner is owner
+        return b""
+
+    monkeypatch.setattr(worker._worker, "control_payload", control)
+    with pytest.raises(RuntimeError, match="second chip import failed"):
+        worker._import_global_domain_node(command, 0)
+    assert set(state.contexts) == {0} and state.view is None
+    imported_identity = state.contexts[0].buffers["payload"].identity
+    assert imported_identity in worker._child_alloc
+    assert state.host_owner is owner and worker._global_node_domains[7] is state
+    assert state.phase is GlobalDomainPhase.PREPARE_EXPORT
+    with pytest.raises(RuntimeError, match="IMPORT completion"):
+        worker._commit_global_domain_node(replace(command, phase=GlobalDomainPhase.COMMIT))
+    views = GlobalDomainReleaseCommand(7, 3, GlobalDomainReleaseStage.VIEWS)
+    owners = replace(views, stage=GlobalDomainReleaseStage.OWNERS)
+    with pytest.raises(RuntimeError, match="all local views released"):
+        worker._release_global_domain_node(owners)
+    assert events == [("import", 0), ("import", 1)]
+    worker._release_global_domain_node(views)
+    assert state.views_released and state.host_owner is owner
+    assert imported_identity not in worker._child_alloc
+    assert worker._global_node_domains[7] is state
+    worker._release_global_domain_node(owners)
+    assert state.host_owner is None and 7 not in worker._global_node_domains
+    assert events == [
+        ("import", 0),
+        ("import", 1),
+        (GlobalDomainReleaseStage.VIEWS, 0),
+        (GlobalDomainReleaseStage.VIEWS, 1),
+        (GlobalDomainReleaseStage.OWNERS, 0),
+        (GlobalDomainReleaseStage.OWNERS, 1),
+        "host-close",
+        "host-unlink",
+    ]
