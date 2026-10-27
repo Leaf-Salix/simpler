@@ -94,7 +94,7 @@ inline bool graph_span_fits(uint64_t offset, uint64_t size, uint64_t capacity) n
     return offset <= capacity && size <= capacity - offset;
 }
 
-// The only excluded bytes are the runtime-patched address and this checksum.
+// The only excluded bytes are the reserved-zero address field and this checksum.
 // The envelope, binding, identity, region descriptors and padding are covered.
 inline uint64_t graph_packet_checksum(const void *packet, size_t size) noexcept {
     constexpr size_t skip = sizeof(SimplerKernelInvocationHeader) + offsetof(GraphPacketHeader, inline_payload_addr);
