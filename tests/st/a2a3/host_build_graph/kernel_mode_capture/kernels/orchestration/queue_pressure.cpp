@@ -9,6 +9,8 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <vector>
+
 #include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 extern "C" void queue_pressure(const ChipTaskArgs &args) {
@@ -16,7 +18,7 @@ extern "C" void queue_pressure(const ChipTaskArgs &args) {
     const uint32_t blocks = args.scalar<uint32_t>(2);
     const bool dependencies = args.scalar<uint32_t>(3) != 0;
     rt_scope_begin(ScopeMode::MANUAL);
-    TaskId tasks[128];
+    std::vector<TaskId> tasks(count);
     for (uint32_t i = 0; i < count; ++i) {
         CoreTaskArgsWithDeps<128> task;
         task.add_output(args.tensor(0).ref());

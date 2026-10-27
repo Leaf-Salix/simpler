@@ -3701,13 +3701,13 @@ protected:
 
     static std::vector<uint8_t> image(int children, uint8_t code_byte) {
         const int32_t ids[] = {3, 8};
-        std::vector<uint8_t> child_images[2];
+        std::vector<std::vector<uint8_t>> child_images(children);
         for (int i = 0; i < children; ++i) {
             child_images[i] = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, &code_byte, 1);
             reinterpret_cast<CoreCallable *>(child_images[i].data())->resolved_addr_ = 0x1000 + code_byte + i;
         }
         return make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
-            nullptr, 0, "orch", &code_byte, 1, ids, child_images, children, ""
+            nullptr, 0, "orch", &code_byte, 1, ids, child_images.data(), children, ""
         );
     }
 
