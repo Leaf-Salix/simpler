@@ -61,6 +61,32 @@ def _matrix(root, *, profile="sim", host_nodes=(0, 1), members=None):
     )
 
 
+def test_host_attachment_rejects_registry_changed_during_planning(planner, monkeypatch):
+    original = wm.BackendResolver.plan
+
+    def retire_registry(resolver, *args):
+        result = original(resolver, *args)
+        planner._invalidate_endpoint_registry()
+        return result
+
+    monkeypatch.setattr(wm.BackendResolver, "plan", retire_registry)
+    with pytest.raises(ce.EndpointResolveError, match="stale endpoint registry"):
+        _matrix(planner)
+
+
+def test_host_consumer_grant_rejects_stale_registry(planner, monkeypatch):
+    planner._remote_worker_specs[0] = replace(planner._remote_worker_specs[0], num_sub_workers=1)
+    registry = planner._get_endpoint_registry()
+    planner._invalidate_endpoint_registry()
+    monkeypatch.setattr(planner, "_get_endpoint_registry", lambda: registry)
+    command = SimpleNamespace(
+        host_windows=(SimpleNamespace(node_worker_id=0),),
+        attachments_for_node=lambda _node: (SimpleNamespace(adapter_kind=ce.AdapterKind.EXPLICIT_TRANSFER),),
+    )
+    with pytest.raises(ce.EndpointResolveError, match="stale endpoint registry"):
+        planner._global_host_consumer_attachments(command)
+
+
 @pytest.mark.parametrize("profile", ["sim", "a3-fabric-v1"])
 def test_cross_node_host_attachment_is_scoped_and_wire_stable(planner, profile):
     ordinary = _matrix(planner, host_nodes=())

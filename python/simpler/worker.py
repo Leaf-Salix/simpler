@@ -8081,8 +8081,11 @@ class Worker:
     def _append_host_consumer_topology(entries, path, node_identity, count, *, mpi_session=None):
         entries.extend(
             _EndpointTopologyEntry(
-                f"{path}/SUB[{index}]", HOST_CPU, node_identity,
-                has_buffer_identity_allocator=False, mpi_session=mpi_session,
+                f"{path}/SUB[{index}]",
+                HOST_CPU,
+                node_identity,
+                has_buffer_identity_allocator=False,
+                mpi_session=mpi_session,
             )
             for index in range(count)
         )
@@ -8227,9 +8230,7 @@ class Worker:
         self._validate_endpoint_registry(registry, resolved.members)
         plan = BackendResolver(registry, self._get_region_access_service()).plan(resolved, layout)
         self._validate_endpoint_registry(registry, resolved.members)
-        return validate_executable_region_plan(
-            MaterializationContext(worker=self, registry=registry, plan=plan, layout=layout)
-        )
+        return plan
 
     def _get_region_access_service(self) -> RegionAccessService:
         service = self._region_access_service
@@ -8250,7 +8251,10 @@ class Worker:
         with self._operation_lease("_plan_region"):
             registry = self._get_endpoint_registry()
             resolved = registry.resolve_region_spec(members, topology)
-            return self._plan_current_region(registry, resolved, layout_summary)
+            plan = self._plan_current_region(registry, resolved, layout_summary)
+            return validate_executable_region_plan(
+                MaterializationContext(worker=self, registry=registry, plan=plan, layout=layout_summary)
+            )
 
     def _materialize_region_instance(
         self, members, topology: SingleOwner, layout_summary: RegionLayoutSpec
@@ -11516,10 +11520,12 @@ class Worker:
                     (provider_selector, consumer_selector),
                     SingleOwner(provider=provider_selector),
                 )
+                self._validate_endpoint_registry(registry, resolved.members)
                 plan = resolver.plan(
                     resolved,
                     RegionLayoutSpec(payload_bytes=int(window_size), counter_bytes=0),
                 )
+                self._validate_endpoint_registry(registry, resolved.members)
                 adapter_kind: AdapterKind | None = None
                 adapter_profile: AdapterProfile | None = None
                 if not isinstance(plan, UnsupportedRegionPlan):
@@ -11553,6 +11559,7 @@ class Worker:
             for consumer in registry.records:
                 if not consumer.path.startswith(prefix) or consumer.deployment is not HOST_CPU:
                     continue
+                self._validate_endpoint_registry(registry, (consumer,))
                 slot = int(consumer.path.rsplit("[", 1)[1][:-1])
                 # SUB and its L3 Host have the same deployment and node scope.
                 ranks = tuple(rank for rank, adapter in enumerate(row) if adapter.adapter_kind is not None)

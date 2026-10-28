@@ -25,9 +25,11 @@ from test_mpi_direct import _topology_dict
 
 
 @pytest.fixture
-def session():
+def session(request):
     worker = worker_mod.Worker(level=4)
-    topology = MpiDirectTopology.from_dict(_topology_dict())
+    config = _topology_dict()
+    config["executor_ranks"][0]["num_sub_workers"] = getattr(request, "param", 0)
+    topology = MpiDirectTopology.from_dict(config)
     hub = _MpiDirectTransportHub(topology.max_pending_frame_bytes)
     session_id = (1 << 64) - 1
     for spec in topology.executors:
@@ -170,3 +172,20 @@ def test_attach_failure_retires_unpublished_session(session):
     with pytest.raises(RuntimeError, match="attach failed"):
         worker._activate_mpi_direct_workers(time.monotonic() + 5)
     assert state.retired and not state.active and state.session_epoch == 2
+
+
+@pytest.mark.parametrize("session", [1], indirect=True)
+@pytest.mark.parametrize("change", ["epoch", "unavailable"])
+def test_sub_endpoint_inherits_and_validates_mpi_session(session, change):
+    worker, _hub = session
+    registry = worker._get_endpoint_registry()
+    host, sub = registry.resolve_members([ce.at("L4/L3[0]", ce.HOST_CPU), ce.at("L4/L3[0]/SUB[0]", ce.HOST_CPU)])
+    assert registry.mpi_session_for_endpoint(sub) == registry.mpi_session_for_endpoint(host)
+    worker._validate_endpoint_registry(registry, (sub,))
+    state = worker._mpi_direct_session
+    if change == "epoch":
+        state.session_epoch += 1
+    else:
+        state.hub = cast(Any, Mock(session_snapshot=lambda: (False, "", [0])))
+    with pytest.raises(ce.EndpointResolveError):
+        worker._validate_endpoint_registry(registry, (sub,))
