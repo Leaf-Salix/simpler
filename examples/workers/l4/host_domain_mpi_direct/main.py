@@ -336,7 +336,19 @@ def run_matrix(worker, nodes, kernel, route):
             saved[0].release()
 
 
-def run(*, local_host, remote_host, python_executable, local_devices, remote_devices, mpirun_path, launcher_family):
+def run(
+    *,
+    local_host,
+    remote_host,
+    python_executable,
+    local_devices,
+    remote_devices,
+    mpirun_path,
+    launcher_family,
+    coexistence=False,
+):
+    if coexistence and (remote_host is None or remote_host == local_host):
+        raise ValueError("--coexistence requires two distinct hosts")
     pairs = [(local_host, local_devices)]
     if remote_host is not None:
         pairs.append((remote_host, remote_devices))
@@ -371,7 +383,7 @@ def run(*, local_host, remote_host, python_executable, local_devices, remote_dev
         path.write_text(json.dumps(topology), encoding="utf-8")
         return run_supervisor(
             str(path),
-            MODULE + ":controller",
+            MODULE.rsplit(".", 1)[0] + ".coexistence:controller" if coexistence else MODULE + ":controller",
             python_executable=python_executable,
             mpirun_path=mpirun_path,
             launcher_family=launcher_family,
@@ -380,6 +392,7 @@ def run(*, local_host, remote_host, python_executable, local_devices, remote_dev
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--coexistence", action="store_true", help="verify Host and pure NPU domains on two hosts")
     parser.add_argument("--local-host", required=True, help="numeric IP of controller and first executor")
     parser.add_argument("--remote-host", help="numeric IP of second executor; omit for one-node control")
     parser.add_argument("--python", dest="python_executable", required=True)
