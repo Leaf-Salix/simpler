@@ -44,7 +44,7 @@ CTRL_REGION_PEER = 29
 # session, transaction, resource, owner device, target device, operation
 _PEER_HEADER = struct.Struct("<8sQQIII")
 _PEER_BASES = struct.Struct("<QQ")
-_PEER_IMPORT, _PEER_CLOSE, _PEER_ENABLE = range(3)
+_PEER_IMPORT, _PEER_CLOSE, _PEER_ENABLE, _PEER_CONFIRM = range(4)
 _DESCRIPTOR_BYTES = 88
 
 
@@ -132,8 +132,8 @@ class PeerRegionImports:
             raise ValueError("invalid Region peer target or allocation identity")
         if any(_PEER_BASES.unpack_from(frame, len(frame) - _PEER_BASES.size)):
             raise ValueError("Region peer request must not contain local addresses")
-        if operation == _PEER_ENABLE:
-            self._enable(owner)
+        if operation in (_PEER_ENABLE, _PEER_CONFIRM):
+            self._enable(owner, wait=operation == _PEER_CONFIRM)
             return
         key = session, transaction
         request = bytes(frame[_PEER_HEADER.size : -_PEER_BASES.size])
@@ -185,9 +185,9 @@ class PeerRegionImports:
                 raise
         _PEER_BASES.pack_into(frame, len(frame) - _PEER_BASES.size, record.binding[2], record.binding[4])
 
-    def _enable(self, owner):
+    def _enable(self, owner, *, wait=True):
         if not self.platform.endswith("sim"):
-            _region_enable_peer_access(self.device_id, owner)
+            _region_enable_peer_access(self.device_id, owner, wait)
 
     def validates(self, binding):
         return any(
@@ -233,7 +233,7 @@ class PeerRegionLease:
     def exchange(self, operation):
         session, transaction, resource, owner, target = self.header
         worker_id = self.consumer_worker_id
-        if operation == _PEER_ENABLE:
+        if operation in (_PEER_ENABLE, _PEER_CONFIRM):
             owner, target = target, owner
             worker_id = self.owner_worker_id
         frame = bytearray(_PEER_HEADER.pack(session, transaction, resource, owner, target, operation))
@@ -251,6 +251,7 @@ class PeerRegionLease:
     def import_views(self):
         self.exchange(_PEER_ENABLE)
         bases = self.exchange(_PEER_IMPORT)
+        self.exchange(_PEER_CONFIRM)
         if any(base <= 0 for base in bases):
             raise RuntimeError("Region peer import returned no local mapping")
         return (

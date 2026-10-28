@@ -252,6 +252,56 @@ def test_peer_lease_rejects_changed_reply_identity(in_place):
         lease.import_views()
 
 
+@pytest.mark.parametrize("fail_confirm", [False, True])
+def test_peer_both_directions_enabled_before_confirmation(imports, monkeypatch, fail_confirm):
+    consumer, leases = imports
+    consumer.platform = "a2a3"
+    owner = peer.PeerRegionImports(0, "a2a3", "owner-test")
+    enabled = set()
+    confirmed = set()
+
+    def enable(device, other, wait=True):
+        enabled.add(device)
+        if wait:
+            if other not in enabled:
+                raise RuntimeError("peer access remained unconfirmed")
+            if fail_confirm and device == 0:
+                raise RuntimeError("owner confirmation failed")
+            confirmed.add(device)
+
+    monkeypatch.setattr(peer, "_region_enable_peer_access", enable)
+
+    def control(_kind, worker_id, _command, frame, _timeout):
+        (owner if worker_id == 0 else consumer).handle(frame)
+        return frame
+
+    worker = SimpleNamespace(
+        _provider_import_device_id=lambda worker_id: worker_id,
+        _worker=SimpleNamespace(control_payload=control),
+        _py_control_timeout_s=1.0,
+    )
+    instance = SimpleNamespace(_allocation_identity=(b"session1", 3), provider_resource_id=7, worker_id=0)
+    frame = _frame()
+    raw = frame[peer._PEER_HEADER.size : -peer._PEER_BASES.size]
+    descriptor = RegionExportDescriptor(
+        peer._decode_buffer_descriptor_wire(bytes(raw[: peer._DESCRIPTOR_BYTES])),
+        peer._decode_buffer_descriptor_wire(bytes(raw[peer._DESCRIPTOR_BYTES :])),
+    )
+    lease = peer.PeerRegionLease(worker, instance, descriptor, 1, 0)
+    try:
+        if fail_confirm:
+            with pytest.raises(RuntimeError, match="owner confirmation failed"):
+                lease.import_views()
+        else:
+            assert len(lease.import_views()) == 2
+            assert confirmed == {0, 1}
+    finally:
+        lease.close()
+    assert len(leases) == 2
+    assert all(mapping.close_count == 1 for mapping in leases)
+    assert not consumer.holds_resources
+
+
 def test_region_binding_prefix_is_exact_and_requires_complete_descriptor():
     args = TaskArgs()
     args.add_scalar(17)

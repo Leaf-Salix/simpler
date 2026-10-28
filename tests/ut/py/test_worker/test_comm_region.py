@@ -3048,6 +3048,7 @@ def test_device_peer_uses_consumer_spans_and_closes_views_before_provider(region
     assert [call for call in calls if call[0] == "peer_control"] == [
         ("peer_control", 1, peer._PEER_ENABLE),
         ("peer_control", 0, peer._PEER_IMPORT),
+        ("peer_control", 1, peer._PEER_CONFIRM),
         ("peer_control", 0, peer._PEER_CLOSE),
     ]
     assert calls[-3:] == [("mapping_close", 0x5000), ("mapping_close", 0x6000), ("release", 1, 42)]

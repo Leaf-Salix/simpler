@@ -318,7 +318,7 @@ public:
         acl_check(export_handle(handle, 1, 2, token), "aclrtMemExportToShareableHandleV2");
     }
 
-    void enable_peer_access_with_check(int device_id, int peer_device_id) const {
+    void enable_peer_access_with_check(int device_id, int peer_device_id, bool wait) const {
         if (device_id < 0 || peer_device_id < 0 || device_id == peer_device_id) {
             throw std::invalid_argument("Region peer access requires distinct nonnegative device ids");
         }
@@ -331,6 +331,10 @@ public:
         acl_check(status(device_id, peer_device_id, &enabled), "aclrtDevicePeerAccessStatus");
         if (enabled == 1) return;
         int enable_rc = enable(peer_device_id, 0);
+        if (!wait) {
+            acl_check(enable_rc, "aclrtDeviceEnablePeerAccess");
+            return;
+        }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         while (true) {
             acl_check(status(device_id, peer_device_id, &enabled), "aclrtDevicePeerAccessStatus");
@@ -4682,11 +4686,12 @@ NB_MODULE(_task_interface, m) {
     );
     m.def(
         "_region_enable_peer_access",
-        [](int device_id, int peer_device_id) {
-            acl_api().enable_peer_access_with_check(device_id, peer_device_id);
+        [](int device_id, int peer_device_id, bool wait) {
+            acl_api().enable_peer_access_with_check(device_id, peer_device_id, wait);
         },
-        nb::arg("device_id"), nb::arg("peer_device_id"), nb::call_guard<nb::gil_scoped_release>(),
-        "Enable and confirm one device's access to a peer before Region import."
+        nb::arg("device_id"), nb::arg("peer_device_id"), nb::arg("wait") = true,
+        nb::call_guard<nb::gil_scoped_release>(),
+        "Enable peer access; defer confirmation until the reverse direction is enabled."
     );
     m.def(
         "_region_vmm_granularity",
