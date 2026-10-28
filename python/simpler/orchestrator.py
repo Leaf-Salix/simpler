@@ -135,7 +135,7 @@ def _reject_device_args(args: object, *, kind: str) -> None:
 
     for i in range(args.tensor_count()):
         desc = args.tensor(i).buffer
-        if desc.address_space == AddressSpace.DEVICE:
+        if desc.address_space == AddressSpace.DEVICE or args.tensor(i).domain_mapping:
             raise ValueError(
                 f"{kind}: argument {i} is a DEVICE-space tensor ({desc.backend_kind.name}); a Python "
                 f"sub-worker runs on the host and can only take HOST-space tensors"
@@ -646,14 +646,6 @@ class Orchestrator:
         elif absolute > limit or nbytes > limit - absolute:
             raise ValueError("Global CommDomain copy exceeds the mapped window")
         return absolute
-
-    def copy_domain(
-        self, dst: Buffer, src: Buffer, *, worker: int, nbytes: int, dst_offset: int = 0, src_offset: int = 0
-    ) -> None:
-        """Synchronously copy two granted windows through an explicit local domain chip."""
-        if self._worker is None:
-            raise RuntimeError("domain copy requires a bound Worker")
-        self._worker.copy_domain(dst, src, worker=worker, nbytes=nbytes, dst_offset=dst_offset, src_offset=src_offset)
 
     def copy_to_domain(
         self,

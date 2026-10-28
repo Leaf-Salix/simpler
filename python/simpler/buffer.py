@@ -818,7 +818,11 @@ _BUFFER_ACCESS_SERVICE = DefaultRegionAccessService()
 
 
 def select_adapter(
-    desc: BufferDescriptor, context: ImportContext, *, where: str = "ImportRegistry"
+    desc: BufferDescriptor,
+    context: ImportContext,
+    *,
+    where: str = "ImportRegistry",
+    _host_fabric_imported: bool = False,
 ) -> tuple[AdapterKind, AdapterProfile]:
     """The mechanism ``context``'s endpoint reaches ``desc``'s backing by -- mapping or not.
 
@@ -845,6 +849,7 @@ def select_adapter(
     registered snapshot's ``owner_worker_id``); this is the backstop for a path that arrives
     without one.
     """
+    _host_fabric_imported = _host_fabric_imported and desc.address_space == AddressSpace.HOST
     if desc.address_space == AddressSpace.DEVICE:
         # Concrete-Buffer authorization precedes the shared physical judgment. The nonce is the
         # child-side backstop; owner-side dispatch separately proves the exact worker and sends the
@@ -859,16 +864,17 @@ def select_adapter(
 
     query = BufferAccessQuery(
         backend_kind=desc.backend_kind,
-        # HOST buffers are mapped by this process's host-side materializer even when it is
-        # preparing args for a device endpoint. DEVICE buffers use the endpoint deployment from
-        # the fork-time context. This preserves the distinction between materializing a local shm
-        # name here and planning a POSIX_SHM attachment for an AICPU/AICore endpoint.
-        consumer_deployment=context.deployment if desc.address_space == AddressSpace.DEVICE else HOST_CPU,
+        # Ordinary HOST buffers use this process's host materializer. An imported Host Fabric
+        # attachment already names a device VA; it uses the actual consumer deployment.
+        consumer_deployment=(
+            context.deployment if desc.address_space == AddressSpace.DEVICE or _host_fabric_imported else HOST_CPU
+        ),
         same_node=True,
         # A device descriptor reaching a device materializer has already passed the owner-side
         # exact-worker check. Region planning sets this false for consumer attachments, which is
         # what distinguishes DEVICE_LOCAL from a same-node DEVICE_PEER over the same backend.
         same_endpoint=desc.address_space == AddressSpace.DEVICE and context.deployment in (DEVICE_AICORE, DEVICE_AICPU),
+        _host_fabric_imported=_host_fabric_imported,
     )
     last_decision = None
     for candidate in buffer_adapter_candidates(query):
@@ -1078,7 +1084,7 @@ class ImportContext:
 
 class ImportRegistry:
     """Per-consumer-endpoint lazy import cache: materialize a ``Tensor``'s embedded descriptor to a
-    local base on first receipt (map-once), keyed by canonical identity.
+    local base on first receipt (map-once), keyed by canonical identity and optional mapping selector.
 
     A consumer calls ``materialize`` for each tensor's embedded descriptor as it arrives; the first
     sight of an identity maps its backing into this process, later sights reuse the cached base
@@ -1091,33 +1097,39 @@ class ImportRegistry:
     """
 
     def __init__(self, context: ImportContext) -> None:
-        self._by_identity: dict[CanonicalIdentity, ImportedBuffer] = {}
+        self._by_identity: dict[Any, ImportedBuffer] = {}
         self._context = context
 
-    def register_borrowed(self, descriptor: BufferDescriptor, base: int) -> None:
-        """Bind an already granted device mapping without taking allocation ownership."""
+    def register_borrowed(self, descriptor: BufferDescriptor, base: int, *, mapping: int = 0) -> None:
+        """Register this endpoint's granted Host-domain view without owning its backing."""
         if (
             self._context.deployment not in (DEVICE_AICORE, DEVICE_AICPU)
-            or descriptor.address_space != AddressSpace.DEVICE
+            or descriptor.address_space != AddressSpace.HOST
             or descriptor.backend_kind != BackendKind.REMOTE_SIDECAR
+            or not 1 <= mapping <= 64
             or base <= 0
         ):
-            raise ValueError("borrowed mapping requires a granted device reference and nonzero VA")
-        cached = self._by_identity.get(descriptor.identity)
+            raise ValueError("borrowed mapping requires a Host domain grant, target rank and nonzero VA")
+        key = (descriptor.identity, mapping)
+        if any(isinstance(k, tuple) and k[0] == descriptor.identity and k != key for k in self._by_identity):
+            raise ValueError("Host backing already has a different target on this endpoint")
+        cached = self._by_identity.get(key)
         if cached is not None:
             if cached.descriptor != descriptor or cached.base != base:
                 raise ValueError("borrowed mapping conflicts with an existing import")
             return
-        self._by_identity[descriptor.identity] = ImportedBuffer(
+        kind, profile = select_adapter(descriptor, self._context, _host_fabric_imported=True)
+        self._by_identity[key] = ImportedBuffer(
             descriptor.identity,
             base,
             descriptor.nbytes,
-            descriptor.address_space,
+            AddressSpace.DEVICE,
             descriptor=descriptor,
-            capabilities=capabilities_for_adapter(AdapterKind.DIRECT_MAP, descriptor.access),
+            profile=profile,
+            capabilities=capabilities_for_adapter(kind, descriptor.access),
         )
 
-    def materialize(self, desc: BufferDescriptor) -> ImportedBuffer:
+    def materialize(self, desc: BufferDescriptor, *, mapping: int = 0) -> ImportedBuffer:
         """Map ``desc``'s backing into this process on first sight of its identity; reuse the
         cached ImportedBuffer thereafter (map-once).
 
@@ -1136,7 +1148,7 @@ class ImportRegistry:
         that reaches the backing without producing an address is refused *here* rather than there --
         this returns a mapping, and that is the only narrowing it applies to the judgment.
         """
-        key = desc.identity
+        key = (desc.identity, mapping) if mapping else desc.identity
         cached = self._by_identity.get(key)
         if cached is not None:
             # Field-wise, so wire padding and the unused tail of `body` do not make one backing look
@@ -1150,6 +1162,8 @@ class ImportRegistry:
                     f"this is refused"
                 )
             return cached
+        if mapping:
+            raise ValueError("Host domain mapping has no live grant on this endpoint")
         kind, profile = select_adapter(desc, self._context)
         resolver = _RESOLVERS.get(profile)
         if resolver is None:
@@ -1175,14 +1189,18 @@ class ImportRegistry:
         self._by_identity[key] = imported
         return imported
 
-    def materialize_args(self, args) -> dict[CanonicalIdentity, tuple[int, int]]:
+    def materialize_args(self, args) -> dict[Any, tuple[int, int]]:
         """Materialize every embedded descriptor in a ``TaskArgs`` and return the resolved map:
         identity -> (local base, address_space), scoped to this call's own tensors."""
-        resolved: dict[CanonicalIdentity, tuple[int, int]] = {}
+        resolved: dict[Any, tuple[int, int]] = {}
         for i in range(args.tensor_count()):
-            desc = args.tensor(i).buffer
-            imported = self.materialize(desc)
-            resolved[desc.identity] = (imported.base, int(imported.address_space))
+            tensor = args.tensor(i)
+            desc, mapping = tensor.buffer, tensor.domain_mapping
+            imported = self.materialize(desc, mapping=mapping) if mapping else self.materialize(desc)
+            resolved[(desc.identity, mapping) if mapping else desc.identity] = (
+                imported.base,
+                int(imported.address_space),
+            )
         return resolved
 
     def mapped_args_from_blob(self, blob_ptr: int, capacity: int) -> MappedArgs:
@@ -1195,7 +1213,7 @@ class ImportRegistry:
         tensors = []
         for i in range(args.tensor_count()):
             t = args.tensor(i)
-            if t.buffer.address_space == AddressSpace.DEVICE:
+            if t.buffer.address_space == AddressSpace.DEVICE or t.domain_mapping:
                 # Depth behind the submit-time endpoint check: this process is a host compute leaf, so
                 # a device address here would be handed to torch as a host pointer.
                 raise ValueError(
@@ -1248,12 +1266,12 @@ class ImportRegistry:
         before that point is a mapping nothing can reach to retry — so the raise leaves the entry
         in place for this registry's own ``close()`` to attempt again.
         """
-        imported = self._by_identity.get(identity)
-        if imported is None:
-            return
-        if imported.shm is not None:
-            imported.shm.close()
-        del self._by_identity[identity]
+        for key in list(self._by_identity):
+            if (key[0] if isinstance(key, tuple) else key) == identity:
+                imported = self._by_identity[key]
+                if imported.shm is not None:
+                    imported.shm.close()
+                del self._by_identity[key]
 
     def close(self) -> None:
         """Close every mapping this endpoint made. Consumer-side only — unlinking belongs to the

@@ -1857,8 +1857,7 @@ CtypesFormat classify_ctypes_format(const char *format) {
 }
 
 // Resolve one wire tensor onto a local base and build the address-bearing device POD.
-// `resolved` maps CanonicalIdentity -> (local_base, address_space); the caller populates it by
-// materializing each embedded descriptor.
+// Mapping attachments use (identity, selector); plain views use the backing identity.
 ChipTensor materialize_one(const Tensor &r, TensorTransfer transfer, nb::dict resolved) {
     uint64_t elem = get_element_size(r.dtype);
     if (elem == 0) {
@@ -1868,12 +1867,16 @@ ChipTensor materialize_one(const Tensor &r, TensorTransfer transfer, nb::dict re
         throw std::runtime_error("materialize: byte_offset is not a multiple of dtype size");
     }
     nb::object key = nb::cast(r.buffer.identity);
+    if (r.domain_mapping) key = nb::make_tuple(key, r.domain_mapping);
     if (!resolved.contains(key)) {
         throw std::runtime_error("materialize: canonical identity not in the import registry");
     }
     nb::tuple val = nb::cast<nb::tuple>(resolved[key]);
     auto base = nb::cast<uint64_t>(val[0]);
     auto addr_space = nb::cast<int>(val[1]);
+    if (r.domain_mapping && addr_space != static_cast<int>(AddressSpace::DEVICE)) {
+        throw std::runtime_error("materialize: domain mapping binding requires a DEVICE address");
+    }
     // The view origin is base + byte_offset (start_offset folded into addr); strides carry any
     // non-row-major layout (transpose / permute / step-slice), which ChipTensor expresses natively.
     return make_tensor_strided(
@@ -2568,6 +2571,18 @@ NB_MODULE(_task_interface, m) {
 
         .def_ro("buffer", &Tensor::buffer)
         .def_ro("byte_offset", &Tensor::byte_offset)
+        .def_ro("domain_mapping", &Tensor::domain_mapping)
+        .def(
+            "_with_domain_mapping",
+            [](const Tensor &self, int rank) {
+                if (rank < 0 || rank >= 64) throw std::invalid_argument("domain mapping rank must be in [0, 64)");
+                Tensor mapped = self;
+                mapped.domain_mapping = static_cast<uint8_t>(rank + 1);
+                validate_tensor(mapped);
+                return mapped;
+            },
+            nb::arg("rank")
+        )
         .def_ro("ndims", &Tensor::ndims)
         .def_prop_ro(
             "shapes",
@@ -2593,7 +2608,7 @@ NB_MODULE(_task_interface, m) {
             "__eq__",
             [](const Tensor &a, const Tensor &b) {
                 if (!(a.buffer == b.buffer) || a.byte_offset != b.byte_offset || a.ndims != b.ndims ||
-                    a.dtype != b.dtype) {
+                    a.dtype != b.dtype || a.domain_mapping != b.domain_mapping) {
                     return false;
                 }
                 for (uint32_t i = 0; i < a.ndims; ++i) {
@@ -3018,6 +3033,7 @@ NB_MODULE(_task_interface, m) {
                 const int32_t n = self.tensor_count();
                 for (int32_t i = 0; i < n; ++i) {
                     const auto backend = static_cast<BackendKind>(self.tensor(i).buffer.backend_kind);
+                    if (self.tensor(i).domain_mapping) return true;
                     if (backend == BackendKind::DEVICE_MALLOC || backend == BackendKind::VMM_WINDOW) return true;
                 }
                 return false;
@@ -4279,7 +4295,8 @@ NB_MODULE(_task_interface, m) {
         "Materialize a TaskArgs held in this process into the runtime.so-ABI ChipStorageTaskArgs "
         "POD — the sole path to that POD, whether the args are an L2 leaf's own or a chip child's "
         "read back from its mailbox with read_args_from_blob. Each tensor's embedded buffer "
-        "identity is resolved via `resolved` {CanonicalIdentity: (local_base, address_space)}; "
+        "identity (or (identity, domain_mapping) for mapped views) is resolved via `resolved` to (local_base, "
+        "address_space); "
         "addr = base + byte_offset. The caller pre-populates `resolved` by materializing each "
         "embedded descriptor on first receipt. Strided views (transpose / permute / step-slice) "
         "materialize to strided ChipTensors. Rejects an unknown identity and a non-dtype-aligned "

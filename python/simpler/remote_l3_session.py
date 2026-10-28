@@ -599,6 +599,8 @@ def _materialize_task_args(
     """
     if len(args.remote_desc) != len(args.tensors):
         raise ValueError("remote TASK descriptor count does not match tensor count")
+    if any(tensor.domain_mapping for tensor in args.tensors):
+        raise ValueError("remote TASK endpoint-local mapping cannot cross Remote L3")
     task_args = TaskArgs()
     inline_backings: list[Buffer] = []
 

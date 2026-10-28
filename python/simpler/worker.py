@@ -218,7 +218,6 @@ from .comm_provider_control import (
 from .comm_region import (
     MaterializationContext,
     MaterializationError,
-    PayloadPart,
     RegionInstance,
     RegionInstanceRegistry,
     RegionInstanceState,
@@ -1278,39 +1277,23 @@ class _GlobalNodeDomainState:
     host_owner: Any = None
     node_worker_id: int = -1
     views_released: bool = False
-    backing_ids: dict[int, tuple[CanonicalIdentity, ...]] = field(default_factory=dict)
     host_buffers: dict[int, Buffer] = field(default_factory=dict)
 
 
 def _host_domain_buffers(command):
     return {
-        window.node_worker_id: Buffer(
-            identity=CanonicalIdentity(command.owner_instance_id, window.buffer_id, 1),
-            address_space=AddressSpace.DEVICE,
-            access=AccessMode.READWRITE,
-            backend_kind=BackendKind.REMOTE_SIDECAR,
-            nbytes=window.spec.nbytes,
+        window.node_worker_id: buffer_reference(
+            BufferDescriptor(
+                CanonicalIdentity(command.owner_instance_id, window.buffer_id, 1),
+                AddressSpace.HOST,
+                AccessMode.READWRITE,
+                BackendKind.REMOTE_SIDECAR,
+                window.spec.nbytes,
+            ),
             owner_worker_id=-1,
         )
         for window in command.host_windows
     }
-
-
-def _domain_backing_descriptor(identity, nbytes):
-    return BufferDescriptor(identity, AddressSpace.DEVICE, AccessMode.READWRITE, BackendKind.REMOTE_SIDECAR, nbytes)
-
-
-def _domain_buffer_slots(command):
-    result = {}
-    for member in command.members:
-        offset = 0
-        for index, spec in enumerate(command.buffers):
-            descriptor = command.backing_refs[member.domain_rank * len(command.buffers) + index]
-            result[descriptor.identity] = (descriptor, member.domain_rank, offset)
-            offset += spec.nbytes
-    for index, buffer in enumerate(_host_domain_buffers(command).values()):
-        result[buffer.identity] = (buffer.to_descriptor(), len(command.members) + index, 0)
-    return result
 
 
 def _release_domain_host_owner(state):
@@ -1321,30 +1304,6 @@ def _release_domain_host_owner(state):
     else:
         state.host_owner.release()
     state.host_owner = None
-
-
-def _host_part_for(owner, ref):
-    worker = owner()
-    if worker is None:
-        raise RuntimeError("Host domain Worker no longer exists")
-    return worker._local_host_part(ref)
-
-
-class _DomainHostAccess:
-    def __init__(self, worker, ref):
-        self._owner, self._ref = weakref.ref(worker), ref
-
-    def write_bytes(self, _span, offset, pointer, nbytes):
-        self._copy(offset, pointer, nbytes, writing=True)
-
-    def read_bytes(self, _span, offset, pointer, nbytes):
-        self._copy(offset, pointer, nbytes, writing=False)
-
-    def _copy(self, offset, pointer, nbytes, *, writing):
-        worker = self._owner()
-        if worker is None:
-            raise RuntimeError("Host domain Worker no longer exists")
-        worker._host_domain_bytes(self._ref, offset, pointer, nbytes, writing=writing)
 
 
 @dataclass(frozen=True)
@@ -2699,6 +2658,8 @@ def _reexport_args_from_mailbox(buf, worker: Worker) -> TaskArgs:
     """
     args_ptr = _buffer_field_addr(buf, _OFF_TASK_ARGS_BLOB)
     args = read_args_from_blob(args_ptr, _MAILBOX_ARGS_CAPACITY)
+    if any(args.tensor(i).domain_mapping for i in range(args.tensor_count())):
+        raise ValueError("endpoint-local mapping cannot cross nested Worker")
     out = TaskArgs()
     for i in range(args.tensor_count()):
         ref = args.tensor(i)
@@ -3044,8 +3005,7 @@ class _L2GlobalDomain:
     mapping_size: int
     requested_window_size: int
     device_ctx: int = 0
-    descriptor_table: bytes = b""
-    grants: dict[CanonicalIdentity, tuple[BufferDescriptor, int, int]] = field(default_factory=dict)
+    import_command: GlobalDomainCommand | None = None
     revoked: bool = False
     host_enabled: bool = False
 
@@ -3280,28 +3240,23 @@ def _handle_ctrl_global_domain_import(
             or GLOBAL_DOMAIN_PROFILE_IDS[command.profile] != entry.descriptor.profile_id
         ):
             raise ValueError("Global CommDomain import command conflicts with the prepared window")
-        if descriptors[entry.domain_rank] != entry.descriptor:
+        if command.host_windows and entry.descriptor not in descriptors:
             raise RuntimeError("Global CommDomain import table does not contain the local exported descriptor")
         table = b"".join(descriptor.encode() for descriptor in command.descriptors)
         if bool(command.host_windows) != entry.host_enabled or (
-            entry.descriptor_table and entry.descriptor_table != table
+            entry.import_command is not None and entry.import_command != command
         ):
-            raise RuntimeError("Global CommDomain repeated import changes its window table")
+            raise ValueError("Global CommDomain repeated import changes its command")
         if entry.device_ctx == 0:
             entry.device_ctx = int(cw.comm_global_domain_import(int(domain_id), table))
             if entry.device_ctx == 0:
                 raise RuntimeError("Global CommDomain backend returned a zero device context")
-            entry.descriptor_table = table
+        entry.import_command = command
         if command.host_windows:
-            granted = _domain_buffer_slots(command)
-            if entry.grants and entry.grants != granted:
-                raise ValueError("Global CommDomain repeated import changes its slice grants")
-            entry.grants = granted
             if registry is not None:
-                for descriptor, slot, offset in granted.values():
-                    if slot >= entry.rank_count:
-                        base = int(cw.comm_global_domain_window(int(domain_id), slot)[0]) + offset
-                        registry.register_borrowed(descriptor, base)
+                for slot, buffer in enumerate(_host_domain_buffers(command).values(), entry.rank_count):
+                    base = int(cw.comm_global_domain_window(int(domain_id), slot)[0])
+                    registry.register_borrowed(buffer.to_descriptor(), base, mapping=entry.domain_rank + 1)
         if payload_size < LOCAL_IMPORT_REPLY.size:
             raise RuntimeError("Global CommDomain import reply capacity is too small")
         LOCAL_IMPORT_REPLY.pack_into(
@@ -3335,9 +3290,9 @@ def _handle_ctrl_global_domain_release(
             raise RuntimeError("Global CommDomain release generation mismatch")
         if entry is not None:
             entry.revoked = True
-            if registry is not None:
-                for identity in entry.grants:
-                    registry.unregister(identity)
+            if registry is not None and entry.host_enabled and entry.import_command is not None:
+                for buffer in _host_domain_buffers(entry.import_command).values():
+                    registry.unregister(buffer.identity)
             cw.comm_global_domain_release(int(domain_id), *([int(stage)] if stage else []))
             if stage is not GlobalDomainReleaseStage.VIEWS:
                 store.domains.pop(int(domain_id), None)
@@ -3395,32 +3350,14 @@ def _handle_ctrl_global_domain_copy(
         staged.close()
 
 
-def _domain_copy_ranges(grants, descriptors, offsets, nbytes):
-    operands = []
-    for descriptor, offset in zip(descriptors, offsets):
-        grant = grants.get(descriptor.identity)
-        if grant is None or grant[0] != descriptor:
-            raise ValueError("domain copy operand does not match its granted Buffer")
-        _, slot, slice_offset = grant
-        RegionPartSpan(0, descriptor.nbytes).validate_range(offset, nbytes, "domain copy")
-        operands.append((slot, slice_offset + offset, descriptor.access))
-    dst, src = operands
-    if dst[2] not in (AccessMode.WRITE, AccessMode.READWRITE) or src[2] not in (
-        AccessMode.READ,
-        AccessMode.READWRITE,
-    ):
-        raise ValueError("domain copy requires destination WRITE and source READ")
-    if dst[0] == src[0] and dst[1] < src[1] + nbytes and src[1] < dst[1] + nbytes:
-        raise ValueError("domain copy ranges overlap in the same pool")
-    return (*dst[:2], *src[:2])
-
-
 def _handle_ctrl_domain_pool_copy(cw, buf, store) -> None:
     staged, payload, size = _open_global_domain_payload(buf)
     try:
-        if size != LOCAL_POOL_COPY.size + 2 * CALLABLE_HASH_DIGEST_BYTES:
+        if size != LOCAL_POOL_COPY.size:
             raise ValueError("domain copy metadata size mismatch")
-        magic, version, domain_id, generation, dst_offset, src_offset, nbytes = LOCAL_POOL_COPY.unpack_from(payload)
+        magic, version, domain_id, generation, dst_slot, src_slot, dst_offset, src_offset, nbytes = (
+            LOCAL_POOL_COPY.unpack_from(payload)
+        )
         _validate_local_global_header(magic, version, domain_id, generation, operation="domain copy")
         entry = store.domains.get(domain_id)
         if (
@@ -3431,22 +3368,8 @@ def _handle_ctrl_domain_pool_copy(cw, buf, store) -> None:
             or not entry.host_enabled
         ):
             raise ValueError("domain copy requires a live Host domain grant")
-        descriptors = []
-        for start in (LOCAL_POOL_COPY.size, LOCAL_POOL_COPY.size + CALLABLE_HASH_DIGEST_BYTES):
-            granted = entry.grants.get(
-                _unpack_identity_wire(bytes(payload[start : start + CALLABLE_HASH_DIGEST_BYTES]))
-            )
-            if granted is None:
-                raise ValueError("domain copy identity has no granted Buffer")
-            descriptors.append(granted[0])
-        ranges = _domain_copy_ranges(
-            entry.grants,
-            descriptors,
-            (dst_offset, src_offset),
-            nbytes,
-        )
         try:
-            cw.comm_global_domain_copy(domain_id, *ranges, nbytes)
+            cw.comm_global_domain_copy(domain_id, dst_slot, dst_offset, src_slot, src_offset, nbytes)
         except BaseException:
             entry.revoked = True
             raise
@@ -10784,17 +10707,6 @@ class Worker:
                     if state.borrowed_handle is None:
                         command = state.command
                         local = {context.domain_rank: context.buffers for context in state.contexts.values()}
-                        if command.host_windows:
-                            for member in command.members:
-                                local.setdefault(
-                                    member.domain_rank,
-                                    {
-                                        spec.name: buffer_reference(
-                                            command.backing_refs[member.domain_rank * len(command.buffers) + index]
-                                        )
-                                        for index, spec in enumerate(command.buffers)
-                                    },
-                                )
                         state.borrowed_handle = CommDomainHandle(
                             name=command.name,
                             members=tuple(
@@ -10810,7 +10722,6 @@ class Worker:
                             retain_after_run=command.retain_after_run,
                             ref=name,
                             host_buffers=state.host_buffers,
-                            local_host_fn=lambda owner=weakref.ref(self), ref=name: _host_part_for(owner, ref),
                             _release_fn=None,
                         )
                     return state.borrowed_handle
@@ -11439,6 +11350,12 @@ class Worker:
             return tuple(prior.descriptors[rank] for rank in sorted(prior.descriptors))
 
         state = _GlobalNodeDomainState(command=command, node_worker_id=node_worker_id)
+        host_ids = {buffer.identity for buffer in _host_domain_buffers(command).values()}
+        if any(
+            host_ids.intersection(buffer.identity for buffer in _host_domain_buffers(other.command).values())
+            for other in self._global_node_domains.values()
+        ):
+            raise ValueError("Host backing already belongs to another domain")
         self._global_node_domains[command.domain_id] = state
         local_members = self._global_local_members(command, node_worker_id)
         capacity = max(LOCAL_PREPARE_REQUEST.size, LOCAL_PREPARE_REPLY.size + GLOBAL_DOMAIN_DESCRIPTOR_BYTES)
@@ -11501,8 +11418,6 @@ class Worker:
                 state.descriptors[member.domain_rank] = descriptor
                 state.local_window_bases[member.local_worker_id] = int(local_base)
                 state.mapping_sizes[member.local_worker_id] = int(mapping_size)
-                if command.host_windows:
-                    state.backing_ids[member.domain_rank] = tuple(self._burn_buffer_identity() for _ in command.buffers)
             return tuple(state.descriptors[rank] for rank in sorted(state.descriptors))
         except BaseException:
             if not command.host_windows:
@@ -11512,18 +11427,7 @@ class Worker:
             raise
 
     def _prepare_global_domain_reply(self, command, node_worker_id) -> bytes:
-        exports = encode_descriptor_table(self._prepare_global_domain_node(command, node_worker_id))
-        if not command.host_windows:
-            return exports
-        state = self._global_node_domains[command.domain_id]
-        return exports + encode_domain_buffer_refs(
-            tuple(
-                (_domain_backing_descriptor(identity, spec.nbytes), 0, 0)
-                for member in command.members
-                if member.node_worker_id == node_worker_id
-                for identity, spec in zip(state.backing_ids[member.domain_rank], command.buffers)
-            )
-        )
+        return encode_descriptor_table(self._prepare_global_domain_node(command, node_worker_id))
 
     def _import_global_domain_node(  # noqa: PLR0912 -- immutable grant validation precedes native fanout and publication
         self, command: GlobalDomainCommand, node_worker_id: int
@@ -11550,22 +11454,15 @@ class Worker:
             profile=command.profile,
             host_windows=command.host_windows,
         )
-        if any(command.descriptors[slot] != descriptor for slot, descriptor in state.descriptors.items()):
+        if command.host_windows and any(
+            descriptor not in command.descriptors for descriptor in state.descriptors.values()
+        ):
             raise RuntimeError("Import table changes this node's exported backing")
         if state.phase in (GlobalDomainPhase.IMPORT, GlobalDomainPhase.COMMIT):
-            if state.command.descriptors != command.descriptors or state.command.backing_refs != command.backing_refs:
+            if state.command.descriptors != command.descriptors:
                 raise RuntimeError("Global CommDomain repeated import changes its descriptor table")
             return
         local_members = self._global_local_members(command, node_worker_id)
-        if command.host_windows:
-            for member in local_members:
-                expected = tuple(
-                    _domain_backing_descriptor(identity, spec.nbytes)
-                    for identity, spec in zip(state.backing_ids[member.domain_rank], command.buffers)
-                )
-                start = member.domain_rank * len(command.buffers)
-                if command.backing_refs[start : start + len(command.buffers)] != expected:
-                    raise ValueError("Global CommDomain import changes this node's backing references")
         import_command = encode_domain_command(replace(command, attachments=()))
         request_size = LOCAL_IMPORT_REQUEST.size + len(import_command)
         capacity = max(request_size, LOCAL_IMPORT_REPLY.size)
@@ -11600,12 +11497,11 @@ class Worker:
                     raise RuntimeError("Global CommDomain import reply mapping size mismatch")
                 if command.host_windows and local_base != state.local_window_bases[member.local_worker_id]:
                     raise RuntimeError("Global CommDomain import reply local backing mismatch")
-                identities = iter(state.backing_ids.get(member.domain_rank, ()))
                 offset = 0
                 domain_buffers: dict[str, Buffer] = {}
                 for buffer in command.buffers:
                     base = int(local_base) + offset
-                    identity = next(identities) if command.host_windows else self._burn_buffer_identity()
+                    identity = self._burn_buffer_identity()
                     domain_buffers[buffer.name] = wrap_vmm_window(
                         base,
                         int(buffer.nbytes),
@@ -11671,7 +11567,6 @@ class Worker:
         if (
             self._global_domain_command_identity(state.command) != self._global_domain_command_identity(command)
             or state.command.descriptors != command.descriptors
-            or state.command.backing_refs != command.backing_refs
         ):
             raise RuntimeError("Global CommDomain commit command conflicts with IMPORT")
         backings = []
@@ -11690,15 +11585,7 @@ class Worker:
                     ):
                         raise ValueError("communication domain slice has no matching registered backing")
                     backings.append(backing)
-            backings.extend(state.host_buffers.values())
             state.phase = GlobalDomainPhase.COMMIT
-            self._domain_buffer_routes.update(
-                {
-                    (buffer.identity, chip): replace(buffer, owner_worker_id=chip)
-                    for buffer in state.host_buffers.values()
-                    for chip in state.contexts
-                }
-            )
         state.view._committed = True  # noqa: SLF001 -- session owns the transaction
         return tuple(backings)
 
@@ -11801,18 +11688,11 @@ class Worker:
             raise KeyError("communication domain reference has no live grant on this node")
         return state
 
-    def _local_host_part(self, ref):
-        with self._operation_lease("local_host", allow_continuation=True), self._domain_serialization():
-            state = self._domain_state(ref)
-            if state.host_owner is None:
-                raise RuntimeError("this node has no Host DRAM owner")
-            host = next(h for h in state.command.host_windows if h.node_worker_id == state.node_worker_id)
-            return PayloadPart(RegionPartSpan(0, host.spec.nbytes), _DomainHostAccess(self, ref))
-
     def _host_domain_bytes(self, ref, offset, pointer, nbytes, *, writing):
         with (
             self._operation_lease("Host domain access", allow_continuation=True),
             self._control_admission("Host domain access"),
+            self._child_prov_lock,
         ):
             self._require_region_control_before_submit("Host domain access")
             state = self._domain_state(ref)
@@ -11830,53 +11710,72 @@ class Worker:
             else:
                 state.host_owner.read_bytes(offset, pointer, nbytes)
 
-    def copy_domain(
-        self, dst: Buffer, src: Buffer, *, worker: int, nbytes: int, dst_offset: int = 0, src_offset: int = 0
+    def _copy_domain_pools(
+        self,
+        ref: CommDomainRef,
+        *,
+        worker: int,
+        dst_slot: int,
+        src_slot: int,
+        nbytes: int,
+        dst_offset: int = 0,
+        src_offset: int = 0,
     ) -> None:
-        """Synchronously copy two granted windows through an explicit local domain chip."""
-        worker, nbytes, dst_offset, src_offset = map(operator.index, (worker, nbytes, dst_offset, src_offset))
+        """Backend: synchronously copy between this node's Host pool and one domain pool."""
+        worker, dst_slot, src_slot, nbytes, dst_offset, src_offset = map(
+            operator.index, (worker, dst_slot, src_slot, nbytes, dst_offset, src_offset)
+        )
         if self.level != 3 or self._worker is None:
-            raise RuntimeError("copy_domain requires an owning L3 execution node")
-        with self._operation_lease("copy_domain", allow_continuation=True), self._control_admission("copy_domain"):
-            self._require_region_control_before_submit("copy_domain")
-            descriptors = [buffer.to_descriptor() for buffer in (dst, src)]
-            state = next(
-                (
-                    state
-                    for state in self._global_node_domains.values()
-                    if state.phase is GlobalDomainPhase.COMMIT
-                    and state.command.host_windows
-                    and all(descriptor.identity in _domain_buffer_slots(state.command) for descriptor in descriptors)
-                ),
-                None,
-            )
-            if state is None or worker not in state.contexts:
-                raise ValueError("copy_domain requires Buffers from one participating live Host domain")
+            raise RuntimeError("domain pool copy requires an owning L3 execution node")
+        with (
+            self._operation_lease("domain pool copy", allow_continuation=True),
+            self._control_admission("domain pool copy"),
+            self._child_prov_worker_lock(worker),
+            self._child_prov_lock,
+        ):
+            self._require_region_control_before_submit("domain pool copy")
+            state = self._domain_state(ref)
             command = state.command
-            domain_id, generation = command.domain_id, command.generation
-            with self._child_prov_worker_lock(worker), self._child_prov_lock:
-                grants = _domain_buffer_slots(command)
-                for context in state.contexts.values():
-                    for buffer in context.buffers.values():
-                        _, slot, offset = grants[buffer.identity]
-                        grants[buffer.identity] = (buffer.to_descriptor(), slot, offset)
-                _domain_copy_ranges(grants, descriptors, (dst_offset, src_offset), nbytes)
-                payload = LOCAL_POOL_COPY.pack(
-                    LOCAL_DOMAIN_MAGIC, GLOBAL_DOMAIN_VERSION, domain_id, generation, dst_offset, src_offset, nbytes
+            hosts = command.host_windows
+            if not hosts or worker not in state.contexts:
+                raise ValueError("domain pool copy requires a local participating chip")
+            local_slot = len(command.members) + next(
+                i for i, host in enumerate(hosts) if host.node_worker_id == state.node_worker_id
+            )
+            if local_slot not in (dst_slot, src_slot):
+                raise ValueError("domain pool copy requires this node's Host pool")
+            if nbytes <= 0:
+                raise ValueError("domain pool copy requires positive nbytes")
+            sizes = [command.window_size] * len(command.members) + [host.spec.nbytes for host in hosts]
+            for slot, offset in ((dst_slot, dst_offset), (src_slot, src_offset)):
+                if not 0 <= slot < len(sizes):
+                    raise ValueError("domain copy slot is outside the granted pools")
+                RegionPartSpan(0, sizes[slot]).validate_range(offset, nbytes, "domain pool copy")
+            if dst_slot == src_slot and dst_offset < src_offset + nbytes and src_offset < dst_offset + nbytes:
+                raise ValueError("domain copy ranges overlap in the same pool")
+            payload = LOCAL_POOL_COPY.pack(
+                LOCAL_DOMAIN_MAGIC,
+                GLOBAL_DOMAIN_VERSION,
+                command.domain_id,
+                command.generation,
+                dst_slot,
+                src_slot,
+                dst_offset,
+                src_offset,
+                nbytes,
+            )
+            try:
+                self._worker.control_payload(
+                    WorkerType.NEXT_LEVEL,
+                    worker,
+                    CTRL_GLOBAL_DOMAIN_POOL_COPY,
+                    bytearray(payload),
+                    self._py_control_timeout_s,
                 )
-                payload += b"".join(_pack_identity_wire(d.identity) for d in descriptors)
-                try:
-                    self._worker.control_payload(
-                        WorkerType.NEXT_LEVEL,
-                        worker,
-                        CTRL_GLOBAL_DOMAIN_POOL_COPY,
-                        bytearray(payload),
-                        self._py_control_timeout_s,
-                    )
-                except BaseException as exc:
-                    state.phase = GlobalDomainPhase.ABORT
-                    self._record_unreclaimable("Host domain copy completion is unconfirmed", exc, keep_transport=True)
-                    raise
+            except BaseException as exc:
+                state.phase = GlobalDomainPhase.ABORT
+                self._record_unreclaimable("Host domain copy completion is unconfirmed", exc, keep_transport=True)
+                raise
 
     def _copy_global_domain_node(self, command: GlobalDomainCopyCommand, *, copy_to_device: bool) -> bytes:
         state = self._global_node_domains.get(command.domain_id)
@@ -11935,15 +11834,9 @@ class Worker:
         if control is ControlName.ALLOC_DOMAIN:
             command = decode_domain_command(payload)
             if command.phase is GlobalDomainPhase.PREPARE_EXPORT:
-                return (
-                    4
-                    + 2 * GLOBAL_DOMAIN_MAX_RANKS * GLOBAL_DOMAIN_DESCRIPTOR_BYTES
-                    + len(command.members) * len(command.buffers) * GLOBAL_DOMAIN_BUFFER_REF_BYTES
-                )
+                return 4 + (len(command.members) + len(command.host_windows)) * GLOBAL_DOMAIN_DESCRIPTOR_BYTES
             if command.phase is GlobalDomainPhase.COMMIT:
-                return (
-                    len(command.members) * len(command.buffers) + len(command.host_windows)
-                ) * GLOBAL_DOMAIN_BUFFER_REF_BYTES
+                return len(command.members) * len(command.buffers) * GLOBAL_DOMAIN_BUFFER_REF_BYTES
             return 0
         if control is ControlName.COPY_FROM_DOMAIN:
             command = decode_copy_command(payload, include_data=False)
@@ -12010,58 +11903,33 @@ class Worker:
         # flag set, so every MPI rank receives the same envelope.
         return self._global_domain_control(group.ranks[0].worker_id, control_name, payload, group=True)
 
-    def _collect_global_domain_exports(self, base_command, involved_nodes, prepared_nodes):
+    def _collect_global_domain_exports(self, command, involved_nodes, prepared_nodes):
         from .remote_l3_protocol import ControlName  # noqa: PLC0415
 
-        descriptor_by_rank = {}
-        backing_refs = {}
-        identities = set()
+        exports = {}
         for node in involved_nodes:
             prepared_nodes.append(node)
-            reply = self._global_domain_control(node, ControlName.ALLOC_DOMAIN, encode_domain_command(base_command))
-            count = struct.unpack_from("<I", reply)[0]
-            end = 4 + count * GLOBAL_DOMAIN_DESCRIPTOR_BYTES
-            exports = decode_descriptor_table(reply[:end])
-            expected_slots = {m.domain_rank for m in base_command.members if m.node_worker_id == node}
-            expected_slots.update(
-                len(base_command.members) + i
-                for i, h in enumerate(base_command.host_windows)
-                if h.node_worker_id == node
-            )
-            if len(exports) != len(expected_slots) or {d.domain_rank for d in exports} != expected_slots:
-                raise RuntimeError("Export reply does not match the requested node windows")
-            for descriptor in exports:
-                if descriptor.domain_rank in descriptor_by_rank:
-                    raise RuntimeError("Global CommDomain prepare returned a duplicate slot")
-                descriptor_by_rank[descriptor.domain_rank] = descriptor
-            records = decode_domain_buffer_refs(reply[end:])
-            expected = [
-                (m, spec) for m in base_command.members if m.node_worker_id == node for spec in base_command.buffers
-            ]
-            if len(records) != (len(expected) if base_command.host_windows else 0):
-                raise ValueError("Global CommDomain prepare returned incomplete backing references")
-            for (descriptor, locator, generation), (member, spec) in zip(records, expected):
-                if locator or generation or descriptor.identity in identities:
-                    raise ValueError("Global CommDomain prepare returned conflicting backing references")
-                identities.add(descriptor.identity)
-                backing_refs[(member.domain_rank, spec.name)] = descriptor
-        return (
-            tuple(
-                descriptor_by_rank[rank] for rank in range(len(base_command.members) + len(base_command.host_windows))
-            ),
-            tuple(
-                backing_refs[(m.domain_rank, spec.name)] for m in base_command.members for spec in base_command.buffers
-            )
-            if base_command.host_windows
-            else (),
-        )
+            reply = self._global_domain_control(node, ControlName.ALLOC_DOMAIN, encode_domain_command(command))
+            descriptors = decode_descriptor_table(reply)
+            if command.host_windows:
+                expected = {member.domain_rank for member in command.members if member.node_worker_id == node}
+                expected.update(
+                    len(command.members) + i
+                    for i, host in enumerate(command.host_windows)
+                    if host.node_worker_id == node
+                )
+                if len(descriptors) != len(expected) or {d.domain_rank for d in descriptors} != expected:
+                    raise RuntimeError("Export reply does not match the requested node windows")
+            for descriptor in descriptors:
+                if descriptor.domain_rank in exports:
+                    raise RuntimeError("Global CommDomain prepare returned a duplicate rank")
+                exports[descriptor.domain_rank] = descriptor
+        return tuple(exports[slot] for slot in range(len(command.members) + len(command.host_windows)))
 
-    def _commit_global_domain_buffers(self, command, involved_nodes):
+    def _commit_global_domain_buffers(self, command, involved_nodes) -> dict[int, dict[str, Buffer]]:
         from .remote_l3_protocol import ControlName  # noqa: PLC0415
 
         result = {member.domain_rank: {} for member in command.members}
-        hosts = _host_domain_buffers(command)
-        routes = {}
         identities = set()
         for node in involved_nodes:
             records = decode_domain_buffer_refs(
@@ -12073,17 +11941,16 @@ class Worker:
                 if member.node_worker_id == node
                 for spec in command.buffers
             ]
-            if len(records) != len(expected) + len(hosts):
+            if len(records) != len(expected):
                 raise RuntimeError("Global CommDomain commit returned incomplete Buffer references")
             remote = node in self._remote_like_worker_ids()
             locators = set()
-            for (descriptor, reference_id, generation), (member, spec) in zip(records[: len(expected)], expected):
+            for (descriptor, reference_id, generation), (member, spec) in zip(records, expected):
                 if (
                     descriptor.backend_kind != BackendKind.REMOTE_SIDECAR
                     or descriptor.address_space != AddressSpace.DEVICE
                     or descriptor.access != AccessMode.READWRITE
                     or descriptor.owner_worker_path_id != 0
-                    or descriptor.body
                     or descriptor.nbytes != spec.nbytes
                     or not any(descriptor.identity.owner_instance_id)
                     or not descriptor.identity.buffer_id
@@ -12093,28 +11960,12 @@ class Worker:
                     or (remote and (reference_id, generation) in locators)
                 ):
                     raise RuntimeError("Global CommDomain commit returned conflicting Buffer references")
-                if command.host_windows:
-                    index = member.domain_rank * len(command.buffers) + command.buffers.index(spec)
-                    if descriptor != command.backing_refs[index]:
-                        raise RuntimeError("Global CommDomain commit changes its prepared backing")
                 identities.add(descriptor.identity)
                 locators.add((reference_id, generation))
                 result[member.domain_rank][spec.name] = buffer_reference(
                     descriptor, owner_worker_id=node, remote_ref=(reference_id, generation) if remote else None
                 )
-            for (descriptor, reference_id, generation), host in zip(records[len(expected) :], hosts.values()):
-                if (
-                    descriptor != host.to_descriptor()
-                    or bool(reference_id) != remote
-                    or bool(generation) != remote
-                    or (remote and (reference_id, generation) in locators)
-                ):
-                    raise RuntimeError("Global CommDomain commit returned conflicting Host references")
-                locators.add((reference_id, generation))
-                routes[(host.identity, node)] = buffer_reference(
-                    descriptor, owner_worker_id=node, remote_ref=(reference_id, generation) if remote else None
-                )
-        return result, hosts, routes
+        return result
 
     def _allocate_global_domain(  # noqa: PLR0912, PLR0915 -- transaction validation and prepare/import/commit rollback stay ordered
         self,
@@ -12274,11 +12125,8 @@ class Worker:
                     encode_domain_command(base_command),
                 )
                 descriptors = decode_descriptor_table(reply)
-                backing_refs = ()
             else:
-                descriptors, backing_refs = self._collect_global_domain_exports(
-                    base_command, involved_nodes, prepared_nodes
-                )
+                descriptors = self._collect_global_domain_exports(base_command, involved_nodes, prepared_nodes)
             validate_descriptor_table(
                 descriptors,
                 rank_count=len(domain_members_tuple),
@@ -12301,7 +12149,6 @@ class Worker:
                 owner_instance_id=base_command.owner_instance_id,
                 retain_after_run=base_command.retain_after_run,
                 host_windows=base_command.host_windows,
-                backing_refs=backing_refs,
             )
             if mpi_group is None:
                 import_command = GlobalDomainCommand(
@@ -12317,7 +12164,6 @@ class Worker:
                     owner_instance_id=base_command.owner_instance_id,
                     retain_after_run=base_command.retain_after_run,
                     host_windows=base_command.host_windows,
-                    backing_refs=backing_refs,
                 )
                 for node_worker_id in involved_nodes:
                     self._global_domain_control(
@@ -12325,7 +12171,7 @@ class Worker:
                         ControlName.ALLOC_DOMAIN,
                         encode_domain_command(import_command),
                     )
-            member_buffers, host_buffers, routes = self._commit_global_domain_buffers(commit_command, involved_nodes)
+            member_buffers = self._commit_global_domain_buffers(commit_command, involved_nodes)
             handle = CommDomainHandle(
                 name=name,
                 members=tuple(
@@ -12341,7 +12187,7 @@ class Worker:
                 requested_window_size=window_size,
                 ref=CommDomainRef(base_command.owner_instance_id, domain_id, generation),
                 attachments=attachment_matrix,
-                host_buffers=host_buffers,
+                host_buffers=_host_domain_buffers(commit_command),
             )
             with self._child_prov_lock:
                 for member in handle.members:
@@ -12349,12 +12195,6 @@ class Worker:
                         self._record_device_alloc(
                             buffer, domain_allocation_id=self._global_domain_provenance_id(domain_id)
                         )
-                for buffer in host_buffers.values():
-                    self._record_device_alloc(
-                        buffer,
-                        domain_allocation_id=self._global_domain_provenance_id(domain_id),
-                    )
-                self._domain_buffer_routes.update(routes)
             resources.requires_ordered_cleanup = True
             self._live_global_domains[name] = handle
         except BaseException:
@@ -12553,8 +12393,7 @@ class Worker:
             if live_domains.get(handle.name) is handle:
                 live_domains.pop(handle.name)
 
-        owned = {handle.domain_id: handle for handle in live_domains.values()}
-        _raise_first(_release, list(owned.values())[::-1])
+        _raise_first(_release, list(live_domains.values())[::-1])
 
     def _copy_to_global_domain(
         self, handle: GlobalCommDomainHandle, domain_rank: int, data: bytes, offset: int
@@ -12669,7 +12508,6 @@ class Worker:
         # revoked BEFORE the native free (and before a domain's backend release), so an interrupted
         # op never leaves an identity resolving to memory that is already gone. Cleared on close().
         self._child_alloc = _DeviceAllocations()
-        self._domain_buffer_routes: dict[tuple[CanonicalIdentity, int], Buffer] = {}
         self._device_buffer_source: _DeviceBufferSource | None = None
         self._source_context_failed = False
         self._source_attachments: set[CanonicalIdentity] = set()
@@ -12784,8 +12622,6 @@ class Worker:
         identity resolvable to an address that is already gone.
         """
         self._child_alloc.revoke(identity)
-        for key in [key for key in self._domain_buffer_routes if key[0] == identity]:
-            self._domain_buffer_routes.pop(key)
 
     def _drop_domain_allocs(self, allocation_id: int) -> None:
         """Revoke every identity a CommDomain allocation minted. Caller holds neither lock.
@@ -12811,11 +12647,6 @@ class Worker:
                     int(handle.owner_worker_id)
                     for identity in self._domain_members.get(allocation_id, ())
                     if (handle := self._child_alloc.get(identity)) is not None and handle.owner_worker_id >= 0
-                }
-                | {
-                    target
-                    for identity, target in self._domain_buffer_routes
-                    if identity in self._domain_members.get(allocation_id, ())
                 }
             )
             # Host pool copies hold this lock through native completion. Revoke
@@ -12886,7 +12717,7 @@ class Worker:
                     f"(never allocated here, already freed, or its domain was released)"
                 )
             if bound.owner_worker_id < 0:
-                raise ValueError("a shared Host domain Buffer requires explicit copy_domain")
+                raise ValueError("a shared Host domain Buffer requires its domain backend")
             return int(bound.owner_worker_id)
 
     def _require_device_capability_locked(
@@ -12974,14 +12805,30 @@ class Worker:
 
         A ``DEVICE_MALLOC`` (worker device malloc) or ``VMM_WINDOW`` (domain-carved) ref names an
         allocation behind a chip boundary, so its identity is what the owner can resolve.
-        Host-backed refs (POSIX/fork shm) name nothing the owner allocation table holds and
-        contribute nothing.
+        Fabric Host refs use the same registration gate; ordinary POSIX/fork shm
+        does not name a child allocation.
         """
         return args.has_device_backed_tensor() or any(
-            (descriptor := args.tensor(index).buffer).address_space == AddressSpace.DEVICE
-            and descriptor.backend_kind == BackendKind.REMOTE_SIDECAR
-            for index in range(args.tensor_count())
+            args.tensor(index).buffer.backend_kind == BackendKind.REMOTE_SIDECAR for index in range(args.tensor_count())
         )
+
+    def _require_domain_mapping_target(self, tensor, target_worker_id: int) -> None:
+        """Validate the selected attachment against the committed node's rank table."""
+        matches = [
+            state
+            for state in self._global_node_domains.values()
+            if state.phase is GlobalDomainPhase.COMMIT
+            and any(buffer.identity == tensor.buffer.identity for buffer in state.host_buffers.values())
+        ]
+        if self.level != 3 or len(matches) != 1:
+            raise ValueError("Host mapping has no unique live local domain grant")
+        state = matches[0]
+        rank = tensor.domain_mapping - 1
+        if not 0 <= rank < len(state.command.members):
+            raise ValueError("Host mapping rank is outside its domain grant")
+        member = state.command.members[rank]
+        if member.node_worker_id != state.node_worker_id or member.local_worker_id != target_worker_id:
+            raise ValueError("Host mapping targets another node or chip")
 
     def _prepare_buffer_references(self, args, sidecar, target_worker_id: int):
         """Authorize registered address-free references under the provenance lock."""
@@ -12989,19 +12836,20 @@ class Worker:
         for index in range(args.tensor_count()):
             tensor = args.tensor(index)
             descriptor = tensor.buffer
-            if descriptor.address_space != AddressSpace.DEVICE or descriptor.backend_kind != BackendKind.REMOTE_SIDECAR:
+            if descriptor.backend_kind != BackendKind.REMOTE_SIDECAR:
                 continue
-            bound = self._domain_buffer_routes.get(
-                (descriptor.identity, target_worker_id), self._child_alloc.get(descriptor.identity)
-            )
+            mapped = bool(tensor.domain_mapping)
+            if mapped:
+                self._require_domain_mapping_target(tensor, target_worker_id)
+            bound = self._child_alloc.get(descriptor.identity)
             explicit = refs[index] is not None and refs[index].present
-            if explicit and bound is None:
+            if explicit and bound is None and not mapped:
                 continue
             if (
                 explicit
                 or bound is None
                 or bound.backend_kind != BackendKind.REMOTE_SIDECAR
-                or bound.owner_worker_id != target_worker_id
+                or (bound.owner_worker_id != target_worker_id and not (mapped and bound.owner_worker_id == -1))
                 or bound.to_descriptor() != descriptor
             ):
                 raise ValueError("Buffer reference is stale, targets another worker, or differs from its registration")
@@ -13113,7 +12961,6 @@ class Worker:
         """
         with self._child_prov_lock:
             self._child_alloc.clear()
-            self._domain_buffer_routes.clear()
             self._source_attachments.clear()
             self._domain_members.clear()
 
@@ -13821,6 +13668,8 @@ class Worker:
         The slot is dropped only when it still holds *this* buffer: a buffer_id minted elsewhere can
         collide with a registry key, and evicting the live entry it names would strand that
         backing."""
+        if buffer.backend_kind in (BackendKind.REMOTE_SIDECAR, BackendKind.VMM_WINDOW):
+            raise ValueError("release_buffer cannot revoke a domain Buffer; use domain.release()")
         if not buffer.closed:
             # Exclusive, not shared: `shared()` would already exclude admission and so
             # satisfy the "never mid-callback" argument above, but this keeps the

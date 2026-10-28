@@ -15,8 +15,8 @@ import json
 import pytest
 from simpler.worker import RemoteCallable, RemoteWorkerSpec, Worker
 
-from examples.workers.l4.host_domain_mpi_direct.main import MODULE, _build_kernel, node_orch, run_matrix
 from tests.st.worker.comm_domain import test_domain_tensor_remote as remote_domain
+from tests.st.worker.comm_domain.host_domain_matrix import MODULE, _build_kernel, node_orch, run_matrix
 
 _RUNTIME = "tensormap_and_ringbuffer"
 tcp_daemon = remote_domain.tcp_daemon

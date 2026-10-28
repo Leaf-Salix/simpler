@@ -28,10 +28,9 @@ from simpler.buffer import (
     ImportRegistry,
     buffer_reference,
 )
-from simpler.comm_domain import DomainConfig
+from simpler.comm_domain import CommDomainRef, DomainConfig
 from simpler.comm_endpoints import DEVICE_AICPU, HOST_CPU
 from simpler.global_comm_domain import (
-    GLOBAL_DOMAIN_BUFFER_REF_BYTES,
     GLOBAL_DOMAIN_VERSION,
     GlobalDomainBuffer,
     GlobalDomainCommand,
@@ -45,12 +44,37 @@ from simpler.global_comm_domain import (
     decode_domain_command,
     decode_release_command,
     encode_descriptor_table,
-    encode_domain_buffer_refs,
     encode_domain_command,
     encode_release_command,
 )
-from simpler.task_interface import HostWindowSpec
+from simpler.task_interface import (
+    ChipDomainContext,
+    CommDomainHandle,
+    DataType,
+    HostWindowSpec,
+    TaskArgs,
+    TensorArgType,
+    TensorTransfer,
+)
 from simpler.worker import _host_domain_buffers
+
+
+@pytest.fixture
+def native_domain_lib(arch, runtime):
+    root = Path(__file__).resolve().parents[3] / "build/lib"
+    ctypes.CDLL(str(root / "libcpu_sim_context.so"), mode=ctypes.RTLD_GLOBAL)
+    lib = ctypes.CDLL(str(root / arch / "sim" / runtime / "libhost_runtime.so"))
+    u64, u32, size, ptr = ctypes.c_uint64, ctypes.c_uint32, ctypes.c_size_t, ctypes.c_void_p
+    for name, args in {
+        "prepare": [u64, u32, u32, size, u32, u32, ptr, ptr],
+        "import": [u64, ptr, size, ptr],
+        "window": [u64, u32, ptr, ptr],
+        "copy": [u64, u32, size, u32, size, size, ptr],
+        "release": [u64, u32],
+    }.items():
+        function = getattr(lib, "comm_global_domain_" + name)
+        function.argtypes, function.restype = args, ctypes.c_int
+    return lib
 
 
 def _command():
@@ -80,16 +104,39 @@ def _exported_command():
             GlobalDomainDescriptor(GLOBAL_DOMAIN_VERSION, 1, slot, 2, size, b"backing")
             for slot, size in enumerate((4096, 4096, 96, 128))
         ),
-        backing_refs=tuple(
-            BufferDescriptor(
-                CanonicalIdentity(owner, 10, 1),
-                AddressSpace.DEVICE,
-                AccessMode.READWRITE,
-                BackendKind.REMOTE_SIDECAR,
-                64,
-            )
-            for owner in (b"hbmnode2", b"hbmnode5")
-        ),
+    )
+
+
+def _hbm_descriptor():
+    return BufferDescriptor(
+        CanonicalIdentity(b"hbmnode2", 10, 1),
+        AddressSpace.DEVICE,
+        AccessMode.READWRITE,
+        BackendKind.REMOTE_SIDECAR,
+        64,
+    )
+
+
+def _local_host_part(worker, domain, node):
+    from tests.st.worker.comm_domain.host_domain_matrix import local_host_part  # noqa: PLC0415
+
+    return local_host_part(worker, domain, node)
+
+
+def _host_handle(command, local_rank=0):
+    member = command.members[local_rank]
+    return CommDomainHandle(
+        name=command.name,
+        members=command.members,
+        contexts={
+            member.local_worker_id: ChipDomainContext(command.name, local_rank, len(command.members), 1, 4096, 4096, {})
+        },
+        buffers=command.buffers,
+        domain_id=command.domain_id,
+        generation=command.generation,
+        host_buffers=_host_domain_buffers(command),
+        ref=CommDomainRef(command.owner_instance_id, command.domain_id, command.generation),
+        _release_fn=lambda _handle: None,
     )
 
 
@@ -128,14 +175,64 @@ def test_host_command_and_logical_buffers_preserve_identity(phase):
     logical = _host_domain_buffers(command)[5]
     mapped = replace(_host_domain_buffers(received)[5], base=8192)
     assert logical.to_descriptor() == mapped.to_descriptor() and mapped.base == 8192
+    assert logical.address_space == mapped.address_space == AddressSpace.HOST
     assert logical.backend_kind == BackendKind.REMOTE_SIDECAR and not logical.body
-    assert logical.identity != _exported_command().backing_refs[1].identity
+    assert logical.identity != _host_domain_buffers(command)[2].identity
     with pytest.raises(KeyError):
         _host_domain_buffers(command)[99]
     exports = _exported_command().descriptors
     assert decode_descriptor_table(encode_descriptor_table(exports)) == exports
     with pytest.raises(ValueError, match="trailing"):
         decode_descriptor_table(encode_descriptor_table(exports) + b"x")
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_host_map_view_preserves_backing_and_original_tensor(rank):
+    handle = _host_handle(_exported_command(), rank)
+    source = handle.host(2).tensor([8], DataType.UINT8, byte_offset=4)
+    mapped = handle.map_view(source, domain_rank=rank)
+    assert mapped is not source and mapped.buffer == source.buffer
+    assert mapped.buffer.address_space == AddressSpace.HOST
+    assert (mapped.shapes, mapped.strides, mapped.dtype, mapped.byte_offset) == (
+        source.shapes,
+        source.strides,
+        source.dtype,
+        source.byte_offset,
+    )
+    assert mapped.domain_mapping == rank + 1
+    args = TaskArgs()
+    args.add_tensor(mapped, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
+    assert args.tensor(0).domain_mapping == rank + 1 and args.transfer(0) == TensorTransfer.NONE
+    assert source.domain_mapping == 0 and source.buffer == handle.host(2).to_descriptor()
+
+
+@pytest.mark.parametrize("local", [False, True])
+def test_host_map_view_requires_existing_local_context(local):
+    handle = _host_handle(_exported_command())
+    source = handle.host(2).tensor([8], DataType.UINT8)
+    if not local:
+        handle.contexts.clear()
+    with pytest.raises(KeyError):
+        handle.map_view(source, domain_rank=1 if local else 0)
+
+
+@pytest.mark.parametrize("mutation", ["rank", "foreign", "extent", "hbm", "released"])
+def test_host_map_view_rejects_ungranted_or_released_views(mutation):
+    handle = _host_handle(_exported_command())
+    buffer = handle.host(2)
+    rank = 0
+    if mutation == "rank":
+        rank = len(handle.members)
+    elif mutation == "foreign":
+        buffer = replace(buffer, identity=CanonicalIdentity(b"foreign1", 12, 1))
+    elif mutation == "extent":
+        buffer = replace(buffer, nbytes=64)
+    elif mutation == "hbm":
+        buffer = buffer_reference(_hbm_descriptor())
+    else:
+        handle.release()
+    with pytest.raises((ValueError, IndexError, RuntimeError)):
+        handle.map_view(buffer.tensor([8], DataType.UINT8), domain_rank=rank)
 
 
 @pytest.mark.parametrize("mutation", ["order", "collision", "missing", "unprepared", "creator"])
@@ -172,16 +269,6 @@ def test_release_stage_and_old_wire_are_strict():
         decode_domain_command(encoded + b"x")
 
 
-@pytest.mark.parametrize("tag", [7, 128, 255])
-def test_native_descriptor_rejects_retired_and_unknown_domain_backends(tag):
-    from _task_interface import _decode_buffer_descriptor_wire, _encode_buffer_descriptor_wire  # noqa: PLC0415
-
-    wire = bytearray(_encode_buffer_descriptor_wire(_exported_command().backing_refs[0]))
-    wire[4] = tag
-    with pytest.raises(ValueError):
-        _decode_buffer_descriptor_wire(bytes(wire))
-
-
 @pytest.mark.parametrize(
     "slot,field,value",
     [
@@ -209,7 +296,7 @@ def test_window_exports_reject_invalid_metadata(slot, field, value):
 @pytest.mark.parametrize("field,value", [("node", -1), ("identity", 0)])
 def test_host_config_rejects_invalid_wire(field, value):
     wire = bytearray(encode_domain_command(_exported_command()))
-    first_host = len(wire) - 4 - 2 * GLOBAL_DOMAIN_BUFFER_REF_BYTES - 2 * struct.calcsize("<iiQQ")
+    first_host = len(wire) - 2 * struct.calcsize("<iiQQ")
     struct.pack_into("<i" if field == "node" else "<Q", wire, first_host + (0 if field == "node" else 16), value)
     with pytest.raises(ValueError):
         decode_domain_command(bytes(wire))
@@ -240,13 +327,12 @@ def test_exports_collector_checks_node_ownership(monkeypatch, mutation):
     monkeypatch.setattr(
         worker,
         "_global_domain_control",
-        lambda node, *_args: encode_descriptor_table(replies[node])
-        + encode_domain_buffer_refs(((command.backing_refs[(2, 5).index(node)], 0, 0),)),
+        lambda node, *_args: encode_descriptor_table(replies[node]),
     )
     try:
         with pytest.raises(RuntimeError, match="node windows"):
             worker._collect_global_domain_exports(
-                replace(command, phase=GlobalDomainPhase.PREPARE_EXPORT, descriptors=(), backing_refs=()), (2, 5), []
+                replace(command, phase=GlobalDomainPhase.PREPARE_EXPORT, descriptors=()), (2, 5), []
             )
     finally:
         worker.close()
@@ -265,21 +351,8 @@ def test_host_fabric_export_requires_exact_token_size(length):
 @pytest.mark.parametrize("arch", ["a2a3", "a5"])
 @pytest.mark.parametrize("runtime", ["host_build_graph", "tensormap_and_ringbuffer"])
 @pytest.mark.parametrize("oversized", [False, True])
-def test_native_host_views_copy_and_two_stage_release(arch, runtime, oversized):
-    root = Path(__file__).resolve().parents[3] / "build/lib"
-    ctypes.CDLL(str(root / "libcpu_sim_context.so"), mode=ctypes.RTLD_GLOBAL)
-    lib = ctypes.CDLL(str(root / arch / "sim" / runtime / "libhost_runtime.so"))
-    u64, u32, size, ptr = ctypes.c_uint64, ctypes.c_uint32, ctypes.c_size_t, ctypes.c_void_p
-    signatures = {
-        "prepare": [u64, u32, u32, size, u32, u32, ptr, ptr],
-        "import": [u64, ptr, size, ptr],
-        "window": [u64, u32, ptr, ptr],
-        "copy": [u64, u32, size, u32, size, size, ptr],
-        "release": [u64, u32],
-    }
-    for name, args in signatures.items():
-        function = getattr(lib, "comm_global_domain_" + name)
-        function.argtypes, function.restype = args, ctypes.c_int
+def test_native_host_views_copy_and_two_stage_release(native_domain_lib, oversized):
+    lib, u64, size = native_domain_lib, ctypes.c_uint64, ctypes.c_size_t
     domain_id = int.from_bytes(os.urandom(8), "little") or 1
     owner = SharedMemory(create=True, size=128)
     try:
@@ -334,20 +407,8 @@ def test_native_host_views_copy_and_two_stage_release(arch, runtime, oversized):
 
 @pytest.mark.parametrize("arch", ["a2a3", "a5"])
 @pytest.mark.parametrize("runtime", ["host_build_graph", "tensormap_and_ringbuffer"])
-def test_native_partial_import_keeps_views_unpublished_until_release(arch, runtime):
-    root = Path(__file__).resolve().parents[3] / "build/lib"
-    ctypes.CDLL(str(root / "libcpu_sim_context.so"), mode=ctypes.RTLD_GLOBAL)
-    lib = ctypes.CDLL(str(root / arch / "sim" / runtime / "libhost_runtime.so"))
-    u64, u32, size, ptr = ctypes.c_uint64, ctypes.c_uint32, ctypes.c_size_t, ctypes.c_void_p
-    for name, args in {
-        "prepare": [u64, u32, u32, size, u32, u32, ptr, ptr],
-        "import": [u64, ptr, size, ptr],
-        "window": [u64, u32, ptr, ptr],
-        "copy": [u64, u32, size, u32, size, size, ptr],
-        "release": [u64, u32],
-    }.items():
-        function = getattr(lib, "comm_global_domain_" + name)
-        function.argtypes, function.restype = args, ctypes.c_int
+def test_native_partial_import_keeps_views_unpublished_until_release(native_domain_lib):
+    lib, u64, size = native_domain_lib, ctypes.c_uint64, ctypes.c_size_t
     domain_ids = tuple(int.from_bytes(os.urandom(8), "little") or 1 for _ in range(2))
     owner = SharedMemory(create=True, size=128)
     try:
@@ -389,8 +450,11 @@ def test_native_partial_import_keeps_views_unpublished_until_release(arch, runti
 
 
 def test_two_node_host_cpu_copy_reuse_and_stale_access():
+    from functools import partial  # noqa: PLC0415
+
     from simpler.comm_domain import CommDomainRef  # noqa: PLC0415
-    from simpler.task_interface import CommBufferSpec, DataType, TaskArgs  # noqa: PLC0415
+    from simpler.orchestrator import Orchestrator  # noqa: PLC0415
+    from simpler.task_interface import CallConfig, CommBufferSpec, TaskArgs  # noqa: PLC0415
     from simpler.worker import Worker  # noqa: PLC0415
 
     saved_parts = []
@@ -405,37 +469,63 @@ def test_two_node_host_cpu_copy_reuse_and_stale_access():
         domain = orch.get_domain(
             CommDomainRef(int(args.scalar(2)).to_bytes(8, "little"), int(args.scalar(3)), int(args.scalar(4)))
         )
-        part = domain.local_host()
-        local = domain.host(node)
+        part = _local_host_part(orch._worker, domain, node)
+        local_slot = len(domain.members) + node
+
+        def copy(dst, src, chip, nbytes, dst_offset=0, src_offset=0):
+            orch._worker._copy_domain_pools(
+                domain.ref,
+                worker=chip,
+                dst_slot=dst,
+                src_slot=src,
+                nbytes=nbytes,
+                dst_offset=dst_offset,
+                src_offset=src_offset,
+            )
+
         if phase == 0:
             saved_parts.append(part)
             data = bytes([node + 11]) * 128 + bytes([0xCC]) * (1536 - 128)
             part.write(0, data)
             for member in domain.members:
                 if member.node_worker_id == node:
-                    orch._worker.copy_domain(
-                        member.buffers["payload"], local, worker=member.local_worker_id, nbytes=512
-                    )
+                    copy(member.domain_rank, local_slot, member.local_worker_id, 512)
             return
-        pools = [(domain.host(n), n) for n in nodes]
-        pools += [(member.buffers["payload"], member.node_worker_id) for member in domain.members]
+        pools = [(len(domain.members) + n, n) for n in nodes]
+        pools += [(member.domain_rank, member.node_worker_id) for member in domain.members]
         for chip in (0, 1):
             for pool, owner in pools:
-                orch.copy_domain(local, pool, worker=chip, nbytes=128, dst_offset=512)
+                copy(local_slot, pool, chip, 128, dst_offset=512)
                 result = bytearray(128)
                 part.read(512, result)
                 assert result == bytes([owner + 11]) * 128
-                orch.copy_domain(pool, local, worker=chip, nbytes=64, dst_offset=128)
-                orch.copy_domain(local, pool, worker=chip, nbytes=512, dst_offset=512)
+                copy(pool, local_slot, chip, 64, dst_offset=128)
+                copy(local_slot, pool, chip, 512, dst_offset=512)
                 result = bytearray(512)
                 part.read(512, result)
                 assert result == bytes([owner + 11]) * 128 + bytes([node + 11]) * 64 + bytes([0xCC]) * 320
         with pytest.raises(ValueError, match="overlap"):
-            orch.copy_domain(local, local, worker=0, nbytes=64, dst_offset=16)
+            copy(local_slot, local_slot, 0, 64, dst_offset=16)
         with pytest.raises(ValueError, match="range"):
-            orch.copy_domain(local, local, worker=0, nbytes=64, dst_offset=1530)
-        with pytest.raises(ValueError, match="granted"):
-            orch.copy_domain(replace(local, nbytes=1024), local, worker=0, nbytes=64)
+            copy(local_slot, local_slot, 0, 64, dst_offset=1530)
+        for dst, src in ((0, 1), (0, len(domain.members) + (node ^ 1))):
+            with pytest.raises(ValueError, match="this node's Host"):
+                copy(dst, src, 0, 64)
+        for count, offset in ((0, 0), (-1, 0), (64, -1)):
+            with pytest.raises(ValueError):
+                copy(local_slot, 0, 0, count, dst_offset=offset)
+        with pytest.raises((ValueError, KeyError, RuntimeError)):
+            copy(local_slot, 999, 0, 64)
+        with pytest.raises((ValueError, KeyError, RuntimeError)):
+            copy(local_slot, 0, 999, 64)
+        with pytest.raises((ValueError, KeyError, RuntimeError)):
+            orch._worker._copy_domain_pools(
+                replace(domain.ref, generation=domain.ref.generation + 1),
+                worker=0,
+                dst_slot=local_slot,
+                src_slot=0,
+                nbytes=64,
+            )
 
     root = Worker(level=4, num_sub_workers=0)
     task = root.register(node_task)
@@ -470,32 +560,45 @@ def test_two_node_host_cpu_copy_reuse_and_stale_access():
             domain = orch.get_or_allocate_domain(**request)
             assert orch.get_or_allocate_domain(**request) is domain
             captured.append(domain)
-            with pytest.raises(RuntimeError, match="no local Host"):
-                domain.local_host()
 
         root.run(allocate)
         domain = captured[0]
         assert len({b.identity for b in domain._host_buffers.values()}) == 2
+
+        def submit_step(
+            orch: Orchestrator,
+            _args: TaskArgs | None,
+            _config: CallConfig,
+            *,
+            node: int,
+            phase: int,
+        ) -> None:
+            args = TaskArgs()
+            if phase != 2:
+                current = orch.get_domain(domain.ref)
+            args.add_scalar(node)
+            args.add_scalar(phase)
+            if phase != 2:
+                args.add_scalar(int.from_bytes(current.ref.owner_instance_id, "little"))
+                args.add_scalar(current.ref.domain_id)
+                args.add_scalar(current.ref.generation)
+            orch.submit_next_level(task, args, worker=node)
+
         for phase in (0, 1, 2):
             if phase == 2:
-                domain.release()
-                assert domain.freed
+                assert domain.released and domain.freed
             for node in nodes:
-
-                def submit(orch, _args, _config, node=node, phase=phase):
-                    args = TaskArgs()
-                    if phase != 2:
-                        current = orch.get_domain(domain.ref)
-                        args.add_tensor(current.host(node).tensor([1536], DataType.UINT8))
-                    args.add_scalar(node)
-                    args.add_scalar(phase)
-                    if phase != 2:
-                        args.add_scalar(int.from_bytes(current.ref.owner_instance_id, "little"))
-                        args.add_scalar(current.ref.domain_id)
-                        args.add_scalar(current.ref.generation)
-                    orch.submit_next_level(task, args, worker=node)
-
-                root.run(submit)
+                step = partial(submit_step, node=node, phase=phase)
+                if phase == 1 and node == nodes[-1]:
+                    pending = root.submit(step)
+                    assert pending._resources.live_global_domains.get(domain.name) is domain
+                    assert pending._resources.requires_ordered_cleanup
+                    domain.release()
+                    assert domain.released and not domain.freed
+                    pending.wait()
+                    assert domain.freed
+                else:
+                    root.run(step)
         assert not root.live_domains
     finally:
         root.close()
@@ -611,64 +714,17 @@ def test_host_close_cannot_bypass_global_release(monkeypatch, mode):
             worker.close()
 
 
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        "valid",
-        "unknown",
-        "stale",
-        "overlap",
-        "range",
-        "read-only",
-        "revoked",
-        "generation",
-        "truncated",
-        "native-failure",
-    ],
-)
-def test_pool_copy_reuses_grants_and_revokes_unknown_completion(monkeypatch, mutation):
+@pytest.mark.parametrize("mutation", ["valid", "missing", "revoked", "generation", "truncated", "native-failure"])
+def test_pool_copy_reuses_domain_state_and_revokes_unknown_completion(monkeypatch, mutation):
     import simpler.worker as module  # noqa: PLC0415
 
-    command = _exported_command()
-    host, peer = _host_domain_buffers(command)[2], buffer_reference(command.backing_refs[1])
-    slots = module._domain_buffer_slots(command)
-    entry = module._L2GlobalDomain(
-        7,
-        3,
-        0,
-        2,
-        None,
-        0,
-        4096,
-        4096,
-        device_ctx=123,
-        host_enabled=True,
-        grants={identity: slots[identity] for identity in (host.identity, peer.identity)},
-    )
-    store = module._L2GlobalDomainStore({7: entry})
-    dst, src, offset = host, peer, 8
-    if mutation in ("unknown", "stale"):
-        identity = host.identity
-        dst = replace(
-            host,
-            identity=CanonicalIdentity(
-                identity.owner_instance_id,
-                identity.buffer_id + (mutation == "unknown"),
-                identity.generation + (mutation == "stale"),
-            ),
-        )
-    elif mutation == "overlap":
-        src, offset = host, 2
-    elif mutation == "range":
-        offset = host.nbytes
-    elif mutation == "read-only":
-        entry.grants[host.identity] = (replace(host, access=AccessMode.READ).to_descriptor(), *slots[host.identity][1:])
-    elif mutation == "revoked":
+    entry = module._L2GlobalDomain(7, 3, 0, 2, None, 0, 4096, 4096, device_ctx=123, host_enabled=True)
+    store = module._L2GlobalDomainStore({7: entry} if mutation != "missing" else {})
+    if mutation == "revoked":
         entry.revoked = True
     elif mutation == "generation":
         entry.generation += 1
-    payload = module.LOCAL_POOL_COPY.pack(module.LOCAL_DOMAIN_MAGIC, GLOBAL_DOMAIN_VERSION, 7, 3, offset, 4, 8)
-    payload += module._pack_identity_wire(dst.identity) + module._pack_identity_wire(src.identity)
+    payload = module.LOCAL_POOL_COPY.pack(module.LOCAL_DOMAIN_MAGIC, GLOBAL_DOMAIN_VERSION, 7, 3, 2, 1, 8, 4, 8)
     if mutation == "truncated":
         payload = payload[:-1]
     monkeypatch.setattr(module, "_open_global_domain_payload", lambda _buf: _control_payload(payload))
@@ -687,8 +743,9 @@ def test_pool_copy_reuses_grants_and_revokes_unknown_completion(monkeypatch, mut
         with pytest.raises(RuntimeError, match="unknown"):
             module._handle_ctrl_domain_pool_copy(Chip(), memoryview(bytearray()), store)
         assert entry.revoked
-        with pytest.raises(ValueError, match="live Host domain grant"):
+        with pytest.raises(ValueError):
             module._handle_ctrl_domain_pool_copy(Chip(), memoryview(bytearray()), store)
+        assert calls == [(7, 2, 8, 1, 4, 8)]
     else:
         with pytest.raises(ValueError):
             module._handle_ctrl_domain_pool_copy(Chip(), memoryview(bytearray()), store)
@@ -702,7 +759,7 @@ def test_import_freezes_this_nodes_exports_before_dispatch(field, value):
     command = _exported_command()
     worker = module.Worker(level=3, num_sub_workers=0)
     state = module._GlobalNodeDomainState(
-        replace(command, phase=GlobalDomainPhase.PREPARE_EXPORT, descriptors=(), backing_refs=()), node_worker_id=2
+        replace(command, phase=GlobalDomainPhase.PREPARE_EXPORT, descriptors=()), node_worker_id=2
     )
     state.descriptors = {0: command.descriptors[0], 2: command.descriptors[2]}
     worker._global_node_domains[7] = state
@@ -746,85 +803,52 @@ def test_commit_freezes_complete_host_exports(field, value):
 
 
 def test_shared_host_targets_preserve_exact_descriptor_and_hbm_chip_checks():
-    from simpler.task_interface import DataType, TaskArgs  # noqa: PLC0415
-    from simpler.worker import Worker  # noqa: PLC0415
+    import simpler.worker as module  # noqa: PLC0415
 
-    worker = Worker(level=3, num_sub_workers=0)
+    worker = module.Worker(level=3, num_sub_workers=0)
     command = _exported_command()
     host = _host_domain_buffers(command)[2]
-    hbm = buffer_reference(command.backing_refs[0], owner_worker_id=2)
+    handle = _host_handle(command)
+    hbm = buffer_reference(_hbm_descriptor(), owner_worker_id=0)
+    worker._global_node_domains[7] = module._GlobalNodeDomainState(
+        command, phase=GlobalDomainPhase.COMMIT, node_worker_id=2, host_buffers=handle._host_buffers
+    )
     try:
         with worker._child_prov_lock:
             worker._record_device_alloc(host)
-            for target in (2, 5):
-                worker._domain_buffer_routes[(host.identity, target)] = buffer_reference(host, owner_worker_id=target)
             worker._record_device_alloc(hbm)
             args = TaskArgs()
-            args.add_tensor(host.tensor([8], DataType.UINT8))
-            for target in (2, 5):
-                worker._prepare_buffer_references(args, None, target)
-                worker._child_prov_check_dispatch_locked(args, target, api="test")
-            with pytest.raises(ValueError, match="another worker|stale"):
+            args.add_tensor(
+                handle.map_view(host.tensor([8], DataType.UINT8), domain_rank=0), transfer=TensorTransfer.NONE
+            )
+            worker._prepare_buffer_references(args, None, 0)
+            worker._child_prov_check_dispatch_locked(args, 0, api="test")
+            with pytest.raises(ValueError):
                 worker._prepare_buffer_references(args, None, 999)
             changed = TaskArgs()
-            changed.add_tensor(replace(host, nbytes=64).tensor([8], DataType.UINT8))
-            with pytest.raises(ValueError, match="differs from its registration"):
-                worker._prepare_buffer_references(changed, None, 2)
-            args.add_tensor(hbm.tensor([8], DataType.UINT8))
-            with pytest.raises(ValueError, match="another worker|stale"):
-                worker._prepare_buffer_references(args, None, 5)
-        with pytest.raises(ValueError, match="explicit copy_domain"):
+            changed.add_tensor(
+                replace(host, nbytes=64).tensor([8], DataType.UINT8)._with_domain_mapping(0),
+                transfer=TensorTransfer.NONE,
+            )
+            with pytest.raises(ValueError):
+                worker._prepare_buffer_references(changed, None, 0)
+            wrong_rank = TaskArgs()
+            wrong_rank.add_tensor(
+                host.tensor([8], DataType.UINT8)._with_domain_mapping(1), transfer=TensorTransfer.NONE
+            )
+            with pytest.raises(ValueError):
+                worker._prepare_buffer_references(wrong_rank, None, 0)
+            hbm_args = TaskArgs()
+            hbm_args.add_tensor(hbm.tensor([8], DataType.UINT8))
+            worker._prepare_buffer_references(hbm_args, None, 0)
+            with pytest.raises(ValueError):
+                worker._prepare_buffer_references(hbm_args, None, 1)
+        with pytest.raises(ValueError, match="shared Host"):
             worker._device_worker_for(host.identity, api="test")
     finally:
+        worker._global_node_domains.clear()
         worker._clear_child_prov()
         worker.close()
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    ["missing", "duplicate", "host-collision", "extent", "access", "space", "path", "backend", "phase", "no-host"],
-)
-def test_command_backing_references_reject_conflicting_grants(mutation):
-    command = _exported_command()
-    first, second = command.backing_refs
-    changes = {
-        "host-collision": {
-            "identity": CanonicalIdentity(command.owner_instance_id, command.host_windows[0].buffer_id, 1)
-        },
-        "extent": {"nbytes": 128},
-        "access": {"access": AccessMode.READ},
-        "space": {"address_space": AddressSpace.HOST},
-        "path": {"owner_worker_path_id": 1},
-        "backend": {"backend_kind": BackendKind.VMM_WINDOW, "body": (4096).to_bytes(8, "little")},
-    }
-    if mutation in changes:
-        command = replace(
-            command, backing_refs=(replace(buffer_reference(first), **changes[mutation]).to_descriptor(), second)
-        )
-    elif mutation == "missing":
-        command = replace(command, backing_refs=(first,))
-    elif mutation == "duplicate":
-        command = replace(command, backing_refs=(first, first))
-    elif mutation == "phase":
-        command = replace(command, phase=GlobalDomainPhase.PREPARE_EXPORT, descriptors=())
-    else:
-        command = replace(command, host_windows=(), descriptors=command.descriptors[:2])
-    with pytest.raises(ValueError, match="backing reference"):
-        encode_domain_command(command)
-
-
-@pytest.mark.parametrize("mutation", ["locator", "count", "truncated"])
-def test_command_backing_reference_wire_rejects_malformed_payload(mutation):
-    wire = bytearray(encode_domain_command(_exported_command()))
-    count_at = len(wire) - 2 * GLOBAL_DOMAIN_BUFFER_REF_BYTES - 4
-    if mutation == "locator":
-        struct.pack_into("<QQ", wire, count_at + 4 + 88, 1, 1)
-    elif mutation == "count":
-        struct.pack_into("<I", wire, count_at, 4097)
-    else:
-        del wire[-1]
-    with pytest.raises(ValueError):
-        decode_domain_command(bytes(wire))
 
 
 def test_borrowed_host_identity_has_endpoint_local_mappings_and_revocation():
@@ -832,93 +856,84 @@ def test_borrowed_host_identity_has_endpoint_local_mappings_and_revocation():
     registries = [ImportRegistry(ImportContext(DEVICE_AICPU)) for _ in range(2)]
     host = ImportRegistry(ImportContext(HOST_CPU))
     try:
-        for registry, base in zip(registries, (4096, 8192)):
-            registry.register_borrowed(descriptor, base)
-            registry.register_borrowed(descriptor, base)
-            assert registry.materialize(descriptor).base == base
+        for mapping, (registry, base) in enumerate(zip(registries, (4096, 8192)), start=1):
+            registry.register_borrowed(descriptor, base, mapping=mapping)
+            registry.register_borrowed(descriptor, base, mapping=mapping)
+            imported = registry.materialize(descriptor, mapping=mapping)
+            assert imported.base == base and imported.address_space == AddressSpace.DEVICE
+            assert imported.descriptor == descriptor and descriptor.address_space == AddressSpace.HOST
+            with pytest.raises(ValueError):
+                registry.materialize(descriptor)
+            with pytest.raises(ValueError):
+                registry.materialize(descriptor, mapping=3)
+            with pytest.raises(ValueError, match="different target"):
+                registry.register_borrowed(descriptor, base, mapping=3)
             with pytest.raises(ValueError, match="conflict"):
-                registry.register_borrowed(descriptor, base + 64)
+                registry.register_borrowed(descriptor, base + 64, mapping=mapping)
             changed = replace(buffer_reference(descriptor), nbytes=64).to_descriptor()
             with pytest.raises(ValueError, match="conflict"):
-                registry.register_borrowed(changed, base)
+                registry.register_borrowed(changed, base, mapping=mapping)
             with pytest.raises(ValueError, match="different descriptor"):
-                registry.materialize(changed)
-        with pytest.raises(ValueError, match="granted device"):
-            host.register_borrowed(descriptor, 4096)
+                registry.materialize(changed, mapping=mapping)
+        with pytest.raises(ValueError, match="Host domain grant"):
+            host.register_borrowed(descriptor, 4096, mapping=1)
         registries[0].unregister(descriptor.identity)
         with pytest.raises(KeyError, match="no buffer registered"):
             registries[0].require(descriptor.identity)
-        assert registries[1].require(descriptor.identity).base == 8192
+        assert registries[1].materialize(descriptor, mapping=2).base == 8192
         with pytest.raises(ValueError):
-            registries[0].materialize(descriptor)
+            registries[0].materialize(descriptor, mapping=1)
     finally:
         for registry in (*registries, host):
             registry.close()
 
 
-def test_shared_host_reference_uses_each_receiving_session_locator():
-    from simpler.task_interface import DataType, TaskArgs, _RemoteTaskArgsSidecar  # noqa: PLC0415
-    from simpler.worker import Worker  # noqa: PLC0415
+def test_host_mapping_rejects_nested_worker_forwarding(monkeypatch):
+    import simpler.worker as module  # noqa: PLC0415
 
-    worker = Worker(level=4, num_sub_workers=0)
-    public = _host_domain_buffers(_command())[2]
+    worker = module.Worker(level=3, num_sub_workers=0)
+    handle = _host_handle(_exported_command(), 1)
     args = TaskArgs()
-    args.add_tensor(public.tensor([8], DataType.UINT8, byte_offset=4))
-    sidecar = _RemoteTaskArgsSidecar((None,), b"")
+    args.add_tensor(
+        handle.map_view(handle.host(2).tensor([8], DataType.UINT8), domain_rank=1),
+        TensorArgType.INPUT,
+        transfer=TensorTransfer.NONE,
+    )
+    monkeypatch.setattr(module, "_buffer_field_addr", lambda *_: 0)
+    monkeypatch.setattr(module, "read_args_from_blob", lambda *_: args)
     try:
-        with worker._child_prov_lock:
-            worker._record_device_alloc(public)
-            for target, locator in ((2, (41, 3)), (5, (62, 4))):
-                worker._domain_buffer_routes[(public.identity, target)] = buffer_reference(
-                    public, owner_worker_id=target, remote_ref=locator
-                )
-                prepared = worker._prepare_buffer_references(args, sidecar, target)
-                assert prepared is not None and prepared.tensors[0] is not None
-                descriptor = prepared.tensors[0].desc
-                assert (descriptor.owner_worker_id, descriptor.buffer_id, descriptor.generation) == (target, *locator)
-                assert descriptor.offset == 4 and descriptor.nbytes == public.nbytes - 4
-                worker._child_prov_check_dispatch_locked(args, target, api="test")
-            assert public._remote_ref is None and sidecar.tensors == (None,)
-            with pytest.raises(ValueError, match="another worker|stale"):
-                worker._prepare_buffer_references(args, sidecar, 99)
-            worker._drop_device_alloc(public.identity)
-            assert not worker._domain_buffer_routes
-            with pytest.raises(ValueError, match="stale"):
-                worker._prepare_buffer_references(args, sidecar, 2)
+        with pytest.raises(ValueError, match="mapping"):
+            module._reexport_args_from_mailbox(None, worker)
     finally:
-        worker._clear_child_prov()
         worker.close()
 
 
-@pytest.mark.parametrize("mutation", [None, "missing", "duplicate", "locator"])
-def test_exports_collector_preserves_rank_order_and_rejects_conflicting_references(monkeypatch, mutation):
+@pytest.mark.parametrize("kind", ["host", "hbm"])
+@pytest.mark.parametrize("state", ["live", "revoked", "closed-wrapper"])
+def test_domain_buffer_cannot_bypass_collective_release(monkeypatch, kind, state):
+    from simpler.buffer import wrap_vmm_window  # noqa: PLC0415
     from simpler.worker import Worker  # noqa: PLC0415
 
-    command = _exported_command()
-    worker = Worker(level=4, num_sub_workers=0)
-    replies = {}
-    for index, node in enumerate((2, 5)):
-        refs = [(command.backing_refs[index], int(mutation == "locator"), 0)]
-        if mutation == "missing" and node == 5:
-            refs = []
-        elif mutation == "duplicate" and node == 5:
-            refs = [(command.backing_refs[0], 0, 0)]
-        replies[node] = encode_descriptor_table((command.descriptors[index], command.descriptors[index + 2]))
-        replies[node] += encode_domain_buffer_refs(refs)
-    monkeypatch.setattr(worker, "_global_domain_control", lambda node, *_args: replies[node])
-    prepared = []
+    worker = Worker(level=3, num_sub_workers=0)
+    buffer = (
+        _host_domain_buffers(_command())[2]
+        if kind == "host"
+        else wrap_vmm_window(4096, 64, worker._owner_instance_id, 41, owner_worker_id=0)
+    )
+    calls = []
+    monkeypatch.setattr(worker, "_release_import_recursive", lambda *_: calls.append("unregister"))
     try:
-        base = replace(command, phase=GlobalDomainPhase.PREPARE_EXPORT, descriptors=(), backing_refs=())
-        if mutation:
-            with pytest.raises(ValueError, match="backing references"):
-                worker._collect_global_domain_exports(base, (2, 5), prepared)
-        else:
-            assert worker._collect_global_domain_exports(base, (2, 5), prepared) == (
-                command.descriptors,
-                command.backing_refs,
-            )
-            assert prepared == [2, 5]
+        with worker._child_prov_lock:
+            worker._record_device_alloc(buffer, domain_allocation_id=7)
+        if state == "revoked":
+            worker._drop_domain_allocs(7)
+        elif state == "closed-wrapper":
+            buffer.close()
+        with pytest.raises(ValueError):
+            worker.release_buffer(buffer)
+        assert not calls
     finally:
+        worker._clear_child_prov()
         worker.close()
 
 
@@ -972,7 +987,7 @@ def test_borrowed_host_access_outside_callback_does_not_reenter_serializer(monke
             ref = CommDomainRef(command.owner_instance_id, 7, 3)
             handle = worker._get_domain(ref)
             assert handle.borrowed and worker._get_domain(ref) is handle
-            part = handle.local_host()
+            part = _local_host_part(worker, handle, 2)
             source = bytearray(b"head" + bytes(range(96)) + b"tail")
             result = bytearray([0xCC] * 80)
             with monkeypatch.context() as copy_patch:
@@ -1026,7 +1041,8 @@ def test_native_host_owner_rejects_access_without_a_live_mapping(method):
         getattr(_DomainHostMemory(), method)(0, 0, 1)
 
 
-def test_host_import_leaves_local_hbm_for_ordinary_vmm_materialization(monkeypatch):
+@pytest.mark.parametrize("partial_failure", [False, True])
+def test_host_import_leaves_local_hbm_for_ordinary_vmm_materialization(monkeypatch, partial_failure):
     import simpler.worker as module  # noqa: PLC0415
 
     command = _exported_command()
@@ -1048,31 +1064,58 @@ def test_host_import_leaves_local_hbm_for_ordinary_vmm_materialization(monkeypat
             return 4096 * (slot + 1), command.descriptors[slot].mapping_size
 
     try:
+        if partial_failure:
+            register = registry.register_borrowed
+            registrations = []
+
+            def register_one(descriptor, base, *, mapping):
+                if registrations:
+                    raise RuntimeError("second mapping refused")
+                register(descriptor, base, mapping=mapping)
+                registrations.append(descriptor)
+
+            monkeypatch.setattr(registry, "register_borrowed", register_one)
+            with pytest.raises(RuntimeError, match="second mapping refused"):
+                module._handle_ctrl_global_domain_import(Chip(), memoryview(bytearray()), store, registry)
+            assert entry.import_command == command and len(calls) == len(registrations) == 1
+            assert registry.materialize(registrations[0], mapping=1).base != 0
+            payload = module.LOCAL_RELEASE_REQUEST.pack(
+                module.LOCAL_DOMAIN_MAGIC, GLOBAL_DOMAIN_VERSION, 7, 3, int(GlobalDomainReleaseStage.VIEWS)
+            )
+
+            class Release:
+                def comm_global_domain_release(self, *_):
+                    assert entry.revoked
+                    for descriptor in registrations:
+                        with pytest.raises(ValueError, match="no live grant"):
+                            registry.materialize(descriptor, mapping=1)
+                    calls.append("release")
+
+            module._handle_ctrl_global_domain_release(Release(), memoryview(bytearray()), store, registry)
+            assert calls[-1] == "release"
+            return
+
         for _ in range(2):
             module._handle_ctrl_global_domain_import(Chip(), memoryview(bytearray()), store, registry)
         assert calls == [(7, b"".join(descriptor.encode() for descriptor in command.descriptors))]
-        assert entry.grants == module._domain_buffer_slots(command)
+        assert entry.import_command == command
         changed = replace(
-            command,
-            backing_refs=(
-                replace(
-                    buffer_reference(command.backing_refs[0]), identity=CanonicalIdentity(b"changed1", 99, 1)
-                ).to_descriptor(),
-                command.backing_refs[1],
-            ),
+            command, host_windows=(replace(command.host_windows[0], buffer_id=99), command.host_windows[1])
         )
         payload = module.LOCAL_IMPORT_REQUEST.pack(module.LOCAL_DOMAIN_MAGIC, GLOBAL_DOMAIN_VERSION, 7, 3, 4)
         payload += encode_domain_command(changed)
-        with pytest.raises(ValueError, match="changes its slice grants"):
+        with pytest.raises(ValueError, match="changes its command"):
             module._handle_ctrl_global_domain_import(Chip(), memoryview(bytearray()), store, registry)
-        assert entry.grants == module._domain_buffer_slots(command) and len(calls) == 1
-        for descriptor in command.backing_refs:
+        assert entry.import_command == command and len(calls) == 1
+        for descriptor in (_hbm_descriptor(),):
             with pytest.raises(KeyError, match="no buffer registered"):
                 registry.require(descriptor.identity)
         for slot, host in enumerate(_host_domain_buffers(command).values(), start=2):
-            assert registry.require(host.identity).base == 4096 * (slot + 1)
+            assert registry.materialize(host.to_descriptor(), mapping=entry.domain_rank + 1).base == 4096 * (slot + 1)
+            with pytest.raises(ValueError):
+                registry.materialize(host.to_descriptor())
         local_hbm = replace(
-            buffer_reference(command.backing_refs[0]),
+            buffer_reference(_hbm_descriptor()),
             backend_kind=BackendKind.VMM_WINDOW,
             body=(4096).to_bytes(8, "little"),
         ).to_descriptor()
@@ -1141,23 +1184,19 @@ def test_concurrent_domain_revocations_both_drain_an_authorized_hbm_copy(monkeyp
     assert sorted(completed) == ["first-drop", "second-drop"]
 
 
-@pytest.mark.parametrize("mutation", ["valid", "changed-identity", "changed-base"])
-def test_import_preserves_reserved_hbm_identity_and_backing(mutation):
+@pytest.mark.parametrize("changed_base", [False, True])
+def test_import_preserves_local_hbm_backing(changed_base):
     import simpler.worker as module  # noqa: PLC0415
 
     worker = module.Worker(level=3, device_ids=(0,), num_sub_workers=0)
-    identity = worker._burn_buffer_identity()
     command = _exported_command()
-    local = module._domain_backing_descriptor(identity, command.buffers[0].nbytes)
-    command = replace(command, backing_refs=(local, command.backing_refs[1]))
     state = module._GlobalNodeDomainState(
-        command=replace(command, phase=GlobalDomainPhase.PREPARE_EXPORT, descriptors=(), backing_refs=()),
+        command=replace(command, phase=GlobalDomainPhase.PREPARE_EXPORT, descriptors=()),
         prepared_domain_ranks={0},
         descriptors={0: command.descriptors[0], 2: command.descriptors[2]},
         local_window_bases={0: 4096},
         mapping_sizes={0: 4096},
         node_worker_id=2,
-        backing_ids={0: (identity,)},
     )
     worker._global_node_domains[7] = state
     calls = []
@@ -1172,24 +1211,13 @@ def test_import_preserves_reserved_hbm_identity_and_backing(mutation):
                 7,
                 3,
                 123,
-                8192 if mutation == "changed-base" else 4096,
+                8192 if changed_base else 4096,
                 4096,
             )
 
     worker._worker = Chip()
     try:
-        if mutation == "changed-identity":
-            command = replace(
-                command,
-                backing_refs=(
-                    replace(buffer_reference(local), identity=worker._burn_buffer_identity()).to_descriptor(),
-                    command.backing_refs[1],
-                ),
-            )
-            with pytest.raises(ValueError, match="backing references"):
-                worker._import_global_domain_node(command, 2)
-            assert not calls
-        elif mutation == "changed-base":
+        if changed_base:
             with pytest.raises(RuntimeError, match="local backing mismatch"):
                 worker._import_global_domain_node(command, 2)
             assert not state.contexts
@@ -1197,12 +1225,146 @@ def test_import_preserves_reserved_hbm_identity_and_backing(mutation):
             for _ in range(2):
                 worker._import_global_domain_node(command, 2)
             buffer = state.contexts[0].buffers["payload"]
-            assert buffer.identity == identity and buffer.base == 4096
-            assert buffer.backend_kind == BackendKind.VMM_WINDOW
+            assert bytes(buffer.identity.owner_instance_id) == worker._owner_instance_id
+            assert buffer.base == 4096 and buffer.backend_kind == BackendKind.VMM_WINDOW
             assert len(calls) == 1
     finally:
-        # Synthetic grants only; no native owner or child process was created.
         worker._worker = None
         worker._global_node_domains.clear()
         worker._clear_child_prov()
         worker.close()
+
+
+@pytest.mark.parametrize("writing", [False, True])
+def test_host_byte_access_holds_release_fence_through_cpu_copy(writing):
+    import simpler.worker as module  # noqa: PLC0415
+    from simpler.task_interface import GlobalCommDomainView  # noqa: PLC0415
+
+    worker = module.Worker(level=3, num_sub_workers=0)
+    entered, proceed, releasing, freed = (threading.Event() for _ in range(4))
+    errors = []
+    command = replace(_exported_command(), profile="a3-fabric-v1")
+
+    class Owner:
+        def read_bytes(self, *_):
+            entered.set()
+            assert worker._child_prov_lock.locked()
+            assert proceed.wait(3)
+            assert not freed.is_set()
+
+        write_bytes = read_bytes
+
+        def release(self):
+            assert proceed.is_set()
+            freed.set()
+
+    view = GlobalCommDomainView(
+        name="mixed", members=command.members, contexts={}, domain_id=7, generation=3, mapping_size=4096
+    )
+    state = module._GlobalNodeDomainState(
+        command,
+        phase=GlobalDomainPhase.COMMIT,
+        view=view,
+        host_owner=Owner(),
+        node_worker_id=2,
+    )
+    worker._global_node_domains[7] = state
+    worker._lifecycle = module._Lifecycle.READY
+    worker._worker = object()
+
+    def access():
+        try:
+            worker._host_domain_bytes(CommDomainRef(command.owner_instance_id, 7, 3), 0, 1234, 8, writing=writing)
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+
+    def release():
+        try:
+            releasing.set()
+            for stage in (GlobalDomainReleaseStage.VIEWS, GlobalDomainReleaseStage.OWNERS):
+                worker._release_global_domain_node(GlobalDomainReleaseCommand(7, 3, stage))
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+
+    threads = [threading.Thread(target=target, daemon=True) for target in (access, release)]
+    try:
+        threads[0].start()
+        assert entered.wait(3)
+        threads[1].start()
+        assert releasing.wait(3)
+        assert worker._child_prov_lock.locked() and not freed.is_set()
+    finally:
+        proceed.set()
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join(3)
+        worker._worker = None
+        worker._global_node_domains.clear()
+        worker.close()
+    assert not errors and freed.is_set()
+    assert all(not thread.is_alive() for thread in threads)
+
+
+def test_pool_copy_rechecks_state_after_waiting_for_actor_fence(monkeypatch):
+    from contextlib import contextmanager  # noqa: PLC0415
+
+    import simpler.worker as module  # noqa: PLC0415
+    from simpler.task_interface import GlobalCommDomainView  # noqa: PLC0415
+
+    worker = module.Worker(level=3, num_sub_workers=0)
+    command = _exported_command()
+    state = module._GlobalNodeDomainState(
+        command,
+        phase=GlobalDomainPhase.COMMIT,
+        node_worker_id=2,
+        view=GlobalCommDomainView(
+            name="mixed", members=command.members, contexts={}, domain_id=7, generation=3, mapping_size=4096
+        ),
+        contexts={0: _host_handle(command).local_context(0)},
+    )
+    worker._global_node_domains[7] = state
+    worker._lifecycle = module._Lifecycle.READY
+    attempted, fence = threading.Event(), threading.Lock()
+    calls, errors = [], []
+
+    class Chip:
+        def control_payload(self, *_):
+            calls.append("copy")
+
+    worker._worker = Chip()
+
+    @contextmanager
+    def acquire_actor(_worker):
+        attempted.set()
+        with fence:
+            yield
+
+    monkeypatch.setattr(worker, "_child_prov_worker_lock", acquire_actor)
+
+    def copy():
+        try:
+            worker._copy_domain_pools(
+                CommDomainRef(command.owner_instance_id, 7, 3),
+                worker=0,
+                dst_slot=2,
+                src_slot=0,
+                nbytes=8,
+            )
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+
+    thread = threading.Thread(target=copy, daemon=True)
+    fence.acquire()
+    try:
+        thread.start()
+        assert attempted.wait(3)
+        with worker._child_prov_lock:
+            state.phase = GlobalDomainPhase.ABORT
+    finally:
+        fence.release()
+        thread.join(3)
+        worker._worker = None
+        worker._global_node_domains.clear()
+        worker.close()
+    assert not thread.is_alive() and len(errors) == 1 and isinstance(errors[0], KeyError)
+    assert not calls and worker._ordered_cleanup_error is None and worker._cleanup_journal.empty

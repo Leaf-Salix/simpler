@@ -135,8 +135,13 @@ from .comm_endpoints import DEVICE_AICPU
 def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -> None:
     """Check callable-side host access before descriptors become address-only PODs."""
     for i in range(args.tensor_count()):
-        buffer = args.tensor(i).buffer
-        if buffer.address_space != AddressSpace.HOST or args.transfer(i) != TensorTransfer.NONE:
+        tensor = args.tensor(i)
+        buffer = tensor.buffer
+        if (
+            tensor.domain_mapping
+            or buffer.address_space != AddressSpace.HOST
+            or args.transfer(i) != TensorTransfer.NONE
+        ):
             continue
         direction = target.sig(i) if target is not None and i < target.sig_count else None
         needed = {
@@ -1172,7 +1177,6 @@ class CommDomainHandle:
         "_ref",
         "requested_window_size",
         "_host_buffers",
-        "_local_host_fn",
     )
 
     def __init__(  # noqa: PLR0913 -- preserve the L3 and legacy L4 constructor keywords
@@ -1194,7 +1198,6 @@ class CommDomainHandle:
         _domain_ranks: dict[int, int] | None = None,
         ref: CommDomainRef | None = None,
         host_buffers=None,
-        local_host_fn=None,
         requested_window_size: int | None = None,
         _release_scope: Callable[[CommDomainHandle], contextlib.AbstractContextManager] = contextlib.nullcontext,
     ) -> None:
@@ -1217,7 +1220,6 @@ class CommDomainHandle:
         self.attachments = tuple(attachments)
         self._config = None
         self._host_buffers = dict(host_buffers or {})
-        self._local_host_fn = local_host_fn
         self._released = False
         self._freed = False
         self._ref = ref
@@ -1244,12 +1246,15 @@ class CommDomainHandle:
         self._require_live()
         return self._host_buffers[operator.index(node_worker_id)]
 
-    def local_host(self):
-        """Protected byte access to the owning L3's local DRAM, without exposing its VA."""
-        self._require_live()
-        if self._local_host_fn is None:
-            raise RuntimeError("this handle has no local Host owner")
-        return self._local_host_fn()
+    def map_view(self, tensor: Tensor, *, domain_rank: int) -> Tensor:
+        """Select this domain's granted Device attachment without changing Host storage."""
+        domain_rank = operator.index(domain_rank)
+        self.local_context(domain_rank)
+        if not isinstance(tensor, Tensor) or not any(
+            tensor.buffer == buffer.to_descriptor() for buffer in self._host_buffers.values()
+        ):
+            raise ValueError("map_view requires this domain's exact Host backing")
+        return tensor._with_domain_mapping(domain_rank)
 
     def local_context(self, domain_rank: int) -> ChipDomainContext:
         """Return this creator's local chip mapping; L4 creators hold no such mappings."""
@@ -1926,7 +1931,7 @@ class ChipWorker:
                 args = _ti_module._snapshot_local_task_args(args)
                 _validate_host_control_access(state.target, args)
                 for i in range(args.tensor_count()):
-                    if args.tensor(i).buffer.address_space == AddressSpace.DEVICE:
+                    if args.tensor(i).buffer.address_space == AddressSpace.DEVICE or args.tensor(i).domain_mapping:
                         raise ValueError(
                             f"ChipWorker.run: argument {i} is DEVICE; use Worker(level=2).submit "
                             "for source registration and lifetime validation"

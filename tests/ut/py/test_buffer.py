@@ -61,6 +61,7 @@ from simpler.comm_endpoints import (
     AdapterKind,
     AdapterProfile,
     BufferAccessQuery,
+    RegionAccessDecision,
     RegionAccessReasonCode,
     buffer_adapter_candidates,
 )
@@ -1328,3 +1329,149 @@ def test_task_args_owns_transfer_without_mutating_the_source_view():
     args.clear()
     args.add_tensor(tensor)
     assert args.transfer(0) == TensorTransfer.H2D
+
+
+def _fabric_host_tensor():
+    descriptor = BufferDescriptor(
+        CanonicalIdentity(_OID, 811, 1),
+        AddressSpace.HOST,
+        AccessMode.READWRITE,
+        BackendKind.REMOTE_SIDECAR,
+        64,
+    )
+    return descriptor.tensor((4,), DataType.FLOAT32, byte_offset=8)
+
+
+@pytest.mark.parametrize("access", [AccessMode.READ, AccessMode.READWRITE])
+def test_borrowed_host_mapping_uses_shared_adapter_verdict(access):
+    descriptor = replace(buffer_mod.buffer_reference(_fabric_host_tensor().buffer), access=access).to_descriptor()
+    context = ImportContext(DEVICE_AICPU)
+    registry = ImportRegistry(context)
+    try:
+        with pytest.raises(ValueError, match="REMOTE_SIDECAR"):
+            select_adapter(descriptor, context)
+        with pytest.raises(ValueError, match="no live grant"):
+            registry.materialize(descriptor, mapping=1)
+        service = buffer_mod._BUFFER_ACCESS_SERVICE
+        with patch.object(service, "evaluate_buffer_access", wraps=service.evaluate_buffer_access) as evaluate:
+            registry.register_borrowed(descriptor, 4096, mapping=1)
+        evaluate.assert_called_once()
+        imported = registry.materialize(descriptor, mapping=1)
+        assert imported.profile is not None and imported.profile.value == "HOST_FABRIC_MAP"
+        assert imported.address_space == AddressSpace.DEVICE and imported.descriptor == descriptor
+        assert imported.capabilities == capabilities_for_adapter(AdapterKind.DIRECT_MAP, access)
+        with pytest.raises(ValueError, match="REMOTE_SIDECAR"):
+            select_adapter(descriptor, context)
+        with pytest.raises(ValueError, match="REMOTE_SIDECAR"):
+            registry.materialize(descriptor)
+        registry.unregister(descriptor.identity)
+        with pytest.raises(ValueError, match="no live grant"):
+            registry.materialize(descriptor, mapping=1)
+    finally:
+        registry.close()
+
+
+def test_borrowed_host_mapping_service_refusal_does_not_register_an_address():
+    descriptor = _fabric_host_tensor().buffer
+    registry = ImportRegistry(ImportContext(DEVICE_AICPU))
+    try:
+        with patch.object(
+            buffer_mod._BUFFER_ACCESS_SERVICE,
+            "evaluate_buffer_access",
+            return_value=RegionAccessDecision(False, "mapping unavailable"),
+        ):
+            with pytest.raises(ValueError):
+                registry.register_borrowed(descriptor, 4096, mapping=1)
+        with pytest.raises(ValueError, match="no live grant"):
+            registry.materialize(descriptor, mapping=1)
+    finally:
+        registry.close()
+
+
+def test_host_fabric_fact_cannot_reclassify_device_storage():
+    descriptor = replace(
+        buffer_mod.buffer_reference(_fabric_host_tensor().buffer), address_space=AddressSpace.DEVICE
+    ).to_descriptor()
+    context = ImportContext(DEVICE_AICPU, bytes(descriptor.identity.owner_instance_id))
+    with pytest.raises(ValueError, match="REMOTE_SIDECAR"):
+        select_adapter(descriptor, context, _host_fabric_imported=True)
+
+
+def test_domain_mapping_requires_explicit_none_without_changing_host_default():
+    plain = _fabric_host_tensor()
+    mapped = plain._with_domain_mapping(0)
+    args = TaskArgs()
+    args.add_tensor(plain)
+    with pytest.raises(ValueError, match="mapping.*NONE"):
+        args.add_tensor(mapped)
+    assert args.tensor_count() == 1 and args.transfer(0) == TensorTransfer.H2D
+    args.add_tensor(mapped, transfer=TensorTransfer.NONE)
+    assert args.tensor_count() == 2 and args.transfer(1) == TensorTransfer.NONE
+    assert mapped.buffer == plain.buffer and plain.domain_mapping == 0
+
+
+def test_domain_mapping_keeps_host_storage_and_binds_each_view_independently():
+    from _task_interface import materialize_task_args  # noqa: PLC0415
+
+    plain = _fabric_host_tensor()
+    mapped = plain._with_domain_mapping(1)
+    other = plain._with_domain_mapping(2)
+    assert plain.domain_mapping == 0
+    assert mapped.domain_mapping == 2 and other.domain_mapping == 3
+    assert mapped not in (plain, other)
+    assert mapped.buffer == plain.buffer and mapped.buffer.address_space == AddressSpace.HOST
+    assert mapped.shapes == plain.shapes and mapped.strides == plain.strides
+    assert mapped.byte_offset == plain.byte_offset and mapped.dtype == plain.dtype
+    args = TaskArgs()
+    args.add_tensor(plain, transfer=TensorTransfer.NONE)
+    args.add_tensor(mapped, transfer=TensorTransfer.NONE)
+    assert args.has_device_backed_tensor()
+    assert args.transfer(1) == TensorTransfer.NONE
+    native = materialize_task_args(
+        args,
+        {
+            plain.buffer.identity: (100, int(AddressSpace.HOST)),
+            (plain.buffer.identity, 2): (200, int(AddressSpace.DEVICE)),
+        },
+    )
+    assert native.tensor(0).data == 108 and native.tensor(0).address_space == AddressSpace.HOST
+    assert native.tensor(1).data == 208 and native.tensor(1).address_space == AddressSpace.DEVICE
+    with pytest.raises(ValueError, match="mapping.*NONE"):
+        TaskArgs().add_tensor(mapped, transfer=TensorTransfer.H2D)
+    with pytest.raises(ValueError, match="mapping.*NONE"):
+        TaskArgs().add_tensor(mapped, transfer=TensorTransfer.D2H)
+    with pytest.raises(RuntimeError, match="import registry"):
+        materialize_task_args(args, {plain.buffer.identity: (100, int(AddressSpace.HOST))})
+
+
+@pytest.mark.parametrize("rank", [-1, 64])
+def test_domain_mapping_rejects_invalid_target_rank(rank):
+    with pytest.raises(ValueError, match="rank"):
+        _fabric_host_tensor()._with_domain_mapping(rank)
+
+
+def test_domain_mapping_rejects_non_fabric_storage():
+    tensor = _descriptor_with_path_id(0).tensor((2,), DataType.FLOAT32)
+    with pytest.raises(ValueError, match="HOST.*REMOTE_SIDECAR"):
+        tensor._with_domain_mapping(0)
+
+
+def test_domain_mapping_survives_mailbox_without_changing_the_slot_size():
+    from _task_interface import read_args_from_blob  # noqa: PLC0415
+
+    from tests.ut.py.test_worker._wire_blob import encode_blob  # noqa: PLC0415
+
+    plain = _fabric_host_tensor()
+    raw = bytearray(encode_blob([plain], transfers=[TensorTransfer.NONE]))
+    assert len(raw) == 8 + 144
+    raw[8 + 142] = 64
+    blob = ctypes.create_string_buffer(bytes(raw))
+    args = read_args_from_blob(ctypes.addressof(blob), len(blob))
+    assert args.tensor(0).domain_mapping == 64
+    assert args.tensor(0).buffer == plain.buffer
+    assert args.transfer(0) == TensorTransfer.NONE
+    for selector in (65, 255):
+        raw[8 + 142] = selector
+        blob = ctypes.create_string_buffer(bytes(raw))
+        with pytest.raises(ValueError, match="mapping"):
+            read_args_from_blob(ctypes.addressof(blob), len(blob))

@@ -618,6 +618,7 @@ class AdapterProfile(str, Enum):
     # Buffer candidate/service judgment as the profiles used by region planning.
     FORK_INHERITED_VA = "FORK_INHERITED_VA"
     DEVICE_LOCAL = "DEVICE_LOCAL"
+    HOST_FABRIC_MAP = "HOST_FABRIC_MAP"
     # A host endpoint reaching a chip-owned `DEVICE_MALLOC` Buffer by asking that chip to copy. The
     # planner has no counterpart because `_backend_kind_for_provider` never gives a region a
     # `DEVICE_MALLOC` Buffer; the `VMM_WINDOW` half of the same relation is `HOST_VMM_COPY`.
@@ -709,6 +710,8 @@ class BufferAccessQuery:
     same_endpoint: bool = False
     platform: str | None = None
     runtime: str | None = None
+    # Present only after this endpoint's native Host Fabric IMPORT has succeeded.
+    _host_fabric_imported: bool = False
 
 
 @dataclass(frozen=True)
@@ -809,7 +812,7 @@ class DefaultRegionAccessService:
         query: BufferAccessQuery,
         candidate: _AdapterCandidate,
     ) -> RegionAccessDecision:
-        if query.backend_kind is BackendKind.REMOTE_SIDECAR:
+        if query.backend_kind is BackendKind.REMOTE_SIDECAR and not query._host_fabric_imported:
             return _region_access_unsupported(
                 RegionAccessReasonCode.UNSUPPORTED_BACKEND_KIND,
                 candidate.unsupported_reason or "REMOTE_SIDECAR is not a locally materializable backend",
@@ -847,15 +850,14 @@ class DefaultRegionAccessService:
                 query,
                 candidate,
             )
-        # Every profile admitted here is carried out by something: `HOST_VMM_COPY` and
-        # `OWNER_DEVICE_COPY` by the owner's control-plane copy, the three map profiles by a
-        # resolver in `buffer._RESOLVERS`. A mechanism with no implementation belongs above, not
-        # here — admitting one lets a plan through that no materializer can honour.
+        # Admitted profiles have an owner-side copy, a resolver in `buffer._RESOLVERS`, or an
+        # already imported native Host Fabric mapping.
         if candidate.profile in (
             AdapterProfile.HOST_VMM_COPY,
             AdapterProfile.HOST_SHM_MAP,
             AdapterProfile.FORK_INHERITED_VA,
             AdapterProfile.DEVICE_LOCAL,
+            AdapterProfile.HOST_FABRIC_MAP,
             AdapterProfile.OWNER_DEVICE_COPY,
         ):
             return _region_access_supported(query, candidate)
@@ -1062,6 +1064,8 @@ def buffer_adapter_candidates(query: BufferAccessQuery) -> tuple[_AdapterCandida
     injected service cannot override it.
     """
     if query.backend_kind is BackendKind.REMOTE_SIDECAR:
+        if query._host_fabric_imported and query.consumer_deployment in (DEVICE_AICORE, DEVICE_AICPU):
+            return (_AdapterCandidate(AdapterKind.DIRECT_MAP, AdapterProfile.HOST_FABRIC_MAP),)
         return _explicit_transfer_candidates(
             "REMOTE_SIDECAR is resolved by its remote session, never by a local materializer"
         )

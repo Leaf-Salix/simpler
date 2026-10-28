@@ -66,12 +66,7 @@ payload = domain.member(0).buffers["payload"]
 tensor = payload.tensor([1024], DataType.FLOAT32)
 ```
 
-L4 domains can also request one shared DRAM pool per participating node through
-`host_windows={node_id: HostWindowSpec(numa_id, nbytes)}`. `domain.host(node_id)`
-names the same backing on every chip; each chip resolves its own authorized view.
-`domain.local_host()` provides protected byte access on the owning L3, and
-`orch.copy_domain(...)` performs synchronous pool-to-pool copies through a local chip.
-See [Host domain design](zh-cn/host-comm-domain-design.md) for the access and lifetime contracts.
+Host DRAM / `host_windows` / `map_view`: [API](zh-cn/host-comm-domain-design.md).
 
 `allocate_domain` rejects a live name. `get_or_allocate_domain` returns the
 same handle only if ordered members and target identities, requested window

@@ -92,7 +92,6 @@ struct DomainAllocation {
     bool host_enabled = false;
     bool import_started = false;
     bool views_released = false;
-    bool completion_unknown = false;
     VmmWindow local_window;
     std::vector<VmmWindow> peer_windows;
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
@@ -1775,7 +1774,7 @@ extern "C" int comm_global_domain_window(uint64_t id, uint32_t slot, uint64_t *b
     if (it == global_domain_allocations.end() || !base || !size) return -1;
     auto &a = *it->second;
     auto *window = global_window(a, slot);
-    if (!a.device_ctx || a.views_released || a.release_failed || a.completion_unknown || !window) return -1;
+    if (!a.device_ctx || a.views_released || a.release_failed || !window) return -1;
     *base = reinterpret_cast<uint64_t>(window->base);
     *size = window->size;
     return 0;
@@ -1789,8 +1788,8 @@ extern "C" int comm_global_domain_copy(
     if (it == global_domain_allocations.end() || !bytes || !stream) return -1;
     auto &a = *it->second;
     auto *dst = global_window(a, dst_slot), *src = global_window(a, src_slot);
-    if (!a.host_enabled || !a.device_ctx || a.views_released || a.release_failed || a.completion_unknown || !dst ||
-        !src || dst_offset > dst->size || bytes > dst->size - dst_offset || src_offset > src->size ||
+    if (!a.host_enabled || !a.device_ctx || a.views_released || a.release_failed || !dst || !src ||
+        dst_offset > dst->size || bytes > dst->size - dst_offset || src_offset > src->size ||
         bytes > src->size - src_offset ||
         (dst_slot == src_slot && dst_offset < src_offset + bytes && src_offset < dst_offset + bytes))
         return -1;
@@ -1800,7 +1799,7 @@ extern "C" int comm_global_domain_copy(
     );
     if (status == ACL_SUCCESS) status = aclrtSynchronizeStreamWithTimeout(stream, 30000);
     if (status != ACL_SUCCESS) {
-        a.completion_unknown = true;
+        a.release_failed = true;
         return status;
     }
     return 0;
@@ -1811,9 +1810,7 @@ extern "C" int comm_global_domain_release(uint64_t domain_id, uint32_t stage) tr
     auto it = global_domain_allocations.find(domain_id);
     if (it == global_domain_allocations.end()) return 0;
     auto &a = *it->second;
-    if (stage > 2 || a.release_failed || a.completion_unknown || (a.host_enabled && stage == 0) ||
-        (stage == 2 && !a.views_released))
-        return -1;
+    if (stage > 2 || a.release_failed || (a.host_enabled && stage == 0) || (stage == 2 && !a.views_released)) return -1;
     if (stage != 2 && !a.views_released) {
         aclError status = ACL_SUCCESS;
         if (a.device_ctx) {

@@ -103,11 +103,13 @@ it is the resolved `addr` + `size`. That is the whole of what materialization do
 | — | ⟂ | `buffer.addr` |
 | `byte_offset` (bytes) | ≈ | `start_offset` (elements) |
 | `shapes[5]` / `strides[5]` / `ndims` / `dtype` | = | `shapes[5]` / `strides[5]` / `ndims` / `dtype` |
-| `buffer.address_space` | = | `address_space` |
+| `buffer.address_space` | ≈ | `address_space` (`domain_mapping`: HOST → DEVICE) |
+| `domain_mapping` | ⟂ | — |
 | `TaskArgs.transfer(i)` (per-call metadata) | = | `ChipStorageTaskArgs.tensor(i).transfer` (internal ABI carrier) |
 
 `AddressSpace` describes the backing's physical HOST/DEVICE location. `Tensor` holds
-only the backing descriptor and view geometry. `TensorTransfer` belongs to each
+the backing descriptor, view geometry and optional `domain_mapping`.
+`TensorTransfer` belongs to each
 TaskArgs entry: `NONE` borrows storage, `H2D` requests Program-managed device storage,
 and `D2H` is reserved and rejected. Callable direction still controls input copies
 and output copy-back; H2D does not mean every argument is copied in. Buffer identity,
@@ -125,10 +127,12 @@ changes `view`. Omitted transfer in `TaskArgs.add_tensor` or the transitional L2
 `ChipTensor.make(..., address_space=...)` constructor selects location only;
 `child_memory` remains a compatibility spelling and cannot be combined with
 `address_space`. Both spellings use the same add-time defaults.
+`domain.map_view`: [API](zh-cn/host-comm-domain-design.md).
 
-Mailbox slots preserve each request in byte 141, formerly reserved view padding;
-standalone Tensor values do not carry it. Re-export and L2 materialization preserve
-the request alongside the view. Chip binders accept HOST/H2D and DEVICE/NONE.
+Mailbox slots preserve each request in byte 141; standalone Tensor values do not carry it.
+Byte 142 carries `domain_mapping` (0: ordinary; 1..64: granted rank + 1); byte 143 remains reserved.
+Mapped views require explicit NONE and resolve `(identity, domain_mapping)` to a registered DEVICE binding.
+Re-export and L2 materialization preserve the request alongside the view. Chip binders accept HOST/H2D and DEVICE/NONE.
 HBG also accepts HOST/NONE with a declared IN/OUT/INOUT direction; TMR device
 orchestration returns UNSUPPORTED for it. Invalid location/transfer pairs return
 INVALID_ARGUMENT before tensor content copying or device allocation. HOST/H2D also requires canonical
@@ -159,9 +163,8 @@ so a host-only write changes only the host backing; it does not update the separ
 device argument. To read a prior device result on the host, wait and explicitly
 copy it before submitting the next call. The caller retains host backing through
 completion; argument registration does not transfer its ownership.
- Remote protocol v4
-represents only legacy location defaults: its encoder rejects other per-call
-requests before emitting a payload instead of silently dropping them.
+Remote protocol v4 represents ordinary legacy location defaults. Endpoint-local mapped views
+and other per-call requests are rejected before encoding instead of silently dropping their meaning.
 Tensor/ChipTensor sizes remain 144/72 bytes; the internal ChipTensor carrier uses
 byte 70 for the request. Local endpoints must use the same build, as for every
 existing layout change. ChipTensor remains a transitional materialized ABI carrier,
@@ -508,7 +511,8 @@ further public `run` calls are refused, and only successful `finalize` releases
 them. Failed teardown preserves them for retry. Public `run` and `finalize` are
 serialized. Descriptors do not retain the caller's allocation: callers must keep
 host storage valid through successful return or successful teardown after an
-error; no Buffer ownership transfers to ChipWorker. HOST/NONE is consumed by HBG host orchestration; it provides no cross-side mapping.
+error; no Buffer ownership transfers to ChipWorker. Ordinary HOST/NONE is consumed by HBG host orchestration;
+it provides no cross-side mapping. Domain mapping uses the separately granted `domain.map_view` attachment.
 Explicit task dependencies stay an L3 orchestration concept: a direct L2
 submission is one task, so no `TaskArgs` dependency entry reaches the chip
 through this path.
