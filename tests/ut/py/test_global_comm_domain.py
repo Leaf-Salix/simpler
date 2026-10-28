@@ -49,6 +49,7 @@ from simpler.global_comm_domain import (
     GLOBAL_DOMAIN_DESCRIPTOR_BYTES,
     GLOBAL_DOMAIN_MAX_ATTACHMENTS,
     GLOBAL_DOMAIN_MAX_BUFFERS,
+    GLOBAL_DOMAIN_MAX_RANKS,
     GLOBAL_DOMAIN_PROFILE_IDS,
     GLOBAL_DOMAIN_VERSION,
     GlobalCommInitCommand,
@@ -292,7 +293,7 @@ def test_committed_buffer_wire_uses_native_descriptor_validation(remote, corrupt
     elif corruption == "generation":
         struct.pack_into("<I", wire, 24, 0)
     elif corruption == "count":
-        wire *= 4097
+        wire *= GLOBAL_DOMAIN_MAX_RANKS * (GLOBAL_DOMAIN_MAX_BUFFERS + 1) + 1
     if corruption:
         with pytest.raises((RuntimeError, ValueError)):
             decode_domain_buffer_refs(bytes(wire))
@@ -904,7 +905,9 @@ def test_mixed_local_remote_import_failure_rolls_back_local_node(monkeypatch):
                     rank_count,
                     profile_id,
                     window_size,
+                    host_enabled,
                 ) = LOCAL_PREPARE_REQUEST.unpack_from(payload, 0)
+                assert not host_enabled
                 descriptor = GlobalDomainDescriptor(
                     version=GLOBAL_DOMAIN_VERSION,
                     profile_id=profile_id,

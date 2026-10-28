@@ -1094,6 +1094,29 @@ class ImportRegistry:
         self._by_identity: dict[CanonicalIdentity, ImportedBuffer] = {}
         self._context = context
 
+    def register_borrowed(self, descriptor: BufferDescriptor, base: int) -> None:
+        """Bind an already granted device mapping without taking allocation ownership."""
+        if (
+            self._context.deployment not in (DEVICE_AICORE, DEVICE_AICPU)
+            or descriptor.address_space != AddressSpace.DEVICE
+            or descriptor.backend_kind != BackendKind.REMOTE_SIDECAR
+            or base <= 0
+        ):
+            raise ValueError("borrowed mapping requires a granted device reference and nonzero VA")
+        cached = self._by_identity.get(descriptor.identity)
+        if cached is not None:
+            if cached.descriptor != descriptor or cached.base != base:
+                raise ValueError("borrowed mapping conflicts with an existing import")
+            return
+        self._by_identity[descriptor.identity] = ImportedBuffer(
+            descriptor.identity,
+            base,
+            descriptor.nbytes,
+            descriptor.address_space,
+            descriptor=descriptor,
+            capabilities=capabilities_for_adapter(AdapterKind.DIRECT_MAP, descriptor.access),
+        )
+
     def materialize(self, desc: BufferDescriptor) -> ImportedBuffer:
         """Map ``desc``'s backing into this process on first sight of its identity; reuse the
         cached ImportedBuffer thereafter (map-once).
