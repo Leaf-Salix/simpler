@@ -530,30 +530,34 @@ inline void bind_worker(nb::module_ &m) {
 
         .def(
             "add_next_level_worker",
-            [](Worker &self, uint64_t mailbox_ptr, uint64_t mailbox_bytes, int child_pid, uint32_t granted_sets) {
+            [](Worker &self, uint64_t mailbox_ptr, uint64_t mailbox_bytes, int child_pid, uint32_t granted_sets,
+               nb::object) {
                 self.add_worker(
                     WorkerType::NEXT_LEVEL, reinterpret_cast<void *>(mailbox_ptr), static_cast<size_t>(mailbox_bytes),
                     child_pid, granted_sets
                 );
             },
             nb::arg("mailbox_ptr"), nb::arg("mailbox_bytes"), nb::arg("child_pid") = -1, nb::arg("granted_sets") = 1,
+            nb::arg("mailbox_owner") = nb::none(), nb::keep_alive<1, 6>(),
             "Add a NEXT_LEVEL sub-worker. `mailbox_ptr` is the address of a MAP_SHARED region and "
             "`mailbox_bytes` is how much of it the caller mapped, which must cover "
             "`mailbox_size(granted_sets)`; the child process loop is "
             "Python-managed (fork + _chip_process_loop). `child_pid` is that "
-            "forked child, used to detect an exit before mailbox completion."
+            "forked child, used to detect an exit before mailbox completion. "
+            "`mailbox_owner` keeps the mapping alive through native teardown."
         )
         .def(
             "add_next_level_worker_at",
             [](Worker &self, int32_t worker_id, uint64_t mailbox_ptr, uint64_t mailbox_bytes, int child_pid,
-               uint32_t granted_sets) {
+               uint32_t granted_sets, nb::object) {
                 self.add_next_level_worker(
                     worker_id, reinterpret_cast<void *>(mailbox_ptr), static_cast<size_t>(mailbox_bytes), child_pid,
                     granted_sets
                 );
             },
             nb::arg("worker_id"), nb::arg("mailbox_ptr"), nb::arg("mailbox_bytes"), nb::arg("child_pid") = -1,
-            nb::arg("granted_sets") = 1, "Add a NEXT_LEVEL sub-worker with an explicit worker id."
+            nb::arg("granted_sets") = 1, nb::arg("mailbox_owner") = nb::none(), nb::keep_alive<1, 7>(),
+            "Add a NEXT_LEVEL sub-worker with an explicit worker id and optional mapping owner."
         )
         .def(
             "configure_pipeline_depth", &Worker::configure_pipeline_depth, nb::arg("depth"),
@@ -565,18 +569,20 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def(
             "add_sub_worker",
-            [](Worker &self, uint64_t mailbox_ptr, uint64_t mailbox_bytes, int child_pid) {
+            [](Worker &self, uint64_t mailbox_ptr, uint64_t mailbox_bytes, int child_pid, nb::object) {
                 self.add_worker(
                     WorkerType::SUB, reinterpret_cast<void *>(mailbox_ptr), static_cast<size_t>(mailbox_bytes),
                     child_pid
                 );
             },
             nb::arg("mailbox_ptr"), nb::arg("mailbox_bytes"), nb::arg("child_pid") = -1,
+            nb::arg("mailbox_owner") = nb::none(), nb::keep_alive<1, 5>(),
             "Add a SUB sub-worker. `mailbox_ptr` is the address of a MAP_SHARED region and "
             "`mailbox_bytes` is how much of it the caller mapped, which must cover `mailbox_size(1)`; "
             "the child process loop is "
             "Python-managed (fork + _sub_worker_loop). `child_pid` is that "
-            "forked child, used to detect an exit before mailbox completion."
+            "forked child, used to detect an exit before mailbox completion. "
+            "`mailbox_owner` keeps the mapping alive through native teardown."
         )
         .def(
             "malloc",
@@ -635,7 +641,7 @@ inline void bind_worker(nb::module_ &m) {
         .def(
             "add_mpi_group_mailbox",
             [](Worker &self, const std::vector<int32_t> &worker_ids, const std::vector<uint64_t> &session_ids,
-               uint64_t mailbox_ptr, size_t mailbox_bytes, int mpirun_pid, double runtime_timeout_s) {
+               uint64_t mailbox_ptr, size_t mailbox_bytes, int mpirun_pid, double runtime_timeout_s, nb::object) {
                 nb::gil_scoped_release release;
                 self.add_mpi_group_mailbox(
                     worker_ids, session_ids, reinterpret_cast<void *>(mailbox_ptr), mailbox_bytes, mpirun_pid,
@@ -643,8 +649,9 @@ inline void bind_worker(nb::module_ &m) {
                 );
             },
             nb::arg("worker_ids"), nb::arg("session_ids"), nb::arg("mailbox_ptr"), nb::arg("mailbox_bytes"),
-            nb::arg("mpirun_pid"), nb::arg("runtime_timeout_s") = 30.0,
-            "Register one shared-memory MPI group endpoint for each worker id."
+            nb::arg("mpirun_pid"), nb::arg("runtime_timeout_s") = 30.0, nb::arg("mailbox_owner") = nb::none(),
+            nb::keep_alive<1, 8>(),
+            "Register one shared-memory MPI group endpoint for each worker id, retaining its optional mapping owner."
         )
         .def(
             "add_remote_l3_mpi",

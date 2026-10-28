@@ -772,7 +772,9 @@ def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkey
             self.configured_pending_depths.append(int(pending_depth))
             self.configured_launch_depths.append(int(launch_depth))
 
-        def add_next_level_worker(self, mailbox_addr: int, mailbox_bytes: int, pid: int, granted_sets: int) -> None:
+        def add_next_level_worker(
+            self, mailbox_addr: int, mailbox_bytes: int, pid: int, granted_sets: int, mailbox_owner
+        ) -> None:
             self.next_level_calls.append((int(mailbox_addr), int(mailbox_bytes), int(pid), int(granted_sets)))
 
         def init(self) -> None:
@@ -884,7 +886,7 @@ def test_start_hierarchical_seeds_the_logger_when_the_process_owns_no_chips(monk
         ) -> None:
             self.configured = (depth, pending_depth, launch_depth, initial_admission_depth)
 
-        def add_sub_worker(self, _mailbox_addr: int, _mailbox_bytes: int, pid: int) -> None:
+        def add_sub_worker(self, _mailbox_addr: int, _mailbox_bytes: int, pid: int, mailbox_owner) -> None:
             self.sub_workers.append(pid)
 
         def init(self) -> None:
@@ -8705,6 +8707,57 @@ def test_a_failed_diagnostic_sidecar_write_fails_the_task_not_the_loop(tmp_path)
         assert not thread.is_alive()
         shm.close()
         shm.unlink()
+
+
+@pytest.mark.parametrize("kind", ["sub", "next", "next_at", "mpi"])
+def test_native_worker_retains_mailbox_until_native_teardown(kind):
+    from simpler.mpi_group_mailbox import MAILBOX_SIZE, MpiGroupMailbox
+
+    native = _Worker(3)
+    if kind == "mpi":
+        owner = MpiGroupMailbox.create(world_size=1)
+        native.add_mpi_group_mailbox([0], [1], owner.address, MAILBOX_SIZE, -1, 1.0, owner)
+        owner._shm.unlink()
+    else:
+        owner = SharedMemory(create=True, size=worker_mod.mailbox_size(1))
+        addr, extent = _mailbox_addr(owner), _mailbox_extent(owner)
+        if kind == "sub":
+            native.add_sub_worker(addr, extent, -1, owner)
+        elif kind == "next":
+            native.add_next_level_worker(addr, extent, -1, 1, owner)
+        else:
+            native.add_next_level_worker_at(0, addr, extent, -1, 1, owner)
+        owner.unlink()
+        native.init()
+    reference = weakref.ref(owner)
+    del owner
+    gc.collect()
+    assert reference() is not None
+    del native
+    gc.collect()
+    assert reference() is None
+
+
+def test_failed_region_cleanup_keeps_mailbox_alive_during_interpreter_exit():
+    source = """
+from simpler.worker import Worker
+
+worker = Worker(level=3, num_sub_workers=1, platform="a2a3sim")
+worker.init()
+def fail_cleanup():
+    raise RuntimeError("retained Region")
+worker._sweep_region_instances = fail_cleanup
+try:
+    worker.close()
+except RuntimeError as exc:
+    assert str(exc) == "retained Region"
+else:
+    raise AssertionError("cleanup failure was suppressed")
+assert worker._worker is not None
+assert not worker._cleanup_journal.empty
+"""
+    completed = subprocess.run([sys.executable, "-c", source], check=False, capture_output=True, text=True, timeout=30)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_the_cpp_pre_bind_level_word_is_the_ladder_word_for_l3():

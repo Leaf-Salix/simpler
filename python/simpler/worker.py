@@ -6909,6 +6909,7 @@ class Worker:
                 MPI_MAILBOX_SIZE,
                 group.process.pid,
                 session_timeout,
+                mailbox,
             )
             group.monitor_thread = threading.Thread(
                 target=self._monitor_mpirun_group,
@@ -10036,7 +10037,7 @@ class Worker:
         if device_ids:
             _require_matching_pids(self._chip_shms, self._chip_pids, "chip")
             for shm, pid, granted_sets in zip(self._chip_shms, self._chip_pids, self._chip_run_resource_set_counts):
-                dw.add_next_level_worker(_mailbox_addr(shm), _mailbox_extent(shm), pid, granted_sets)
+                dw.add_next_level_worker(_mailbox_addr(shm), _mailbox_extent(shm), pid, granted_sets, shm)
 
         # Register Worker children as NEXT_LEVEL (L4+)
         if self._next_level_shms and not hasattr(dw, "add_next_level_worker_at"):
@@ -10044,11 +10045,13 @@ class Worker:
         _require_matching_pids(self._next_level_shms, self._next_level_pids, "next_level")
         for idx, shm in enumerate(self._next_level_shms):
             worker_id = self._next_level_worker_ids[idx]
-            dw.add_next_level_worker_at(worker_id, _mailbox_addr(shm), _mailbox_extent(shm), self._next_level_pids[idx])
+            dw.add_next_level_worker_at(
+                worker_id, _mailbox_addr(shm), _mailbox_extent(shm), self._next_level_pids[idx], 1, shm
+            )
 
         _require_matching_pids(self._sub_shms, self._sub_pids, "sub")
         for shm, pid in zip(self._sub_shms, self._sub_pids):
-            dw.add_sub_worker(_mailbox_addr(shm), _mailbox_extent(shm), pid)
+            dw.add_sub_worker(_mailbox_addr(shm), _mailbox_extent(shm), pid, shm)
 
         # Start Scheduler + WorkerThreads (C++ threads start here, after fork)
         dw.init()
