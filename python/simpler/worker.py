@@ -2864,7 +2864,13 @@ def _read_shm_name(buf, offset: int) -> str:
 
 
 def _handle_ctrl_alloc_domain(
-    cw: _ChipWorker, buf: memoryview, *, base_comm_handle: int, import_registry=None, host_sources=None
+    cw: _ChipWorker,
+    buf: memoryview,
+    *,
+    base_comm_handle: int,
+    import_registry=None,
+    host_sources=None,
+    chip_platform: str = "",
 ) -> None:
     """CTRL_ALLOC_DOMAIN handler — runs on the chip child.
 
@@ -2939,7 +2945,7 @@ def _handle_ctrl_alloc_domain(
                 host_descriptor,
                 host_base,
                 mapping_ref=domain_rank + 1,
-                profile=host_attachment_profile(host_export),
+                profile=host_attachment_profile(host_export, chip_platform),
                 live=lambda: int(allocation_id) in host_sources,
             )
 
@@ -3752,6 +3758,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                     base_comm_handle=base_comm_handle,
                     import_registry=import_registry,
                     host_sources=host_domain_sources,
+                    chip_platform=chip_platform,
                 )
             elif sub_cmd == _CTRL_RELEASE_DOMAIN:
                 _handle_ctrl_release_domain(

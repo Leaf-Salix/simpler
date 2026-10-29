@@ -8,12 +8,11 @@
 # -----------------------------------------------------------------------------------------------------------
 """Platform-specific Host backing; domain identity and lifetime live in host_domain."""
 
-from _task_interface import _HostDomainMemory
+import os
 
 from .buffer import create_host_shared_buffer
 from .comm_endpoints import AdapterProfile
 from .global_comm_domain import (
-    GLOBAL_DOMAIN_PROFILE_A3_FABRIC,
     GLOBAL_DOMAIN_PROFILE_IDS,
     GLOBAL_DOMAIN_PROFILE_SIM,
     GLOBAL_DOMAIN_VERSION,
@@ -21,15 +20,18 @@ from .global_comm_domain import (
 )
 
 
-class SimHostBacking:
+class SharedHostBacking:
     profile = AdapterProfile.HOST_SHM_MAP
+    attachment_profile = AdapterProfile.HOST_SHM_MAP
 
     def __init__(self):
         self.shared = None
 
     def allocate(self, spec, identity, device, rank_count):
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        mapping_size = (spec.nbytes + page_size - 1) // page_size * page_size
         self.shared = create_host_shared_buffer(
-            spec.nbytes,
+            mapping_size,
             bytes(identity.owner_instance_id),
             identity.buffer_id,
             generation=identity.generation,
@@ -39,7 +41,7 @@ class SimHostBacking:
             GLOBAL_DOMAIN_PROFILE_IDS[GLOBAL_DOMAIN_PROFILE_SIM],
             0,
             rank_count,
-            spec.nbytes,
+            mapping_size,
             self.shared.body,
         )
 
@@ -48,42 +50,25 @@ class SimHostBacking:
             self.shared.close()
 
 
-class A3HostBacking:
-    profile = AdapterProfile.HOST_VMM_MAP
-
-    def __init__(self):
-        self.native = _HostDomainMemory()
+class A3HostBacking(SharedHostBacking):
+    attachment_profile = AdapterProfile.HOST_SVM_MAP
 
     def allocate(self, spec, identity, device, rank_count):
-        size, token = self.native.allocate(device, spec.numa_id, spec.nbytes)
-        return self.native.base, GlobalDomainDescriptor(
-            GLOBAL_DOMAIN_VERSION,
-            GLOBAL_DOMAIN_PROFILE_IDS[GLOBAL_DOMAIN_PROFILE_A3_FABRIC],
-            0,
-            rank_count,
-            size,
-            token,
-        )
-
-    def release(self):
-        self.native.release()
+        if spec.numa_id != 0:
+            raise ValueError("HostRegister backing uses OS placement; explicit NUMA placement is unsupported")
+        return super().allocate(spec, identity, device, rank_count)
 
 
 def host_backing_type(platform):
     """Select before any allocation. Unsupported platforms fail without side effects."""
-    backends = {"a2a3sim": SimHostBacking, "a2a3": A3HostBacking}
+    backends = {"a2a3sim": SharedHostBacking, "a2a3": A3HostBacking}
     try:
         return backends[platform]
     except KeyError:
         raise ValueError(f"Host domain backing is not implemented for {platform!r}") from None
 
 
-def host_attachment_profile(descriptor: GlobalDomainDescriptor) -> AdapterProfile:
-    profiles = {
-        GLOBAL_DOMAIN_PROFILE_IDS[GLOBAL_DOMAIN_PROFILE_SIM]: AdapterProfile.HOST_SHM_MAP,
-        GLOBAL_DOMAIN_PROFILE_IDS[GLOBAL_DOMAIN_PROFILE_A3_FABRIC]: AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT,
-    }
-    try:
-        return profiles[descriptor.profile_id]
-    except KeyError:
-        raise ValueError("unsupported Host attachment profile") from None
+def host_attachment_profile(descriptor: GlobalDomainDescriptor, platform: str) -> AdapterProfile:
+    if descriptor.profile_id != GLOBAL_DOMAIN_PROFILE_IDS[GLOBAL_DOMAIN_PROFILE_SIM]:
+        raise ValueError("HostRegister attachment requires a local shared-memory descriptor")
+    return host_backing_type(platform).attachment_profile

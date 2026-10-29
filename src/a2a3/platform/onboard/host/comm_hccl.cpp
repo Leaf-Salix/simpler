@@ -28,8 +28,10 @@
 #include "common/unified_log.h"
 #include "host/file_marker_handshake.h"
 
-#include <algorithm>
-#include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -89,9 +91,9 @@ struct DomainAllocation {
     bool release_failed = false;
     VmmWindow local_window;
     void *host_base = nullptr;
-    aclrtDrvMemHandle host_handle = nullptr;
-    uint64_t host_reservation = 0;
-    bool host_mapped = false;
+    uint64_t host_bytes = 0;
+    bool host_registered = false;
+    bool host_locked = false;
     std::vector<VmmWindow> peer_windows;
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
 };
@@ -371,17 +373,17 @@ static aclError import_ipc_window(int32_t device_id, uint64_t shareable_handle, 
 }
 
 static aclError release_domain_host(DomainAllocation *alloc) {
-    if (alloc->host_mapped) {
-        if (auto status = aclrtUnmapMem(alloc->host_base); status != ACL_SUCCESS) return status;
-        alloc->host_mapped = false;
+    if (alloc->host_registered) {
+        if (auto status = aclrtHostUnregister(alloc->host_base); status != ACL_SUCCESS) return status;
+        alloc->host_registered = false;
+    }
+    if (alloc->host_locked) {
+        if (munlock(alloc->host_base, alloc->host_bytes) != 0) return -1;
+        alloc->host_locked = false;
     }
     if (alloc->host_base) {
-        if (auto status = aclrtReleaseMemAddress(alloc->host_base); status != ACL_SUCCESS) return status;
+        if (munmap(alloc->host_base, alloc->host_bytes) != 0) return -1;
         alloc->host_base = nullptr;
-    }
-    if (alloc->host_handle) {
-        if (auto status = aclrtFreePhysical(alloc->host_handle); status != ACL_SUCCESS) return status;
-        alloc->host_handle = nullptr;
     }
     return ACL_SUCCESS;
 }
@@ -1519,44 +1521,42 @@ extern "C" int comm_attach_domain_host(
 ) try {
     if (!h || !descriptor || !base_out) return -1;
     auto it = h->domain_allocations.find(allocation_id);
-    if (it == h->domain_allocations.end()) return -1;
-    auto &allocation = *it->second;
-    if (allocation.host_base || allocation.host_handle || descriptor->version != COMM_GLOBAL_DOMAIN_VERSION ||
-        descriptor->profile != COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC || descriptor->reserved ||
-        descriptor->handle_size != sizeof(aclrtMemFabricHandle) || !descriptor->mapping_size)
+    if (it == h->domain_allocations.end() || it->second->host_base ||
+        descriptor->version != COMM_GLOBAL_DOMAIN_VERSION || descriptor->reserved ||
+        descriptor->profile != COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM || !descriptor->mapping_size ||
+        !descriptor->handle_size || descriptor->handle_size > COMM_GLOBAL_DOMAIN_HANDLE_BYTES)
         return -1;
-    constexpr uint64_t unit = 1ULL << 30, begin = 40ULL << 40, end = 224ULL << 40;
-    if (descriptor->mapping_size > end - begin - unit) return -1;
-    const uint64_t bytes = (descriptor->mapping_size + unit - 1) / unit * unit;
-    std::vector<std::pair<uint64_t, uint64_t>> occupied;
-    for (const auto &entry : h->domain_allocations) {
-        if (entry.second->host_base)
-            occupied.emplace_back(reinterpret_cast<uint64_t>(entry.second->host_base), entry.second->host_reservation);
+    std::string name(reinterpret_cast<const char *>(descriptor->handle), descriptor->handle_size);
+    if (name.find('\0') != std::string::npos) return -1;
+    if (name.front() != '/') name.insert(name.begin(), '/');
+    const int fd = shm_open(name.c_str(), O_RDWR, 0600);
+    if (fd < 0) return -1;
+    struct stat statbuf{};
+    if (fstat(fd, &statbuf) || statbuf.st_size < 0 ||
+        static_cast<uint64_t>(statbuf.st_size) < descriptor->mapping_size) {
+        close(fd);
+        return -1;
     }
-    std::sort(occupied.begin(), occupied.end());
-    uint64_t address = begin;
-    for (const auto &[base, length] : occupied) {
-        if (address <= base && bytes <= base - address) break;
-        address = std::max(address, base + length);
+    void *base = mmap(nullptr, descriptor->mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (base == MAP_FAILED) return -1;
+    auto &allocation = *it->second;
+    allocation.host_base = base;
+    allocation.host_bytes = descriptor->mapping_size;
+    if (mlock(base, allocation.host_bytes) != 0) {
+        LOG_ERROR("[comm] Host backing mlock failed: %s", std::strerror(errno));
+        return -1;
     }
-    if (address > end - bytes) return -1;
-    using Reserve = decltype(&aclrtReserveMemAddressNoUCMemory);
-    auto reserve = reinterpret_cast<Reserve>(dlsym(RTLD_DEFAULT, "aclrtReserveMemAddressNoUCMemory"));
-    if (!reserve) return -1;
-    aclrtMemFabricHandle token{};
-    std::memcpy(&token, descriptor->handle, sizeof(token));
-    auto status = aclrtMemImportFromShareableHandleV2(
-        &token, ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, ACL_RT_IPC_MEM_EXPORT_FLAG_DEFAULT, &allocation.host_handle
-    );
-    if (status != ACL_SUCCESS) return static_cast<int>(status);
-    // NoUC needs explicit [40, 224) TiB VA with 1 GiB reservation alignment.
-    status = reserve(&allocation.host_base, bytes, 0, reinterpret_cast<void *>(address), 0);
-    if (status != ACL_SUCCESS) return static_cast<int>(status);
-    allocation.host_reservation = bytes;
-    status = aclrtMapMem(allocation.host_base, descriptor->mapping_size, 0, allocation.host_handle, 0);
-    if (status != ACL_SUCCESS) return static_cast<int>(status);
-    allocation.host_mapped = true;
-    *base_out = reinterpret_cast<uint64_t>(allocation.host_base);
+    allocation.host_locked = true;
+    void *device_base = nullptr;
+    auto status = aclrtHostRegister(base, allocation.host_bytes, ACL_HOST_REGISTER_MAPPED, &device_base);
+    if (status != ACL_SUCCESS) {
+        LOG_ERROR("[comm] HostRegister failed with code %d", static_cast<int>(status));
+        return static_cast<int>(status);
+    }
+    allocation.host_registered = true;
+    if (!device_base) return -1;
+    *base_out = reinterpret_cast<uint64_t>(device_base);
     return 0;
 } catch (...) {
     return -1;

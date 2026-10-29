@@ -311,24 +311,6 @@ public:
         }
     }
 
-    void require_host_fabric() const {
-        using SocName = const char *(*)();
-        auto soc_name = reinterpret_cast<SocName>(resolve_symbol("aclrtGetSocName"));
-        const char *soc = soc_name();
-        if (!soc || std::strncmp(soc, "Ascend910_93", 12) != 0)
-            throw std::runtime_error("Host Fabric backing requires an A3 device");
-        (void)resolve_symbol("aclrtMemExportToShareableHandleV2");
-        (void)resolve_symbol("aclrtReserveMemAddressNoUCMemory");
-    }
-
-    void export_fabric(void *handle, void *token) const {
-        using Export = int (*)(void *, uint64_t, int, void *);
-        constexpr uint64_t disable_pid_validation = 1;
-        constexpr int fabric_handle_type = 2;
-        auto export_handle = reinterpret_cast<Export>(resolve_symbol("aclrtMemExportToShareableHandleV2"));
-        acl_check(export_handle(handle, disable_pid_validation, fabric_handle_type, token), "Fabric export");
-    }
-
 private:
     static constexpr int kAclSuccess = 0;
     static constexpr int kAclMemcpyHostToDevice = 1;
@@ -376,67 +358,6 @@ AclRuntimeApi &acl_api() {
     });
     return *api;
 }
-
-// Explicitly released by the node domain after every imported view is acknowledged gone.
-// Destruction cannot prove that acknowledgement and therefore does not free the allocation.
-class HostDomainMemory {
-public:
-    nb::tuple allocate(int device, uint32_t numa, uint64_t logical_bytes) {
-        if (handle_ || base_ || !logical_bytes) throw std::invalid_argument("Host allocation is not empty");
-        auto &api = acl_api();
-        api.bind_device_with_check(device);
-        api.require_host_fabric();
-        device_ = device;
-        LocalAclPhysicalMemProp prop{};
-        constexpr int p2p_huge = 16, host_numa = 4;
-        prop.memAttr = p2p_huge;
-        prop.location = {numa, host_numa};
-        size_t granularity = 0;
-        check(api.aclrtMemGetAllocationGranularity(&prop, 0, &granularity), "Host granularity");
-        if (!granularity || logical_bytes > SIZE_MAX - (granularity - 1))
-            throw std::invalid_argument("Host allocation extent overflow");
-        size_ = (logical_bytes + granularity - 1) / granularity * granularity;
-        check(api.aclrtMallocPhysical(&handle_, size_, &prop, 0), "Host physical allocation");
-        check(api.aclrtReserveMemAddress(&base_, size_, 0, nullptr, 1), "Host VA reservation");
-        check(api.aclrtMapMem(base_, size_, 0, handle_, 0), "Host owner mapping");
-        mapped_ = true;
-        std::memset(base_, 0, logical_bytes);
-        api.export_fabric(handle_, token_.data());
-        return nb::make_tuple(size_, nb::bytes(reinterpret_cast<const char *>(token_.data()), token_.size()));
-    }
-    uint64_t base() const {
-        if (!mapped_ || !base_) throw std::invalid_argument("Host owner has no live mapping");
-        return reinterpret_cast<uint64_t>(base_);
-    }
-    void release() {
-        if (!base_ && !handle_) return;
-        auto &api = acl_api();
-        api.bind_device_with_check(device_);
-        if (mapped_) {
-            check(api.aclrtUnmapMem(base_), "Host unmap");
-            mapped_ = false;
-        }
-        if (base_) {
-            check(api.aclrtReleaseMemAddress(base_), "Host VA release");
-            base_ = nullptr;
-        }
-        if (handle_) {
-            check(api.aclrtFreePhysical(handle_), "Host physical free");
-            handle_ = nullptr;
-        }
-    }
-
-private:
-    int device_ = -1;
-    void *base_ = nullptr;
-    void *handle_ = nullptr;
-    bool mapped_ = false;
-    uint64_t size_ = 0;
-    std::array<uint8_t, 128> token_{};
-    static void check(int rc, const char *op) {
-        if (rc) throw std::runtime_error(std::string(op) + " failed with code " + std::to_string(rc));
-    }
-};
 
 std::string region_shm_name_for_open(const std::string &token) {
     if (token.empty()) {
@@ -2125,11 +2046,6 @@ BufferDescriptor decode_buffer_descriptor_wire(const uint8_t *raw, size_t size) 
 #endif
 
 NB_MODULE(_task_interface, m) {
-    nb::class_<HostDomainMemory>(m, "_HostDomainMemory")
-        .def(nb::init<>())
-        .def("allocate", &HostDomainMemory::allocate)
-        .def_prop_ro("base", &HostDomainMemory::base)
-        .def("release", &HostDomainMemory::release);
     m.doc() = "Nanobind bindings for task_interface (DataType, Buffer/Tensor wire ABI, ChipTensor, TaskArgs variants)";
 
     // Source commit this extension was compiled from; "" when git was

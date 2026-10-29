@@ -33,7 +33,9 @@ args.add_tensor(mapped, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
 - **domain / ImportRegistry**：成员与 endpoint 授权、消费端解析、旧引用失效；复用既有登记和解析路径。
 - **Run / completion 生命周期**：接受使用后保留资源，真实完成前不放行消费者、不复用输出；关闭先撤销新使用。
 
-平台后端负责内存分配约束、注册/映射、设备可用地址或通信 context、提交与完成适配，以及逆序释放。A3 当前使用 Host NUMA physical/Fabric/NoUC，数据搬运复用已有 MTE 或 PTO SDMA 路径；A5 后续可以实现本地 ACL/MTE 或跨 rank URMA。
+平台后端负责内存分配约束、注册/映射、设备可用地址或通信 context、提交与完成适配，以及逆序释放。A3 当前实验实现使用 POSIX SHM backing，每个 chip 进程独立 mmap、mlock、HostRegister；数据搬运继续使用已有 MTE 或 PTO SDMA 路径，兼容性分别验证；A5 后续可以实现本地 ACL/MTE 或跨 rank URMA。
+
+默认 `numa_id=0` 在本实验中表示采用 OS 放置；显式非零 NUMA 请求被拒绝。物理共享范围向上对齐系统页，公开 Buffer 范围仍为请求的逻辑大小。
 
 `HostDomainResource` 只保留资源身份、view 校验、使用保留和清理责任；`host_domain_backend.py` 提供 A3 与模拟 backing 的创建/释放实现，消费侧由平台 `comm_attach_domain_host` 建立映射。A5 尚未实现，不会落入 A3 默认分支；接入时不复制 domain/registry/runner。
 
@@ -47,8 +49,8 @@ flowchart TD
   T --> A["TaskArgs：参数方向 + transfer=NONE"]
   A --> I["ImportRegistry：按 identity、mapping_ref 解析"]
   I --> C["ChipTensor：当前卡有效地址，DEVICE/NONE"]
-  B --> O["A3 owner：Host NUMA physical + CPU VA + Fabric 导出"]
-  O --> M["每卡：Fabric 导入 + NoUC 映射"]
+  B --> O["Owner：POSIX SHM + CPU 原生 VA"]
+  O --> M["各 chip 进程：mmap → mlock → HostRegister"]
   M --> I
   C --> K["现有 kernel / PTO 接口"]
 ```
@@ -71,11 +73,13 @@ flowchart TD
 ```mermaid
 flowchart LR
   R["domain.release：撤销新使用"] --> F["已有 Run fence：等待已接受任务"]
-  F --> U["各卡撤销 attachment、释放映射"]
+  F --> U["各卡撤销 attachment → HostUnregister → munlock → munmap"]
   U --> H["确认全部卡释放后，清理 Host owner"]
 ```
 
 复用现有 domain accepted-use 和清理 journal。任一卡释放未确认，保留 Host owner；卡端释放已经成功而 Host 清理失败时，仅重试 owner 清理，不重放 collective release。Worker.close 仍负责处理未完成的清理责任。
+
+正常域释放逐步记录注销、解锁与解除映射的结果。现有 `comm_destroy` 是 communicator 的终止清理，不承诺失败后重试同一 native handle；它的失败或进程退出不能代替域的 VIEWS 成功确认，owner 仍按未确认状态保留。
 
 ## 验证入口
 
@@ -83,7 +87,9 @@ flowchart LR
 - `tests/ut/py/test_buffer.py`：同 identity 的原生/映射参数共存、grant 与失效校验。
 - `tests/st/worker/comm_domain/test_host_domain.py`：两卡 MTE 读写、PTO SDMA producer→consumer、BF16 设备选行，以及任务提交后的域释放；SDMA 必须在 A3 真机执行。
 
-2026-10-29 在 A3、CANN 9.0.0、`tensormap_and_ringbuffer` 上完成双卡验证：上述六项全部通过，MTE/SDMA 两个方向均跨两轮 Run 复用 backing。公共 Python 回归 375 项通过、2 项跳过，C++ Buffer/RemoteWire 共 39 项通过。未进行全仓测试；这些结果不代表 A2/A5、其他 runtime 或通信计算重叠的验收。
+Fabric/NoUC 对照提交 `ea4ae7912` 曾在 A3、CANN 9.0.0、TMR 上通过上述六项双卡测试。HostRegister 替换版本已独立通过公共 Python 回归 377 项（2 项跳过）、四项双卡模拟测试，以及 A3 双卡六项真机测试：MTE 双向、PTO SDMA 双向及其消费者可见性、BF16 设备选行、在途域释放。另有两项 HBM retained-domain 基线通过。真机使用 Linux 5.10、CANN 9.0.0、驱动 26.0.rc1 和 TMR；结论限于此环境及测试范围。
+
+本实验使用 Linux 5.10/CANN 9.0 下的共享页注册组合。该版本文档要求旧内核使用 aclrtMallocHost 锁页内存，mlock 并不能证明驱动 pin 契约；普通 HostRegister 返回地址的内存复制也受限。因此本分支属于资格验证，MTE、PTO SDMA 分别测试，不宣称任意 ACL memcpy、A2/A5、其他 runtime 或跨机支持。Host 路径不使用 Fabric；既有 HBM 域的通信实现保持原样。
 
 ## 对齐 #2657 的业务场景
 
@@ -105,7 +111,7 @@ flowchart LR
 需要按实际数据路径补齐以下验收，不把模型算法写进公共 scheduler：
 
 1. 设备生成/持有 row IDs，读取重复 ID、首尾行和越界情况；输出由调用方提供。A3 多卡读取同一 Host backing 作为当前阶段用例，不能代替 A5 跨 rank URMA 或多机验收。
-2. 表只初始化、注册一次，后续 Run 只读取所选行；设备存储不随整表大小增长。除整段 FP32 MTE/SDMA 测试外，`test_device_selected_bf16_rows` 使用设备侧 ID 选择 BF16 payload 行（逐位比较），并将非法 ID 定义为零行；两轮复用同一 backing，第二轮更新源数据以验证可见性。该用例已通过 A3 双卡真机验证，不覆盖 MXFP8/dequant；后者随对应业务路径验证。
+2. 表只初始化、注册一次，后续 Run 只读取所选行；设备存储不随整表大小增长。除整段 FP32 MTE/SDMA 测试外，`test_device_selected_bf16_rows` 使用设备侧 ID 选择 BF16 payload 行（逐位比较），并将非法 ID 定义为零行；两轮复用同一 backing，第二轮更新源数据以验证可见性。该用例在 Fabric 对照和 HostRegister 版本上分别通过 A3 双卡真机验证；不覆盖 MXFP8/dequant；后者随对应业务路径验证。
 3. 分开记录 issue kernel 返回和真实传输完成。延迟完成时 Dequant/WKV 不能提前运行，独立 Backbone 可继续推进；若等待占住必需 AIV，应明确限制，不能仅凭 token 宣称隐藏延迟。
 4. 两次 fetch 交错：请求/completion 槽只在后端确认不再引用后退休，输出 D 必须保留到其最后消费者结束。第二次 fetch 不能覆盖第一次仍被消费的输出。
 5. trace 观察请求发出、数据可见、独立计算与消费者开始；在途期间有用计算推进是 issue 验收要求。相同工作量串行对照、剩余等待、总耗时与 Backbone 是否变慢是本项目补充的性能验收建议，不是 issue 规定的固定加速比。

@@ -7,12 +7,14 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+import os
 import struct
 
 import pytest
 from simpler.buffer import AddressSpace, ImportContext, ImportRegistry
-from simpler.comm_endpoints import DEVICE_AICPU
+from simpler.comm_endpoints import DEVICE_AICPU, AdapterProfile
 from simpler.host_domain import HostDomainResource
+from simpler.host_domain_backend import A3HostBacking, host_attachment_profile
 from simpler.task_interface import CommBufferSpec, DataType, HostWindowSpec, TaskArgs, TensorTransfer
 from simpler.worker import Worker
 
@@ -114,6 +116,26 @@ def test_host_domain_native_reference_requires_endpoint_grant(host_worker):
     with pytest.raises(ValueError, match="no granted attachment"):
         registry.resolve_tensor(tensor)
     domain.release()
+
+
+def test_shared_host_backing_keeps_logical_bounds_and_endpoint_profile(host_worker):
+    domain = allocate(host_worker)
+    resource = domain._host_resource
+    assert domain.host().nbytes == 128
+    assert resource.export.mapping_size % os.sysconf("SC_PAGE_SIZE") == 0
+    assert resource.export.mapping_size >= domain.host().nbytes
+    assert host_attachment_profile(resource.export, "a2a3sim") == AdapterProfile.HOST_SHM_MAP
+    assert host_attachment_profile(resource.export, "a2a3") == AdapterProfile.HOST_SVM_MAP
+    with pytest.raises(ValueError, match="exceeds"):
+        resource.copy(128, b"x", writing=True)
+    domain.release()
+
+
+def test_hostregister_rejects_unimplemented_numa_placement_before_allocating():
+    backing = A3HostBacking()
+    with pytest.raises(ValueError, match="NUMA placement"):
+        backing.allocate(HostWindowSpec(128, numa_id=1), None, 0, 2)
+    assert backing.shared is None
 
 
 @pytest.mark.parametrize("kwargs", [dict(nbytes=0), dict(nbytes=63), dict(nbytes=True), dict(nbytes=64, numa_id=-1)])

@@ -605,11 +605,10 @@ class AdapterKind(str, Enum):
 class AdapterProfile(str, Enum):
     """How a consumer reaches a Buffer — the mechanism, not the wire backend tag."""
 
-    # `HOST_SVM_MAP` currently has no implemented producer. It remains a named mechanism so the
-    # service can reject it explicitly instead of conflating it with an unknown profile.
+    # Local Host domains establish this attachment explicitly; the generic region
+    # planner still refuses to infer Host registration from a backing alone.
     HOST_SVM_MAP = "HOST_SVM_MAP"
     HOST_VMM_COPY = "HOST_VMM_COPY"
-    HOST_VMM_MAP = "HOST_VMM_MAP"
     DEVICE_VMM_PEER_IMPORT = "DEVICE_VMM_PEER_IMPORT"
     DEVICE_FABRIC_V2_PEER_IMPORT = "DEVICE_FABRIC_V2_PEER_IMPORT"
     REMOTE_COPY = "REMOTE_COPY"
