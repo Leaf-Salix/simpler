@@ -162,6 +162,7 @@ struct KernelArgs {
     uint64_t pmu_run_terminal_bank{0};
     uint64_t dep_gen_run_terminal_bank{0};
     uint64_t scope_stats_run_terminal_bank{0};
+    uint64_t capture_control{0};
     // 32-bit tail.
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|chip_swimlane|pmu|dep_gen|scope_stats
 
@@ -211,10 +212,10 @@ static_assert(
 );
 // Where the 32-bit tail's Graph triple begins. `sizeof` alone cannot see a
 // reorder inside that tail, because every member of it is the same width: the
-// eighteen 8-byte fields end at 144 and the eight uint32_t that follow fill 176
+// nineteen 8-byte fields end at 152 and the eight uint32_t that follow fill 184
 // exactly, in whatever order they are written.
-static_assert(offsetof(KernelArgs, graph_section_offset) == 164, "KernelArgs::graph_section_offset offset drift");
-static_assert(sizeof(KernelArgs) == 176, "KernelArgs launch-payload size drift");
+static_assert(offsetof(KernelArgs, graph_section_offset) == 172, "KernelArgs::graph_section_offset offset drift");
+static_assert(sizeof(KernelArgs) == 184, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.
@@ -250,9 +251,10 @@ struct AicoreLaunchArgs {
     // this run's report. Zero on a kernel/persistent launch, which keeps the
     // `aicore_done != 0` predicate.
     uint64_t report_epoch;
+    uint64_t capture_control;
 };
 
-static_assert(sizeof(AicoreLaunchArgs) == 40, "AicoreLaunchArgs size drift");
+static_assert(sizeof(AicoreLaunchArgs) == 48, "AicoreLaunchArgs size drift");
 
 /**
  * Fill the `AicoreLaunchArgs` fields every architecture shares, from the
@@ -268,6 +270,7 @@ inline void fill_shared_launch_args(AicoreLaunchArgs &args, const KernelArgs &k_
     args.runtime_args = reinterpret_cast<uint64_t>(k_args.runtime_args);
     args.enable_profiling_flag = k_args.enable_profiling_flag;
     args.report_epoch = k_args.run_result_epoch;
+    args.capture_control = k_args.capture_control;
 }
 
 /**

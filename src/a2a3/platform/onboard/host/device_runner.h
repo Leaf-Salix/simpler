@@ -106,6 +106,10 @@ public:
         std::unique_ptr<PreparedExecution> *prepared
     ) override;
     void abandon_prepared_execution(PreparedExecution &prepared) noexcept override;
+    bool supports_native_capture() const override { return runtime_native_capture_supported_impl() != 0; }
+    int reserve_native_capture_streams() override { return ensure_run_streams(); }
+    LaunchTransactionResult record_native_run(PreparedExecution &prepared, LaunchPermit permit);
+
     int poll_execution(const ActiveExecution &active) override;
     DrainOutcome drain_execution(ActiveExecution &active) override;
     bool can_accept_run() const override { return !device_unusable_.load(std::memory_order_acquire); }
@@ -164,6 +168,7 @@ public:
      * address is a query result and owns nothing.
      */
     int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) override;
+    int configure_kernel_affinity(Runtime &runtime) override;
 
     /**
      * Fill `InitArgs.l2_cache_offset` from the driver's per-device report.
