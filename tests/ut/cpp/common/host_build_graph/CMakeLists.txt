@@ -82,6 +82,9 @@ hbg_cases(
     test_hbg_scratch_retention.cpp
     ORCH)
 
+# Consumer-release regressions deliberately wait on a producer thread.
+set_tests_properties(test_a2a3_hbg_ready_queue_seed test_a5_hbg_ready_queue_seed PROPERTIES TIMEOUT 10)
+
 hbg_case(test_hbg_graph_cache.cpp
     SOURCES ${SIMPLER_SRC}/common/host_build_graph/device/graph_execution.cpp)
 
@@ -152,6 +155,26 @@ hbg_case(test_hbg_scheduler_drain.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
     A2A3_SOURCES ${SIMPLER_SRC}/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
     A5_SOURCES   ${CMAKE_CURRENT_SOURCE_DIR}/support/scheduler_drain_a5_stubs.cpp)
+
+# Exercise production dispatch while substituting only its drain coordinator.
+# Unused scheduler entry points require hardware runtime services; discard them.
+hbg_case(test_hbg_scheduler_requeue.cpp
+    TIMEOUT 10
+    SOURCES
+        ${SIMPLER_SRC}/@arch@/runtime/host_build_graph/runtime/scheduler/scheduler_dispatch.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/host_build_graph/runtime/scheduler/scheduler_cold_path.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/args_dump_aicpu.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
+    A2A3_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/support/stall_dump_level_a2a3_stubs.cpp
+    A5_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/support/scheduler_drain_a5_stubs.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/support/stall_dump_level_a5_stubs.cpp
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS
+        "$<$<PLATFORM_ID:Darwin>:-Wl,-dead_strip>"
+        "$<$<NOT:$<PLATFORM_ID:Darwin>>:-Wl,--gc-sections>")
 
 hbg_case(test_hbg_stall_dump_level.cpp
     SOURCES

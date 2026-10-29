@@ -63,7 +63,7 @@
 #endif
 
 // =============================================================================
-// Ready Queue (Lock-free bounded MPMC — Vyukov design)
+// Ready Queue (Bounded MPMC — Vyukov sequence ownership)
 // =============================================================================
 
 /**
@@ -76,7 +76,7 @@ struct ChipReadyQueueSlot {
 };
 
 /**
- * Lock-free bounded MPMC queue (Dmitry Vyukov design)
+ * Bounded MPMC queue (Dmitry Vyukov sequence ownership)
  *
  * Key properties:
  * - enqueue_pos and dequeue_pos on separate cache lines (no false sharing)
@@ -129,6 +129,16 @@ struct alignas(64) ChipReadyQueue {
                                  )) {}
     }
 
+    // A consumer advances dequeue_pos before reading the payload and releasing
+    // its sequence. A producer wrapping to that ticket must wait for release;
+    // only an unclaimed ticket represents capacity exhaustion. The RMW observes
+    // the latest dequeue modification even though claiming itself is relaxed.
+    // Do not require an exact sequence generation: its acquire load may still
+    // observe an older value when enqueue_pos was loaded with relaxed ordering.
+    bool consumer_is_releasing(uint64_t pos) {
+        return pos >= capacity && dequeue_pos.fetch_add(0, std::memory_order_acquire) > pos - capacity;
+    }
+
     // An untagged push carries the reserved sentinel: only the three queues that
     // pop with a tag ever read this field, and all of them push with one, so an
     // untagged entry's tag is never compared. The sentinel says so, where a zero
@@ -150,7 +160,7 @@ struct alignas(64) ChipReadyQueue {
                     break;
                 }
             } else if (diff < 0) {
-                return false;  // Queue full
+                if (!consumer_is_releasing(pos)) return false;
             }
         }
 
@@ -164,9 +174,9 @@ struct alignas(64) ChipReadyQueue {
     // Batch push: reserve count slots with a single CAS after confirming
     // every target slot is available under the usual Vyukov sequence check.
     // Returns false without publishing anything when the queue cannot take all
-    // `count` items. A target slot holding an older generation means full and
-    // ends the call; a slot a peer has reserved but not yet published is
-    // transient and retries, so this only spins while a peer is mid-publish.
+    // `count` items. A consumer-owned slot waits for release; an unclaimed
+    // older generation returns false. Consumers release all claimed slots
+    // before returning, so requeue never waits on its own consumer reservation.
     bool push_batch(ChipTaskSlotState **items, int count) { return push_batch_tagged(items, nullptr, count); }
 
     bool push_batch_tagged(ChipTaskSlotState **items, const TaskId *task_id_snapshots, int count) {
@@ -182,7 +192,9 @@ struct alignas(64) ChipReadyQueue {
                 int64_t seq = slot->sequence.load(std::memory_order_acquire);
                 int64_t diff = seq - static_cast<int64_t>(pos + i);
                 if (diff < 0) {
-                    return false;  // Queue full
+                    if (!consumer_is_releasing(pos + i)) return false;
+                    ready = false;
+                    continue;
                 }
                 if (diff > 0) {
                     ready = false;
@@ -232,7 +244,9 @@ struct alignas(64) ChipReadyQueue {
                 contended = true;
                 atomic_ops++;  // failed CAS
             } else if (diff < 0) {
-                return false;  // Queue full
+                if (!consumer_is_releasing(pos)) return false;
+                atomic_ops++;  // dequeue_pos RMW in consumer_is_releasing
+                contended = true;
             } else {
                 contended = true;  // diff > 0: slot not yet released, spin
             }
