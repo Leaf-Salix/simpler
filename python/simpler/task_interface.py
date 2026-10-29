@@ -127,7 +127,7 @@ from _task_interface import (
 )
 
 from .buffer import AccessMode, AddressSpace, Buffer, ImportContext, ImportRegistry, Tensor, TensorTransfer
-from .comm_domain import CommDomainRef
+from .comm_domain import CommDomainRef, HostWindowSpec
 from .comm_endpoints import DEVICE_AICPU
 
 
@@ -229,6 +229,7 @@ _assert_bindings_match_source_tree()
 from .global_comm_domain import GlobalDomainAttachment, GlobalDomainBuffer, GlobalDomainMember  # noqa: E402
 
 __all__ = [
+    "HostWindowSpec",
     "DataType",
     "DeviceMemoryInfo",
     "ExecutionContextRefused",
@@ -1169,6 +1170,7 @@ class CommDomainHandle:
         "_config",
         "_ref",
         "requested_window_size",
+        "_host_resource",
     )
 
     def __init__(  # noqa: PLR0913 -- preserve the L3 and legacy L4 constructor keywords
@@ -1210,6 +1212,7 @@ class CommDomainHandle:
         self.retain_after_run = bool(retain_after_run)
         self.attachments = tuple(attachments)
         self._config = None
+        self._host_resource = None
         self._released = False
         self._freed = False
         self._ref = ref
@@ -1222,6 +1225,21 @@ class CommDomainHandle:
     def _require_live(self) -> None:
         if self._released:
             raise RuntimeError(f"CommDomainHandle({self.name!r}) is already released")
+
+    def host(self) -> Buffer:
+        """Return the creator's native Host backing. Host is not a communication rank."""
+        self._require_live()
+        if self._host_resource is None:
+            raise ValueError("domain has no local Host window")
+        return self._host_resource.buffer
+
+    def map_view(self, tensor: Tensor, *, domain_rank: int) -> Tensor:
+        """Select a fixed NPU attachment while retaining the source backing identity."""
+        self._require_live()
+        member = self.member(domain_rank)
+        if self._host_resource is None:
+            raise ValueError("domain has no local Host window")
+        return self._host_resource.map_view(tensor, member.local_worker_id)
 
     def member(self, domain_rank: int) -> GlobalDomainMember:
         """Return rank-ordered topology and ordinary Buffer slices."""

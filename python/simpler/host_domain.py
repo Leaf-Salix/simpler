@@ -1,0 +1,105 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Local Host backing and fixed per-chip attachments owned by a CommDomain."""
+
+from __future__ import annotations
+
+import ctypes
+
+from _task_interface import DataType, _encode_buffer_descriptor_wire
+
+from .buffer import (
+    AccessMode,
+    AddressSpace,
+    BackendKind,
+    Buffer,
+    ImportContext,
+    ImportRegistry,
+    Tensor,
+)
+from .comm_domain import HostWindowSpec
+from .comm_endpoints import HOST_CPU
+from .host_domain_backend import host_backing_type
+
+
+class HostDomainResource:
+    """Owner retained until all member views are confirmed gone.
+
+    Attachments are fixed for the domain lifetime. A new domain burns a new backing
+    identity; a selector cannot survive release even if its name, rank or VA repeats.
+    """
+
+    def __init__(self, spec: HostWindowSpec, identity, workers, platform, device):
+        self.spec = spec
+        self.identity = identity
+        self.workers = tuple(workers)
+        self.device = device
+        self.backend = host_backing_type(platform)()
+        self.buffer = None
+        self.export = None
+        self.published = False
+        self.views_released = False
+        self.closed = False
+        self.registry = ImportRegistry(ImportContext(HOST_CPU))
+
+    def allocate(self):
+        base, self.export = self.backend.allocate(self.spec, self.identity, self.device, len(self.workers))
+        self.buffer = Buffer(
+            identity=self.identity,
+            address_space=AddressSpace.HOST,
+            access=AccessMode.READWRITE,
+            backend_kind=BackendKind.REMOTE_SIDECAR,
+            nbytes=self.spec.nbytes,
+            base=base,
+        )
+        self.registry.register_attachment(
+            self.buffer.to_descriptor(),
+            base,
+            mapping_ref=0,
+            profile=self.backend.profile,
+            live=lambda: not self.closed and self.buffer is not None and not self.buffer.closed,
+        )
+
+    def request(self) -> bytes:
+        if self.export is None or self.buffer is None:
+            raise RuntimeError("Host backing has not been allocated")
+        return self.export.encode() + _encode_buffer_descriptor_wire(self.buffer.to_descriptor())
+
+    def map_view(self, tensor: Tensor, worker: int) -> Tensor:
+        if self.closed or self.buffer is None or self.buffer.closed or tensor.buffer != self.buffer.to_descriptor():
+            raise ValueError("Host mapping requires the live domain backing")
+        if tensor.mapping_ref:
+            raise ValueError("map_view requires the native Tensor view")
+        return tensor._with_mapping_ref(self.workers.index(worker) + 1)
+
+    def validate(self, tensor, worker):
+        if self.closed or self.buffer is None or self.buffer.closed or tensor.buffer != self.buffer.to_descriptor():
+            raise ValueError("Host domain Tensor is stale or differs from its source registration")
+        if worker not in self.workers or tensor.mapping_ref != self.workers.index(worker) + 1:
+            raise ValueError("Host Tensor requires an explicit mapping for the target worker")
+
+    def copy(self, offset, value, *, writing):
+        size = len(value) if writing else value
+        if offset < 0 or size < 0 or offset > self.spec.nbytes or size > self.spec.nbytes - offset:
+            raise ValueError("Host domain copy exceeds the backing range")
+        tensor = Tensor(self.buffer, shapes=(1,), dtype=DataType.UINT8)
+        imported = self.registry.resolve_tensor(tensor)
+        if writing:
+            ctypes.memmove(imported.base + offset, value, size)
+            return None
+        return ctypes.string_at(imported.base + offset, size)
+
+    def close(self):
+        self.closed = True
+        if self.buffer is not None:
+            self.buffer.closed = True
+        if self.published and not self.views_released:
+            raise RuntimeError("Host domain owner retained: member view release is unconfirmed")
+        self.backend.release()
+        self.registry.close()

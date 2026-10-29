@@ -80,6 +80,11 @@ static_assert(offsetof(CommGlobalDomainDescriptor, reserved) == 28, "CommGlobalD
 static_assert(offsetof(CommGlobalDomainDescriptor, handle) == 32, "CommGlobalDomainDescriptor.handle offset drift");
 #endif
 
+/** Attach one Host backing to an existing local domain without adding a rank. */
+int comm_attach_domain_host(
+    CommHandle h, uint64_t allocation_id, const CommGlobalDomainDescriptor *descriptor, uint64_t *base_out
+);
+
 /** Bit mask of DmaWorkspaceKind values this platform can provision. */
 uint32_t dma_workspace_supported_mask(void);
 

@@ -44,6 +44,7 @@ from _task_interface import _Orchestrator as _COrchestrator  # pyright: ignore[r
 
 from .buffer import AccessMode, BackendKind, Buffer, wrap_fork_inherited
 from .callable_identity import CallableHandle
+from .comm_domain import HostWindowSpec
 from .task_interface import (
     CallConfig,
     ChipCallable,
@@ -534,6 +535,7 @@ class Orchestrator:
         window_size: int,
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
+        host_window: HostWindowSpec | None = None,
         workers: Sequence[int] | None = None,
     ) -> CommDomainHandle:
         """Create a domain using L3 chip ids or L4 ``(node, chip)`` members.
@@ -550,7 +552,13 @@ class Orchestrator:
         if workers is not None and self._worker is not None and self._worker.level != 3:
             raise TypeError("legacy workers= is only supported by an L3 Worker")
         return self._domain(
-            name, members if members is not None else workers, window_size, buffers, retain_after_run, reuse=False
+            name,
+            members if members is not None else workers,
+            window_size,
+            buffers,
+            retain_after_run,
+            host_window=host_window,
+            reuse=False,
         )
 
     def get_or_allocate_domain(
@@ -561,15 +569,16 @@ class Orchestrator:
         window_size: int,
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
+        host_window: HostWindowSpec | None = None,
     ) -> CommDomainHandle:
         """Return the same live handle on an exact configuration match, otherwise create it.
 
         Member order, full buffer definitions, window request, retention and topology must match.
         A hit neither allocates nor initializes the existing window.
         """
-        return self._domain(name, members, window_size, buffers, retain_after_run, reuse=True)
+        return self._domain(name, members, window_size, buffers, retain_after_run, host_window=host_window, reuse=True)
 
-    def _domain(self, name, members, window_size, buffers, retain_after_run, *, reuse):
+    def _domain(self, name, members, window_size, buffers, retain_after_run, *, host_window=None, reuse):
         if self._worker is None:
             raise RuntimeError("domain allocation requires an Orchestrator bound to a Worker")
         return self._worker._comm_domain(
@@ -579,6 +588,7 @@ class Orchestrator:
             buffers=buffers,
             retain_after_run=retain_after_run,
             reuse=reuse,
+            host_window=host_window,
         )
 
     def get_domain(self, name: str | CommDomainRef) -> CommDomainHandle:
@@ -639,7 +649,7 @@ class Orchestrator:
     def copy_to_domain(
         self,
         handle: CommDomainHandle,
-        domain_rank: int,
+        domain_rank: int | None,
         data: bytes,
         *,
         buffer: str | None = None,
@@ -655,7 +665,7 @@ class Orchestrator:
     def copy_from_domain(
         self,
         handle: CommDomainHandle,
-        domain_rank: int,
+        domain_rank: int | None,
         nbytes: int,
         *,
         buffer: str | None = None,
@@ -686,6 +696,11 @@ class Orchestrator:
             self._worker._use_domain(handle)
         size = len(data) if writing else data
         handle._require_live()
+        if rank is None:
+            if buffer is not None or handle._host_resource is None:
+                raise ValueError("Host domain copy requires a local Host window and no buffer slice name")
+            with self._control_admission("Host domain copy"):
+                return handle._host_resource.copy(offset, data, writing=writing)
         absolute = self._global_copy_range(handle, buffer=buffer, offset=offset, nbytes=size)
         handle.member(rank)
         if not handle.workers and not handle.borrowed:

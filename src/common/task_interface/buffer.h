@@ -231,8 +231,15 @@ struct Tensor {
     uint32_t shapes[MAX_TENSOR_DIMS];
     uint32_t strides[MAX_TENSOR_DIMS];
     DataType dtype;
-    uint8_t _pad[3];
+    uint8_t _pad[1];
+    uint8_t mapping_ref;  // Zero selects the native view; nonzero selects a confirmed endpoint attachment.
+    uint8_t _reserved;
 };
+
+inline const char *tensor_transfer_error(const Tensor &tensor, TensorTransfer transfer) {
+    if (tensor.mapping_ref && transfer != TensorTransfer::NONE) return "mapping requires transfer NONE";
+    return tensor_transfer_error(static_cast<AddressSpace>(tensor.buffer.address_space), transfer);
+}
 
 // Saturating u64 arithmetic. Every input below is wire-supplied, and `shapes[i]` and `strides[i]`
 // are each u32, so one product alone reaches ~2^64: an unsaturated sum would wrap to a SMALL extent
@@ -629,3 +636,5 @@ static_assert(offsetof(Tensor, ndims) == 96);
 static_assert(offsetof(Tensor, shapes) == 100);
 static_assert(offsetof(Tensor, strides) == 120);
 static_assert(offsetof(Tensor, dtype) == 140);
+
+static_assert(offsetof(Tensor, mapping_ref) == 142);

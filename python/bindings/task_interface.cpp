@@ -311,6 +311,24 @@ public:
         }
     }
 
+    void require_host_fabric() const {
+        using SocName = const char *(*)();
+        auto soc_name = reinterpret_cast<SocName>(resolve_symbol("aclrtGetSocName"));
+        const char *soc = soc_name();
+        if (!soc || std::strncmp(soc, "Ascend910_93", 12) != 0)
+            throw std::runtime_error("Host Fabric backing requires an A3 device");
+        (void)resolve_symbol("aclrtMemExportToShareableHandleV2");
+        (void)resolve_symbol("aclrtReserveMemAddressNoUCMemory");
+    }
+
+    void export_fabric(void *handle, void *token) const {
+        using Export = int (*)(void *, uint64_t, int, void *);
+        constexpr uint64_t disable_pid_validation = 1;
+        constexpr int fabric_handle_type = 2;
+        auto export_handle = reinterpret_cast<Export>(resolve_symbol("aclrtMemExportToShareableHandleV2"));
+        acl_check(export_handle(handle, disable_pid_validation, fabric_handle_type, token), "Fabric export");
+    }
+
 private:
     static constexpr int kAclSuccess = 0;
     static constexpr int kAclMemcpyHostToDevice = 1;
@@ -358,6 +376,67 @@ AclRuntimeApi &acl_api() {
     });
     return *api;
 }
+
+// Explicitly released by the node domain after every imported view is acknowledged gone.
+// Destruction cannot prove that acknowledgement and therefore does not free the allocation.
+class HostDomainMemory {
+public:
+    nb::tuple allocate(int device, uint32_t numa, uint64_t logical_bytes) {
+        if (handle_ || base_ || !logical_bytes) throw std::invalid_argument("Host allocation is not empty");
+        auto &api = acl_api();
+        api.bind_device_with_check(device);
+        api.require_host_fabric();
+        device_ = device;
+        LocalAclPhysicalMemProp prop{};
+        constexpr int p2p_huge = 16, host_numa = 4;
+        prop.memAttr = p2p_huge;
+        prop.location = {numa, host_numa};
+        size_t granularity = 0;
+        check(api.aclrtMemGetAllocationGranularity(&prop, 0, &granularity), "Host granularity");
+        if (!granularity || logical_bytes > SIZE_MAX - (granularity - 1))
+            throw std::invalid_argument("Host allocation extent overflow");
+        size_ = (logical_bytes + granularity - 1) / granularity * granularity;
+        check(api.aclrtMallocPhysical(&handle_, size_, &prop, 0), "Host physical allocation");
+        check(api.aclrtReserveMemAddress(&base_, size_, 0, nullptr, 1), "Host VA reservation");
+        check(api.aclrtMapMem(base_, size_, 0, handle_, 0), "Host owner mapping");
+        mapped_ = true;
+        std::memset(base_, 0, logical_bytes);
+        api.export_fabric(handle_, token_.data());
+        return nb::make_tuple(size_, nb::bytes(reinterpret_cast<const char *>(token_.data()), token_.size()));
+    }
+    uint64_t base() const {
+        if (!mapped_ || !base_) throw std::invalid_argument("Host owner has no live mapping");
+        return reinterpret_cast<uint64_t>(base_);
+    }
+    void release() {
+        if (!base_ && !handle_) return;
+        auto &api = acl_api();
+        api.bind_device_with_check(device_);
+        if (mapped_) {
+            check(api.aclrtUnmapMem(base_), "Host unmap");
+            mapped_ = false;
+        }
+        if (base_) {
+            check(api.aclrtReleaseMemAddress(base_), "Host VA release");
+            base_ = nullptr;
+        }
+        if (handle_) {
+            check(api.aclrtFreePhysical(handle_), "Host physical free");
+            handle_ = nullptr;
+        }
+    }
+
+private:
+    int device_ = -1;
+    void *base_ = nullptr;
+    void *handle_ = nullptr;
+    bool mapped_ = false;
+    uint64_t size_ = 0;
+    std::array<uint8_t, 128> token_{};
+    static void check(int rc, const char *op) {
+        if (rc) throw std::runtime_error(std::string(op) + " failed with code " + std::to_string(rc));
+    }
+};
 
 std::string region_shm_name_for_open(const std::string &token) {
     if (token.empty()) {
@@ -1786,12 +1865,15 @@ ChipTensor materialize_one(const Tensor &r, TensorTransfer transfer, nb::dict re
         throw std::runtime_error("materialize: byte_offset is not a multiple of dtype size");
     }
     nb::object key = nb::cast(r.buffer.identity);
+    if (r.mapping_ref) key = nb::make_tuple(key, r.mapping_ref);
     if (!resolved.contains(key)) {
         throw std::runtime_error("materialize: canonical identity not in the import registry");
     }
     nb::tuple val = nb::cast<nb::tuple>(resolved[key]);
     auto base = nb::cast<uint64_t>(val[0]);
     auto addr_space = nb::cast<int>(val[1]);
+    if (r.mapping_ref && addr_space != static_cast<int>(AddressSpace::DEVICE))
+        throw std::invalid_argument("mapped Tensor requires a DEVICE attachment");
     // The view origin is base + byte_offset (start_offset folded into addr); strides carry any
     // non-row-major layout (transpose / permute / step-slice), which ChipTensor expresses natively.
     return make_tensor_strided(
@@ -2043,6 +2125,11 @@ BufferDescriptor decode_buffer_descriptor_wire(const uint8_t *raw, size_t size) 
 #endif
 
 NB_MODULE(_task_interface, m) {
+    nb::class_<HostDomainMemory>(m, "_HostDomainMemory")
+        .def(nb::init<>())
+        .def("allocate", &HostDomainMemory::allocate)
+        .def_prop_ro("base", &HostDomainMemory::base)
+        .def("release", &HostDomainMemory::release);
     m.doc() = "Nanobind bindings for task_interface (DataType, Buffer/Tensor wire ABI, ChipTensor, TaskArgs variants)";
 
     // Source commit this extension was compiled from; "" when git was
@@ -2480,6 +2567,18 @@ NB_MODULE(_task_interface, m) {
 
         .def_ro("buffer", &Tensor::buffer)
         .def_ro("byte_offset", &Tensor::byte_offset)
+        .def_ro("mapping_ref", &Tensor::mapping_ref)
+        .def(
+            "_with_mapping_ref",
+            [](const Tensor &self, uint8_t reference) {
+                if (!reference) throw std::invalid_argument("mapping reference must be nonzero");
+                Tensor mapped = self;
+                mapped.mapping_ref = reference;
+                validate_tensor(mapped);
+                return mapped;
+            },
+            nb::arg("reference")
+        )
         .def_ro("ndims", &Tensor::ndims)
         .def_prop_ro(
             "shapes",
@@ -2505,7 +2604,7 @@ NB_MODULE(_task_interface, m) {
             "__eq__",
             [](const Tensor &a, const Tensor &b) {
                 if (!(a.buffer == b.buffer) || a.byte_offset != b.byte_offset || a.ndims != b.ndims ||
-                    a.dtype != b.dtype) {
+                    a.dtype != b.dtype || a.mapping_ref != b.mapping_ref) {
                     return false;
                 }
                 for (uint32_t i = 0; i < a.ndims; ++i) {
@@ -2929,6 +3028,7 @@ NB_MODULE(_task_interface, m) {
             [](const TaskArgs &self) {
                 const int32_t n = self.tensor_count();
                 for (int32_t i = 0; i < n; ++i) {
+                    if (self.tensor(i).mapping_ref) return true;
                     const auto backend = static_cast<BackendKind>(self.tensor(i).buffer.backend_kind);
                     if (backend == BackendKind::DEVICE_MALLOC || backend == BackendKind::VMM_WINDOW) return true;
                 }
@@ -4118,6 +4218,15 @@ NB_MODULE(_task_interface, m) {
             "comm_release_domain_windows", &ChipWorker::comm_release_domain_windows, nb::arg("comm_handle"),
             nb::arg("allocation_id"), nb::arg("rank_count"), nb::arg("domain_rank"),
             "Pair to comm_alloc_domain_windows: collectively release the per-rank pool."
+        )
+        .def(
+            "comm_attach_domain_host",
+            [](ChipWorker &self, uint64_t handle, uint64_t allocation, nb::bytes descriptor) {
+                const auto *begin = reinterpret_cast<const uint8_t *>(descriptor.c_str());
+                return self.comm_attach_domain_host(
+                    handle, allocation, std::vector<uint8_t>(begin, begin + descriptor.size())
+                );
+            }
         )
         .def(
             "comm_global_domain_prepare",

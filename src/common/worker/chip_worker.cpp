@@ -445,6 +445,7 @@ void ChipWorker::init(
         comm_get_window_size_fn_ = module->required<CommGetWindowSizeFn>("comm_get_window_size");
         comm_derive_context_fn_ = module->required<CommDeriveContextFn>("comm_derive_context");
         comm_alloc_domain_windows_fn_ = module->required<CommAllocDomainWindowsFn>("comm_alloc_domain_windows");
+        comm_attach_domain_host_fn_ = module->optional<CommAttachDomainHostFn>("comm_attach_domain_host");
         comm_release_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_release_domain_windows");
         comm_global_domain_prepare_fn_ = module->required<CommGlobalDomainPrepareFn>("comm_global_domain_prepare");
         comm_global_domain_import_fn_ = module->required<CommGlobalDomainImportFn>("comm_global_domain_import");
@@ -890,6 +891,7 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     comm_get_window_size_fn_ = nullptr;
     comm_derive_context_fn_ = nullptr;
     comm_alloc_domain_windows_fn_ = nullptr;
+    comm_attach_domain_host_fn_ = nullptr;
     comm_release_domain_windows_fn_ = nullptr;
     comm_global_domain_prepare_fn_ = nullptr;
     comm_global_domain_import_fn_ = nullptr;
@@ -2355,6 +2357,19 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
         throw std::runtime_error("comm_alloc_domain_windows returned null device_ctx / local_window_base");
     }
     return {device_ctx, local_window_base, actual_window_size};
+}
+
+uint64_t
+ChipWorker::comm_attach_domain_host(uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint8_t> &bytes) {
+    if (!comm_attach_domain_host_fn_ || bytes.size() != sizeof(CommGlobalDomainDescriptor))
+        throw std::invalid_argument("Host domain attachment is unsupported or has an invalid descriptor");
+    CommGlobalDomainDescriptor descriptor{};
+    std::memcpy(&descriptor, bytes.data(), sizeof(descriptor));
+    uint64_t base = 0;
+    const int rc =
+        comm_attach_domain_host_fn_(reinterpret_cast<void *>(comm_handle), allocation_id, &descriptor, &base);
+    if (rc || !base) throw std::runtime_error("comm_attach_domain_host failed with code " + std::to_string(rc));
+    return base;
 }
 
 void ChipWorker::comm_release_domain_windows(

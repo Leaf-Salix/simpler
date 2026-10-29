@@ -966,6 +966,7 @@ class ImportedBuffer:
     descriptor: BufferDescriptor | None = None
     profile: AdapterProfile | None = None
     capabilities: frozenset[BufferCapability] = frozenset()
+    live: Callable[[], bool] | None = None
 
 
 @dataclass
@@ -1093,6 +1094,64 @@ class ImportRegistry:
     def __init__(self, context: ImportContext) -> None:
         self._by_identity: dict[CanonicalIdentity, ImportedBuffer] = {}
         self._context = context
+        self._attachments: dict[tuple[CanonicalIdentity, int], ImportedBuffer] = {}
+
+    def register_attachment(
+        self,
+        descriptor: BufferDescriptor,
+        base: int,
+        *,
+        mapping_ref: int,
+        profile: AdapterProfile,
+        live: Callable[[], bool],
+    ) -> None:
+        """Register a backend-confirmed address in this endpoint's current context.
+
+        Zero selects a native Host attachment; nonzero selects a Device attachment.
+        The domain owns physical cleanup and revokes admission before unregistering.
+        Neither a Tensor selector nor an unregistered descriptor can create a grant.
+        """
+        if isinstance(mapping_ref, bool) or not 0 <= operator.index(mapping_ref) <= 255:
+            raise ValueError("mapping reference must be in [0, 255]")
+        if isinstance(base, bool) or not 0 < operator.index(base) <= (1 << 64) - descriptor.nbytes:
+            raise ValueError("attachment requires a nonempty uint64 address range")
+        deployments = (DEVICE_AICPU, DEVICE_AICORE) if mapping_ref else (HOST_CPU,)
+        if self._context.deployment not in deployments or not live():
+            raise ValueError("attachment requires a live matching endpoint")
+        if not mapping_ref and descriptor.address_space != AddressSpace.HOST:
+            raise ValueError("native Host attachment requires HOST backing")
+        for item in (*self._by_identity.values(), *self._attachments.values()):
+            if item.identity == descriptor.identity and item.descriptor != descriptor:
+                raise ValueError("one identity names one backing descriptor")
+        key = (descriptor.identity, mapping_ref)
+        old = self._attachments.get(key)
+        if old is not None:
+            if old.base != base or old.profile != profile or old.live is None or not old.live():
+                raise ValueError("attachment conflicts with an existing mapping")
+            return
+        self._attachments[key] = ImportedBuffer(
+            descriptor.identity,
+            base,
+            descriptor.nbytes,
+            AddressSpace.DEVICE if mapping_ref else AddressSpace.HOST,
+            descriptor=descriptor,
+            profile=profile,
+            capabilities=capabilities_for_adapter(AdapterKind.DIRECT_MAP, descriptor.access),
+            live=live,
+        )
+
+    def resolve_tensor(self, tensor: Tensor) -> ImportedBuffer:
+        """Resolve the selected attachment without changing the backing descriptor."""
+        desc = tensor.buffer
+        key = (desc.identity, tensor.mapping_ref)
+        attachment = self._attachments.get(key)
+        if attachment is not None:
+            if attachment.descriptor != desc or attachment.live is None or not attachment.live():
+                raise ValueError("Tensor attachment is not live or its descriptor differs")
+            return attachment
+        if tensor.mapping_ref or desc.backend_kind == BackendKind.REMOTE_SIDECAR:
+            raise ValueError("Tensor has no granted attachment on this endpoint")
+        return self.materialize(desc)
 
     def materialize(self, desc: BufferDescriptor) -> ImportedBuffer:
         """Map ``desc``'s backing into this process on first sight of its identity; reuse the
@@ -1113,6 +1172,9 @@ class ImportRegistry:
         that reaches the backing without producing an address is refused *here* rather than there --
         this returns a mapping, and that is the only narrowing it applies to the judgment.
         """
+        for attachment in self._attachments.values():
+            if attachment.identity == desc.identity and attachment.descriptor != desc:
+                raise ValueError("one identity names one backing descriptor")
         key = desc.identity
         cached = self._by_identity.get(key)
         if cached is not None:
@@ -1152,14 +1214,14 @@ class ImportRegistry:
         self._by_identity[key] = imported
         return imported
 
-    def materialize_args(self, args) -> dict[CanonicalIdentity, tuple[int, int]]:
-        """Materialize every embedded descriptor in a ``TaskArgs`` and return the resolved map:
-        identity -> (local base, address_space), scoped to this call's own tensors."""
-        resolved: dict[CanonicalIdentity, tuple[int, int]] = {}
+    def materialize_args(self, args) -> dict[Any, tuple[int, int]]:
+        """Resolve each argument's selected view; native and mapped views may coexist."""
+        resolved: dict[Any, tuple[int, int]] = {}
         for i in range(args.tensor_count()):
-            desc = args.tensor(i).buffer
-            imported = self.materialize(desc)
-            resolved[desc.identity] = (imported.base, int(imported.address_space))
+            tensor = args.tensor(i)
+            imported = self.resolve_tensor(tensor)
+            key = (tensor.buffer.identity, tensor.mapping_ref) if tensor.mapping_ref else tensor.buffer.identity
+            resolved[key] = (imported.base, int(imported.address_space))
         return resolved
 
     def mapped_args_from_blob(self, blob_ptr: int, capacity: int) -> MappedArgs:
@@ -1172,14 +1234,14 @@ class ImportRegistry:
         tensors = []
         for i in range(args.tensor_count()):
             t = args.tensor(i)
-            if t.buffer.address_space == AddressSpace.DEVICE:
+            if t.buffer.address_space == AddressSpace.DEVICE or t.mapping_ref:
                 # Depth behind the submit-time endpoint check: this process is a host compute leaf, so
                 # a device address here would be handed to torch as a host pointer.
                 raise ValueError(
                     f"sub-worker argument {i} is a DEVICE-space tensor "
                     f"({t.buffer.backend_kind.name}); it cannot be mapped into a host process"
                 )
-            tensors.append(MappedArg(self.materialize(t.buffer), t.byte_offset, t.shapes, t.strides, t.dtype))
+            tensors.append(MappedArg(self.resolve_tensor(t), t.byte_offset, t.shapes, t.strides, t.dtype))
         return MappedArgs(tensors, tuple(args.scalar(i) for i in range(args.scalar_count())))
 
     def require(
@@ -1225,6 +1287,9 @@ class ImportRegistry:
         before that point is a mapping nothing can reach to retry — so the raise leaves the entry
         in place for this registry's own ``close()`` to attempt again.
         """
+        for key in tuple(self._attachments):
+            if key[0] == identity:
+                del self._attachments[key]
         imported = self._by_identity.get(identity)
         if imported is None:
             return
@@ -1241,6 +1306,7 @@ class ImportRegistry:
         error is raised once the sweep is done, so a caller still learns the endpoint leaked rather
         than seeing a silent success.
         """
+        self._attachments.clear()
         errors: list[BaseException] = []
         for identity, imported in list(self._by_identity.items()):
             if imported.shm is not None:

@@ -28,6 +28,8 @@
 #include "common/unified_log.h"
 #include "host/file_marker_handshake.h"
 
+#include <algorithm>
+#include <dlfcn.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -86,6 +88,10 @@ struct DomainAllocation {
     int nranks = 0;
     bool release_failed = false;
     VmmWindow local_window;
+    void *host_base = nullptr;
+    aclrtDrvMemHandle host_handle = nullptr;
+    uint64_t host_reservation = 0;
+    bool host_mapped = false;
     std::vector<VmmWindow> peer_windows;
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
 };
@@ -364,7 +370,25 @@ static aclError import_ipc_window(int32_t device_id, uint64_t shareable_handle, 
     return status;
 }
 
+static aclError release_domain_host(DomainAllocation *alloc) {
+    if (alloc->host_mapped) {
+        if (auto status = aclrtUnmapMem(alloc->host_base); status != ACL_SUCCESS) return status;
+        alloc->host_mapped = false;
+    }
+    if (alloc->host_base) {
+        if (auto status = aclrtReleaseMemAddress(alloc->host_base); status != ACL_SUCCESS) return status;
+        alloc->host_base = nullptr;
+    }
+    if (alloc->host_handle) {
+        if (auto status = aclrtFreePhysical(alloc->host_handle); status != ACL_SUCCESS) return status;
+        alloc->host_handle = nullptr;
+    }
+    return ACL_SUCCESS;
+}
+
 static aclError release_domain_windows(DomainAllocation *alloc) {
+    aclError host_status = release_domain_host(alloc);
+    if (host_status != ACL_SUCCESS) return host_status;
     aclError first_error = release_vmm_windows(&alloc->peer_windows);
     record_first_error(release_vmm_window(&alloc->local_window), &first_error);
     return first_error;
@@ -1490,6 +1514,54 @@ extern "C" int comm_alloc_domain_windows(
     return -1;
 }
 
+extern "C" int comm_attach_domain_host(
+    CommHandle h, uint64_t allocation_id, const CommGlobalDomainDescriptor *descriptor, uint64_t *base_out
+) try {
+    if (!h || !descriptor || !base_out) return -1;
+    auto it = h->domain_allocations.find(allocation_id);
+    if (it == h->domain_allocations.end()) return -1;
+    auto &allocation = *it->second;
+    if (allocation.host_base || allocation.host_handle || descriptor->version != COMM_GLOBAL_DOMAIN_VERSION ||
+        descriptor->profile != COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC || descriptor->reserved ||
+        descriptor->handle_size != sizeof(aclrtMemFabricHandle) || !descriptor->mapping_size)
+        return -1;
+    constexpr uint64_t unit = 1ULL << 30, begin = 40ULL << 40, end = 224ULL << 40;
+    if (descriptor->mapping_size > end - begin - unit) return -1;
+    const uint64_t bytes = (descriptor->mapping_size + unit - 1) / unit * unit;
+    std::vector<std::pair<uint64_t, uint64_t>> occupied;
+    for (const auto &entry : h->domain_allocations) {
+        if (entry.second->host_base)
+            occupied.emplace_back(reinterpret_cast<uint64_t>(entry.second->host_base), entry.second->host_reservation);
+    }
+    std::sort(occupied.begin(), occupied.end());
+    uint64_t address = begin;
+    for (const auto &[base, length] : occupied) {
+        if (address <= base && bytes <= base - address) break;
+        address = std::max(address, base + length);
+    }
+    if (address > end - bytes) return -1;
+    using Reserve = decltype(&aclrtReserveMemAddressNoUCMemory);
+    auto reserve = reinterpret_cast<Reserve>(dlsym(RTLD_DEFAULT, "aclrtReserveMemAddressNoUCMemory"));
+    if (!reserve) return -1;
+    aclrtMemFabricHandle token{};
+    std::memcpy(&token, descriptor->handle, sizeof(token));
+    auto status = aclrtMemImportFromShareableHandleV2(
+        &token, ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, ACL_RT_IPC_MEM_EXPORT_FLAG_DEFAULT, &allocation.host_handle
+    );
+    if (status != ACL_SUCCESS) return static_cast<int>(status);
+    // NoUC needs explicit [40, 224) TiB VA with 1 GiB reservation alignment.
+    status = reserve(&allocation.host_base, bytes, 0, reinterpret_cast<void *>(address), 0);
+    if (status != ACL_SUCCESS) return static_cast<int>(status);
+    allocation.host_reservation = bytes;
+    status = aclrtMapMem(allocation.host_base, descriptor->mapping_size, 0, allocation.host_handle, 0);
+    if (status != ACL_SUCCESS) return static_cast<int>(status);
+    allocation.host_mapped = true;
+    *base_out = reinterpret_cast<uint64_t>(allocation.host_base);
+    return 0;
+} catch (...) {
+    return -1;
+}
+
 extern "C" int
 comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) try {
     if (!h) return -1;
@@ -1510,6 +1582,7 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
         );
         return -1;
     }
+    if (release_domain_host(alloc.get()) != ACL_SUCCESS) return -1;
     int rc = 0;
     // Best-effort subset barrier so peers don't free local memory under each
     // other.  If a peer crashed mid-allocation, the timeout returns false and
