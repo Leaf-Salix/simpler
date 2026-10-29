@@ -323,19 +323,19 @@ static aclError reserve_and_map_vmm_window(
     if (status != ACL_SUCCESS) return status;
     window->mapped = true;
 
-    if (!no_uc) {
-        // aclrtMemAccessDesc::location.id is consumed in the driver-visible space, unlike
-        // aclrtPhysicalMemProp::location.id in its caller create_local_vmm_window, which takes the ACL-logical
-        // id. Under ASCEND_RT_VISIBLE_DEVICES the logical id here names the wrong card and aclrtMemSetAccess
-        // fails with 507899 (ACL_ERROR_RT_DRV_INTERNAL_ERROR). See common/acl_hal_device.h.
-        aclrtMemAccessDesc access_desc{};
-        access_desc.flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE;
-        access_desc.location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
-        access_desc.location.id = static_cast<uint32_t>(pto::acl_to_hal_device_id(device_id));
-        status = aclrtMemSetAccess(base, size, &access_desc, 1);
-        if (status != ACL_SUCCESS) {
-            return status;
-        }
+    if (no_uc) return ACL_SUCCESS;
+
+    // aclrtMemAccessDesc::location.id is consumed in the driver-visible space, unlike
+    // aclrtPhysicalMemProp::location.id in its caller create_local_vmm_window, which takes the ACL-logical
+    // id. Under ASCEND_RT_VISIBLE_DEVICES the logical id here names the wrong card and aclrtMemSetAccess
+    // fails with 507899 (ACL_ERROR_RT_DRV_INTERNAL_ERROR). See common/acl_hal_device.h.
+    aclrtMemAccessDesc access_desc{};
+    access_desc.flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE;
+    access_desc.location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
+    access_desc.location.id = static_cast<uint32_t>(pto::acl_to_hal_device_id(device_id));
+    status = aclrtMemSetAccess(base, size, &access_desc, 1);
+    if (status != ACL_SUCCESS) {
+        return status;
     }
     window->base = base;
     window->handle = handle;
@@ -1780,21 +1780,25 @@ extern "C" int comm_global_domain_window(uint64_t id, uint32_t slot, uint64_t *b
     return 0;
 }
 
-extern "C" int comm_global_domain_copy(
-    uint64_t id, uint32_t dst_slot, size_t dst_offset, uint32_t src_slot, size_t src_offset, size_t bytes, void *stream
-) {
+extern "C" int comm_global_domain_copy(uint64_t id, uint64_t dst_va, uint64_t src_va, size_t bytes, void *stream) {
     std::lock_guard<std::mutex> lock(global_domain_allocations_mutex);
     auto it = global_domain_allocations.find(id);
     if (it == global_domain_allocations.end() || !bytes || !stream) return -1;
     auto &a = *it->second;
-    auto *dst = global_window(a, dst_slot), *src = global_window(a, src_slot);
-    if (!a.host_enabled || !a.device_ctx || a.views_released || a.release_failed || !dst || !src ||
-        dst_offset > dst->size || bytes > dst->size - dst_offset || src_offset > src->size ||
-        bytes > src->size - src_offset ||
-        (dst_slot == src_slot && dst_offset < src_offset + bytes && src_offset < dst_offset + bytes))
+    if (!a.host_enabled || !a.device_ctx || a.views_released || a.release_failed) return -1;
+    auto contains = [&](uint64_t address) {
+        auto in_window = [&](const VmmWindow &view) {
+            const auto begin = reinterpret_cast<uint64_t>(view.base);
+            return view.base && view.mapped && address >= begin && address - begin <= view.size &&
+                   bytes <= view.size - (address - begin);
+        };
+        return in_window(a.local_window) || std::any_of(a.peer_windows.begin(), a.peer_windows.end(), in_window);
+    };
+    if (!contains(dst_va) || !contains(src_va) ||
+        (dst_va <= src_va ? src_va - dst_va < bytes : dst_va - src_va < bytes))
         return -1;
     auto status = aclrtMemcpyAsync(
-        static_cast<char *>(dst->base) + dst_offset, bytes, static_cast<char *>(src->base) + src_offset, bytes,
+        reinterpret_cast<void *>(dst_va), bytes, reinterpret_cast<const void *>(src_va), bytes,
         ACL_MEMCPY_DEVICE_TO_DEVICE, stream
     );
     if (status == ACL_SUCCESS) status = aclrtSynchronizeStreamWithTimeout(stream, 30000);

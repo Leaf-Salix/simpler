@@ -176,7 +176,7 @@ TEST(ChildMemory, DomainMappingPreservesStorageAndNoneRequestAcrossMailbox) {
     plain.buffer.body_len = 0;
     std::memset(plain.buffer.body, 0, sizeof(plain.buffer.body));
     Tensor mapped = plain;
-    mapped.domain_mapping = 64;
+    mapped.mapping_ref = 64;
     TaskArgs args;
     args.add_tensor(plain);
     EXPECT_THROW(args.add_tensor(mapped), std::invalid_argument);
@@ -192,12 +192,12 @@ TEST(ChildMemory, DomainMappingPreservesStorageAndNoneRequestAcrossMailbox) {
     EXPECT_EQ(blob.size(), 8u + 2u * 144u);
     write_blob(blob.data(), copy);
     const auto view = read_blob(blob.data(), blob.size());
-    EXPECT_EQ(view.tensors(0).domain_mapping, 0);
-    EXPECT_EQ(view.tensors(1).domain_mapping, 64);
+    EXPECT_EQ(view.tensors(0).mapping_ref, 0);
+    EXPECT_EQ(view.tensors(1).mapping_ref, 64);
     EXPECT_EQ(view.tensors(0).buffer, view.tensors(1).buffer);
     EXPECT_EQ(view.transfer(1), TensorTransfer::NONE);
     blob[8 + 144 + 142] = 65;
-    EXPECT_THROW(view.tensors(1), std::invalid_argument);
+    EXPECT_EQ(view.tensors(1).mapping_ref, 65);
 }
 
 TEST(ChildMemory, InvalidTransferDoesNotAppendAnArgumentAndLocationMutationIsRejected) {

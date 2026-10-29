@@ -135,7 +135,7 @@ def _reject_device_args(args: object, *, kind: str) -> None:
 
     for i in range(args.tensor_count()):
         desc = args.tensor(i).buffer
-        if desc.address_space == AddressSpace.DEVICE or args.tensor(i).domain_mapping:
+        if desc.address_space == AddressSpace.DEVICE or args.tensor(i).mapping_ref:
             raise ValueError(
                 f"{kind}: argument {i} is a DEVICE-space tensor ({desc.backend_kind.name}); a Python "
                 f"sub-worker runs on the host and can only take HOST-space tensors"

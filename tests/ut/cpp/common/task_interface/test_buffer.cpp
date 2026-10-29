@@ -102,29 +102,29 @@ TEST(BufferAbi, StructSizesAreFrozen) {
     EXPECT_EQ(sizeof(CanonicalIdentity), 32u);
     EXPECT_EQ(sizeof(Tensor), 144u);
     EXPECT_EQ(sizeof(BufferDescriptor), 88u);
-    EXPECT_EQ(offsetof(Tensor, domain_mapping), 142u);
+    EXPECT_EQ(offsetof(Tensor, mapping_ref), 142u);
 }
 
-TEST(BufferAbi, DomainMappingRequiresHostSidecarAndValidTarget) {
+TEST(BufferAbi, MappingReferencePreservesBackingPlacement) {
     Tensor tensor = make_tensor();
     tensor.buffer.backend_kind = static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR);
     tensor.buffer.body_len = 0;
     std::memset(tensor.buffer.body, 0, sizeof(tensor.buffer.body));
-    for (uint8_t selector : {1, 64}) {
-        tensor.domain_mapping = selector;
+    for (uint8_t selector : {1, 64, 255}) {
+        tensor.mapping_ref = selector;
         EXPECT_NO_THROW(validate_tensor(tensor));
     }
     Tensor alias = tensor;
-    alias.domain_mapping = 1;
+    alias.mapping_ref = 1;
     EXPECT_TRUE(tensors_overlap(tensor, alias));
-    tensor.domain_mapping = 65;
-    EXPECT_THROW(validate_tensor(tensor), std::invalid_argument);
-    tensor.domain_mapping = 1;
+    tensor.mapping_ref = 65;
+    EXPECT_NO_THROW(validate_tensor(tensor));
+    tensor.mapping_ref = 1;
     tensor.buffer.address_space = static_cast<uint8_t>(AddressSpace::DEVICE);
-    EXPECT_THROW(validate_tensor(tensor), std::invalid_argument);
+    EXPECT_NO_THROW(validate_tensor(tensor));
     tensor = make_tensor();
-    tensor.domain_mapping = 1;
-    EXPECT_THROW(validate_tensor(tensor), std::invalid_argument);
+    tensor.mapping_ref = 1;
+    EXPECT_NO_THROW(validate_tensor(tensor));
 }
 
 TEST(BufferAbi, ConstantsAreFrozen) {

@@ -11,7 +11,7 @@
 - CPU 读写本机 DRAM：owner CPU VA 上的 memcpy，字节操作返回时完成。
 - CPU 访问其他 DRAM/HBM：本机参与 NPU 的 ACL SDMA，copy stream 同步成功后返回。
 - NPU kernel 读写任意 DRAM：显式映射 Tensor，经 kernel/MTE 访问，所属 run 完成后可交接。
-- NPU kernel 访问 HBM：原本机 Tensor 或 CommContext peer window，所属 run 完成后可交接。
+- NPU kernel 访问 HBM：真实目标 Buffer 的显式映射 Tensor，所属 run 完成后可交接。
 
 不交付跨机 CPU 原生 load/store、A5 HostRegister、URMA、capture、自动故障恢复或通用 Buffer COPY。
 MPI 负责启动与控制；ACL 负责内存和数据传输。
@@ -41,11 +41,13 @@ device_view = domain.map_view(host_tensor, domain_rank=rank)
 args.add_tensor(device_view, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
 ```
 
-Buffer 的物理位置仍为 HOST，两个 Tensor 保持同一 backing identity；映射不复制数据，不修改原 Tensor。
+Host Buffer 的物理位置仍为 HOST；HBM 也保留其原身份。原 Tensor 与映射 Tensor 共享 backing identity，映射不复制数据。
 映射必须显式选择 NONE；省略 transfer 保留原 HOST/H2D 默认，因而被映射入口拒绝。
 映射只在持有对应 `local_context` 的 L3 创建；不能跨 Remote 或 nested Worker 转发。
-每个 chip 经现有 adapter/service 判断后，在同一 ImportRegistry 注册本端 Device VA；
-解析按 `(identity, mapping)` 精确命中，不回退普通 Host binding。
+每个 chip 在 native 导入成功后，将实际 Device VA 注册到同一 ImportRegistry，复用既有 adapter 能力表收窄权限；
+解析按 `(identity, mapping_ref)` 精确命中，不回退普通 Host binding。
+`mapping_ref` 是公共 Tensor 的不透明 attachment 引用；rank 编码只由域 backend 解释，
+不代表本 PR 已交付 direct L2/A5 映射或通用 Buffer COPY。
 
 ## Backend 边界
 
@@ -54,15 +56,21 @@ L2 将 Host export 加在原 HBM descriptor 表之后，复用原 peer view 容�
 `[0,R)` 为原 HBM rank，`[R,R+H)` 为按 node 排序的 Host pool，不修改 CommContext ABI。
 含 Host 的域复用逐节点 MPI 控制交换；无 Host 域保留原 collective 快路径。
 
-核心提供两个内部 backend 操作：
+CPU、SDMA 与 kernel 参数共用 `ImportRegistry.require` 的 source descriptor、权限、范围及存活校验。
+L3 保存仅供委托复制使用的 binding，不提供可解引用 VA；L2 保存实际已导入的 Device VA。
+L2 direct 与 chip child 继续共用原 materializer，普通 Buffer 路径保持原约束。
 
-- `_host_domain_bytes`：检查域引用、状态、逻辑范围与控制准入，在原 provenance 锁内读写本机 owner。
-- `_copy_domain_pools`：只允许本机 Host pool 与目标域 pool 之间同步复制。
-  L3 在原锁内验证域引用、actor、slot、逻辑范围及 overlap，向受信 L2 mailbox 发送 slot/offset；
-  L2 检查 live/generation，native 检查实际映射范围并完成 ACL copy/synchronize。
+- `_host_domain_bytes`：校验精确本机 Host descriptor，在原 provenance 锁内读写 owner。
+- `_copy_domain_buffers`：接收域内 source/destination Buffer 与相对范围；L2 再解析同一资源，native 只接收已解析 VA。
+  操作限于本机 Host backing 与已声明的域 backing，stream 同步成功才返回。
 
-没有任意两个 Buffer 的新公开复制接口，不提前交换全部 HBM canonical identity，
-不为复制在 L2 维护第二份完整 grant 表。原 HBM identity 仍由所属 L3 在 IMPORT 创建。
+Host 域的 HBM identity 由所属 L3 在 PREPARE 确认本地 backing 后创建，
+暂存在原 member.buffers 中；此时不登记执行授权或发布远端 locator。
+L4 复用原 Buffer 引用校验，首次 IMPORT 即携带完整来源表；L3 沿用这些 identity
+构造原 VMM Buffer，L2 一次安装全部附件。COMMIT 核对同一来源表及 owner 登记，
+再发布远端 locator；所有节点确认后才发布 L4 handle。重试必须保持完整表一致。
+本地 IMPORT 临时复用原 command codec，L2 不保存完整 command，也不另建 grant 表或生命周期状态机。
+部分安装失败立即撤销使用资格，保留映射与 owner，交由原分阶段流程清理。
 Host 访问的 PayloadPart 适配、初始化/校验、CPU actor 编排和 MPI 验收矩阵位于测试模块；
 backend 不依赖测试代码。
 

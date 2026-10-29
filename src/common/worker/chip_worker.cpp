@@ -2361,9 +2361,7 @@ std::pair<uint64_t, size_t> ChipWorker::comm_global_domain_window(uint64_t id, u
     return {base, size};
 }
 
-void ChipWorker::comm_global_domain_copy(
-    uint64_t id, uint32_t dst_slot, size_t dst_offset, uint32_t src_slot, size_t src_offset, size_t bytes
-) {
+void ChipWorker::comm_global_domain_copy(uint64_t id, uint64_t dst_va, uint64_t src_va, size_t bytes) {
     if (!comm_global_domain_copy_fn_) throw std::runtime_error("domain copy is unavailable");
     auto domain = global_domain_ids_.find(id);
     if (domain == global_domain_ids_.end() || domain->second == 0)
@@ -2372,8 +2370,7 @@ void ChipWorker::comm_global_domain_copy(
         if (!global_domain_copy_stream_) global_domain_copy_stream_ = create_comm_stream_checked("domain copy");
         if (!global_domain_copy_stream_) throw std::runtime_error("domain copy stream creation failed");
     }
-    int rc =
-        comm_global_domain_copy_fn_(id, dst_slot, dst_offset, src_slot, src_offset, bytes, global_domain_copy_stream_);
+    int rc = comm_global_domain_copy_fn_(id, dst_va, src_va, bytes, global_domain_copy_stream_);
     if (rc) throw std::runtime_error("domain copy failed with code " + std::to_string(rc));
 }
 

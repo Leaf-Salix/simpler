@@ -976,19 +976,26 @@ extern "C" int comm_global_domain_window(uint64_t id, uint32_t slot, uint64_t *b
     return 0;
 }
 
-extern "C" int comm_global_domain_copy(
-    uint64_t id, uint32_t dst_slot, size_t dst_offset, uint32_t src_slot, size_t src_offset, size_t bytes, void *
-) {
+extern "C" int comm_global_domain_copy(uint64_t id, uint64_t dst_va, uint64_t src_va, size_t bytes, void *) {
     std::scoped_lock lock(global_domain_allocations_mutex);
     auto it = global_domain_allocations.find(id);
-    if (it == global_domain_allocations.end() || !bytes || !it->second->host_enabled || it->second->views_released)
+    if (it == global_domain_allocations.end() || !bytes) return -1;
+    auto &a = *it->second;
+    if (!a.host_enabled || !a.host_ctx || a.views_released) return -1;
+    auto contains = [&](uint64_t address) {
+        auto in_window = [&](void *base, size_t size) {
+            const auto begin = reinterpret_cast<uint64_t>(base);
+            return base && address >= begin && address - begin <= size && bytes <= size - (address - begin);
+        };
+        if (in_window(a.local_base, a.mapping_size)) return true;
+        for (const auto &view : a.peer_mappings)
+            if (in_window(view.base, view.size)) return true;
+        return false;
+    };
+    if (!contains(dst_va) || !contains(src_va) ||
+        (dst_va <= src_va ? src_va - dst_va < bytes : dst_va - src_va < bytes))
         return -1;
-    auto dst = global_window(*it->second, dst_slot), src = global_window(*it->second, src_slot);
-    if (!dst.first || !src.first || dst_offset > dst.second || bytes > dst.second - dst_offset ||
-        src_offset > src.second || bytes > src.second - src_offset ||
-        (dst_slot == src_slot && dst_offset < src_offset + bytes && src_offset < dst_offset + bytes))
-        return -1;
-    std::memcpy(static_cast<char *>(dst.first) + dst_offset, static_cast<char *>(src.first) + src_offset, bytes);
+    std::memcpy(reinterpret_cast<void *>(dst_va), reinterpret_cast<const void *>(src_va), bytes);
     return 0;
 }
 

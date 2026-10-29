@@ -599,7 +599,7 @@ def _materialize_task_args(
     """
     if len(args.remote_desc) != len(args.tensors):
         raise ValueError("remote TASK descriptor count does not match tensor count")
-    if any(tensor.domain_mapping for tensor in args.tensors):
+    if any(tensor.mapping_ref for tensor in args.tensors):
         raise ValueError("remote TASK endpoint-local mapping cannot cross Remote L3")
     task_args = TaskArgs()
     inline_backings: list[Buffer] = []
@@ -1182,6 +1182,10 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                                     register_domain_buffers(command, backings),
                                 )
                             except BaseException:
+                                if command.host_windows:
+                                    inner_worker._drop_domain_allocs(  # noqa: SLF001
+                                        inner_worker._global_domain_provenance_id(command.domain_id)  # noqa: SLF001
+                                    )
                                 revoke_domain_buffers(command.domain_id, command.generation)
                                 raise
                         elif command.phase is GlobalDomainPhase.ABORT:

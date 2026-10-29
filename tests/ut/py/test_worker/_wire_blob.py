@@ -32,7 +32,7 @@ _DESC_HEAD = struct.Struct("<HBBB3x")
 _DESC_TAIL = struct.Struct("<QIH2x32s")
 
 # Tensor, 144 B: buffer @0, byte_offset u64 @88, ndims u32 @96, shapes[5] @100, strides[5] @120,
-# dtype u8 @140, transfer padding @141, domain_mapping @142, reserved @143.
+# dtype u8 @140, transfer padding @141, mapping_ref @142, reserved @143.
 _TENSOR_TAIL = struct.Struct("<QI5I5IBxBx")
 
 # Leading sentinel of a BufferDescriptor, frozen by buffer.h and deliberately not exported to Python
@@ -54,7 +54,7 @@ def encode_tensor(t) -> bytes:
     ndims = t.ndims
     shapes = list(t.shapes) + [0] * (_MAX_TENSOR_DIMS - ndims)
     strides = list(t.strides) + [0] * (_MAX_TENSOR_DIMS - ndims)
-    view = _TENSOR_TAIL.pack(t.byte_offset, ndims, *shapes, *strides, int(t.dtype), t.domain_mapping)
+    view = _TENSOR_TAIL.pack(t.byte_offset, ndims, *shapes, *strides, int(t.dtype), t.mapping_ref)
     return head + identity + tail + view
 
 
@@ -64,7 +64,7 @@ def encode_blob(tensors=(), scalars=(), transfers=None) -> bytes:
     for i, tensor in enumerate(tensors):
         slot = bytearray(encode_tensor(tensor))
         slot[141] = (
-            (1 if int(tensor.buffer.address_space) == 0 and not tensor.domain_mapping else 0)
+            (1 if int(tensor.buffer.address_space) == 0 and not tensor.mapping_ref else 0)
             if transfers is None
             else int(transfers[i])
         )

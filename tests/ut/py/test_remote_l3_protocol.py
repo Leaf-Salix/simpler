@@ -184,7 +184,7 @@ def _registered_host_args():
 def test_registered_host_decodes_without_payload_or_placement_change():
     args = decode_remote_task_args(_registered_host_args())
     tensor = args.tensors[0]
-    assert tensor.domain_mapping == 0
+    assert tensor.mapping_ref == 0
     assert tensor.buffer.address_space == AddressSpace.HOST
     assert tensor.byte_offset == 8 and tensor.buffer.nbytes == 64
     assert tensor.buffer.identity.owner_instance_id == b"creator1"
@@ -207,7 +207,7 @@ def test_remote_materializer_rejects_endpoint_local_mapping():
     from simpler.remote_l3_session import _materialize_task_args, _RemoteBufferEntry  # noqa: PLC0415
 
     plain = decode_remote_task_args(_registered_host_args())
-    tensor = plain.tensors[0]._with_domain_mapping(0)
+    tensor = plain.tensors[0]._with_mapping_ref(1)
     backing = buffer_reference(tensor.buffer)
     locator = plain.remote_desc[0].desc
     assert locator is not None

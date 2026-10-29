@@ -63,31 +63,28 @@ def _pools(domain):
 
 
 class _HostAccess:
-    def __init__(self, worker, ref):
-        self.worker, self.ref = worker, ref
+    def __init__(self, worker, ref, descriptor):
+        self.worker, self.ref, self.descriptor = worker, ref, descriptor
 
     def read_bytes(self, _span, offset, pointer, nbytes):
-        self.worker._host_domain_bytes(self.ref, offset, pointer, nbytes, writing=False)
+        self.worker._host_domain_bytes(self.ref, self.descriptor, offset, pointer, nbytes, writing=False)
 
     def write_bytes(self, _span, offset, pointer, nbytes):
-        self.worker._host_domain_bytes(self.ref, offset, pointer, nbytes, writing=True)
+        self.worker._host_domain_bytes(self.ref, self.descriptor, offset, pointer, nbytes, writing=True)
 
 
 def local_host_part(worker, domain, node):
-    return PayloadPart(RegionPartSpan(0, domain.host(node).nbytes), _HostAccess(worker, domain.ref))
+    host = domain.host(node)
+    return PayloadPart(RegionPartSpan(0, host.nbytes), _HostAccess(worker, domain.ref, host.to_descriptor()))
 
 
 def _copy(orch, domain, dst, src, chip, nbytes, dst_offset=0, src_offset=0):
-    nodes = len(domain.members) // 2
-
-    def slot(pool):
-        return len(domain.members) + pool if pool < nodes else pool - nodes
-
-    orch._worker._copy_domain_pools(
+    pools = _pools(domain)
+    orch._worker._copy_domain_buffers(
         domain.ref,
         worker=chip,
-        dst_slot=slot(dst),
-        src_slot=slot(src),
+        dst=pools[dst],
+        src=pools[src],
         nbytes=nbytes,
         dst_offset=dst_offset,
         src_offset=src_offset,
@@ -177,9 +174,7 @@ def node_orch(orch, args, cfg, chip_handle=None):
         return
     rank = actor - nodes
     chip = domain.member(rank).local_worker_id
-    context = domain.local_context(rank)
-    peer = target - nodes if target >= nodes else -1
-    operand = domain.host(target) if peer < 0 else context.buffers["payload"]
+    operand = _pools(domain)[target]
     source = local if write else operand
     destination = operand if write else local
     chip_args = TaskArgs()
@@ -187,13 +182,8 @@ def node_orch(orch, args, cfg, chip_handle=None):
         (source, SOURCE if write else TARGET, TensorArgType.INPUT),
         (destination, TARGET if write else RESULT, TensorArgType.OUTPUT_EXISTING),
     ):
-        tensor = buffer.tensor([COUNT], DataType.FLOAT32, byte_offset=offset)
-        if buffer.address_space == AddressSpace.HOST:
-            tensor = domain.map_view(tensor, domain_rank=rank)
+        tensor = domain.map_view(buffer.tensor([COUNT], DataType.FLOAT32, byte_offset=offset), domain_rank=rank)
         chip_args.add_tensor(tensor, tag, transfer=TensorTransfer.NONE)
-    chip_args.add_scalar(context.device_ctx)
-    chip_args.add_scalar(peer if not write else -1)
-    chip_args.add_scalar(peer if write else -1)
     digest = b"".join(int(args.scalar(i)).to_bytes(8, "little") for i in range(7, 11))
     _KEEPALIVE[:] = [chip_args]
     orch.submit_next_level(chip_handle or get_inner_handle(digest.hex()), chip_args, cfg, worker=chip)

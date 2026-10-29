@@ -1977,7 +1977,7 @@ extern "C" int comm_global_domain_release(uint64_t, uint32_t) {
 }
 
 extern "C" int comm_global_domain_window(uint64_t, uint32_t, uint64_t *, size_t *) { return -1; }
-extern "C" int comm_global_domain_copy(uint64_t, uint32_t, size_t, uint32_t, size_t, size_t, void *) { return -1; }
+extern "C" int comm_global_domain_copy(uint64_t, uint64_t, uint64_t, size_t, void *) { return -1; }
 
 extern "C" int comm_destroy(CommHandle h) try {
     if (!h) return -1;

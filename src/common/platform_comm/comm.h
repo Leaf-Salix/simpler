@@ -321,10 +321,7 @@ int comm_global_domain_release(uint64_t domain_id, uint32_t stage);
 
 // Resolve an owned/imported pool without exposing a second address registry.
 int comm_global_domain_window(uint64_t domain_id, uint32_t slot, uint64_t *base, size_t *size);
-int comm_global_domain_copy(
-    uint64_t domain_id, uint32_t dst_slot, size_t dst_offset, uint32_t src_slot, size_t src_offset, size_t bytes,
-    void *stream
-);
+int comm_global_domain_copy(uint64_t domain_id, uint64_t dst_va, uint64_t src_va, size_t bytes, void *stream);
 
 /**
  * Synchronize all ranks.

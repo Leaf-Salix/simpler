@@ -383,28 +383,17 @@ public:
         if (!granularity || logical_bytes > SIZE_MAX - (granularity - 1))
             throw std::invalid_argument("Host allocation extent overflow");
         size_ = (logical_bytes + granularity - 1) / granularity * granularity;
-        logical_bytes_ = logical_bytes;
         check(api.aclrtMallocPhysical(&handle_, size_, &prop, 0), "Host physical allocation");
         check(api.aclrtReserveMemAddress(&base_, size_, 0, nullptr, 1), "Host VA reservation");
         check(api.aclrtMapMem(base_, size_, 0, handle_, 0), "Host owner mapping");
         mapped_ = true;
-        std::memset(base_, 0, logical_bytes_);
+        std::memset(base_, 0, logical_bytes);
         api.export_fabric(handle_, token_.data());
         return nb::make_tuple(size_, nb::bytes(reinterpret_cast<const char *>(token_.data()), token_.size()));
     }
-    void read_bytes(uint64_t offset, uint64_t host_ptr, uint64_t bytes) const {
-        bounds(offset, bytes);
-        if (!host_ptr) throw std::invalid_argument("Host read destination must be nonzero");
-        std::memmove(
-            reinterpret_cast<void *>(static_cast<uintptr_t>(host_ptr)), static_cast<const char *>(base_) + offset, bytes
-        );
-    }
-    void write_bytes(uint64_t offset, uint64_t host_ptr, uint64_t bytes) {
-        bounds(offset, bytes);
-        if (!host_ptr) throw std::invalid_argument("Host write source must be nonzero");
-        std::memmove(
-            static_cast<char *>(base_) + offset, reinterpret_cast<const void *>(static_cast<uintptr_t>(host_ptr)), bytes
-        );
+    uint64_t base() const {
+        if (!mapped_ || !base_) throw std::invalid_argument("Host owner has no live mapping");
+        return reinterpret_cast<uint64_t>(base_);
     }
     void release() {
         if (!base_ && !handle_) return;
@@ -430,14 +419,9 @@ private:
     void *handle_ = nullptr;
     bool mapped_ = false;
     uint64_t size_ = 0;
-    uint64_t logical_bytes_ = 0;
     std::array<uint8_t, 128> token_{};
     static void check(int rc, const char *op) {
         if (rc) throw std::runtime_error(std::string(op) + " failed with code " + std::to_string(rc));
-    }
-    void bounds(uint64_t offset, uint64_t bytes) const {
-        if (!mapped_ || offset > logical_bytes_ || bytes > logical_bytes_ - offset)
-            throw std::invalid_argument("Host access exceeds the live logical window");
     }
 };
 
@@ -1867,15 +1851,15 @@ ChipTensor materialize_one(const Tensor &r, TensorTransfer transfer, nb::dict re
         throw std::runtime_error("materialize: byte_offset is not a multiple of dtype size");
     }
     nb::object key = nb::cast(r.buffer.identity);
-    if (r.domain_mapping) key = nb::make_tuple(key, r.domain_mapping);
+    if (r.mapping_ref) key = nb::make_tuple(key, r.mapping_ref);
     if (!resolved.contains(key)) {
         throw std::runtime_error("materialize: canonical identity not in the import registry");
     }
     nb::tuple val = nb::cast<nb::tuple>(resolved[key]);
     auto base = nb::cast<uint64_t>(val[0]);
     auto addr_space = nb::cast<int>(val[1]);
-    if (r.domain_mapping && addr_space != static_cast<int>(AddressSpace::DEVICE)) {
-        throw std::runtime_error("materialize: domain mapping binding requires a DEVICE address");
+    if (r.mapping_ref && addr_space != static_cast<int>(AddressSpace::DEVICE)) {
+        throw std::runtime_error("materialize: mapping binding requires a DEVICE address");
     }
     // The view origin is base + byte_offset (start_offset folded into addr); strides carry any
     // non-row-major layout (transpose / permute / step-slice), which ChipTensor expresses natively.
@@ -2131,8 +2115,7 @@ NB_MODULE(_task_interface, m) {
     nb::class_<DomainHostMemory>(m, "_DomainHostMemory")
         .def(nb::init<>())
         .def("allocate", &DomainHostMemory::allocate)
-        .def("read_bytes", &DomainHostMemory::read_bytes)
-        .def("write_bytes", &DomainHostMemory::write_bytes)
+        .def_prop_ro("base", &DomainHostMemory::base)
         .def("release", &DomainHostMemory::release);
     m.doc() = "Nanobind bindings for task_interface (DataType, Buffer/Tensor wire ABI, ChipTensor, TaskArgs variants)";
 
@@ -2571,17 +2554,18 @@ NB_MODULE(_task_interface, m) {
 
         .def_ro("buffer", &Tensor::buffer)
         .def_ro("byte_offset", &Tensor::byte_offset)
-        .def_ro("domain_mapping", &Tensor::domain_mapping)
+        .def_ro("mapping_ref", &Tensor::mapping_ref)
         .def(
-            "_with_domain_mapping",
-            [](const Tensor &self, int rank) {
-                if (rank < 0 || rank >= 64) throw std::invalid_argument("domain mapping rank must be in [0, 64)");
+            "_with_mapping_ref",
+            [](const Tensor &self, int reference) {
+                if (reference <= 0 || reference > UINT8_MAX)
+                    throw std::invalid_argument("mapping reference must be in [1, 255]");
                 Tensor mapped = self;
-                mapped.domain_mapping = static_cast<uint8_t>(rank + 1);
+                mapped.mapping_ref = static_cast<uint8_t>(reference);
                 validate_tensor(mapped);
                 return mapped;
             },
-            nb::arg("rank")
+            nb::arg("reference")
         )
         .def_ro("ndims", &Tensor::ndims)
         .def_prop_ro(
@@ -2608,7 +2592,7 @@ NB_MODULE(_task_interface, m) {
             "__eq__",
             [](const Tensor &a, const Tensor &b) {
                 if (!(a.buffer == b.buffer) || a.byte_offset != b.byte_offset || a.ndims != b.ndims ||
-                    a.dtype != b.dtype || a.domain_mapping != b.domain_mapping) {
+                    a.dtype != b.dtype || a.mapping_ref != b.mapping_ref) {
                     return false;
                 }
                 for (uint32_t i = 0; i < a.ndims; ++i) {
@@ -3033,7 +3017,7 @@ NB_MODULE(_task_interface, m) {
                 const int32_t n = self.tensor_count();
                 for (int32_t i = 0; i < n; ++i) {
                     const auto backend = static_cast<BackendKind>(self.tensor(i).buffer.backend_kind);
-                    if (self.tensor(i).domain_mapping) return true;
+                    if (self.tensor(i).mapping_ref) return true;
                     if (backend == BackendKind::DEVICE_MALLOC || backend == BackendKind::VMM_WINDOW) return true;
                 }
                 return false;
@@ -4295,7 +4279,7 @@ NB_MODULE(_task_interface, m) {
         "Materialize a TaskArgs held in this process into the runtime.so-ABI ChipStorageTaskArgs "
         "POD — the sole path to that POD, whether the args are an L2 leaf's own or a chip child's "
         "read back from its mailbox with read_args_from_blob. Each tensor's embedded buffer "
-        "identity (or (identity, domain_mapping) for mapped views) is resolved via `resolved` to (local_base, "
+        "identity (or (identity, mapping_ref) for mapped views) is resolved via `resolved` to (local_base, "
         "address_space); "
         "addr = base + byte_offset. The caller pre-populates `resolved` by materializing each "
         "embedded descriptor on first receipt. Strided views (transpose / permute / step-slice) "

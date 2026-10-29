@@ -111,7 +111,7 @@ public:
 };
 
 // The mailbox argument slot carries the invocation request at byte 141; the view's
-// domain mapping selector at byte 142 is independent of this per-call request.
+// opaque mapping reference at byte 142 is independent of this per-call request.
 inline constexpr size_t TASK_ARG_TRANSFER_OFFSET = offsetof(Tensor, _pad);
 static_assert(TASK_ARG_TRANSFER_OFFSET == 141, "mailbox transfer offset is wire ABI");
 

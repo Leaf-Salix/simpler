@@ -103,12 +103,12 @@ it is the resolved `addr` + `size`. That is the whole of what materialization do
 | — | ⟂ | `buffer.addr` |
 | `byte_offset` (bytes) | ≈ | `start_offset` (elements) |
 | `shapes[5]` / `strides[5]` / `ndims` / `dtype` | = | `shapes[5]` / `strides[5]` / `ndims` / `dtype` |
-| `buffer.address_space` | ≈ | `address_space` (`domain_mapping`: HOST → DEVICE) |
-| `domain_mapping` | ⟂ | — |
+| `buffer.address_space` | ≈ | `address_space` (`mapping_ref`: HOST → DEVICE) |
+| `mapping_ref` | ⟂ | — |
 | `TaskArgs.transfer(i)` (per-call metadata) | = | `ChipStorageTaskArgs.tensor(i).transfer` (internal ABI carrier) |
 
 `AddressSpace` describes the backing's physical HOST/DEVICE location. `Tensor` holds
-the backing descriptor, view geometry and optional `domain_mapping`.
+the backing descriptor, view geometry and optional `mapping_ref`.
 `TensorTransfer` belongs to each
 TaskArgs entry: `NONE` borrows storage, `H2D` requests Program-managed device storage,
 and `D2H` is reserved and rejected. Callable direction still controls input copies
@@ -130,8 +130,8 @@ changes `view`. Omitted transfer in `TaskArgs.add_tensor` or the transitional L2
 `domain.map_view`: [API](zh-cn/host-comm-domain-design.md).
 
 Mailbox slots preserve each request in byte 141; standalone Tensor values do not carry it.
-Byte 142 carries `domain_mapping` (0: ordinary; 1..64: granted rank + 1); byte 143 remains reserved.
-Mapped views require explicit NONE and resolve `(identity, domain_mapping)` to a registered DEVICE binding.
+Byte 142 carries `mapping_ref` (0: native; 1..255: opaque endpoint attachment reference); byte 143 remains reserved.
+Mapped views require explicit NONE and resolve `(identity, mapping_ref)` to a registered DEVICE binding.
 Re-export and L2 materialization preserve the request alongside the view. Chip binders accept HOST/H2D and DEVICE/NONE.
 HBG also accepts HOST/NONE with a declared IN/OUT/INOUT direction; TMR device
 orchestration returns UNSUPPORTED for it. Invalid location/transfer pairs return
@@ -272,6 +272,8 @@ Domains expose the same Buffer/Tensor interface through `domain.member(rank).buf
 Across nodes, existing `REMOTE_SIDECAR` entries locate VMM backings while preserving canonical
 identity, access, extent and view geometry. Sender and receiver revalidate private registration,
 target chip and the complete descriptor; release or name reuse invalidates old references.
+Host domains reserve real owner identities during PREPARE and install the complete source table
+in one IMPORT. COMMIT confirms those identities before publishing remote locators and handles.
 The domain owns its windows; session entries only borrow them, so ordinary remote free/copy/export
 rejects these entries. Pass domain ref/rank explicitly for context, without inferring it from a Tensor.
 
@@ -512,7 +514,13 @@ them. Failed teardown preserves them for retry. Public `run` and `finalize` are
 serialized. Descriptors do not retain the caller's allocation: callers must keep
 host storage valid through successful return or successful teardown after an
 error; no Buffer ownership transfers to ChipWorker. Ordinary HOST/NONE is consumed by HBG host orchestration;
-it provides no cross-side mapping. Domain mapping uses the separately granted `domain.map_view` attachment.
+it provides no cross-side mapping.
+
+`domain.map_view` explicitly selects a granted Host or HBM attachment and preserves the source identity.
+Direct L2 and chip children share the existing materializer. CPU/SDMA and kernel arguments use
+`ImportRegistry.require` for exact descriptor, range, rights and domain-liveness checks.
+A host copy-only binding has no local VA and cannot materialize; chip bindings hold actual imported VAs.
+Physical release remains with the domain's VIEWS-before-OWNERS protocol.
 Explicit task dependencies stay an L3 orchestration concept: a direct L2
 submission is one task, so no `TaskArgs` dependency entry reaches the chip
 through this path.

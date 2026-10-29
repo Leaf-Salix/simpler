@@ -14,15 +14,13 @@
 extern "C" {
 __attribute__((visibility("default"))) OrchestrationConfig host_domain_copy_config(const ChipTaskArgs &args) {
     (void)args;
-    return OrchestrationConfig{.expected_arg_count = 5};
+    return OrchestrationConfig{.expected_arg_count = 2};
 }
 
 __attribute__((visibility("default"))) void host_domain_copy(const ChipTaskArgs &args) {
     CoreTaskArgs params;
     params.add_input(args.tensor(0).ref());
     params.add_output(args.tensor(1).ref());
-    for (int index = 0; index < 3; ++index)
-        params.add_scalar(args.scalar(index));
     rt_submit_aiv_task(0, params);
 }
 }

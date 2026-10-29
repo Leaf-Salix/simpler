@@ -406,9 +406,7 @@ public:
     uint64_t comm_global_domain_import(uint64_t domain_id, const std::vector<uint8_t> &descriptors);
     void comm_global_domain_release(uint64_t domain_id, uint32_t stage = 0);
     std::pair<uint64_t, size_t> comm_global_domain_window(uint64_t domain_id, uint32_t slot);
-    void comm_global_domain_copy(
-        uint64_t domain_id, uint32_t dst_slot, size_t dst_offset, uint32_t src_slot, size_t src_offset, size_t bytes
-    );
+    void comm_global_domain_copy(uint64_t domain_id, uint64_t dst_va, uint64_t src_va, size_t bytes);
     void comm_barrier(uint64_t comm_handle);
     void comm_destroy(uint64_t comm_handle);
     void comm_destroy_all();

@@ -174,9 +174,7 @@ int comm_global_domain_import(
 int comm_global_domain_release(uint64_t domain_id, uint32_t stage) { return PTO_RUNTIME_ERR_INTERNAL; }
 
 int comm_global_domain_window(uint64_t, uint32_t, uint64_t *, size_t *) { return PTO_RUNTIME_ERR_INTERNAL; }
-int comm_global_domain_copy(uint64_t, uint32_t, size_t, uint32_t, size_t, size_t, void *) {
-    return PTO_RUNTIME_ERR_INTERNAL;
-}
+int comm_global_domain_copy(uint64_t, uint64_t, uint64_t, size_t, void *) { return PTO_RUNTIME_ERR_INTERNAL; }
 
 int comm_barrier(CommHandle h) { return PTO_RUNTIME_ERR_INTERNAL; }
 

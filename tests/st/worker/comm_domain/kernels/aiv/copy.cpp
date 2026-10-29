@@ -12,21 +12,16 @@
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 
-#include "platform_comm/comm_context.h"
 #include "tensor.h"
 
-AICORE inline __gm__ float *target_pointer(__gm__ Tensor *tensor, __gm__ CommContext *context, int peer) {
+AICORE inline __gm__ float *target_pointer(__gm__ Tensor *tensor) {
     uint64_t address = tensor->buffer.addr + tensor->start_offset * sizeof(float);
-    if (peer >= 0) {
-        address = context->windowsIn[peer] + address - context->windowsIn[context->rankId];
-    }
     return reinterpret_cast<__gm__ float *>(address);
 }
 
 extern "C" AICORE __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-    auto *context = reinterpret_cast<__gm__ CommContext *>(args[2]);
-    auto *source = target_pointer(reinterpret_cast<__gm__ Tensor *>(args[0]), context, static_cast<int>(args[3]));
-    auto *destination = target_pointer(reinterpret_cast<__gm__ Tensor *>(args[1]), context, static_cast<int>(args[4]));
+    auto *source = target_pointer(reinterpret_cast<__gm__ Tensor *>(args[0]));
+    auto *destination = target_pointer(reinterpret_cast<__gm__ Tensor *>(args[1]));
     using Shape = pto::Shape<1, 1, 1, 1, 256>;
     using Stride = pto::Stride<256, 256, 256, 256, 1>;
     using Global = pto::GlobalTensor<float, Shape, Stride>;

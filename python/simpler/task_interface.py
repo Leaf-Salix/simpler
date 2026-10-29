@@ -137,11 +137,7 @@ def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -
     for i in range(args.tensor_count()):
         tensor = args.tensor(i)
         buffer = tensor.buffer
-        if (
-            tensor.domain_mapping
-            or buffer.address_space != AddressSpace.HOST
-            or args.transfer(i) != TensorTransfer.NONE
-        ):
+        if tensor.mapping_ref or buffer.address_space != AddressSpace.HOST or args.transfer(i) != TensorTransfer.NONE:
             continue
         direction = target.sig(i) if target is not None and i < target.sig_count else None
         needed = {
@@ -1247,14 +1243,18 @@ class CommDomainHandle:
         return self._host_buffers[operator.index(node_worker_id)]
 
     def map_view(self, tensor: Tensor, *, domain_rank: int) -> Tensor:
-        """Select this domain's granted Device attachment without changing Host storage."""
+        """Select a granted chip attachment while preserving the source backing."""
         domain_rank = operator.index(domain_rank)
         self.local_context(domain_rank)
         if not isinstance(tensor, Tensor) or not any(
-            tensor.buffer == buffer.to_descriptor() for buffer in self._host_buffers.values()
+            tensor.buffer == buffer.to_descriptor()
+            for buffer in (
+                *self._host_buffers.values(),
+                *(b for member in self.members for b in member.buffers.values()),
+            )
         ):
-            raise ValueError("map_view requires this domain's exact Host backing")
-        return tensor._with_domain_mapping(domain_rank)
+            raise ValueError("map_view requires this domain's exact backing")
+        return tensor._with_mapping_ref(domain_rank + 1)
 
     def local_context(self, domain_rank: int) -> ChipDomainContext:
         """Return this creator's local chip mapping; L4 creators hold no such mappings."""
@@ -1931,7 +1931,7 @@ class ChipWorker:
                 args = _ti_module._snapshot_local_task_args(args)
                 _validate_host_control_access(state.target, args)
                 for i in range(args.tensor_count()):
-                    if args.tensor(i).buffer.address_space == AddressSpace.DEVICE or args.tensor(i).domain_mapping:
+                    if args.tensor(i).buffer.address_space == AddressSpace.DEVICE or args.tensor(i).mapping_ref:
                         raise ValueError(
                             f"ChipWorker.run: argument {i} is DEVICE; use Worker(level=2).submit "
                             "for source registration and lifetime validation"
