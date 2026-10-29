@@ -97,9 +97,22 @@ hbg_case(test_hbg_task_id.cpp ARCHS a2a3)
 # the orch library: that library carries hbg_orch_stubs.cpp, whose dep-gen and
 # host-phase stubs collide with the real TUs this test needs for
 # dep_gen_host_graph_begin_capture and the bind-phase records.
+hbg_case(test_hbg_definition_packing.cpp)
+
+
+
+
+
+
+
 hbg_case(test_hbg_bind_ledger.cpp
     SOURCES
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/platform_entry_args.cpp
+        ${SIMPLER_SRC}/common/platform/sim/aicpu/platform_aicpu_affinity.cpp
+        ${SIMPLER_SRC}/common/platform/shared/host/kernel_execution_state.cpp
         ${SIMPLER_SRC}/@arch@/runtime/host_build_graph/host/runtime_maker.cpp
+        ${HBG_HOST_DIR}/bind_phase.cpp
+        ${HBG_HOST_DIR}/graph_build.cpp
         ${HBG_HOST_DIR}/orchestrator.cpp
         ${HBG_HOST_DIR}/graph_recording.cpp
         ${HBG_HOST_DIR}/graph_submit.cpp
@@ -179,4 +192,6 @@ hbg_case(test_hbg_tensor_access.cpp
 # Everything else here is a case of this runtime with nothing beyond the
 # directory's own contract, built for both arches. Declaring one above takes it
 # out of this sweep, so the exceptions are the declarations themselves.
+
+
 simpler_ut_glob_cases(hbg_case)

@@ -16,6 +16,8 @@
 
 #include "common/unified_log.h"
 #include "common/kernel_args.h"
+#include "common/native_capture_control.h"
+#include "aicpu/cache_maintenance.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_entry_args.h"
 #include "aicpu/aicpu_device_config.h"
@@ -57,6 +59,21 @@ extern "C" int aicpu_execute(Runtime *arg);
  * @param arg Pointer to the front-less KernelArgs payload (runtime_args @ 0)
  * @return 0 on success, non-zero on error
  */
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_native_capture_gate(void *arg) {
+    if (arg == nullptr) return -1;
+    const auto &gate = *static_cast<NativeCaptureGateArgs *>(arg);
+    auto *control = reinterpret_cast<NativeCaptureControl *>(gate.control);
+    if (control == nullptr) return -1;
+    cache_invalidate_range(control, sizeof(*control));
+    if (control->sticky_error != 0 || control->remaining_threads != 0 || control->execution_epoch == UINT64_MAX ||
+        gate.threads == 0)
+        return -1;
+    control->remaining_threads = gate.threads;
+    ++control->execution_epoch;
+    cache_flush_range(control, sizeof(*control));
+    return 0;
+}
+
 extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *arg) {
     // Log severity was snapshot once by simpler_aicpu_init at worker init; the
     // resident SO keeps it across launches, so exec does not re-snapshot.
@@ -135,7 +152,14 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // same pair here, which is why that storage is atomic. Both zero when the
     // host allocated no region, which every publisher treats as "nothing to
     // publish into".
-    set_platform_run_result(k_args->run_result_data_base, k_args->run_result_epoch);
+    uint64_t execution_epoch = k_args->run_result_epoch;
+    auto *capture = reinterpret_cast<NativeCaptureControl *>(k_args->capture_control);
+    if (capture != nullptr) {
+        cache_invalidate_range(capture, sizeof(*capture));
+        execution_epoch = capture->execution_epoch;
+        if (execution_epoch == 0 || capture->sticky_error != 0) return -1;
+    }
+    set_platform_run_result(k_args->run_result_data_base, execution_epoch);
     // This thread's own view of the launch package, published under its gate
     // survivor index so no other thread writes the slot and no other thread's
     // arguments are borrowed. Base and offset stay separate: the runtime forms
@@ -151,6 +175,16 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     AicpuPhaseScope run_wall(AicpuPhase::RunWall);
 
     int rc = aicpu_execute(runtime);
+    if (capture != nullptr) {
+        if (rc != 0) {
+            int32_t clean = 0;
+            (void)__atomic_compare_exchange_n(
+                &capture->sticky_error, &clean, rc, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED
+            );
+        }
+        (void)__atomic_fetch_sub(&capture->remaining_threads, 1u, __ATOMIC_ACQ_REL);
+        cache_flush_range(capture, sizeof(*capture));
+    }
     if (rc != 0) {
         LOG_ERROR("simpler_aicpu_exec: aicpu_execute failed with rc=%d", rc);
         return rc;

@@ -117,6 +117,7 @@ struct AicpuExecutor {
     // Commit the decided record. Runs on the thread that claims cleanup, after
     // teardown and before it returns from the kernel.
     void publish_run_terminal();
+    int terminal_execution_status(int runtime_status, int participant_status);
 };
 
 static AicpuExecutor g_aicpu_executor;
@@ -257,7 +258,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // threads stop spinning.
         bool boot_ok = (prebuilt_arena != nullptr);
         if (!boot_ok) {
-            LOG_ERROR("Thread %d: host-orch: prebuilt_arena_base is null", thread_idx);
+            LOG_ERROR("Thread %d: graph boot rejected: arena=%p", thread_idx, prebuilt_arena);
             rt = nullptr;
             run_rc = -1;
         }
@@ -443,6 +444,13 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime) {
     terminal_publisher_.take(run_terminal_select(normal_path, header_status, terminal_), nullptr, 0);
 }
 
+int AicpuExecutor::terminal_execution_status(int runtime_status, int participant_status) {
+    const int terminal_status = terminal_publisher_.decided_code();
+    const int status =
+        terminal_status != 0 ? terminal_status : (runtime_status != 0 ? runtime_status : participant_status);
+    return status;
+}
+
 void AicpuExecutor::publish_run_terminal() {
     if (!terminal_publisher_.publish(get_platform_run_result_base(), get_platform_run_result_epoch())) {
         // Nothing to publish is the normal shape for a run that never reached
@@ -545,6 +553,8 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     if (g_aicpu_executor.completion_gate_.claim_cleanup()) {
         LOG_INFO("aicpu_execute: All threads finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
+        const int terminal_status = g_aicpu_executor.terminal_execution_status(runtime_rc, rc);
+        if (terminal_status != 0 && runtime_rc == 0) runtime_rc = terminal_status;
         g_aicpu_executor.publish_run_terminal();
     }
 

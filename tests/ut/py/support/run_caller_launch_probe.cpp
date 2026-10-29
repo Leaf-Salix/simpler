@@ -51,6 +51,12 @@ static int step(const char *op, void *stream, void *event = nullptr) {
     event_trace.push_back(event);
     return ++submits == fail_at ? -777 : 0;
 }
+// Device allocations are host buffers in this probe, including the capture control tail.
+extern "C" aclError aclrtMemset(void *dst, size_t capacity, int32_t value, size_t bytes) {
+    assert(dst != nullptr && bytes <= capacity);
+    std::memset(dst, value, bytes);
+    return ACL_SUCCESS;
+}
 extern "C" rtError_t rtMalloc(void **out, uint64_t bytes, uint32_t, uint16_t) {
     ++allocation_attempts;
     if (allocation_attempts == fail_allocation) {

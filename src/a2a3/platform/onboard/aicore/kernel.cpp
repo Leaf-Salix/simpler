@@ -98,7 +98,7 @@ extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, Co
  */
 extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(
     uint64_t runtime_args, uint32_t enable_profiling_flag, uint64_t ffts_base_addr,
-    uint64_t chip_swimlane_aicore_rotation_table, uint64_t report_epoch
+    uint64_t chip_swimlane_aicore_rotation_table, uint64_t report_epoch, uint64_t capture_control
 ) {
     // Calculate block_idx for this core
 #ifdef __DAV_VEC__
@@ -119,6 +119,12 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(
     // [[block_local]] storage survives across launches on the same loaded
     // binary, so a native run followed by a kernel-mode one must not inherit
     // the native run's epoch.
+    if (capture_control != 0) {
+        auto *epoch = reinterpret_cast<__gm__ uint64_t *>(capture_control);
+        dcci(epoch, SINGLE_CACHE_LINE);
+        report_epoch = *epoch;
+        if (report_epoch == 0) return;
+    }
     set_aicore_report_epoch(report_epoch);
     // Always publish the head slot (nullptr when this launch is disabled or
     // has no rotation table). [[block_local]] storage persists across launches
