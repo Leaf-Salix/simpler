@@ -16,6 +16,8 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <future>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -269,7 +271,7 @@ TEST(HbgReadyQueueSizing, GraphHeadroomDoesNotRaisePopulationAcceptance) {
     EXPECT_FALSE(populations.derive_capacities(&capacities));
 }
 
-TEST(HbgReadyQueueSizing, DoubledQueueToleratesAReleaseWindowButCanStillWrap) {
+TEST(HbgReadyQueueSizing, DoubledQueueWaitsForConsumerWhenRequeuesWrap) {
     ReadyQueuePopulations populations{};
     populations.graph_prepare = 40;
     ReadyQueueCapacities capacities{};
@@ -286,20 +288,20 @@ TEST(HbgReadyQueueSizing, DoubledQueueToleratesAReleaseWindowButCanStillWrap) {
             ASSERT_TRUE(queue.push(fake_slot_state(0)));
         // A consumer owns ticket 0 but has not released its sequence yet.
         queue.dequeue_pos.store(1, std::memory_order_relaxed);
-        uint64_t rejected_at = 0;
-        ChipTaskSlotState *pending = nullptr;
-        for (uint64_t ticket = 40; ticket < attempts; ++ticket) {
-            pending = queue.pop();
-            ASSERT_NE(pending, nullptr);
-            if (!queue.push(pending)) {
-                rejected_at = ticket;
-                break;
+        std::promise<void> started;
+        auto producer = std::async(std::launch::async, [&] {
+            started.set_value();
+            for (uint64_t ticket = 40; ticket < attempts; ++ticket) {
+                auto *pending = queue.pop();
+                if (pending == nullptr || !queue.push(pending)) return false;
             }
-            pending = nullptr;
-        }
-        EXPECT_EQ(rejected_at, attempts <= 128 ? 0 : 128);
+            return true;
+        });
+        started.get_future().wait();
+        const auto status = producer.wait_for(std::chrono::milliseconds(100));
         slots[0].sequence.store(static_cast<int64_t>(capacity), std::memory_order_release);
-        if (pending != nullptr) ASSERT_TRUE(queue.push(pending));
+        if (attempts > capacity) EXPECT_EQ(status, std::future_status::timeout);
+        EXPECT_TRUE(producer.get());
         int drained = 0;
         while (queue.pop() != nullptr)
             ++drained;
@@ -385,3 +387,125 @@ TEST(HbgReadyQueueSizing, FullGraphSeedPreservesTheCopiedRuntimeAndSharedMemoryT
     for (size_t i = 0; i < sm_tail_bytes; ++i)
         EXPECT_EQ(tail[i], 0xA5);
 }
+
+// A consumer owns the payload after advancing dequeue_pos, but releases the
+// sequence only after copying it. This reachable intermediate state has room
+// for a producer and must not be reported to scheduler callers as overflow.
+TEST(HbgReadyQueueSeed, PushWaitsForClaimedConsumerSlot) {
+    for (bool batch : {false, true}) {
+        SCOPED_TRACE(batch);
+        SlotsRegion region(0);
+        ChipReadyQueue queue{};
+        make_queue(&queue, region);
+        queue.seed_slots();
+        for (uint64_t i = 0; i < CAPACITY; ++i)
+            ASSERT_TRUE(queue.push(fake_slot_state(i)));
+        ASSERT_EQ(queue.dequeue_pos.fetch_add(1, std::memory_order_relaxed), 0u);
+        auto *consumed = queue.slots[0].slot_state;
+        auto *replacement = fake_slot_state(CAPACITY);
+        std::promise<void> started;
+        auto producer = std::async(std::launch::async, [&] {
+            started.set_value();
+            return batch ? queue.push_batch(&replacement, 1) : queue.push(replacement);
+        });
+        started.get_future().wait();
+        const auto pending = producer.wait_for(std::chrono::milliseconds(100));
+        // Release even if the assertion fails, so the test cannot strand its producer.
+        queue.slots[0].sequence.store(CAPACITY, std::memory_order_release);
+        EXPECT_EQ(pending, std::future_status::timeout);
+        EXPECT_TRUE(producer.get());
+        EXPECT_EQ(consumed, fake_slot_state(0));
+        for (uint64_t i = 1; i < CAPACITY; ++i)
+            EXPECT_EQ(queue.pop(), fake_slot_state(i));
+        EXPECT_EQ(queue.pop(), replacement);
+        EXPECT_EQ(queue.pop(), nullptr);
+    }
+}
+
+TEST(HbgReadyQueueSeed, TaggedBatchWaitsForConsumerAndPreservesBothEntries) {
+    SlotsRegion region(0);
+    ChipReadyQueue queue{};
+    make_queue(&queue, region);
+    queue.seed_slots();
+    for (uint64_t i = 0; i < CAPACITY; ++i)
+        ASSERT_TRUE(queue.push(fake_slot_state(i)));
+    ASSERT_EQ(queue.dequeue_pos.fetch_add(2, std::memory_order_relaxed), 0u);
+    queue.slots[1].sequence.store(CAPACITY + 1, std::memory_order_release);
+    ChipTaskSlotState *items[] = {fake_slot_state(CAPACITY), fake_slot_state(CAPACITY + 1)};
+    TaskId tags[] = {TaskId::make_global(17), TaskId::make_sub_task(3, 5)};
+    std::promise<void> started;
+    auto producer = std::async(std::launch::async, [&] {
+        started.set_value();
+        return queue.push_batch_tagged(items, tags, 2);
+    });
+    started.get_future().wait();
+    const auto pending = producer.wait_for(std::chrono::milliseconds(100));
+    queue.slots[0].sequence.store(CAPACITY, std::memory_order_release);
+    EXPECT_EQ(pending, std::future_status::timeout);
+    EXPECT_TRUE(producer.get());
+    for (uint64_t i = 2; i < CAPACITY; ++i)
+        EXPECT_EQ(queue.pop(), fake_slot_state(i));
+    ChipTaskSlotState *received[2]{};
+    TaskId received_tags[2];
+    ASSERT_EQ(queue.pop_batch_tagged(received, received_tags, 2), 2);
+    for (int i = 0; i < 2; ++i) {
+        EXPECT_EQ(received[i], items[i]);
+        EXPECT_EQ(received_tags[i], tags[i]);
+    }
+    EXPECT_EQ(queue.pop(), nullptr);
+}
+
+TEST(HbgReadyQueueSeed, BatchRejectsTrueFullSlotAfterConsumerOwnedSlot) {
+    SlotsRegion region(0);
+    ChipReadyQueue queue{};
+    make_queue(&queue, region);
+    queue.seed_slots();
+    for (uint64_t i = 0; i < CAPACITY; ++i)
+        ASSERT_TRUE(queue.push(fake_slot_state(i)));
+    ASSERT_EQ(queue.dequeue_pos.fetch_add(1, std::memory_order_relaxed), 0u);
+    ChipTaskSlotState *items[] = {fake_slot_state(CAPACITY), fake_slot_state(CAPACITY + 1)};
+    std::promise<void> started;
+    auto producer = std::async(std::launch::async, [&] {
+        started.set_value();
+        return queue.push_batch(items, 2);
+    });
+    started.get_future().wait();
+    const auto finished = producer.wait_for(std::chrono::seconds(1));
+    // Always release before checking, including if an incorrect implementation spins.
+    queue.slots[0].sequence.store(CAPACITY, std::memory_order_release);
+    EXPECT_EQ(finished, std::future_status::ready);
+    EXPECT_FALSE(producer.get());
+    EXPECT_EQ(queue.enqueue_pos.load(), CAPACITY);
+    for (uint64_t i = 1; i < CAPACITY; ++i)
+        EXPECT_EQ(queue.pop(), fake_slot_state(i));
+    EXPECT_EQ(queue.pop(), nullptr);
+}
+
+#if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
+TEST(HbgReadyQueueSeed, ProfilingPushWaitsForConsumerRelease) {
+    SlotsRegion region(0);
+    ChipReadyQueue queue{};
+    make_queue(&queue, region);
+    queue.seed_slots();
+    for (uint64_t i = 0; i < CAPACITY; ++i)
+        ASSERT_TRUE(queue.push(fake_slot_state(i)));
+    ASSERT_EQ(queue.dequeue_pos.fetch_add(1, std::memory_order_relaxed), 0u);
+    uint64_t atomic_count = 0;
+    uint64_t wait_cycles = 0;
+    std::promise<void> started;
+    auto producer = std::async(std::launch::async, [&] {
+        started.set_value();
+        return queue.push(fake_slot_state(CAPACITY), atomic_count, wait_cycles);
+    });
+    started.get_future().wait();
+    const auto pending = producer.wait_for(std::chrono::milliseconds(100));
+    queue.slots[0].sequence.store(CAPACITY, std::memory_order_release);
+    EXPECT_EQ(pending, std::future_status::timeout);
+    EXPECT_TRUE(producer.get());
+    EXPECT_GT(atomic_count, 0u);
+    for (uint64_t i = 1; i < CAPACITY; ++i)
+        EXPECT_EQ(queue.pop(), fake_slot_state(i));
+    EXPECT_EQ(queue.pop(), fake_slot_state(CAPACITY));
+    EXPECT_EQ(queue.pop(), nullptr);
+}
+#endif
