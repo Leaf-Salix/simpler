@@ -12,19 +12,16 @@ from __future__ import annotations
 
 import ctypes
 
-from _task_interface import DataType, _encode_buffer_descriptor_wire
+from _task_interface import _encode_buffer_descriptor_wire
 
 from .buffer import (
     AccessMode,
     AddressSpace,
     BackendKind,
     Buffer,
-    ImportContext,
-    ImportRegistry,
     Tensor,
 )
 from .comm_domain import HostWindowSpec, domain_mapping_ref, domain_mapping_target, require_domain_mapping_access
-from .comm_endpoints import HOST_CPU
 from .host_domain_backend import host_backing_type
 
 
@@ -47,7 +44,6 @@ class HostDomainResource:
         self.published = False
         self.views_released = False
         self.closed = False
-        self.registry = ImportRegistry(ImportContext(HOST_CPU))
 
     def allocate(self):
         base, self.export = self.backend.allocate(self.spec, self.identity, self.device, len(self.workers))
@@ -60,13 +56,6 @@ class HostDomainResource:
             base=base,
         )
         self._descriptor = self.buffer.to_descriptor()
-        self.registry.register_attachment(
-            self._descriptor,
-            base,
-            mapping_ref=0,
-            profile=self.backend.profile,
-            live=lambda: not self.closed and self.buffer is not None and not self.buffer.closed,
-        )
 
     def request(self) -> bytes:
         if self.export is None or self.buffer is None:
@@ -95,12 +84,13 @@ class HostDomainResource:
         size = len(value) if writing else value
         if offset < 0 or size < 0 or offset > self.spec.nbytes or size > self.spec.nbytes - offset:
             raise ValueError("Host domain copy exceeds the backing range")
-        tensor = Tensor(self.buffer, shapes=(1,), dtype=DataType.UINT8)
-        imported = self.registry.resolve_tensor(tensor)
+        if self.closed or self.buffer is None or self.buffer.closed:
+            raise ValueError("Host domain backing is not live")
+        base = self.buffer.base
         if writing:
-            ctypes.memmove(imported.base + offset, value, size)
+            ctypes.memmove(base + offset, value, size)
             return None
-        return ctypes.string_at(imported.base + offset, size)
+        return ctypes.string_at(base + offset, size)
 
     def close(self):
         self.closed = True
@@ -109,4 +99,3 @@ class HostDomainResource:
         if self.published and not self.views_released:
             raise RuntimeError("Host domain owner retained: member view release is unconfirmed")
         self.backend.release()
-        self.registry.close()
