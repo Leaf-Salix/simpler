@@ -12,6 +12,7 @@ import struct
 from pathlib import Path
 
 import pytest
+from simpler.buffer import AccessMode
 from simpler.task_interface import (
     ArgDirection as D,
 )
@@ -98,14 +99,16 @@ def test_host_domain_two_chip_transfer(st_platform, st_device_ids, engine, host_
                     assert domain is domains[0]
                 else:
                     domains.append(domain)
-                orch.copy_to_domain(domain, None, data)
+                orch.copy_to_host_domain(domain, data)
                 for rank in range(2):
                     orch.copy_to_domain(domain, rank, data, buffer="input")
                 for rank in range(2):
                     host = domain.host().tensor(
                         (N,), DataType.FLOAT32, byte_offset=(rank + 1) * SIZE if host_output else 0
                     )
-                    mapped = domain.map_view(host, domain_rank=rank)
+                    mapped = domain.map_view(
+                        host, domain_rank=rank, access=AccessMode.WRITE if host_output else AccessMode.READ
+                    )
                     ctx = domain.member(rank)
                     source = ctx.buffers["input"].tensor((N,), DataType.FLOAT32) if host_output else mapped
                     destination = mapped if host_output else ctx.buffers["output"].tensor((N,), DataType.FLOAT32)
@@ -124,7 +127,7 @@ def test_host_domain_two_chip_transfer(st_platform, st_device_ids, engine, host_
             def read(orch, _args, _cfg):
                 for rank in range(2):
                     if host_output:
-                        raw = orch.copy_from_domain(domains[0], None, SIZE, offset=(rank + 1) * SIZE)
+                        raw = orch.copy_from_host_domain(domains[0], SIZE, offset=(rank + 1) * SIZE)
                     else:
                         raw = orch.copy_from_domain(domains[0], rank, SIZE, buffer="output")
                     assert struct.unpack(f"<{N}f", raw) == (expected,) * N
@@ -160,9 +163,11 @@ def test_host_domain_release_after_accepted_tasks(st_platform, st_device_ids):
                 buffers=[CommBufferSpec("unused", "float32", N, SIZE)],
                 host_window=HostWindowSpec(SIZE),
             )
-            orch.copy_to_domain(domain, None, struct.pack(f"<{N}f", *([7.0] * N)))
+            orch.copy_to_host_domain(domain, struct.pack(f"<{N}f", *([7.0] * N)))
             for rank in range(2):
-                view = domain.map_view(domain.host().tensor((N,), DataType.FLOAT32), domain_rank=rank)
+                view = domain.map_view(
+                    domain.host().tensor((N,), DataType.FLOAT32), domain_rank=rank, access=AccessMode.READ
+                )
                 args = TaskArgs()
                 args.add_tensor(view, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
                 args.add_tensor(view, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
@@ -232,10 +237,12 @@ def test_device_selected_bf16_rows(st_platform, st_device_ids):
                 else:
                     saved.append(domain)
                 # CPU initialization updates the Host backing, not a device replica.
-                orch.copy_to_domain(domain, None, struct.pack(f"<{len(table)}H", *table))
+                orch.copy_to_host_domain(domain, struct.pack(f"<{len(table)}H", *table))
                 for rank in range(2):
                     args = TaskArgs()
-                    view = domain.map_view(domain.host().tensor((128, 256), DataType.BFLOAT16), domain_rank=rank)
+                    view = domain.map_view(
+                        domain.host().tensor((128, 256), DataType.BFLOAT16), domain_rank=rank, access=AccessMode.READ
+                    )
                     args.add_tensor(view, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
                     args.add_tensor(ids[rank].tensor((6,), DataType.UINT32), TensorArgType.INPUT)
                     args.add_tensor(results[rank].tensor((6, 256), DataType.BFLOAT16), TensorArgType.OUTPUT_EXISTING)

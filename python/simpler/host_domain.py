@@ -23,7 +23,7 @@ from .buffer import (
     ImportRegistry,
     Tensor,
 )
-from .comm_domain import HostWindowSpec
+from .comm_domain import HostWindowSpec, domain_mapping_ref, domain_mapping_target, require_domain_mapping_access
 from .comm_endpoints import HOST_CPU
 from .host_domain_backend import host_backing_type
 
@@ -73,20 +73,23 @@ class HostDomainResource:
             raise RuntimeError("Host backing has not been allocated")
         return self.export.encode() + _encode_buffer_descriptor_wire(self._descriptor)
 
-    def map_view(self, tensor: Tensor, worker: int) -> Tensor:
+    def map_view(self, tensor: Tensor, worker: int, *, access=AccessMode.READWRITE) -> Tensor:
         if self.closed or self.buffer is None or self.buffer.closed or tensor.buffer != self._descriptor:
             raise ValueError("Host mapping requires the live domain backing")
         if tensor.mapping_ref:
             raise ValueError("map_view requires the native Tensor view")
-        return tensor._with_mapping_ref(self.workers.index(worker) + 1)
+        return tensor._with_mapping_ref(domain_mapping_ref(self.workers.index(worker), access))
 
-    def validate(self, tensor, worker, *, native=False):
+    def validate(self, tensor, worker, *, native=False, required=0):
         if self.closed or self.buffer is None or self.buffer.closed or tensor.buffer != self._descriptor:
             raise ValueError("Host domain Tensor is stale or differs from its source registration")
         if worker not in self.workers or (
-            tensor.mapping_ref != self.workers.index(worker) + 1 and not (native and tensor.mapping_ref == 0)
+            not (native and tensor.mapping_ref == 0)
+            and (not tensor.mapping_ref or domain_mapping_target(tensor.mapping_ref)[0] != self.workers.index(worker))
         ):
             raise ValueError("Host Tensor requires an explicit mapping for the target worker")
+        if tensor.mapping_ref:
+            require_domain_mapping_access(tensor.mapping_ref, required)
 
     def copy(self, offset, value, *, writing):
         size = len(value) if writing else value

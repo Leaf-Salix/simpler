@@ -12,6 +12,7 @@ import struct
 from pathlib import Path
 
 import pytest
+from simpler.buffer import AccessMode
 from simpler.task_interface import (
     ArgDirection as D,
 )
@@ -108,10 +109,12 @@ def test_host_sparse_sdma_consumer(st_platform, st_device_ids):
                 if not domains:
                     domains.append(domain)
                     for row in range(128):
-                        orch.copy_to_domain(domain, None, struct.pack(f"<{N}f", *([float(row)] * N)), offset=row * SIZE)
+                        orch.copy_to_host_domain(domain, struct.pack(f"<{N}f", *([float(row)] * N)), offset=row * SIZE)
                 else:
                     assert domain is domains[0]
-                table = domain.map_view(domain.host().tensor((128 * N,), DataType.FLOAT32), domain_rank=1)
+                table = domain.map_view(
+                    domain.host().tensor((128 * N,), DataType.FLOAT32), domain_rank=1, access=AccessMode.READ
+                )
                 args = TaskArgs()
                 args.add_tensor(table, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
                 args.add_tensor(ids.tensor((1,), DataType.UINT32), TensorArgType.INPUT)

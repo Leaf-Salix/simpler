@@ -149,7 +149,9 @@ def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -
             raise ValueError(f"argument {i}: HOST/NONE Buffer grant does not cover callable direction {direction}")
 
 
-def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry) -> ChipStorageTaskArgs:
+def _materialize_chip_task_args(
+    args: TaskArgs, registry: ImportRegistry, target: ChipCallable | None = None
+) -> ChipStorageTaskArgs:
     """Resolve accepted argument descriptors into this process's chip-only POD.
 
     The caller owns submission/callable checks, backing retention and the registry's
@@ -158,7 +160,19 @@ def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry) -> Chi
     """
     if not isinstance(args, TaskArgs):
         raise TypeError("chip argument materialization requires address-free TaskArgs")
-    resolved = registry.materialize_args(args)
+    if target is not None:
+        for i in range(args.tensor_count()):
+            tensor = args.tensor(i)
+            if tensor.mapping_ref:
+                access = {
+                    ArgDirection.IN: AccessMode.READ,
+                    ArgDirection.OUT: AccessMode.WRITE,
+                    ArgDirection.INOUT: AccessMode.READWRITE,
+                }.get(target.sig(i) if i < target.sig_count else None)
+                if access is None:
+                    raise ValueError("mapped argument requires a declared callable direction")
+                registry.require_mapping_access(tensor, access)
+    resolved = registry.materialize_args(args, check_tags=target is None)
     return _ti_module.materialize_task_args(args, resolved)
 
 
@@ -1233,13 +1247,13 @@ class CommDomainHandle:
             raise ValueError("domain has no local Host window")
         return self._host_resource.buffer
 
-    def map_view(self, tensor: Tensor, *, domain_rank: int) -> Tensor:
+    def map_view(self, tensor: Tensor, *, domain_rank: int, access=AccessMode.READWRITE) -> Tensor:
         """Select a fixed NPU attachment while retaining the source backing identity."""
         self._require_live()
         member = self.member(domain_rank)
         if self._host_resource is None:
             raise ValueError("domain has no local Host window")
-        return self._host_resource.map_view(tensor, member.local_worker_id)
+        return self._host_resource.map_view(tensor, member.local_worker_id, access=access)
 
     def member(self, domain_rank: int) -> GlobalDomainMember:
         """Return rank-ordered topology and ordinary Buffer slices."""

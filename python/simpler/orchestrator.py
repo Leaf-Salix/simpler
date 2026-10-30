@@ -649,33 +649,47 @@ class Orchestrator:
     def copy_to_domain(
         self,
         handle: CommDomainHandle,
-        domain_rank: int | None,
+        domain_rank: int,
         data: bytes,
         *,
         buffer: str | None = None,
         offset: int = 0,
     ) -> None:
-        """Synchronously stage bytes; does not wait for queued tasks.
+        """Synchronously stage bytes to an NPU rank; does not wait for queued tasks.
 
         L3 staging precedes task submission and stays within declared buffer slices.
         L4 keeps its existing window copy path.
         """
-        self._copy_domain(handle, domain_rank, bytes(data), buffer, offset, writing=True)
+        self._copy_domain(handle, operator.index(domain_rank), bytes(data), buffer, offset, writing=True)
 
     def copy_from_domain(
         self,
         handle: CommDomainHandle,
-        domain_rank: int | None,
+        domain_rank: int,
         nbytes: int,
         *,
         buffer: str | None = None,
         offset: int = 0,
     ) -> bytes:
         """Synchronously read bytes with the same range and ordering rules as copy_to_domain."""
-        return cast(bytes, self._copy_domain(handle, domain_rank, int(nbytes), buffer, offset, writing=False))
+        return cast(
+            bytes, self._copy_domain(handle, operator.index(domain_rank), int(nbytes), buffer, offset, writing=False)
+        )
 
     copy_to_global_domain = copy_to_domain
     copy_from_global_domain = copy_from_domain
+
+    def copy_to_host_domain(self, handle: CommDomainHandle, data: bytes, *, offset: int = 0) -> None:
+        """Write the local Host backing before task submission, or between completed runs.
+
+        This uses the same control ordering as NPU domain copies; it does not
+        wait for outstanding tasks. Direct CPU pointer writes bypass this gate.
+        """
+        self._copy_domain(handle, None, bytes(data), None, offset, writing=True)
+
+    def copy_from_host_domain(self, handle: CommDomainHandle, nbytes: int, *, offset: int = 0) -> bytes:
+        """Read the local Host backing with the same ordering as copy_to_host_domain."""
+        return cast(bytes, self._copy_domain(handle, None, int(nbytes), None, offset, writing=False))
 
     def _copy_domain(self, handle, rank, data, buffer, offset, *, writing):
         if self._worker is None:

@@ -393,10 +393,10 @@ class TestL2TouchedIdentityTracking:
         proceed = threading.Event()
         real_materialize = Worker._materialize_l2_args
 
-        def _blocking_materialize(self, args):
+        def _blocking_materialize(self, args, target=None):
             entered_materialize.set()
             proceed.wait(timeout=5)
-            return real_materialize(self, args)
+            return real_materialize(self, args, target)
 
         monkeypatch.setattr(Worker, "_materialize_l2_args", _blocking_materialize)
 

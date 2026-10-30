@@ -14,6 +14,8 @@ import operator
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING
 
+from _task_interface import AccessMode
+
 if TYPE_CHECKING:
     from .task_interface import CommBufferSpec
 
@@ -102,3 +104,31 @@ class DomainConfig:
             if before != after:
                 return f"{item.name}: {before!r} != {after!r}"
         return ""
+
+
+# Same-build mapping selectors: 0 is native; each grant has 64 endpoint slots.
+# These select existing registry records, never create authority from wire bits.
+_MAPPING_ACCESSES = (AccessMode.READWRITE, AccessMode.READ, AccessMode.WRITE)
+
+
+def domain_mapping_ref(rank, access):
+    rank = operator.index(rank)
+    access = AccessMode(access)
+    if not 0 <= rank < 64:
+        raise ValueError("mapping rank must be in [0, 64)")
+    return 1 + rank + 64 * _MAPPING_ACCESSES.index(access)
+
+
+def domain_mapping_target(reference):
+    value = operator.index(reference) - 1
+    if not 0 <= value < 192:
+        raise ValueError("invalid domain mapping reference")
+    slot, rank = divmod(value, 64)
+    return rank, AccessMode(_MAPPING_ACCESSES[slot])
+
+
+def require_domain_mapping_access(reference, required):
+    _, access = domain_mapping_target(reference)
+    granted = 3 if access == AccessMode.READWRITE else 1 if access == AccessMode.READ else 2
+    if required & ~granted:
+        raise ValueError("selected mapping grant does not cover argument access")

@@ -94,13 +94,13 @@ def test_host_domain_cpu_copy_and_configuration_reuse(host_worker):
 
     def fill(orch, _args, _cfg):
         domain = orch.get_or_allocate_domain(**request())
-        orch.copy_to_domain(domain, None, data, offset=64)
-        assert orch.copy_from_domain(domain, None, len(data), offset=64) == data
+        orch.copy_to_host_domain(domain, data, offset=64)
+        assert orch.copy_from_host_domain(domain, len(data), offset=64) == data
         assert orch.get_or_allocate_domain(**request()) is domain
         with pytest.raises(ValueError, match="configuration differs"):
             orch.get_or_allocate_domain(**request(host_window=HostWindowSpec(256)))
         with pytest.raises(ValueError, match="exceeds"):
-            orch.copy_to_domain(domain, None, data, offset=68)
+            orch.copy_to_host_domain(domain, data, offset=68)
         saved.append(domain)
 
     host_worker.run(fill)
@@ -292,10 +292,10 @@ def test_mapping_racing_release_cannot_retain_dispatch_permission(host_worker, m
     original = domain._host_resource.map_view
     failures = []
 
-    def delayed(tensor, worker):
+    def delayed(tensor, worker, **kwargs):
         entered.set()
         assert resume.wait(5)
-        return original(tensor, worker)
+        return original(tensor, worker, **kwargs)
 
     def mapping():
         try:

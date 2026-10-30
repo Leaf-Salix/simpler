@@ -42,6 +42,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     CanonicalIdentity,
     DataType,
     Tensor,
+    TensorArgType,
     TensorTransfer,
     read_args_from_blob,
 )
@@ -1104,6 +1105,7 @@ class ImportRegistry:
         mapping_ref: int,
         profile: AdapterProfile,
         live: Callable[[], bool],
+        access: AccessMode | None = None,
     ) -> None:
         """Register a backend-confirmed address in this endpoint's current context.
 
@@ -1124,10 +1126,22 @@ class ImportRegistry:
         for item in (*self._by_identity.values(), *self._attachments.values()):
             if item.identity == descriptor.identity and item.descriptor != descriptor:
                 raise ValueError("one identity names one backing descriptor")
+        granted = capabilities_for_adapter(AdapterKind.DIRECT_MAP, descriptor.access)
+        if access is not None:
+            requested = capabilities_for_adapter(AdapterKind.DIRECT_MAP, AccessMode(access))
+            if not requested <= granted:
+                raise ValueError("attachment grant exceeds source grant")
+            granted = requested
         key = (descriptor.identity, mapping_ref)
         old = self._attachments.get(key)
         if old is not None:
-            if old.base != base or old.profile != profile or old.live is None or not old.live():
+            if (
+                old.base != base
+                or old.profile != profile
+                or old.capabilities != granted
+                or old.live is None
+                or not old.live()
+            ):
                 raise ValueError("attachment conflicts with an existing mapping")
             return
         self._attachments[key] = ImportedBuffer(
@@ -1137,9 +1151,15 @@ class ImportRegistry:
             AddressSpace.DEVICE if mapping_ref else AddressSpace.HOST,
             descriptor=descriptor,
             profile=profile,
-            capabilities=capabilities_for_adapter(AdapterKind.DIRECT_MAP, descriptor.access),
+            capabilities=granted,
             live=live,
         )
+
+    def require_mapping_access(self, tensor: Tensor, access: AccessMode) -> None:
+        imported = self.resolve_tensor(tensor)
+        required = capabilities_for_adapter(AdapterKind.DIRECT_MAP, access)
+        if not required <= imported.capabilities:
+            raise ValueError("selected mapping grant does not cover argument access")
 
     def resolve_tensor(self, tensor: Tensor) -> ImportedBuffer:
         """Resolve the selected attachment without changing the backing descriptor."""
@@ -1215,8 +1235,24 @@ class ImportRegistry:
         self._by_identity[key] = imported
         return imported
 
-    def materialize_args(self, args) -> dict[Any, tuple[int, int]]:
+    def materialize_args(self, args, *, check_tags=True) -> dict[Any, tuple[int, int]]:
         """Resolve each argument's selected view; native and mapped views may coexist."""
+        # Check every selected grant before materializing any ordinary backing.
+        for i in range(args.tensor_count()):
+            tensor = args.tensor(i)
+            if tensor.mapping_ref:
+                if args.transfer(i) != TensorTransfer.NONE:
+                    raise ValueError("mapped arguments require transfer NONE")
+                if not check_tags:
+                    continue
+                access = {
+                    TensorArgType.INPUT: AccessMode.READ,
+                    TensorArgType.OUTPUT: AccessMode.WRITE,
+                    TensorArgType.OUTPUT_EXISTING: AccessMode.WRITE,
+                    TensorArgType.INOUT: AccessMode.READWRITE,
+                    TensorArgType.NO_DEP: AccessMode.READWRITE,
+                }[args.tag(i)]
+                self.require_mapping_access(tensor, access)
         resolved: dict[Any, tuple[int, int]] = {}
         for i in range(args.tensor_count()):
             tensor = args.tensor(i)

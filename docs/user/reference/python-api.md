@@ -180,7 +180,8 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | `allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | L3/L4 creation returning `CommDomainHandle`; legacy L3 `workers=` and chip-id indexing remain supported |
 | `get_or_allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | Reuse the same live handle after full configuration validation, or create it |
 | `get_domain(name_or_ref)` / `release_domain(handle)` | Creator-local name lookup or borrowing by `CommDomainRef`; only the creator owns release |
-| `copy_to_domain(handle, rank, data, ...)` / `copy_from_domain(handle, rank, nbytes, ...)` | Synchronous bounded staging before task submission; L3 requires declared slices |
+| `copy_to_domain(handle, rank, data, ...)` / `copy_from_domain(handle, rank, nbytes, ...)` | Synchronous bounded NPU-rank staging before task submission; L3 requires declared slices |
+| `copy_to_host_domain(handle, data, *, offset=0)` / `copy_from_host_domain(handle, nbytes, *, offset=0)` | Synchronous local Host staging before callback submissions or between completed runs; no implicit wait |
 | `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Delegates allocation to the owning Worker; target chip memory is named by the returned handle |
 
 `domain.member(rank).buffers[name].tensor(...)` has the same L3/L4 semantics and routes to its owning chip.

@@ -154,7 +154,7 @@ from .callable_identity import (
     parse_python_callable_payload,
     parse_python_import_target,
 )
-from .comm_domain import CommDomainRef, DomainConfig, HostWindowSpec
+from .comm_domain import CommDomainRef, DomainConfig, HostWindowSpec, domain_mapping_ref
 from .comm_endpoints import (
     DEVICE_AICORE,
     DEVICE_AICPU,
@@ -2942,13 +2942,15 @@ def _handle_ctrl_alloc_domain(
             assert host_descriptor is not None and host_sources is not None and import_registry is not None
             host_base = cw.comm_attach_domain_host(int(handle), int(allocation_id), host_export.encode())
             host_sources[int(allocation_id)] = host_descriptor.identity
-            import_registry.register_attachment(
-                host_descriptor,
-                host_base,
-                mapping_ref=domain_rank + 1,
-                profile=host_attachment_profile(host_export, chip_platform),
-                live=lambda: int(allocation_id) in host_sources,
-            )
+            for access in (AccessMode.READWRITE, AccessMode.READ, AccessMode.WRITE):
+                import_registry.register_attachment(
+                    host_descriptor,
+                    host_base,
+                    mapping_ref=domain_mapping_ref(domain_rank, access),
+                    access=access,
+                    profile=host_attachment_profile(host_export, chip_platform),
+                    live=lambda: int(allocation_id) in host_sources,
+                )
 
         # Carve buffer pointers sequentially inside the local window.
         buffer_ptrs: list[int] = []
@@ -3626,7 +3628,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             args_ptr = task_addr + _OFF_TASK_ARGS_BLOB
             args = read_args_from_blob(args_ptr, _MAILBOX_ARGS_CAPACITY)
             _validate_host_control_access(registry.get(cid), args)
-            chip_args = _materialize_chip_task_args(args, import_registry)
+            chip_args = _materialize_chip_task_args(args, import_registry, registry.get(cid))
             # The acceptance flag lives in the mailbox, not in the materialized args, so
             # the fence still publishes through the address the parent polls.
             if cfg.output_prefix:
@@ -4034,7 +4036,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             # its own storage, so this POD need not outlive the call.
             args = staged.pending_args  # type: ignore[attr-defined]
             _validate_host_control_access(registry.get(staged.cid), args)
-            chip_args = _materialize_chip_task_args(args, import_registry)
+            chip_args = _materialize_chip_task_args(args, import_registry, registry.get(staged.cid))
             if staged.config.output_prefix:
                 _bind_host_log_session_directory()
             staged.chip_run = cw._submit_chip_run_materialized(
@@ -12731,7 +12733,12 @@ class Worker:
                     resource = direct[0]
                 if resource is None:
                     raise ValueError("Host domain Tensor is not a live allocation on this Worker")
-                resource.validate(tensor, target_worker_id, native=direct is not None and self.level == 2)
+                resource.validate(
+                    tensor,
+                    target_worker_id,
+                    native=direct is not None and self.level == 2,
+                    required=_required_remote_access_for_tag(args.tag(index)),
+                )
         failure = self._child_alloc.check_dispatch(args, target_worker_id)
         if failure is None:
             return
@@ -13332,14 +13339,23 @@ class Worker:
                 base = cw.comm_attach_domain_host(comm, allocation_id, exported.encode())
                 self._materialize_l2_args(None)
                 assert self._chip_import_registry is not None
-                for selector, address, profile in (
-                    (0, buffer.base, resource.backend.profile),
-                    (1, base, host_attachment_profile(exported, self._config["platform"])),
+                for selector, address, profile, access in (
+                    (0, buffer.base, resource.backend.profile, AccessMode.READWRITE),
+                    *(
+                        (
+                            domain_mapping_ref(0, access),
+                            base,
+                            host_attachment_profile(exported, self._config["platform"]),
+                            access,
+                        )
+                        for access in (AccessMode.READWRITE, AccessMode.READ, AccessMode.WRITE)
+                    ),
                 ):
                     self._chip_import_registry.register_attachment(
                         buffer.to_descriptor(),
                         address,
                         mapping_ref=selector,
+                        access=access,
                         profile=profile,
                         live=lambda: not resource.closed and not buffer.closed,
                     )
@@ -13348,7 +13364,7 @@ class Worker:
                 self._release_direct_host_resource(resource.identity)
                 raise
 
-    def map_view(self, tensor: Tensor, *, target=None) -> Tensor:
+    def map_view(self, tensor: Tensor, *, target=None, access=AccessMode.READWRITE) -> Tensor:
         """Select a direct L2 Host mapping without changing the native Tensor."""
         with self._operation_lease("map_view", allow_continuation=True), self._child_prov_worker_lock(0):
             if self.level != 2 or (target is not None and target != self.device_location):
@@ -13356,7 +13372,7 @@ class Worker:
             entry = self._direct_host_domains.get(tensor.buffer.identity)
             if entry is None:
                 raise ValueError("map_view requires a Host buffer allocated by this Worker")
-            return entry[0].map_view(tensor, 0)
+            return entry[0].map_view(tensor, 0, access=access)
 
     def _release_direct_host_resource(self, identity):
         entry = self._direct_host_domains.get(identity)
@@ -14128,7 +14144,7 @@ class Worker:
                     self._chip_source_uses[run_id] = sources
         native_entered = False
         try:
-            chip_args = self._materialize_l2_args(args)
+            chip_args = self._materialize_l2_args(args, self._callable_registry.get(callable_id))
             native_entered = True
             submit_options = {} if caller_stream is None else {"caller_stream": caller_stream}
             chip_run = self._chip_worker._submit_chip_run_direct(callable_id, chip_args, cfg, **submit_options)
@@ -14421,7 +14437,7 @@ class Worker:
         # the reason the worker is now shut.
         return handle._finalization_error
 
-    def _materialize_l2_args(self, args) -> Any:
+    def _materialize_l2_args(self, args, target=None) -> Any:
         """Resolve an L2 leaf's tensor args to a chip-POD blob in this process.
 
         The user builds args as ``TaskArgs`` (``Tensor``) at every level; an L2 leaf is the consumer of
@@ -14444,12 +14460,12 @@ class Worker:
             self._chip_import_registry = registry
         if args is None:
             args = TaskArgs()
-        return _materialize_chip_task_args(args, registry)
+        return _materialize_chip_task_args(args, registry, target)
 
     def _run_l2_materialized(self, callable_id: int, args, cfg) -> None:
         """Materialize an L2 leaf's tensor args and run the kernel to completion."""
         _validate_host_control_access(self._callable_registry.get(callable_id), TaskArgs() if args is None else args)
-        chip_args = self._materialize_l2_args(args)
+        chip_args = self._materialize_l2_args(args, self._callable_registry.get(callable_id))
         assert self._chip_worker is not None
         self._chip_worker.run_materialized(callable_id, chip_args, cfg)
 

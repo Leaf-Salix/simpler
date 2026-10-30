@@ -11,7 +11,7 @@ domain = orch.get_or_allocate_domain(
     host_window=HostWindowSpec(nbytes=65536, numa_id=0),
     retain_after_run=True,
 )
-orch.copy_to_domain(domain, None, data)  # None 选择本机 Host backing
+orch.copy_to_host_domain(domain, data)  # 显式写入本机 Host backing；Host 不占 NPU rank
 native = domain.host().tensor((16384,), DataType.FLOAT32)
 mapped = domain.map_view(native, domain_rank=0)
 args = TaskArgs()
@@ -20,7 +20,9 @@ args.add_tensor(mapped, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
 # worker 参数使用 members 中对应的实际 worker 编号；本例 rank 0 对应 worker 0。
 ```
 
-`copy_to_domain` / `copy_from_domain` 是同步的编排阶段操作，必须先于当前 Run 的任务提交；它们不会等待已经排队的任务。应在 Run 完成后通过后续 Run 读取输出。CPU 原生访问目前仅支持创建域的 endpoint，不支持把该 Host 引用发给 Python 子任务。
+`copy_to_host_domain` / `copy_from_host_domain` 显式访问本机 Host backing；`copy_to_domain` / `copy_from_domain` 的 rank 仅指 NPU。两组入口复用相同的 operation lease、控制预留和编排顺序检查：回调内必须先拷贝再提交任务；回调外必须等待所有在飞 Run 完成。违反顺序时直接拒绝，不先写入数据，也不隐式等待任务。可在 Run 完成后串行更新表，再提交下一轮。
+
+通过 CPU 原生指针、NumPy view 或 `ctypes` 裸写不会经过上述检查。调用方必须自行保证所有读写任务已完成，且写入结束前不会并发提交新任务；Buffer 的生命周期保留不等于写入互斥。CPU 原生访问目前仅支持创建域的 endpoint，不支持把该 Host 引用发给 Python 子任务。
 
 ## 公共契约与平台实现
 
@@ -129,3 +131,13 @@ A5 后端可参考 [#2714 的单卡 Host URMA 资格验证](https://github.com/h
 此支持限于 owner 所在的直接 L2 进程；L3 子进程没有 owner CPU 地址的访问资格，仍必须选择目标卡的 mapped view。`ImportRegistry.register_attachment` 仅登记已经确认的直接地址映射；后续 A5 URMA 应接入通信 context 与完成机制，不能向这里填入 segment handle。
 
 消费契约修复后，158 项相关 UT 与 9 项 A3 真机 ST 通过；新增 direct L2 同调用 native/H2D + mapped/NONE 验收，原有双卡与稀疏路径全部复验。
+
+## 显式映射权限
+
+`domain.map_view(tensor, domain_rank=rank, access=AccessMode.READ)` 选择只读映射；直接 L2 的 `worker.map_view` 使用相同 `access` 参数。省略时保留 READWRITE 兼容行为。Buffer 的 HOST 身份和原生访问不变，不在 Tensor 上新增权限字段。
+
+当前 A3 profile 在建域时建立固定物理映射，并在目标 registry 登记 READ、WRITE、READWRITE 三种受限 attachment；三者复用同一地址，权限不得超过 source grant。提交端检查参数 tag，消费端按真实 callable signature 校验所选 grant；跨进程参数不携带 tag，不能以默认 INPUT 替代消费者检查。mapped view 只支持 NONE，native/H2D 继续使用原有拷贝合同。
+
+mapping reference 是同 build 内的 registry selector，不是秘密或进程内安全隔离：已经获得 RW attachment 的端点仍可选择其 RW view。选择不存在、已关闭或错误目标的记录会被拒绝。引用采用固定 64 rank、三组 grant；保持原 RW selector，所有生产者和消费者必须使用同一版本。
+
+此实现不宣称完成独立 unmap、按需物理映射或跨域共享一个 Host backing；owner 仍受既有域生命周期管理。后续扩展应复用这套 registry 和使用保留，不能另建参数解析器。
