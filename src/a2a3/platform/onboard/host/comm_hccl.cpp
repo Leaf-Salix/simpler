@@ -89,7 +89,6 @@ struct DomainAllocation {
     int rank = 0;
     int nranks = 0;
     bool release_failed = false;
-    bool host_enabled = false;
     bool import_started = false;
     bool views_released = false;
     VmmWindow local_window;
@@ -1644,7 +1643,7 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
 
 extern "C" int comm_global_domain_prepare(
     uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
-    uint32_t host_enabled, CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
+    CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
 ) try {
     if (domain_id == 0 || rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count ||
         window_size == 0 || profile != COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC || descriptor_out == nullptr ||
@@ -1662,8 +1661,8 @@ extern "C" int comm_global_domain_prepare(
     }
     auto inserted = global_domain_allocations.emplace(domain_id, std::make_unique<DomainAllocation>());
     auto &allocation = inserted.first->second;
-    allocation->host_enabled = host_enabled != 0;
-    aclError status = create_local_fabric_window(device_id, window_size, &allocation->local_window, host_enabled != 0);
+    // Global Fabric HBM windows participate in SDMA and require NoUC mappings.
+    aclError status = create_local_fabric_window(device_id, window_size, &allocation->local_window, true);
     if (status != ACL_SUCCESS) {
         LOG_ERROR("[global domain rank %u] create local Fabric window -> %d", domain_rank, static_cast<int>(status));
         return -1;
@@ -1714,8 +1713,7 @@ extern "C" int comm_global_domain_import(
     }
     auto &allocation = it->second;
     const size_t rank_count = static_cast<size_t>(allocation->nranks);
-    if (rank_count == 0 || descriptor_count < rank_count || descriptor_count > 2 * rank_count ||
-        (descriptor_count > rank_count) != allocation->host_enabled || allocation->device_ctx != nullptr ||
+    if (rank_count == 0 || descriptor_count != rank_count || allocation->device_ctx != nullptr ||
         allocation->import_started || allocation->views_released) {
         return -1;
     }
@@ -1756,9 +1754,8 @@ extern "C" int comm_global_domain_import(
             std::memcpy(&fabric_handle, descriptor->handle, sizeof(fabric_handle));
             peer_windows.emplace_back();
             auto &peer_window = peer_windows.back();
-            aclError status = import_fabric_window(
-                device_id, fabric_handle, descriptor->mapping_size, &peer_window, allocation->host_enabled
-            );
+            aclError status =
+                import_fabric_window(device_id, fabric_handle, descriptor->mapping_size, &peer_window, true);
             if (status != ACL_SUCCESS) {
                 LOG_ERROR(
                     "[global domain rank %d] import peer rank %u -> %d", allocation->rank, rank,
@@ -1772,18 +1769,6 @@ extern "C" int comm_global_domain_import(
         ctx.windowsOut[rank] = window_addr;
     }
 
-    for (size_t i = rank_count; i < descriptor_count; ++i) {
-        const auto &host = descriptors[i];
-        if (host.version != COMM_GLOBAL_DOMAIN_VERSION || host.profile != COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC ||
-            host.domain_rank != i || host.rank_count != rank_count || !host.mapping_size ||
-            host.handle_size != sizeof(aclrtMemFabricHandle))
-            return -1;
-        aclrtMemFabricHandle token{};
-        std::memcpy(&token, host.handle, sizeof(token));
-        peer_windows.emplace_back();
-        auto &view = peer_windows.back();
-        if (import_fabric_window(device_id, token, host.mapping_size, &view, true) != ACL_SUCCESS) return -1;
-    }
     void *device_ctx = nullptr;
     aclError status = aclrtMalloc(&device_ctx, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
     if (status != ACL_SUCCESS) {
@@ -1805,7 +1790,33 @@ extern "C" int comm_global_domain_import(
     return -1;
 }
 
+extern "C" int comm_global_domain_import_host(
+    uint64_t domain_id, uint32_t profile, const uint8_t *token, size_t token_size, size_t mapping_size,
+    uint64_t *base_out
+) try {
+    if (profile != COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC || token == nullptr ||
+        token_size != sizeof(aclrtMemFabricHandle) || mapping_size == 0 || base_out == nullptr)
+        return -1;
+    std::lock_guard<std::mutex> lock(global_domain_allocations_mutex);
+    auto it = global_domain_allocations.find(domain_id);
+    if (it == global_domain_allocations.end()) return -1;
+    auto &allocation = *it->second;
+    if (!allocation.device_ctx || allocation.views_released || allocation.release_failed) return -1;
+    int32_t device_id = -1;
+    if (aclrtGetDevice(&device_id) != ACL_SUCCESS) return -1;
+    aclrtMemFabricHandle handle{};
+    std::memcpy(&handle, token, sizeof(handle));
+    allocation.peer_windows.emplace_back();
+    auto &view = allocation.peer_windows.back();
+    if (import_fabric_window(device_id, handle, mapping_size, &view, true) != ACL_SUCCESS) return -1;
+    *base_out = reinterpret_cast<uint64_t>(view.base);
+    return 0;
+} catch (...) {
+    return -1;
+}
+
 static VmmWindow *global_window(DomainAllocation &a, uint32_t slot) {
+    if (slot >= static_cast<uint32_t>(a.nranks)) return nullptr;
     if (slot == static_cast<uint32_t>(a.rank)) return &a.local_window;
     const size_t index = slot < static_cast<uint32_t>(a.rank) ? slot : slot - 1;
     return index < a.peer_windows.size() ? &a.peer_windows[index] : nullptr;
@@ -1828,7 +1839,7 @@ extern "C" int comm_global_domain_release(uint64_t domain_id, uint32_t stage) tr
     auto it = global_domain_allocations.find(domain_id);
     if (it == global_domain_allocations.end()) return 0;
     auto &a = *it->second;
-    if (stage > 2 || a.release_failed || (a.host_enabled && stage == 0) || (stage == 2 && !a.views_released)) return -1;
+    if (stage > 2 || a.release_failed || (stage == 2 && !a.views_released)) return -1;
     if (stage != 2 && !a.views_released) {
         aclError status = ACL_SUCCESS;
         if (a.device_ctx) {

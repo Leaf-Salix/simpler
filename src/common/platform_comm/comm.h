@@ -37,7 +37,7 @@ extern "C" {
 
 typedef struct CommHandle_ *CommHandle;
 
-#define COMM_GLOBAL_DOMAIN_VERSION 3U
+#define COMM_GLOBAL_DOMAIN_VERSION 2U
 #define COMM_GLOBAL_DOMAIN_HANDLE_BYTES 256U
 #define COMM_GLOBAL_DOMAIN_DESCRIPTOR_BYTES 288U
 
@@ -295,21 +295,28 @@ int comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t ran
  */
 int comm_global_domain_prepare(
     uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
-    uint32_t host_enabled, CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
+    CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
 );
 
 /**
  * Import every peer descriptor and publish a device CommContext.
  *
  * descriptors must contain exactly one entry
- * for every dense domain rank. HBM descriptors lead the table; optional Host
- * descriptors follow in pool-slot order.
+ * for every dense domain rank.
  * The returned context and all imported mappings remain live until
  *
  * comm_global_domain_release().
  */
 int comm_global_domain_import(
     uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count, uint64_t *device_ctx_out
+);
+
+/** Import a raw Host export into an imported domain, returning its device view.
+ * The view shares the domain's VIEWS-stage lifetime and has no domain rank.
+ */
+int comm_global_domain_import_host(
+    uint64_t domain_id, uint32_t profile, const uint8_t *token, size_t token_size, size_t mapping_size,
+    uint64_t *base_out
 );
 
 /**
@@ -319,7 +326,7 @@ int comm_global_domain_import(
  */
 int comm_global_domain_release(uint64_t domain_id, uint32_t stage);
 
-// Resolve an owned/imported pool without exposing a second address registry.
+// Resolve an owned/imported rank window.
 int comm_global_domain_window(uint64_t domain_id, uint32_t slot, uint64_t *base, size_t *size);
 
 /**

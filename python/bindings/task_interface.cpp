@@ -4254,18 +4254,16 @@ NB_MODULE(_task_interface, m) {
         .def(
             "comm_global_domain_prepare",
             [](ChipWorker &self, uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size,
-               uint32_t profile, bool host_enabled) {
-                auto [descriptor, local_window_base, actual_window_size] = self.comm_global_domain_prepare(
-                    domain_id, domain_rank, rank_count, window_size, profile, host_enabled
-                );
+               uint32_t profile) {
+                auto [descriptor, local_window_base, actual_window_size] =
+                    self.comm_global_domain_prepare(domain_id, domain_rank, rank_count, window_size, profile);
                 return nb::make_tuple(
                     nb::bytes(reinterpret_cast<const char *>(descriptor.data()), descriptor.size()), local_window_base,
                     actual_window_size
                 );
             },
             nb::arg("domain_id"), nb::arg("domain_rank"), nb::arg("rank_count"), nb::arg("window_size"),
-            nb::arg("profile"), nb::arg("host_enabled") = false,
-            "Create a Global CommDomain local window and return its transport descriptor."
+            nb::arg("profile"), "Create a Global CommDomain local window and return its transport descriptor."
         )
         .def(
             "comm_global_domain_import",
@@ -4278,6 +4276,18 @@ NB_MODULE(_task_interface, m) {
             },
             nb::arg("domain_id"), nb::arg("descriptors"),
             "Import a rank-ordered Global CommDomain descriptor table and return the device context."
+        )
+        .def(
+            "comm_global_domain_import_host",
+            [](ChipWorker &self, uint64_t domain_id, uint32_t profile, nb::bytes token, size_t mapping_size) {
+                std::vector<uint8_t> token_bytes(
+                    reinterpret_cast<const uint8_t *>(token.c_str()),
+                    reinterpret_cast<const uint8_t *>(token.c_str()) + token.size()
+                );
+                return self.comm_global_domain_import_host(domain_id, profile, token_bytes, mapping_size);
+            },
+            nb::arg("domain_id"), nb::arg("profile"), nb::arg("token"), nb::arg("mapping_size"),
+            "Import a raw Host export and return its device view."
         )
         .def(
             "comm_global_domain_release", &ChipWorker::comm_global_domain_release, nb::arg("domain_id"),

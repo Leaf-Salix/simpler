@@ -406,10 +406,12 @@ public:
     void
     comm_release_domain_windows(uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
     std::tuple<std::vector<uint8_t>, uint64_t, size_t> comm_global_domain_prepare(
-        uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
-        bool host_enabled = false
+        uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile
     );
     uint64_t comm_global_domain_import(uint64_t domain_id, const std::vector<uint8_t> &descriptors);
+    uint64_t comm_global_domain_import_host(
+        uint64_t domain_id, uint32_t profile, const std::vector<uint8_t> &token, size_t mapping_size
+    );
     void comm_global_domain_release(uint64_t domain_id, uint32_t stage = 0);
     std::pair<uint64_t, size_t> comm_global_domain_window(uint64_t domain_id, uint32_t slot);
     void comm_barrier(uint64_t comm_handle);
@@ -594,10 +596,11 @@ private:
         int (*)(void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint64_t *, uint64_t *, size_t *);
     using CommReleaseDomainWindowsFn = int (*)(void *, uint64_t, size_t, uint32_t);
     using CommGlobalDomainPrepareFn =
-        int (*)(uint64_t, uint32_t, uint32_t, size_t, uint32_t, uint32_t, CommGlobalDomainDescriptor *, uint64_t *);
+        int (*)(uint64_t, uint32_t, uint32_t, size_t, uint32_t, CommGlobalDomainDescriptor *, uint64_t *);
     using CommGlobalDomainImportFn = int (*)(uint64_t, const CommGlobalDomainDescriptor *, size_t, uint64_t *);
     using CommGlobalDomainReleaseFn = int (*)(uint64_t, uint32_t);
     using CommGlobalDomainWindowFn = decltype(&::comm_global_domain_window);
+    using CommGlobalDomainImportHostFn = decltype(&::comm_global_domain_import_host);
     using CommBarrierFn = int (*)(void *);
     using CommDestroyFn = int (*)(void *);
     using KernelSupportedFn = decltype(&simpler_kernel_mode_supported);
@@ -727,6 +730,7 @@ private:
     CommGlobalDomainImportFn comm_global_domain_import_fn_ = nullptr;
     CommGlobalDomainReleaseFn comm_global_domain_release_fn_ = nullptr;
     CommGlobalDomainWindowFn comm_global_domain_window_fn_ = nullptr;
+    CommGlobalDomainImportHostFn comm_global_domain_import_host_fn_ = nullptr;
     CommBarrierFn comm_barrier_fn_ = nullptr;
     CommDestroyFn comm_destroy_fn_ = nullptr;
     KernelSupportedFn kernel_supported_fn_ = nullptr;

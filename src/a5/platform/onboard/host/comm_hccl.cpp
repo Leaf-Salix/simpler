@@ -1959,9 +1959,8 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
     return -1;
 }
 
-extern "C" int comm_global_domain_prepare(
-    uint64_t, uint32_t, uint32_t, size_t, uint32_t, uint32_t, CommGlobalDomainDescriptor *, uint64_t *
-) {
+extern "C" int
+comm_global_domain_prepare(uint64_t, uint32_t, uint32_t, size_t, uint32_t, CommGlobalDomainDescriptor *, uint64_t *) {
     LOG_ERROR("[comm] Global CommDomain is not supported by the a5 backend");
     return -1;
 }

@@ -450,6 +450,8 @@ void ChipWorker::init(
         comm_global_domain_import_fn_ = module->required<CommGlobalDomainImportFn>("comm_global_domain_import");
         comm_global_domain_release_fn_ = module->required<CommGlobalDomainReleaseFn>("comm_global_domain_release");
         comm_global_domain_window_fn_ = module->required<CommGlobalDomainWindowFn>("comm_global_domain_window");
+        comm_global_domain_import_host_fn_ =
+            module->optional<CommGlobalDomainImportHostFn>("comm_global_domain_import_host");
         comm_barrier_fn_ = module->required<CommBarrierFn>("comm_barrier");
         comm_destroy_fn_ = module->required<CommDestroyFn>("comm_destroy");
         kernel_supported_fn = module->required<KernelSupportedFn>("simpler_kernel_mode_supported");
@@ -901,6 +903,7 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     comm_global_domain_import_fn_ = nullptr;
     comm_global_domain_release_fn_ = nullptr;
     comm_global_domain_window_fn_ = nullptr;
+    comm_global_domain_import_host_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
     set_retain_runs_fn_ = nullptr;
@@ -2379,20 +2382,19 @@ void ChipWorker::comm_release_domain_windows(
 }
 
 std::tuple<std::vector<uint8_t>, uint64_t, size_t> ChipWorker::comm_global_domain_prepare(
-    uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
-    bool host_enabled
+    uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile
 ) {
     if (comm_global_domain_prepare_fn_ == nullptr) {
         throw std::runtime_error("comm_global_domain_prepare is not supported by this runtime");
     }
-    auto [tracked, inserted] = global_domain_ids_.emplace(domain_id, host_enabled ? profile : 0);
+    auto [tracked, inserted] = global_domain_ids_.emplace(domain_id, 0);
     if (!inserted) {
         throw std::runtime_error("comm_global_domain_prepare received a duplicate domain_id");
     }
     CommGlobalDomainDescriptor descriptor{};
     uint64_t local_window_base = 0;
     int rc = comm_global_domain_prepare_fn_(
-        domain_id, domain_rank, rank_count, window_size, profile, host_enabled, &descriptor, &local_window_base
+        domain_id, domain_rank, rank_count, window_size, profile, &descriptor, &local_window_base
     );
     if (rc != 0) {
         throw std::runtime_error("comm_global_domain_prepare failed with code " + std::to_string(rc));
@@ -2424,6 +2426,25 @@ uint64_t ChipWorker::comm_global_domain_import(uint64_t domain_id, const std::ve
         throw std::runtime_error("comm_global_domain_import returned a null device context");
     }
     return device_ctx;
+}
+
+uint64_t ChipWorker::comm_global_domain_import_host(
+    uint64_t domain_id, uint32_t profile, const std::vector<uint8_t> &token, size_t mapping_size
+) {
+    if (comm_global_domain_import_host_fn_ == nullptr) {
+        throw std::runtime_error("comm_global_domain_import_host is not supported by this runtime");
+    }
+    auto tracked = global_domain_ids_.find(domain_id);
+    if (tracked == global_domain_ids_.end()) {
+        throw std::runtime_error("comm_global_domain_import_host requires a prepared domain");
+    }
+    tracked->second = profile;
+    uint64_t base = 0;
+    int rc = comm_global_domain_import_host_fn_(domain_id, profile, token.data(), token.size(), mapping_size, &base);
+    if (rc != 0 || base == 0) {
+        throw std::runtime_error("comm_global_domain_import_host failed with code " + std::to_string(rc));
+    }
+    return base;
 }
 
 void ChipWorker::comm_global_domain_release(uint64_t domain_id, uint32_t stage) {

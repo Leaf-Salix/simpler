@@ -44,3 +44,35 @@ def test_authorization_targets_preserve_real_identities_and_reject_invalid_profi
             backend.host_authorization_targets("a3-fabric-v1", identities)
     with pytest.raises(ValueError, match="not implemented"):
         backend.host_authorization_targets("unknown", (101,))
+
+
+def test_a3_allocation_exports_platform_token_without_rank(monkeypatch):
+    from simpler.comm_domain import HostWindowSpec  # noqa: PLC0415
+    from simpler.global_comm_domain import HostExportDescriptor  # noqa: PLC0415
+
+    native = MagicMock(base=1234)
+    native.allocate.return_value = (4096, b"t" * 128)
+    monkeypatch.setattr(backend, "_HostDomainMemory", lambda: native)
+    owner = backend.A3HostBacking()
+    base, export = owner.allocate(HostWindowSpec(128, numa_id=1), None, 2)
+    native.allocate.assert_called_once_with(2, 1, 128)
+    assert base == 1234
+    assert export == HostExportDescriptor(2, 4096, b"t" * 128)
+
+
+def test_shared_allocation_keeps_buffer_identity_and_exports_no_rank(monkeypatch):
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from simpler.comm_domain import HostWindowSpec  # noqa: PLC0415
+    from simpler.global_comm_domain import HostExportDescriptor  # noqa: PLC0415
+
+    shared = SimpleNamespace(base=1234, body=b"/shared-token")
+    create = MagicMock(return_value=shared)
+    monkeypatch.setattr(backend, "create_host_shared_buffer", create)
+    monkeypatch.setattr(backend.os, "sysconf", lambda _: 4096)
+    owner = backend.SharedHostBacking()
+    identity = SimpleNamespace(owner_instance_id=b"owner-id", buffer_id=55, generation=3)
+    base, export = owner.allocate(HostWindowSpec(128), identity, 0)
+    create.assert_called_once_with(4096, b"owner-id", 55, generation=3)
+    assert base == 1234
+    assert export == HostExportDescriptor(1, 4096, b"/shared-token")

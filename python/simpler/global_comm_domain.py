@@ -60,7 +60,7 @@ if TYPE_CHECKING:
 #: descriptor it exports and ``_validate_descriptor`` checks it on decode, so advancing one
 #: without the other fails every allocation at PREPARE. The ``LOCAL_*`` L3->L2 mailbox structs
 #: in ``worker.py`` also carry it; producer and consumer there are the same build.
-GLOBAL_DOMAIN_VERSION = 3
+GLOBAL_DOMAIN_VERSION = 2
 GLOBAL_DOMAIN_MAX_RANKS = 64
 GLOBAL_DOMAIN_MAX_BUFFERS = 64
 GLOBAL_DOMAIN_MAX_ATTACHMENT_ROWS = GLOBAL_DOMAIN_MAX_RANKS
@@ -79,7 +79,8 @@ GLOBAL_DOMAIN_MAX_COPY_BYTES = 8 * 1024 * 1024
 GLOBAL_DOMAIN_COPY_MAGIC = 0x434F5059
 GLOBAL_DOMAIN_COPY_VERSION = 1
 GLOBAL_DOMAIN_BUFFER_REF_BYTES = 104
-_DOMAIN_COMMAND_MAGIC = b"SDC1"
+GLOBAL_DOMAIN_COMMAND_VERSION = 2
+_DOMAIN_COMMAND_MAGIC = f"SDC{GLOBAL_DOMAIN_COMMAND_VERSION}".encode("ascii")
 _HOST_WINDOW = struct.Struct("<iiQQ")
 
 CTRL_GLOBAL_DOMAIN_PREPARE = 19
@@ -232,10 +233,20 @@ def resolve_global_comm_capability(*, platform: str, profile: str, local_device_
 
 
 @dataclass(frozen=True)
+class HostExportDescriptor:
+    """Platform token for a Host window; physical identity belongs to its HostWindow."""
+
+    profile_id: int
+    mapping_size: int
+    handle: bytes
+
+
+@dataclass(frozen=True)
 class GlobalDomainHostWindow:
     node_worker_id: int
     spec: HostWindowSpec
     buffer_id: int
+    export: HostExportDescriptor | None = None
 
 
 @dataclass(frozen=True)
@@ -358,7 +369,7 @@ def _validate_descriptor(descriptor: GlobalDomainDescriptor) -> None:
         raise ValueError("global domain descriptor profile is unknown")
     if descriptor.rank_count <= 0 or descriptor.rank_count > GLOBAL_DOMAIN_MAX_RANKS:
         raise ValueError("global domain descriptor rank_count is invalid")
-    if descriptor.domain_rank < 0 or descriptor.domain_rank >= 2 * descriptor.rank_count:
+    if descriptor.domain_rank < 0 or descriptor.domain_rank >= descriptor.rank_count:
         raise ValueError("global domain descriptor domain_rank is invalid")
     if not 0 < descriptor.mapping_size < 2**64:
         raise ValueError("global domain descriptor mapping_size must be positive")
@@ -541,15 +552,17 @@ def validate_attachment_table(
 
 
 def validate_descriptor_table(
-    descriptors: tuple[GlobalDomainDescriptor, ...], *, rank_count: int, profile: str, host_sizes=()
+    descriptors: tuple[GlobalDomainDescriptor, ...], *, rank_count: int, profile: str
 ) -> None:
     if profile not in GLOBAL_DOMAIN_PROFILE_IDS:
         raise ValueError(f"unsupported global domain profile {profile!r}")
-    if len(descriptors) != rank_count + len(host_sizes):
+    if not 0 < rank_count <= GLOBAL_DOMAIN_MAX_RANKS:
+        raise ValueError("global domain descriptor rank_count is invalid")
+    if len(descriptors) != rank_count:
         raise ValueError("global domain descriptor table is incomplete")
     expected_profile = GLOBAL_DOMAIN_PROFILE_IDS[profile]
     ranks = set()
-    for descriptor in descriptors[:rank_count]:
+    for descriptor in descriptors:
         _validate_descriptor(descriptor)
         if descriptor.profile_id != expected_profile or descriptor.rank_count != rank_count:
             raise ValueError("global domain descriptor profile or rank_count mismatch")
@@ -560,19 +573,6 @@ def validate_descriptor_table(
             raise ValueError("global domain descriptor mapping sizes differ")
     if ranks != set(range(rank_count)):
         raise ValueError("global domain descriptor table has missing ranks")
-    for slot, nbytes in enumerate(host_sizes, rank_count):
-        descriptor = descriptors[slot]
-        _validate_descriptor(descriptor)
-        if (
-            descriptor.profile_id != expected_profile
-            or descriptor.rank_count != rank_count
-            or descriptor.domain_rank != slot
-        ):
-            raise ValueError("Host export slot or profile mismatch")
-        if descriptor.mapping_size < nbytes:
-            raise ValueError("Host export mapping is smaller than its logical window")
-        if profile == GLOBAL_DOMAIN_PROFILE_A3_FABRIC and len(descriptor.handle) != 128:
-            raise ValueError("Host Fabric handle must contain 128 bytes")
 
 
 def _put_member(out: bytearray, member: GlobalDomainMember) -> None:
@@ -707,12 +707,86 @@ def _validate_host_windows(command: GlobalDomainCommand) -> None:
     if not command.owner_instance_id or len(set(identities)) != len(identities):
         raise ValueError("Host windows require a creator and distinct Buffer identities")
     for host in hosts:
-        if (
-            not 0 <= host.node_worker_id < 2**31
-            or not isinstance(host.spec, HostWindowSpec)
-            or not 0 < host.buffer_id < 2**64
-        ):
-            raise ValueError("invalid Host window specification or Buffer identity")
+        _validate_host_window(host)
+        if host.export is not None and host.export.profile_id != GLOBAL_DOMAIN_PROFILE_IDS.get(command.profile):
+            raise ValueError("Host export profile differs from its domain")
+    if command.phase in (GlobalDomainPhase.IMPORT, GlobalDomainPhase.COMMIT) and any(
+        host.export is None for host in hosts
+    ):
+        raise ValueError("Host IMPORT/COMMIT requires every Host window export")
+
+
+def _validate_host_window(host: GlobalDomainHostWindow) -> None:
+    if (
+        not 0 <= host.node_worker_id < 2**31
+        or not isinstance(host.spec, HostWindowSpec)
+        or not 0 < host.buffer_id < 2**64
+    ):
+        raise ValueError("invalid Host window specification or Buffer identity")
+    export = host.export
+    if export is None:
+        return
+    if not isinstance(export, HostExportDescriptor) or export.profile_id not in GLOBAL_DOMAIN_PROFILE_IDS.values():
+        raise ValueError("Host export profile is unknown")
+    if not host.spec.nbytes <= export.mapping_size < 2**64:
+        raise ValueError("Host export mapping is smaller than its logical window")
+    if not export.handle or len(export.handle) > GLOBAL_DOMAIN_HANDLE_BYTES:
+        raise ValueError("Host export handle size is invalid")
+    if export.profile_id == GLOBAL_DOMAIN_PROFILE_IDS[GLOBAL_DOMAIN_PROFILE_A3_FABRIC] and len(export.handle) != 128:
+        raise ValueError("Host Fabric handle must contain 128 bytes")
+
+
+def _put_host_windows(out: bytearray, hosts: tuple[GlobalDomainHostWindow, ...]) -> None:
+    if len(hosts) > GLOBAL_DOMAIN_MAX_RANKS:
+        raise ValueError("Host window count exceeds maximum")
+    if len({host.buffer_id for host in hosts}) != len(hosts) or len({host.node_worker_id for host in hosts}) != len(
+        hosts
+    ):
+        raise ValueError("Host window exports contain duplicate source identities")
+    out.extend(struct.pack("<I", len(hosts)))
+    for host in hosts:
+        _validate_host_window(host)
+        out.extend(_HOST_WINDOW.pack(host.node_worker_id, host.spec.numa_id, host.spec.nbytes, host.buffer_id))
+        out.extend(struct.pack("<?", host.export is not None))
+        if host.export is not None:
+            out.extend(struct.pack("<IQ", host.export.profile_id, host.export.mapping_size))
+            _put_blob(out, host.export.handle, GLOBAL_DOMAIN_HANDLE_BYTES, "Host export handle")
+
+
+def _read_host_windows(reader: _Reader) -> tuple[GlobalDomainHostWindow, ...]:
+    count = reader.u32()
+    if count > GLOBAL_DOMAIN_MAX_RANKS:
+        raise ValueError("Host window count exceeds maximum")
+    hosts = []
+    for _ in range(count):
+        node, numa, nbytes, buffer_id = _HOST_WINDOW.unpack(reader.fixed(_HOST_WINDOW.size, "Host window"))
+        present = reader.fixed(1, "Host export presence")
+        if present not in (b"\x00", b"\x01"):
+            raise ValueError("Host export presence is invalid")
+        export = None
+        if present == b"\x01":
+            export = HostExportDescriptor(
+                reader.u32(), reader.u64(), reader.blob(GLOBAL_DOMAIN_HANDLE_BYTES, "Host export handle")
+            )
+        hosts.append(GlobalDomainHostWindow(node, HostWindowSpec(nbytes=nbytes, numa_id=numa), buffer_id, export))
+    return tuple(hosts)
+
+
+def encode_host_exports(hosts: tuple[GlobalDomainHostWindow, ...]) -> bytes:
+    """Exchange prepared Host tokens with their physical node and Buffer identity."""
+    if any(host.export is None for host in hosts):
+        raise ValueError("Host export reply requires an export for every source")
+    out = bytearray()
+    _put_host_windows(out, hosts)
+    return bytes(out)
+
+
+def decode_host_exports(data: bytes) -> tuple[GlobalDomainHostWindow, ...]:
+    reader = _Reader(data)
+    hosts = _read_host_windows(reader)
+    reader.done("Host exports")
+    encode_host_exports(hosts)
+    return hosts
 
 
 def validate_backing_table(backings: tuple[BufferDescriptor, ...], sizes: tuple[int, ...], rank_count: int) -> None:
@@ -768,10 +842,9 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
             command.descriptors,
             rank_count=len(command.members),
             profile=command.profile,
-            host_sizes=tuple(host.spec.nbytes for host in command.host_windows),
         )
     if command.phase in (GlobalDomainPhase.IMPORT, GlobalDomainPhase.COMMIT):
-        if len(command.descriptors) != len(command.members) + len(command.host_windows):
+        if len(command.descriptors) != len(command.members):
             raise ValueError("global domain IMPORT/COMMIT requires a complete descriptor table")
     elif command.descriptors:
         raise ValueError("global domain PREPARE/ABORT must not carry descriptors")
@@ -813,9 +886,7 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
     out.extend(struct.pack("<I", len(command.descriptors)))
     for descriptor in command.descriptors:
         out.extend(descriptor.encode())
-    out.extend(struct.pack("<I", len(command.host_windows)))
-    for host in command.host_windows:
-        out.extend(_HOST_WINDOW.pack(host.node_worker_id, host.spec.numa_id, host.spec.nbytes, host.buffer_id))
+    _put_host_windows(out, command.host_windows)
     out.extend(struct.pack("<I", len(command.backings)))
     for backing in command.backings:
         out.extend(_encode_buffer_descriptor_wire(backing))
@@ -828,7 +899,7 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
 def decode_domain_command(data: bytes) -> GlobalDomainCommand:
     reader = _Reader(data)
     if reader.fixed(4, "domain command magic") != _DOMAIN_COMMAND_MAGIC:
-        raise ValueError("global domain command format is unknown")
+        raise ValueError("global domain command protocol version mismatch; use the same build on all nodes")
     try:
         phase = GlobalDomainPhase(reader.u32())
     except ValueError as exc:
@@ -865,21 +936,13 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
         for _ in range(buffer_count)
     )
     descriptor_count = reader.u32()
-    if descriptor_count > 2 * GLOBAL_DOMAIN_MAX_RANKS:
+    if descriptor_count > GLOBAL_DOMAIN_MAX_RANKS:
         raise ValueError("global domain command descriptor count exceeds maximum")
     descriptors = tuple(
         GlobalDomainDescriptor.decode(reader.fixed(GLOBAL_DOMAIN_DESCRIPTOR_BYTES, "descriptor"))
         for _ in range(descriptor_count)
     )
-    host_count = reader.u32()
-    if host_count > GLOBAL_DOMAIN_MAX_RANKS:
-        raise ValueError("Host window count exceeds maximum")
-    host_windows = tuple(
-        GlobalDomainHostWindow(node, HostWindowSpec(nbytes=nbytes, numa_id=numa), buffer_id)
-        for node, numa, nbytes, buffer_id in _HOST_WINDOW.iter_unpack(
-            reader.fixed(host_count * _HOST_WINDOW.size, "Host windows")
-        )
-    )
+    host_windows = _read_host_windows(reader)
     backing_count = reader.u32()
     if backing_count > member_count * buffer_count:
         raise ValueError("domain backing reference count exceeds its declared slices")
@@ -911,7 +974,7 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
 
 
 def encode_descriptor_table(descriptors: tuple[GlobalDomainDescriptor, ...]) -> bytes:
-    if len(descriptors) > 2 * GLOBAL_DOMAIN_MAX_RANKS:
+    if len(descriptors) > GLOBAL_DOMAIN_MAX_RANKS:
         raise ValueError("global domain descriptor table exceeds maximum")
     return struct.pack("<I", len(descriptors)) + b"".join(descriptor.encode() for descriptor in descriptors)
 
@@ -919,7 +982,7 @@ def encode_descriptor_table(descriptors: tuple[GlobalDomainDescriptor, ...]) -> 
 def decode_descriptor_table(data: bytes) -> tuple[GlobalDomainDescriptor, ...]:
     reader = _Reader(data)
     count = reader.u32()
-    if count > 2 * GLOBAL_DOMAIN_MAX_RANKS:
+    if count > GLOBAL_DOMAIN_MAX_RANKS:
         raise ValueError("global domain descriptor table exceeds maximum")
     descriptors = tuple(
         GlobalDomainDescriptor.decode(reader.fixed(GLOBAL_DOMAIN_DESCRIPTOR_BYTES, "descriptor")) for _ in range(count)

@@ -49,3 +49,11 @@ python -m tests.st.worker.comm_domain.host_domain_matrix \
 - L4 的 `domain.host(node)` 是资源描述，不是本地映射；设备 `map_view` 仍在持有相应 attachment 的 L3 上选择。矩阵初始化和校验均走上述公共 API。
 - 当前实现仍是每节点一个域内 Host backing，并非 Buffer 先行、多 shard/owner 或 #1836 的完整 attachment 轴。`backings` 是跨节点传递 canonical identity 的 wire 表，消费授权仍由现有 ImportRegistry 完成，不建立第二 registry。
 - 控制面按可信节点模型运行，PID 来源是 PREPARE 返回的各 chip 身份；这不等价于对恶意控制端的身份认证。未授权 PID 的真机负向测试尚未完成。两端要求同一构建；copy 消息显式校验自身版本。
+
+## Host 与 rank 的协议边界
+
+rank descriptor 固定每个 NPU member 一条，native descriptor 版本保持 2。Host 的 `HostExportDescriptor` 只保存 profile、物理映射大小与 opaque handle，绑定命令中的 node / Buffer identity，不携带 rank。Python 命令使用 SDC2，交换阶段校验 Host source，IMPORT / COMMIT 之后禁止替换导出结果。
+
+Host 使用独立 `comm_global_domain_import_host` 导入，返回地址供现有 ImportRegistry 建立消费绑定；`comm_global_domain_window` 仅接受真实 NPU rank。底层仍复用 VMM peer 引用和 VIEWS→OWNERS 回收，不要求为 Host 分配 communicator rank。现有 Host 消费 NPU 窗口的 attachment 行继续保留；Host provider / consumer 的完整公共 attachment 模型仍须按设计验收，当前不能宣称 #1836 全部交付。
+
+A3 全局 Fabric HBM 与 Host view 均采用 NoUC，保证已有 SDMA 消费所需地址属性；非全局 Fabric 路径保持原策略。全局无 Host 场景也采用此映射属性，其硬件行为和性能需重新验收，不能从模拟器通过推断。

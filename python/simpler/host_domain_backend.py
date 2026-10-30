@@ -18,8 +18,7 @@ from .global_comm_domain import (
     GLOBAL_DOMAIN_PROFILE_A3_FABRIC,
     GLOBAL_DOMAIN_PROFILE_IDS,
     GLOBAL_DOMAIN_PROFILE_SIM,
-    GLOBAL_DOMAIN_VERSION,
-    GlobalDomainDescriptor,
+    HostExportDescriptor,
 )
 
 
@@ -37,7 +36,7 @@ class SharedHostBacking:
     def authorize(self, identities):
         pass
 
-    def allocate(self, spec, identity, device, rank_count):
+    def allocate(self, spec, identity, device):
         page_size = os.sysconf("SC_PAGE_SIZE")
         mapping_size = (spec.nbytes + page_size - 1) // page_size * page_size
         self.shared = create_host_shared_buffer(
@@ -46,11 +45,8 @@ class SharedHostBacking:
             identity.buffer_id,
             generation=identity.generation,
         )
-        return self.shared.base, GlobalDomainDescriptor(
-            GLOBAL_DOMAIN_VERSION,
+        return self.shared.base, HostExportDescriptor(
             GLOBAL_DOMAIN_PROFILE_IDS[GLOBAL_DOMAIN_PROFILE_SIM],
-            0,
-            rank_count,
             mapping_size,
             self.shared.body,
         )
@@ -67,13 +63,10 @@ class A3HostBacking:
     def __init__(self):
         self.native = _HostDomainMemory()
 
-    def allocate(self, spec, identity, device, rank_count):
+    def allocate(self, spec, identity, device):
         size, token = self.native.allocate(device, spec.numa_id, spec.nbytes)
-        return self.native.base, GlobalDomainDescriptor(
-            GLOBAL_DOMAIN_VERSION,
+        return self.native.base, HostExportDescriptor(
             GLOBAL_DOMAIN_PROFILE_IDS[GLOBAL_DOMAIN_PROFILE_A3_FABRIC],
-            0,
-            rank_count,
             size,
             token,
         )
@@ -108,7 +101,7 @@ def host_backing_type(platform):
         raise ValueError(f"Host domain backing is not implemented for {platform!r}") from None
 
 
-def host_attachment_profile(descriptor: GlobalDomainDescriptor, platform: str) -> AdapterProfile:
+def host_attachment_profile(descriptor: HostExportDescriptor, platform: str) -> AdapterProfile:
     expected = GLOBAL_DOMAIN_PROFILE_SIM if platform == "a2a3sim" else GLOBAL_DOMAIN_PROFILE_A3_FABRIC
     backend = host_backing_type(platform)
     if descriptor.profile_id != GLOBAL_DOMAIN_PROFILE_IDS[expected]:

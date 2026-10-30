@@ -1214,19 +1214,15 @@ def test_borrowed_session_commit_and_revocation(monkeypatch, request, scenario, 
         128 * len(backings),
         members,
         tuple(domain_wire.GlobalDomainBuffer("payload" if i == 0 else "extra", 128) for i in range(len(backings))),
-        (domain_wire.GlobalDomainDescriptor(domain_wire.GLOBAL_DOMAIN_VERSION, 1, 0, 1, 4096, b"unit"),)
-        + (
-            (
-                domain_wire.GlobalDomainDescriptor(
-                    domain_wire.GLOBAL_DOMAIN_VERSION, 1, 1, 1, host_owner.nbytes, host_token
-                ),
-            )
-            if host_owner is not None
-            else ()
-        ),
+        (domain_wire.GlobalDomainDescriptor(domain_wire.GLOBAL_DOMAIN_VERSION, 1, 0, 1, 4096, b"unit"),),
         owner_instance_id=host_owner.identity.owner_instance_id if host_owner is not None else mint_owner_instance_id(),
         host_windows=(
-            domain_wire.GlobalDomainHostWindow(0, HostWindowSpec(nbytes=128, numa_id=0), host_owner.identity.buffer_id),
+            domain_wire.GlobalDomainHostWindow(
+                0,
+                HostWindowSpec(nbytes=128, numa_id=0),
+                host_owner.identity.buffer_id,
+                domain_wire.HostExportDescriptor(1, host_owner.nbytes, host_token),
+            ),
         )
         if host_owner is not None
         else (),

@@ -10,6 +10,7 @@
 import os
 import struct
 from contextlib import nullcontext
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import pytest
@@ -140,7 +141,7 @@ def test_host_domain_native_reference_requires_endpoint_grant(host_worker):
 def test_shared_host_backing_keeps_logical_bounds_and_endpoint_profile(host_worker):
     domain = allocate(host_worker)
     state = host_worker._global_node_domains[domain.domain_id]
-    export = state.descriptors[len(domain.workers)]
+    export = state.command.host_windows[0].export
     assert domain.host().nbytes == 128
     assert export.mapping_size % os.sysconf("SC_PAGE_SIZE") == 0
     assert export.mapping_size >= domain.host().nbytes
@@ -168,7 +169,7 @@ def test_fabric_backing_preserves_logical_extent_and_authorizes_actual_pids(monk
 
     monkeypatch.setattr(host_domain_backend, "_HostDomainMemory", Native)
     backing = A3HostBacking()
-    base, export = backing.allocate(HostWindowSpec(128, numa_id=1), None, 2, 2)
+    base, export = backing.allocate(HostWindowSpec(128, numa_id=1), None, 2)
     assert base == 4096
     assert export.mapping_size == 2097152
     assert export.profile_id == GLOBAL_DOMAIN_PROFILE_IDS[GLOBAL_DOMAIN_PROFILE_A3_FABRIC]
@@ -229,7 +230,7 @@ def test_direct_host_buffer_uses_existing_domain_and_rejects_live_release(monkey
     chip = MagicMock()
     descriptor = GlobalDomainDescriptor(GLOBAL_DOMAIN_VERSION, GLOBAL_DOMAIN_PROFILE_IDS["sim"], 0, 1, 64, b"test")
     chip.comm_global_domain_prepare.return_value = (descriptor.encode(), 4096, 64)
-    chip.comm_global_domain_window.return_value = (8192, 128)
+    chip.comm_global_domain_import_host.return_value = 8192
     worker._chip_worker = chip
     monkeypatch.setattr(worker, "_device_control_admission", lambda _api: nullcontext())
     monkeypatch.setattr(worker, "_comm_plan_rootinfo_path", lambda: "/test/direct-host")
@@ -263,7 +264,7 @@ def test_direct_host_buffer_uses_existing_domain_and_rejects_live_release(monkey
         GlobalDomainReleaseStage.OWNERS,
     ]
     chip.comm_init.assert_not_called()
-    chip.comm_global_domain_prepare.assert_called_once_with(1, 0, 1, 64, GLOBAL_DOMAIN_PROFILE_IDS["sim"], True)
+    chip.comm_global_domain_prepare.assert_called_once_with(1, 0, 1, 64, GLOBAL_DOMAIN_PROFILE_IDS["sim"])
     assert buffer.closed
     assert not worker._direct_host_domains
     with pytest.raises(ValueError, match="not a live allocation"):
@@ -333,3 +334,13 @@ def test_local_domain_rejects_global_host_windows(host_worker, windows):
         allocate(host_worker, host_windows=windows)
     assert not host_worker._global_node_domains
     assert not host_worker._live_domains
+
+
+def test_commit_cannot_change_imported_host_export(host_worker):
+    domain = allocate(host_worker)
+    state = host_worker._domain_state(domain.ref)
+    host = state.command.host_windows[0]
+    changed = replace(host, export=replace(host.export, handle=b"different-host-owner"))
+    with pytest.raises(RuntimeError, match="conflicts with IMPORT"):
+        host_worker._commit_global_domain_node(replace(state.command, host_windows=(changed,)))
+    assert host_worker._domain_state(domain.ref).command.host_windows == (host,)

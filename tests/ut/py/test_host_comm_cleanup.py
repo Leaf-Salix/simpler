@@ -36,3 +36,28 @@ def test_host_global_cleanup_faults(tmp_path):
     executable = tmp_path / "host_comm_cleanup"
     subprocess.run([compiler, "-std=c++17", str(unit), "-o", str(executable)], check=True)
     subprocess.run([str(executable)], check=True)
+
+
+def test_host_global_sim_import_is_independent_of_rank_descriptors(tmp_path):
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("C++ compiler unavailable")
+    root = Path(__file__).resolve().parents[3]
+    source = Path(__file__).parent / "support/host_comm_sim.cpp"
+    executable = tmp_path / "host_comm_sim"
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-pthread",
+            "-I",
+            str(root / "src/common"),
+            "-I",
+            str(root / "src/common/platform/include"),
+            str(source),
+            "-o",
+            str(executable),
+        ],
+        check=True,
+    )
+    subprocess.run([str(executable)], check=True)

@@ -162,7 +162,7 @@ int comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t ran
 
 int comm_global_domain_prepare(
     uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
-    uint32_t host_enabled, CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
+    CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
 ) {
     return PTO_RUNTIME_ERR_INTERNAL;
 }

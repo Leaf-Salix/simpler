@@ -23,7 +23,7 @@ struct VmmWindow {
     bool mapped = true;
 };
 struct DomainAllocation {
-    bool host_enabled = true, views_released = false, release_failed = false;
+    bool views_released = false, release_failed = false;
     void *device_ctx = nullptr;
     VmmWindow local_window;
     std::vector<VmmWindow> peer_windows;
@@ -58,8 +58,12 @@ static DomainAllocation &prepare(bool imported = true) {
 }
 int main() {
     for (bool imported : {false, true}) {
+        prepare(imported);
+        assert(comm_global_domain_release(7, 0) == 0);
+        assert(global_domain_allocations.empty());
+    }
+    for (bool imported : {false, true}) {
         auto &a = prepare(imported);
-        assert(comm_global_domain_release(7, 0) != 0);
         assert(comm_global_domain_release(7, 2) != 0);
         assert(calls.empty());
         assert(comm_global_domain_release(7, 1) == 0);

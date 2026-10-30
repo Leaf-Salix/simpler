@@ -42,7 +42,7 @@ class HostDomainResource:
         self.closed = False
 
     def allocate(self):
-        base, self.export = self.backend.allocate(self.spec, self.identity, self.device, len(self.workers))
+        base, self.export = self.backend.allocate(self.spec, self.identity, self.device)
         self.buffer = Buffer(
             identity=self.identity,
             address_space=AddressSpace.HOST,

@@ -213,7 +213,6 @@ struct GlobalDomainAllocation {
 
     uint32_t rank = 0;
     uint32_t nranks = 0;
-    bool host_enabled = false;
     bool import_started = false;
     bool views_released = false;
     std::string shm_name;
@@ -778,7 +777,7 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
 
 extern "C" int comm_global_domain_prepare(
     uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
-    uint32_t host_enabled, CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
+    CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
 ) try {
     if (domain_id == 0 || rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count ||
         window_size == 0 || profile != COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM || descriptor_out == nullptr ||
@@ -815,7 +814,6 @@ extern "C" int comm_global_domain_prepare(
     std::memset(base, 0, window_size);
 
     auto allocation = std::make_unique<GlobalDomainAllocation>();
-    allocation->host_enabled = host_enabled != 0;
     allocation->rank = domain_rank;
     allocation->nranks = rank_count;
     allocation->shm_name = shm_name;
@@ -853,8 +851,7 @@ extern "C" int comm_global_domain_import(
     }
     auto &allocation = it->second;
     const size_t rank_count = allocation->nranks;
-    if (rank_count == 0 || descriptor_count < rank_count || descriptor_count > 2 * rank_count ||
-        (descriptor_count > rank_count) != allocation->host_enabled || allocation->host_ctx != nullptr ||
+    if (rank_count == 0 || descriptor_count != rank_count || allocation->host_ctx != nullptr ||
         allocation->import_started || allocation->views_released) {
         return -1;
     }
@@ -904,28 +901,6 @@ extern "C" int comm_global_domain_import(
         ctx->windowsOut[rank] = reinterpret_cast<uint64_t>(base);
     }
 
-    for (size_t i = rank_count; i < descriptor_count; ++i) {
-        const auto &host = descriptors[i];
-        if (host.version != COMM_GLOBAL_DOMAIN_VERSION || host.profile != COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM ||
-            host.domain_rank != i || host.rank_count != rank_count || !host.mapping_size || !host.handle_size ||
-            host.handle_size > COMM_GLOBAL_DOMAIN_HANDLE_BYTES)
-            return -1;
-        std::string name(reinterpret_cast<const char *>(host.handle), host.handle_size);
-        if (name.find('\0') != std::string::npos) return -1;
-        if (name.front() != '/') name.insert(name.begin(), '/');
-        int fd = shm_open(name.c_str(), O_RDWR, 0600);
-        if (fd < 0) return -1;
-        struct stat backing{};
-        if (fstat(fd, &backing) != 0 || backing.st_size < 0 ||
-            static_cast<uint64_t>(backing.st_size) < host.mapping_size) {
-            close(fd);
-            return -1;
-        }
-        void *base = mmap(nullptr, host.mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        close(fd);
-        if (base == MAP_FAILED) return -1;
-        peer_mappings.emplace_back(base, host.mapping_size);
-    }
     *device_ctx_out = reinterpret_cast<uint64_t>(ctx.get());
     allocation->host_ctx = std::move(ctx);
     return 0;
@@ -937,6 +912,39 @@ extern "C" int comm_global_domain_import(
     return -1;
 }
 
+extern "C" int comm_global_domain_import_host(
+    uint64_t domain_id, uint32_t profile, const uint8_t *token, size_t token_size, size_t mapping_size,
+    uint64_t *base_out
+) try {
+    if (profile != COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM || token == nullptr || token_size == 0 ||
+        token_size > COMM_GLOBAL_DOMAIN_HANDLE_BYTES || mapping_size == 0 || base_out == nullptr)
+        return -1;
+    std::scoped_lock lock(global_domain_allocations_mutex);
+    auto it = global_domain_allocations.find(domain_id);
+    if (it == global_domain_allocations.end()) return -1;
+    auto &allocation = *it->second;
+    if (!allocation.host_ctx || allocation.views_released) return -1;
+    std::string name(reinterpret_cast<const char *>(token), token_size);
+    if (name.find('\0') != std::string::npos) return -1;
+    if (name.front() != '/') name.insert(name.begin(), '/');
+    int fd = shm_open(name.c_str(), O_RDWR, 0600);
+    if (fd < 0) return -1;
+    struct stat backing{};
+    if (fstat(fd, &backing) != 0 || backing.st_size < 0 || static_cast<uint64_t>(backing.st_size) < mapping_size) {
+        close(fd);
+        return -1;
+    }
+    void *base = mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (base == MAP_FAILED) return -1;
+    GlobalPeerMapping view(base, mapping_size);
+    allocation.peer_mappings.push_back(std::move(view));
+    *base_out = reinterpret_cast<uint64_t>(base);
+    return 0;
+} catch (...) {
+    return -1;
+}
+
 extern "C" int comm_global_domain_release(uint64_t domain_id, uint32_t stage) try {
     std::scoped_lock lock(global_domain_allocations_mutex);
     auto it = global_domain_allocations.find(domain_id);
@@ -944,7 +952,7 @@ extern "C" int comm_global_domain_release(uint64_t domain_id, uint32_t stage) tr
         return 0;
     }
     auto &a = *it->second;
-    if (stage > 2 || (a.host_enabled && stage == 0) || (stage == 2 && !a.views_released)) return -1;
+    if (stage > 2 || (stage == 2 && !a.views_released)) return -1;
     a.host_ctx.reset();
     a.peer_mappings.clear();
     a.views_released = true;
@@ -960,11 +968,8 @@ extern "C" int comm_global_domain_release(uint64_t domain_id, uint32_t stage) tr
 }
 
 static std::pair<void *, size_t> global_window(GlobalDomainAllocation &a, uint32_t slot) {
-    if (!a.host_ctx) return {nullptr, 0};
-    if (slot < a.nranks) return {reinterpret_cast<void *>(a.host_ctx->windowsIn[slot]), a.mapping_size};
-    const size_t index = slot - 1;
-    if (index >= a.peer_mappings.size()) return {nullptr, 0};
-    return {a.peer_mappings[index].base, a.peer_mappings[index].size};
+    if (!a.host_ctx || slot >= a.nranks) return {nullptr, 0};
+    return {reinterpret_cast<void *>(a.host_ctx->windowsIn[slot]), a.mapping_size};
 }
 
 extern "C" int comm_global_domain_window(uint64_t id, uint32_t slot, uint64_t *base, size_t *size) {

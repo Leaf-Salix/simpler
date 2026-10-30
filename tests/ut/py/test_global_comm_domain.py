@@ -63,11 +63,13 @@ from simpler.global_comm_domain import (
     GlobalDomainMember,
     GlobalDomainPhase,
     GlobalDomainReleaseCommand,
+    HostExportDescriptor,
     decode_comm_init,
     decode_copy_command,
     decode_descriptor_table,
     decode_domain_buffer_refs,
     decode_domain_command,
+    decode_host_exports,
     decode_release_command,
     encode_comm_init,
     encode_comm_init_result,
@@ -75,6 +77,7 @@ from simpler.global_comm_domain import (
     encode_descriptor_table,
     encode_domain_buffer_refs,
     encode_domain_command,
+    encode_host_exports,
     encode_release_command,
     resolve_global_comm_capability,
     validate_descriptor_table,
@@ -2045,3 +2048,106 @@ def test_host_copy_target_is_separate_from_rank_and_versioned(writing):
     struct.pack_into("<I", wrong_version, 4, 99)
     with pytest.raises(ValueError, match="version mismatch"):
         decode_copy_command(bytes(wrong_version), include_data=writing)
+
+
+@pytest.mark.parametrize("profile,token", [("sim", b"/host-source"), ("a3-fabric-v1", b"t" * 128)])
+def test_host_exports_roundtrip_without_rank_identity(profile, token):
+    host = GlobalDomainHostWindow(
+        7,
+        HostWindowSpec(128, numa_id=1),
+        55,
+        HostExportDescriptor(GLOBAL_DOMAIN_PROFILE_IDS[profile], 4096, token),
+    )
+    assert decode_host_exports(encode_host_exports((host,))) == (host,)
+    assert not hasattr(host.export, "domain_rank")
+    assert not hasattr(host.export, "rank_count")
+    with pytest.raises(ValueError, match="duplicate source"):
+        encode_host_exports((host, host))
+    wire = encode_host_exports((host,))
+    for malformed in (wire[:-1], wire + b"x"):
+        with pytest.raises(ValueError):
+            decode_host_exports(malformed)
+
+
+@pytest.mark.parametrize(
+    "export",
+    [
+        None,
+        HostExportDescriptor(99, 4096, b"token"),
+        HostExportDescriptor(1, 64, b"token"),
+        HostExportDescriptor(1, 4096, b""),
+        HostExportDescriptor(2, 4096, b"short"),
+    ],
+)
+def test_host_exports_reject_missing_or_invalid_platform_tokens(export):
+    with pytest.raises(ValueError):
+        encode_host_exports((GlobalDomainHostWindow(0, HostWindowSpec(128), 55, export),))
+
+
+def test_rank_descriptor_contract_remains_v2_and_excludes_host_slots():
+    assert GLOBAL_DOMAIN_VERSION == 2
+    descriptor = _descriptors()[0]
+    with pytest.raises(ValueError, match="domain_rank"):
+        replace(descriptor, domain_rank=descriptor.rank_count).encode()
+    with pytest.raises(ValueError, match="incomplete"):
+        validate_descriptor_table((*_descriptors(), descriptor), rank_count=2, profile="sim")
+
+
+def test_host_window_exports_roundtrip_in_command_and_validate_profile():
+    command = GlobalDomainCommand(
+        phase=GlobalDomainPhase.AUTHORIZE,
+        domain_id=1,
+        generation=1,
+        name="host",
+        profile="sim",
+        window_size=128,
+        members=_members(),
+        buffers=(),
+        owner_instance_id=b"owner-id",
+        target_pids=(101, 202),
+        host_windows=tuple(
+            GlobalDomainHostWindow(node, HostWindowSpec(128), node + 1, HostExportDescriptor(1, 4096, b"token"))
+            for node in (0, 1)
+        ),
+    )
+    wire = encode_domain_command(command)
+    assert wire[:4] == b"SDC2"
+    assert decode_domain_command(wire) == command
+    with pytest.raises(ValueError, match="protocol version mismatch"):
+        decode_domain_command(b"SDC1" + wire[4:])
+    with pytest.raises(ValueError, match="profile differs"):
+        encode_domain_command(replace(command, profile="a3-fabric-v1"))
+    with pytest.raises(ValueError, match="cover exactly"):
+        encode_domain_command(replace(command, host_windows=(replace(command.host_windows[0], node_worker_id=7),)))
+
+
+def test_import_keeps_rank_table_and_host_exports_on_separate_axes():
+    command = GlobalDomainCommand(
+        phase=GlobalDomainPhase.IMPORT,
+        domain_id=1,
+        generation=1,
+        name="host",
+        profile="sim",
+        window_size=128,
+        members=_members(),
+        buffers=(),
+        owner_instance_id=b"owner-id",
+        descriptors=_descriptors(),
+        host_windows=tuple(
+            GlobalDomainHostWindow(node, HostWindowSpec(128), node + 1, HostExportDescriptor(1, 4096, b"token"))
+            for node in (0, 1)
+        ),
+    )
+    assert decode_domain_command(encode_domain_command(command)) == command
+    assert len(command.descriptors) == len(command.members)
+    with pytest.raises(ValueError, match="every Host window export"):
+        encode_domain_command(
+            replace(command, host_windows=tuple(replace(h, export=None) for h in command.host_windows))
+        )
+
+
+@pytest.mark.parametrize("node,buffer_id", [(-1, 55), (2**31, 55), (0, 0), (0, 2**64)])
+def test_host_export_requires_valid_physical_source_identity(node, buffer_id):
+    host = GlobalDomainHostWindow(node, HostWindowSpec(128), buffer_id, HostExportDescriptor(1, 4096, b"token"))
+    with pytest.raises(ValueError, match="Buffer identity"):
+        encode_host_exports((host,))
