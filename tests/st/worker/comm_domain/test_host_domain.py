@@ -27,10 +27,10 @@ from simpler.task_interface import (
 )
 from simpler.worker import Worker
 
-from examples.workers.l3.multi_chip_dispatch.main import build_chip_callable
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
+from tests.st.worker.comm_domain.host_domain_kernels import build_chip_callable
 
 N = 128 * 128
 SIZE = N * 4

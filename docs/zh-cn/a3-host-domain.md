@@ -33,9 +33,9 @@ args.add_tensor(mapped, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
 - **domain / ImportRegistry**：成员与 endpoint 授权、消费端解析、旧引用失效；复用既有登记和解析路径。
 - **Run / completion 生命周期**：接受使用后保留资源，真实完成前不放行消费者、不复用输出；关闭先撤销新使用。
 
-平台后端负责内存分配约束、注册/映射、设备可用地址或通信 context、提交与完成适配，以及逆序释放。A3 当前实验实现使用 POSIX SHM backing，每个 chip 进程独立 mmap、mlock、HostRegister；数据搬运继续使用已有 MTE 或 PTO SDMA 路径，兼容性分别验证；A5 后续可以实现本地 ACL/MTE 或跨 rank URMA。
+平台后端负责内存分配约束、注册/映射、设备可用地址或通信 context、提交与完成适配，以及逆序释放。A3 使用 VMM Host physical backing，owner 保留 CPU view，每个 chip 进程经 Fabric 授权、导入并建立 NoUC view；数据搬运继续使用已有 MTE 或 PTO SDMA 路径，兼容性分别验证；A5 后续使用 URMA backend，不把通信 region 当作直接映射地址。
 
-默认 `numa_id=0` 在本实验中表示采用 OS 放置；显式非零 NUMA 请求被拒绝。物理共享范围向上对齐系统页，公开 Buffer 范围仍为请求的逻辑大小。
+`numa_id` 指定 Host 物理分配位置；按驱动报告的分配粒度向上对齐物理范围，公开 Buffer 范围仍为请求的逻辑大小。模拟器仅按系统页对齐。
 
 `HostDomainResource` 只保留资源身份、view 校验、使用保留和清理责任；`host_domain_backend.py` 提供 A3 与模拟 backing 的创建/释放实现，消费侧由平台 `comm_attach_domain_host` 建立映射。A5 尚未实现，不会落入 A3 默认分支；接入时不复制 domain/registry/runner。
 
@@ -49,8 +49,8 @@ flowchart TD
   T --> A["TaskArgs：参数方向 + transfer=NONE"]
   A --> I["ImportRegistry：按 identity、mapping_ref 解析"]
   I --> C["ChipTensor：当前卡有效地址，DEVICE/NONE"]
-  B --> O["Owner：POSIX SHM + CPU 原生 VA"]
-  O --> M["各 chip 进程：mmap → mlock → HostRegister"]
+  B --> O["Owner：Host VMM + CPU 原生 VA"]
+  O --> M["各 chip 进程：BareTgid 授权 → Fabric import → NoUC map"]
   M --> I
   C --> K["现有 kernel / PTO 接口"]
 ```
@@ -73,7 +73,7 @@ flowchart TD
 ```mermaid
 flowchart LR
   R["domain.release：撤销新使用"] --> F["已有 Run fence：等待已接受任务"]
-  F --> U["各卡撤销 attachment → HostUnregister → munlock → munmap"]
+  F --> U["各卡撤销 attachment → unmap → release VA → free imported handle"]
   U --> H["确认全部卡释放后，清理 Host owner"]
 ```
 
@@ -89,7 +89,9 @@ flowchart LR
 
 Fabric/NoUC 对照提交 `ea4ae7912` 曾在 A3、CANN 9.0.0、TMR 上通过上述六项双卡测试。HostRegister 替换版本已独立通过公共 Python 回归 377 项（2 项跳过）、四项双卡模拟测试，以及 A3 双卡六项真机测试：MTE 双向、PTO SDMA 双向及其消费者可见性、BF16 设备选行、在途域释放。另有两项 HBM retained-domain 基线通过。真机使用 Linux 5.10、CANN 9.0.0、驱动 26.0.rc1 和 TMR；结论限于此环境及测试范围。
 
-本实验使用 Linux 5.10/CANN 9.0 下的共享页注册组合。该版本文档要求旧内核使用 aclrtMallocHost 锁页内存，mlock 并不能证明驱动 pin 契约；普通 HostRegister 返回地址的内存复制也受限。因此本分支属于资格验证，MTE、PTO SDMA 分别测试，不宣称任意 ACL memcpy、A2/A5、其他 runtime 或跨机支持。Host 路径不使用 Fabric；既有 HBM 域的通信实现保持原样。
+本次恢复 Fabric backend，并启用 PID 白名单：初始化通信时由各 chip 返回 aclrtDeviceGetBareTgid 的实际进程身份，owner 在发布导入请求前调用 aclrtMemSetPidToShareableHandleV2 授权；不禁用 PID 校验。本次启用 PID 白名单后的 Fabric 版本已在相同 A3/CANN 9.0.0 环境完成硬件复验。模拟器仍用 SHM，不作为 Fabric 硬件支持证据。直接单 L2 可用 `create_buffer(nbytes, host_window=HostWindowSpec(nbytes))` 申请本功能资源，再用 `map_view(tensor, target=worker.device_location)` 选择当前设备映射。其复用单 rank communicator 与 64 B 逻辑 HBM 域窗口（驱动按粒度分配），不是全表 staging；须在加载支持通信的 runtime 后使用。直接 L2 入口已通过单卡真机验收：同时持有两块 backing、显式 view 读取和释放后的旧 view 拒绝。物理回收使用 `Worker.release_buffer(buffer)`；`Buffer.close()` 仅撤销后续使用，不能替代 Worker 的映射/owner 清理。
+
+本次验证：156 项相关 UT 通过；8 项 A3 真机 ST 通过，包括直接 L2、双卡 MTE 双向、BF16 选行、在途释放、PTO SDMA 双向及消费者可见性，以及持久 8 MiB Host 表的设备 ID 驱动 SDMA 取行（64 KiB 输出、首尾及重复行、四轮复用）。后者同时提交独立计算任务并检查结果，但未采集重叠 trace 或测量延迟隐藏收益。
 
 ## 对齐 #2657 的业务场景
 

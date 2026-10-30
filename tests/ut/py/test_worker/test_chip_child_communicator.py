@@ -14,6 +14,7 @@ from contextlib import ExitStack
 from multiprocessing.shared_memory import SharedMemory
 from unittest.mock import MagicMock, call
 
+import _task_interface
 import pytest
 import simpler.worker as worker_mod
 from simpler.buffer import LocalEndpointBufferIdentityAllocator
@@ -182,3 +183,26 @@ def test_failed_reinitialization_preserves_the_established_handle(monkeypatch, f
     assert responses[2:] == [(0, "")] * 2
     assert cw.comm_alloc_domain_windows.call_args.args[0] == 0x3456
     cw.comm_release_domain_windows.assert_called_once_with(0x3456, 7, 1, 0)
+
+
+def test_comm_init_returns_actual_fabric_pid(monkeypatch):
+    monkeypatch.setattr(_task_interface, "_fabric_process_id", lambda: 12345)
+    path = b"/shared/rootinfo\0"
+    request = SharedMemory(create=True, size=worker_mod._COMM_INIT_HEADER.size + len(path) + 4)
+    try:
+        assert request.buf is not None
+        worker_mod._COMM_INIT_HEADER.pack_into(request.buf, 0, 0, 1)
+        offset = worker_mod._COMM_INIT_HEADER.size
+        request.buf[offset : offset + len(path)] = path
+        mailbox = bytearray(worker_mod.mailbox_size(1))
+        mailbox[worker_mod._OFF_ARGS : worker_mod._OFF_ARGS + worker_mod._CTRL_SHM_NAME_BYTES] = (
+            request.name.encode().ljust(worker_mod._CTRL_SHM_NAME_BYTES, b"\0")
+        )
+        cw = MagicMock()
+        cw.comm_init.return_value = 19
+        assert worker_mod._handle_ctrl_comm_init(cw, memoryview(mailbox), chip_platform="a2a3") == 19
+        assert struct.unpack_from("<i", request.buf, offset + len(path))[0] == 12345
+        cw.comm_init.assert_called_once_with(0, 1, "/shared/rootinfo")
+    finally:
+        request.close()
+        request.unlink()

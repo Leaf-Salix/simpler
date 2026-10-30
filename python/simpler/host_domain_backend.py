@@ -10,9 +10,12 @@
 
 import os
 
+from _task_interface import _HostDomainMemory
+
 from .buffer import create_host_shared_buffer
 from .comm_endpoints import AdapterProfile
 from .global_comm_domain import (
+    GLOBAL_DOMAIN_PROFILE_A3_FABRIC,
     GLOBAL_DOMAIN_PROFILE_IDS,
     GLOBAL_DOMAIN_PROFILE_SIM,
     GLOBAL_DOMAIN_VERSION,
@@ -50,13 +53,29 @@ class SharedHostBacking:
             self.shared.close()
 
 
-class A3HostBacking(SharedHostBacking):
-    attachment_profile = AdapterProfile.HOST_SVM_MAP
+class A3HostBacking:
+    profile = AdapterProfile.HOST_VMM_MAP
+    attachment_profile = AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT
+
+    def __init__(self):
+        self.native = _HostDomainMemory()
 
     def allocate(self, spec, identity, device, rank_count):
-        if spec.numa_id != 0:
-            raise ValueError("HostRegister backing uses OS placement; explicit NUMA placement is unsupported")
-        return super().allocate(spec, identity, device, rank_count)
+        size, token = self.native.allocate(device, spec.numa_id, spec.nbytes)
+        return self.native.base, GlobalDomainDescriptor(
+            GLOBAL_DOMAIN_VERSION,
+            GLOBAL_DOMAIN_PROFILE_IDS[GLOBAL_DOMAIN_PROFILE_A3_FABRIC],
+            0,
+            rank_count,
+            size,
+            token,
+        )
+
+    def authorize(self, pids):
+        self.native.authorize(pids)
+
+    def release(self):
+        self.native.release()
 
 
 def host_backing_type(platform):
@@ -69,6 +88,8 @@ def host_backing_type(platform):
 
 
 def host_attachment_profile(descriptor: GlobalDomainDescriptor, platform: str) -> AdapterProfile:
-    if descriptor.profile_id != GLOBAL_DOMAIN_PROFILE_IDS[GLOBAL_DOMAIN_PROFILE_SIM]:
-        raise ValueError("HostRegister attachment requires a local shared-memory descriptor")
-    return host_backing_type(platform).attachment_profile
+    expected = GLOBAL_DOMAIN_PROFILE_SIM if platform == "a2a3sim" else GLOBAL_DOMAIN_PROFILE_A3_FABRIC
+    backend = host_backing_type(platform)
+    if descriptor.profile_id != GLOBAL_DOMAIN_PROFILE_IDS[expected]:
+        raise ValueError("Host attachment descriptor does not match the platform backend")
+    return backend.attachment_profile

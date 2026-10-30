@@ -605,10 +605,10 @@ class AdapterKind(str, Enum):
 class AdapterProfile(str, Enum):
     """How a consumer reaches a Buffer — the mechanism, not the wire backend tag."""
 
-    # Local Host domains establish this attachment explicitly; the generic region
-    # planner still refuses to infer Host registration from a backing alone.
+    # The generic region planner does not infer Host registration from a backing alone.
     HOST_SVM_MAP = "HOST_SVM_MAP"
     HOST_VMM_COPY = "HOST_VMM_COPY"
+    HOST_VMM_MAP = "HOST_VMM_MAP"
     DEVICE_VMM_PEER_IMPORT = "DEVICE_VMM_PEER_IMPORT"
     DEVICE_FABRIC_V2_PEER_IMPORT = "DEVICE_FABRIC_V2_PEER_IMPORT"
     REMOTE_COPY = "REMOTE_COPY"
