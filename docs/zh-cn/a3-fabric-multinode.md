@@ -10,7 +10,7 @@
 
 ## 两机准备
 
-两节点都更新 `feat/a3-host-domain-multinode-clean` 并在各自环境重新安装 `pip install -e .`。当前实现是 Fabric。不要再运行旧 `examples.workers.l4.hostregister_transport.main`：该实验及 IPC 探针已删除。如仍见 `rtsIpcMemGet ExportKey`，先核对实际执行入口、两节点源码提交及 `simpler.__file__`，不要把旧 IPC 实验的失败当作本入口的 Fabric 结果。
+两节点都更新 `experiment/a3-hostregister-multinode` 并在各自环境重新安装 `pip install -e .`。当前实现是 Fabric。不要再运行旧 `examples.workers.l4.hostregister_transport.main`：该实验及 IPC 探针已删除。如仍见 `rtsIpcMemGet ExportKey`，先核对实际执行入口、两节点源码提交及 `simpler.__file__`，不要把旧 IPC 实验的失败当作本入口的 Fabric 结果。
 
 两节点需有实际可达的 HCCS，使用相同分支构建、CANN/PTO、Python 环境及源码路径，MPI/SSH 控制面可达。先通过所在环境的设备队列获取指定设备使用权，再启动实验；以下命令不替代队列预约。
 
