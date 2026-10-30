@@ -42,6 +42,7 @@ class HostDomainResource:
         self.device = device
         self.backend = host_backing_type(platform)()
         self.buffer = None
+        self._descriptor = None
         self.export = None
         self.published = False
         self.views_released = False
@@ -58,8 +59,9 @@ class HostDomainResource:
             nbytes=self.spec.nbytes,
             base=base,
         )
+        self._descriptor = self.buffer.to_descriptor()
         self.registry.register_attachment(
-            self.buffer.to_descriptor(),
+            self._descriptor,
             base,
             mapping_ref=0,
             profile=self.backend.profile,
@@ -69,17 +71,17 @@ class HostDomainResource:
     def request(self) -> bytes:
         if self.export is None or self.buffer is None:
             raise RuntimeError("Host backing has not been allocated")
-        return self.export.encode() + _encode_buffer_descriptor_wire(self.buffer.to_descriptor())
+        return self.export.encode() + _encode_buffer_descriptor_wire(self._descriptor)
 
     def map_view(self, tensor: Tensor, worker: int) -> Tensor:
-        if self.closed or self.buffer is None or self.buffer.closed or tensor.buffer != self.buffer.to_descriptor():
+        if self.closed or self.buffer is None or self.buffer.closed or tensor.buffer != self._descriptor:
             raise ValueError("Host mapping requires the live domain backing")
         if tensor.mapping_ref:
             raise ValueError("map_view requires the native Tensor view")
         return tensor._with_mapping_ref(self.workers.index(worker) + 1)
 
     def validate(self, tensor, worker, *, native=False):
-        if self.closed or self.buffer is None or self.buffer.closed or tensor.buffer != self.buffer.to_descriptor():
+        if self.closed or self.buffer is None or self.buffer.closed or tensor.buffer != self._descriptor:
             raise ValueError("Host domain Tensor is stale or differs from its source registration")
         if worker not in self.workers or (
             tensor.mapping_ref != self.workers.index(worker) + 1 and not (native and tensor.mapping_ref == 0)

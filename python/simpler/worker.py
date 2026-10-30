@@ -13372,7 +13372,8 @@ class Worker:
             if resource.buffer is not None:
                 resource.buffer.closed = True
             if committed.value and not resource.views_released:
-                assert self._chip_worker is not None
+                if self._chip_worker is None:
+                    raise RuntimeError("Host buffer retained: native teardown did not confirm member view release")
                 self._chip_worker.comm_release_domain_windows(comm, allocation_id, 1, 0)
             resource.views_released = True
             if self._chip_import_registry is not None:
@@ -15070,7 +15071,8 @@ class Worker:
         Every ownership-bearing step is first recorded in the post-success
         journal. Independent pre-transport steps are attempted together; if one
         remains owed, the native transport and children stay alive for a later
-        close() retry. The child-reap grace starts only after SHUTDOWN
+        close() retry. Host-domain owner debt is retried after consumer
+        teardown and does not fence that teardown. The child-reap grace starts only after SHUTDOWN
         has been broadcast to every group (below), not at teardown entry, so the
         (potentially blocking) pre-child cleanup cannot consume it and reduce the
         reap to a single poll.
@@ -15120,11 +15122,10 @@ class Worker:
             if not startup_abort:
                 raise journal_err
 
-        host_error = self._cleanup_journal.drive_kinds({"host-domain"})
-        if host_error is not None:
-            errors.append(host_error)
-            if not startup_abort:
-                raise host_error
+        # Local Host owners can depend on child teardown. Their retained debt
+        # must not fence the shutdown that removes those consumers. Other
+        # pre-transport ownership gates above retain their existing ordering.
+        self._cleanup_journal.drive_kinds({"host-domain"})
 
         # Session shutdown is the remote transport barrier: never run it in the
         # same all-attempt batch as pending remote frees.
@@ -15202,6 +15203,8 @@ class Worker:
                 if not self._next_level_pids and not self._next_level_shms:
                     self._next_level_workers.clear()
                     self._next_level_worker_ids.clear()
+                if (host_error := self._cleanup_journal.drive_kinds({"host-domain"})) is not None:
+                    errors.append(host_error)
                 if errors:
                     raise errors[0]
                 return
@@ -15236,6 +15239,10 @@ class Worker:
                 self._next_level_workers.clear()
                 self._next_level_worker_ids.clear()
 
+        # Process exit alone does not assert a successful domain release or
+        # authorize freeing backing imported outside this local worker tree.
+        if (host_error := self._cleanup_journal.drive_kinds({"host-domain"})) is not None:
+            errors.append(host_error)
         if errors:
             raise errors[0]
 

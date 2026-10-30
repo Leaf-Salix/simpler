@@ -387,9 +387,8 @@ static aclError release_domain_host(DomainAllocation *alloc) {
 }
 
 static aclError release_domain_windows(DomainAllocation *alloc) {
-    aclError host_status = release_domain_host(alloc);
-    if (host_status != ACL_SUCCESS) return host_status;
-    aclError first_error = release_vmm_windows(&alloc->peer_windows);
+    aclError first_error = release_domain_host(alloc);
+    record_first_error(release_vmm_windows(&alloc->peer_windows), &first_error);
     record_first_error(release_vmm_window(&alloc->local_window), &first_error);
     return first_error;
 }
@@ -425,6 +424,13 @@ VmmWindow &VmmWindow::operator=(VmmWindow &&other) noexcept {
 }
 
 DomainAllocation::~DomainAllocation() {
+    const aclError host_status = release_domain_host(this);
+    if (host_status != ACL_SUCCESS) {
+        LOG_ERROR(
+            "[comm] domain destruction: Host release failed -> %d; dependent resources retained",
+            static_cast<int>(host_status)
+        );
+    }
     if (device_ctx != nullptr) {
         aclrtFree(device_ctx);
         device_ctx = nullptr;
@@ -1516,68 +1522,124 @@ extern "C" int comm_alloc_domain_windows(
 
 extern "C" int comm_attach_domain_host(
     CommHandle h, uint64_t allocation_id, const CommGlobalDomainDescriptor *descriptor, uint64_t *base_out
-) try {
-    if (!h || !descriptor || !base_out) return -1;
-    auto it = h->domain_allocations.find(allocation_id);
-    if (it == h->domain_allocations.end()) return -1;
-    auto &allocation = *it->second;
-    if (allocation.host_base || allocation.host_handle || descriptor->version != COMM_GLOBAL_DOMAIN_VERSION ||
-        descriptor->profile != COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC || descriptor->reserved ||
-        descriptor->handle_size != sizeof(aclrtMemFabricHandle) || !descriptor->mapping_size)
-        return -1;
-    constexpr uint64_t unit = 1ULL << 30, begin = 40ULL << 40, end = 224ULL << 40;
-    if (descriptor->mapping_size > end - begin - unit) return -1;
-    const uint64_t bytes = (descriptor->mapping_size + unit - 1) / unit * unit;
-    std::vector<std::pair<uint64_t, uint64_t>> occupied;
-    for (const auto &entry : h->domain_allocations) {
-        if (entry.second->host_base)
-            occupied.emplace_back(reinterpret_cast<uint64_t>(entry.second->host_base), entry.second->host_reservation);
-    }
-    std::sort(occupied.begin(), occupied.end());
-    uint64_t address = begin;
-    for (const auto &[base, length] : occupied) {
-        if (address <= base && bytes <= base - address) break;
-        address = std::max(address, base + length);
-    }
-    if (address > end - bytes) return -1;
-    using Reserve = decltype(&aclrtReserveMemAddressNoUCMemory);
-    auto reserve = reinterpret_cast<Reserve>(dlsym(RTLD_DEFAULT, "aclrtReserveMemAddressNoUCMemory"));
-    if (!reserve) return -1;
-    aclrtMemFabricHandle token{};
-    std::memcpy(&token, descriptor->handle, sizeof(token));
-    auto status = aclrtMemImportFromShareableHandleV2(
-        &token, ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, ACL_RT_IPC_MEM_EXPORT_FLAG_DEFAULT, &allocation.host_handle
-    );
-    if (status != ACL_SUCCESS) return static_cast<int>(status);
-    // NoUC needs explicit [40, 224) TiB VA with 1 GiB reservation alignment.
-    void *reserved_base = nullptr;
-    // The driver owns VA reservations across all communicator/runtime instances.
-    // A candidate chosen from this communicator's windows may already belong to
-    // another Worker; do not overwrite its reservation or keep a failed output.
-    constexpr unsigned max_candidates = 64;
-    aclError first_reservation_error = ACL_SUCCESS;
-    for (unsigned attempt = 0; attempt < max_candidates && address <= end - bytes; ++attempt, address += bytes) {
-        reserved_base = nullptr;
-        status = reserve(&reserved_base, bytes, 0, reinterpret_cast<void *>(address), 0);
-        if (status == ACL_SUCCESS) break;
-        if (first_reservation_error == ACL_SUCCESS) first_reservation_error = status;
-    }
-    if (status != ACL_SUCCESS) {
+) {
+    const char *stage = "validate arguments";
+    auto fail = [&](int status) {
         LOG_ERROR(
-            "[comm] NoUC reservation probes failed, first ACL error=%d, last=%d",
-            static_cast<int>(first_reservation_error), static_cast<int>(status)
+            "[comm] attach_domain_host: allocation_id=%llu stage=%s error=%d",
+            static_cast<unsigned long long>(allocation_id), stage, status
         );
-        return static_cast<int>(first_reservation_error);
+        if (descriptor) {
+            LOG_ERROR(
+                "[comm] attach_domain_host: allocation_id=%llu descriptor version=%u profile=%u reserved=%u "
+                "handle_size=%u mapping_size=%llu",
+                static_cast<unsigned long long>(allocation_id), descriptor->version, descriptor->profile,
+                descriptor->reserved, descriptor->handle_size, static_cast<unsigned long long>(descriptor->mapping_size)
+            );
+        }
+        return status;
+    };
+    try {
+        if (!h || !descriptor || !base_out) return fail(-1);
+        *base_out = 0;
+        stage = "find allocation";
+        auto it = h->domain_allocations.find(allocation_id);
+        if (it == h->domain_allocations.end()) return fail(-1);
+        stage = "validate descriptor";
+        auto &allocation = *it->second;
+        if (allocation.host_base || allocation.host_handle) {
+            LOG_ERROR(
+                "[comm] attach_domain_host: allocation_id=%llu existing Host base=%p handle=%p",
+                static_cast<unsigned long long>(allocation_id), allocation.host_base, allocation.host_handle
+            );
+            return fail(-1);
+        }
+        if (descriptor->version != COMM_GLOBAL_DOMAIN_VERSION ||
+            descriptor->profile != COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC || descriptor->reserved ||
+            descriptor->handle_size != sizeof(aclrtMemFabricHandle) || !descriptor->mapping_size)
+            return fail(-1);
+        constexpr uint64_t unit = 1ULL << 30, begin = 40ULL << 40, end = 224ULL << 40;
+        stage = "validate NoUC extent";
+        if (descriptor->mapping_size > end - begin - unit) return fail(-1);
+        const uint64_t bytes = (descriptor->mapping_size + unit - 1) / unit * unit;
+        std::vector<std::pair<uint64_t, uint64_t>> occupied;
+        for (const auto &entry : h->domain_allocations) {
+            if (entry.second->host_base)
+                occupied.emplace_back(
+                    reinterpret_cast<uint64_t>(entry.second->host_base), entry.second->host_reservation
+                );
+        }
+        std::sort(occupied.begin(), occupied.end());
+        uint64_t address = begin;
+        for (const auto &[base, length] : occupied) {
+            if (address <= base && bytes <= base - address) break;
+            address = std::max(address, base + length);
+        }
+        stage = "select NoUC address";
+        if (address > end - bytes) {
+            LOG_ERROR(
+                "[comm] attach_domain_host: allocation_id=%llu NoUC bytes=%llu address=%llu range=[%llu,%llu)",
+                static_cast<unsigned long long>(allocation_id), static_cast<unsigned long long>(bytes),
+                static_cast<unsigned long long>(address), static_cast<unsigned long long>(begin),
+                static_cast<unsigned long long>(end)
+            );
+            return fail(-1);
+        }
+        stage = "resolve NoUC reservation API";
+        using Reserve = decltype(&aclrtReserveMemAddressNoUCMemory);
+        auto reserve = reinterpret_cast<Reserve>(dlsym(RTLD_DEFAULT, "aclrtReserveMemAddressNoUCMemory"));
+        if (!reserve) return fail(-1);
+        aclrtMemFabricHandle token{};
+        std::memcpy(&token, descriptor->handle, sizeof(token));
+        stage = "import Fabric handle";
+        auto status = aclrtMemImportFromShareableHandleV2(
+            &token, ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, ACL_RT_IPC_MEM_EXPORT_FLAG_DEFAULT, &allocation.host_handle
+        );
+        if (status != ACL_SUCCESS) return fail(static_cast<int>(status));
+        // NoUC needs explicit [40, 224) TiB VA with 1 GiB reservation alignment.
+        void *reserved_base = nullptr;
+        // The driver owns VA reservations across all communicator/runtime instances.
+        // A candidate chosen from this communicator's windows may already belong to
+        // another Worker; do not overwrite its reservation or keep a failed output.
+        stage = "reserve NoUC address";
+        constexpr unsigned max_candidates = 64;
+        aclError first_reservation_error = ACL_SUCCESS;
+        const uint64_t first_address = address;
+        unsigned attempt = 0;
+        for (; attempt < max_candidates && address <= end - bytes; ++attempt, address += bytes) {
+            reserved_base = nullptr;
+            status = reserve(&reserved_base, bytes, 0, reinterpret_cast<void *>(address), 0);
+            if (status == ACL_SUCCESS) break;
+            if (first_reservation_error == ACL_SUCCESS) first_reservation_error = status;
+        }
+        if (status != ACL_SUCCESS) {
+            LOG_ERROR(
+                "[comm] attach_domain_host: allocation_id=%llu stage=%s first error=%d last error=%d "
+                "bytes=%llu first_address=%llu next_address=%llu range=[%llu,%llu) candidates=%u",
+                static_cast<unsigned long long>(allocation_id), stage, static_cast<int>(first_reservation_error),
+                static_cast<int>(status), static_cast<unsigned long long>(bytes),
+                static_cast<unsigned long long>(first_address), static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), attempt
+            );
+            return static_cast<int>(first_reservation_error);
+        }
+        allocation.host_base = reserved_base;
+        allocation.host_reservation = bytes;
+        stage = "map imported Host memory";
+        status = aclrtMapMem(allocation.host_base, descriptor->mapping_size, 0, allocation.host_handle, 0);
+        if (status != ACL_SUCCESS) return fail(static_cast<int>(status));
+        allocation.host_mapped = true;
+        *base_out = reinterpret_cast<uint64_t>(allocation.host_base);
+        return 0;
+    } catch (const std::exception &error) {
+        LOG_ERROR(
+            "[comm] attach_domain_host: allocation_id=%llu stage=%s exception=%s",
+            static_cast<unsigned long long>(allocation_id), stage, error.what()
+        );
+        return -1;
+    } catch (...) {
+        return fail(-1);
     }
-    allocation.host_base = reserved_base;
-    allocation.host_reservation = bytes;
-    status = aclrtMapMem(allocation.host_base, descriptor->mapping_size, 0, allocation.host_handle, 0);
-    if (status != ACL_SUCCESS) return static_cast<int>(status);
-    allocation.host_mapped = true;
-    *base_out = reinterpret_cast<uint64_t>(allocation.host_base);
-    return 0;
-} catch (...) {
-    return -1;
 }
 
 extern "C" int
@@ -1600,8 +1662,8 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
         );
         return -1;
     }
-    if (release_domain_host(alloc.get()) != ACL_SUCCESS) return -1;
-    int rc = 0;
+    aclError first_error = release_domain_host(alloc.get());
+    int rc = first_error == ACL_SUCCESS ? 0 : static_cast<int>(first_error);
     // Best-effort subset barrier so peers don't free local memory under each
     // other.  If a peer crashed mid-allocation, the timeout returns false and
     // we proceed with local teardown anyway — same shape as comm_destroy.
@@ -1610,20 +1672,21 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
             domain_barrier_tag(allocation_id, "release"), h->run_token
         )) {
         LOG_WARN("[comm rank %d] release_domain: barrier timed out; releasing local state anyway", h->rank);
-        rc = -1;
+        if (rc == 0) rc = -1;
     }
 
     if (alloc->device_ctx) {
         aclError aret = aclrtFree(alloc->device_ctx);
-        if (aret != ACL_SUCCESS && rc == 0) rc = -1;
-        alloc->device_ctx = nullptr;
+        if (aret != ACL_SUCCESS && rc == 0) rc = static_cast<int>(aret);
+        if (aret == ACL_SUCCESS) alloc->device_ctx = nullptr;
     }
-    aclError release_status = release_domain_windows(alloc.get());
+    aclError release_status = release_vmm_windows(&alloc->peer_windows);
+    record_first_error(release_vmm_window(&alloc->local_window), &release_status);
     if (release_status != ACL_SUCCESS) {
         LOG_ERROR(
             "[comm rank %d] release_domain: release VMM windows -> %d", h->rank, static_cast<int>(release_status)
         );
-        if (rc == 0) rc = -1;
+        if (rc == 0) rc = static_cast<int>(release_status);
     }
     h->domain_allocations.erase(it);
     return rc;

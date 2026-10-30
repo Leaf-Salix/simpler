@@ -77,7 +77,7 @@ flowchart LR
   U --> H["确认全部卡释放后，清理 Host owner"]
 ```
 
-复用现有 domain accepted-use 和清理 journal。任一卡释放未确认，保留 Host owner；卡端释放已经成功而 Host 清理失败时，仅重试 owner 清理，不重放 collective release。Worker.close 仍负责处理未完成的清理责任。
+复用现有 domain accepted-use 和清理 journal。任一卡释放未确认，保留 Host owner；卡端释放已经成功而 Host 清理失败时，仅重试 owner 清理，不重放 collective release。Worker.close 会继续完成 native／child teardown，并重试可确认安全的 owner 清理；若 view 释放仍未确认，则明确报错并保留 owner，不能把进程列表清空或 native 已销毁当作释放成功。
 
 正常域释放逐步记录注销、解锁与解除映射的结果。现有 `comm_destroy` 是 communicator 的终止清理，不承诺失败后重试同一 native handle；它的失败或进程退出不能代替域的 VIEWS 成功确认，owner 仍按未确认状态保留。
 

@@ -10,6 +10,7 @@
 import ctypes
 import os
 import struct
+import threading
 from contextlib import nullcontext
 from unittest.mock import MagicMock
 
@@ -282,3 +283,53 @@ def test_direct_host_buffer_size_mismatch_has_no_side_effects():
     with pytest.raises(ValueError, match="requested buffer size"):
         worker._create_direct_host_buffer(128, HostWindowSpec(64))
     assert not worker._direct_host_domains
+
+
+def test_mapping_racing_release_cannot_retain_dispatch_permission(host_worker, monkeypatch):
+    domain = allocate(host_worker)
+    source = domain.host().tensor((16,), DataType.FLOAT32)
+    entered, resume = threading.Event(), threading.Event()
+    original = domain._host_resource.map_view
+    failures = []
+
+    def delayed(tensor, worker):
+        entered.set()
+        assert resume.wait(5)
+        return original(tensor, worker)
+
+    def mapping():
+        try:
+            domain.map_view(source, domain_rank=0)
+        except ValueError as exc:
+            failures.append(str(exc))
+
+    monkeypatch.setattr(domain._host_resource, "map_view", delayed)
+    thread = threading.Thread(target=mapping)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        domain.release()
+    finally:
+        resume.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert failures == ["Host mapping requires the live domain backing"]
+
+
+def test_host_validation_reuses_registered_descriptor(host_worker, monkeypatch):
+    domain = allocate(host_worker)
+    source = domain.host().tensor((16,), DataType.FLOAT32)
+    resource = domain._host_resource
+
+    def no_rebuild(_buffer):
+        raise AssertionError("dispatch must reuse the registered descriptor")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(type(resource.buffer), "to_descriptor", no_rebuild)
+        mapped = resource.map_view(source, resource.workers[0])
+        resource.validate(mapped, resource.workers[0])
+    resource.buffer.nbytes = 64
+    changed = resource.buffer.tensor((16,), DataType.FLOAT32)
+    with pytest.raises(ValueError, match="differs from its source registration"):
+        resource.validate(changed, resource.workers[0], native=True)
+    domain.release()
