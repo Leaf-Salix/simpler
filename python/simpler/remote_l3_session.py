@@ -64,7 +64,6 @@ from .global_comm_domain import (
     decode_release_command,
     encode_comm_init_result,
     encode_copy_result,
-    encode_descriptor_table,
     encode_domain_buffer_refs,
     resolve_global_comm_capability,
 )
@@ -600,6 +599,8 @@ def _materialize_task_args(
     """
     if len(args.remote_desc) != len(args.tensors):
         raise ValueError("remote TASK descriptor count does not match tensor count")
+    if any(tensor.mapping_ref for tensor in args.tensors):
+        raise ValueError("remote TASK endpoint-local mapping cannot cross Remote L3")
     task_args = TaskArgs()
     inline_backings: list[Buffer] = []
 
@@ -1149,8 +1150,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                                 else None
                             )
                             if result is None:
-                                descriptors = inner_worker._prepare_global_domain_node(command, worker_id)  # noqa: SLF001
-                                result = encode_descriptor_table(descriptors)
+                                result = inner_worker._prepare_global_domain_reply(command, worker_id)  # noqa: SLF001
                             _control_result_reply(
                                 conn,
                                 manifest,
@@ -1158,6 +1158,11 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                                 control.control_name,
                                 control.control_version,
                                 result,
+                            )
+                        elif command.phase is GlobalDomainPhase.AUTHORIZE:
+                            inner_worker._authorize_global_domain_host(command, worker_id)  # noqa: SLF001
+                            _control_reply(
+                                conn, manifest, header.sequence, control.control_name, control.control_version, 0, ""
                             )
                         elif command.phase is GlobalDomainPhase.IMPORT:
                             inner_worker._import_global_domain_node(command, worker_id)  # noqa: SLF001
@@ -1182,6 +1187,10 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                                     register_domain_buffers(command, backings),
                                 )
                             except BaseException:
+                                if command.host_windows:
+                                    inner_worker._drop_domain_allocs(  # noqa: SLF001
+                                        inner_worker._global_domain_provenance_id(command.domain_id)  # noqa: SLF001
+                                    )
                                 revoke_domain_buffers(command.domain_id, command.generation)
                                 raise
                         elif command.phase is GlobalDomainPhase.ABORT:
@@ -1324,6 +1333,7 @@ def run_session(
         device_ids=tuple(int(x) for x in manifest.get("device_ids", [])),
         num_sub_workers=int(manifest.get("num_sub_workers", 0)),
         heap_ring_size=int(manifest["heap_ring_size"]) if manifest.get("heap_ring_size") is not None else None,
+        enable_sdma=bool(manifest.get("enable_sdma", False)),
     )
     # The parent-assigned id names this Worker's diagnostics namespace in the
     # collected hierarchy, including when sibling Workers run on other hosts.

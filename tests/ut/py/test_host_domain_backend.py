@@ -34,3 +34,13 @@ def test_optional_host_identity_does_not_enable_unsupported_backing(monkeypatch)
     assert backend.host_process_identity("a5") == 0
     with pytest.raises(ValueError, match="not implemented"):
         backend.host_backing_type("a5")
+
+
+def test_authorization_targets_preserve_real_identities_and_reject_invalid_profiles():
+    assert backend.host_authorization_targets("a3-fabric-v1", (101, 202)) == (101, 202)
+    assert backend.host_authorization_targets("sim", (0, 0)) == (1, 1)
+    for identities in ((), (0,), (101, -1)):
+        with pytest.raises(ValueError, match="invalid Fabric process IDs"):
+            backend.host_authorization_targets("a3-fabric-v1", identities)
+    with pytest.raises(ValueError, match="not implemented"):
+        backend.host_authorization_targets("unknown", (101,))

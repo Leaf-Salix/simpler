@@ -24,6 +24,7 @@ from typing import cast
 
 import pytest
 from simpler.buffer import AddressSpace, buffer_reference, wrap_vmm_window
+from simpler.comm_domain import HostWindowSpec
 from simpler.comm_endpoints import (
     _ADAPTER_KIND_IDS,
     _ADAPTER_PROFILE_IDS,
@@ -49,6 +50,7 @@ from simpler.global_comm_domain import (
     GLOBAL_DOMAIN_DESCRIPTOR_BYTES,
     GLOBAL_DOMAIN_MAX_ATTACHMENTS,
     GLOBAL_DOMAIN_MAX_BUFFERS,
+    GLOBAL_DOMAIN_MAX_RANKS,
     GLOBAL_DOMAIN_PROFILE_IDS,
     GLOBAL_DOMAIN_VERSION,
     GlobalCommInitCommand,
@@ -57,6 +59,7 @@ from simpler.global_comm_domain import (
     GlobalDomainCommand,
     GlobalDomainCopyCommand,
     GlobalDomainDescriptor,
+    GlobalDomainHostWindow,
     GlobalDomainMember,
     GlobalDomainPhase,
     GlobalDomainReleaseCommand,
@@ -292,7 +295,7 @@ def test_committed_buffer_wire_uses_native_descriptor_validation(remote, corrupt
     elif corruption == "generation":
         struct.pack_into("<I", wire, 24, 0)
     elif corruption == "count":
-        wire *= 4097
+        wire *= GLOBAL_DOMAIN_MAX_RANKS * (GLOBAL_DOMAIN_MAX_BUFFERS + 1) + 1
     if corruption:
         with pytest.raises((RuntimeError, ValueError)):
             decode_domain_buffer_refs(bytes(wire))
@@ -904,7 +907,9 @@ def test_mixed_local_remote_import_failure_rolls_back_local_node(monkeypatch):
                     rank_count,
                     profile_id,
                     window_size,
+                    host_enabled,
                 ) = LOCAL_PREPARE_REQUEST.unpack_from(payload, 0)
+                assert not host_enabled
                 descriptor = GlobalDomainDescriptor(
                     version=GLOBAL_DOMAIN_VERSION,
                     profile_id=profile_id,
@@ -921,6 +926,7 @@ def test_mixed_local_remote_import_failure_rolls_back_local_node(monkeypatch):
                         generation,
                         0x1000,
                         window_size,
+                        0,
                     )
                     + descriptor.encode()
                 )
@@ -1257,6 +1263,32 @@ def _local_node_domain_commands():
     return prepare, imported
 
 
+@pytest.mark.parametrize("suffix", [False, True])
+def test_hbm_prepare_collector_preserves_descriptor_only_contract(monkeypatch, suffix):
+    from simpler.worker import Worker  # noqa: PLC0415
+
+    prepare, imported = _local_node_domain_commands()
+    reply = encode_descriptor_table(imported.descriptors)
+    if suffix:
+        reply += encode_domain_buffer_refs(
+            [(buffer_reference(wrap_vmm_window(4096, 64, b"original", 1)).to_descriptor(), 0, 0)]
+        )
+    worker = Worker(level=4, num_sub_workers=0)
+    monkeypatch.setattr(worker, "_global_domain_control", lambda *_args: reply)
+    prepared = []
+    try:
+        if suffix:
+            with pytest.raises(ValueError, match="unexpected Buffer reference suffix"):
+                worker._collect_global_domain_buffers(prepare, (0,), prepared)
+        else:
+            descriptors, buffers = worker._collect_global_domain_buffers(prepare, (0,), prepared)
+            assert descriptors == imported.descriptors
+            assert buffers == {0: {}, 1: {}}
+        assert prepared == [0] and not worker._child_alloc
+    finally:
+        worker.close()
+
+
 def test_node_import_failure_rolls_back_partial_local_ranks_and_uses_configured_timeout():
     from simpler.worker import (  # noqa: PLC0415
         CTRL_GLOBAL_DOMAIN_IMPORT,
@@ -1358,6 +1390,7 @@ def test_node_import_reuses_prepared_attachment_row_for_view(corruption):
         assert state.command.attachments == prepare.attachments
         assert state.view is not None
         assert state.view.attachments == prepare.attachments_for_node(0)
+        assert all(member.buffers is state.contexts[member.local_worker_id].buffers for member in state.command.members)
 
         identities = tuple(
             state.contexts[member.local_worker_id].buffers["payload"].identity for member in commit.members
@@ -1935,3 +1968,80 @@ def test_mpirun_group_cleanup_continues_after_one_process_wait_fails():
     finally:
         worker._mpi_l3_groups.clear()
         _close_failure_injection_worker(worker, resources)
+
+
+def test_host_fabric_authorization_codec_validates_process_ids():
+    command = GlobalDomainCommand(
+        phase=GlobalDomainPhase.AUTHORIZE,
+        domain_id=1,
+        generation=1,
+        name="host",
+        profile="a3-fabric-v1",
+        window_size=128,
+        members=_members(),
+        buffers=(),
+        owner_instance_id=b"owner-id",
+        host_windows=tuple(GlobalDomainHostWindow(node, HostWindowSpec(128), node + 1) for node in (0, 1)),
+        target_pids=(101, 202),
+    )
+    assert decode_domain_command(encode_domain_command(command)) == command
+    for pids in ((), (0,), (-1,), (2**31,), (True,)):
+        with pytest.raises(ValueError):
+            encode_domain_command(replace(command, target_pids=pids))
+    with pytest.raises(ValueError, match="only carried"):
+        encode_domain_command(replace(command, phase=GlobalDomainPhase.PREPARE_EXPORT))
+
+
+@pytest.mark.parametrize("owns_host", [False, True])
+@pytest.mark.parametrize("profile", ["a3-fabric-v1", "sim"])
+def test_host_authorization_handles_owner_and_import_only_nodes(owns_host, profile):
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from simpler.worker import Worker, _GlobalNodeDomainState  # noqa: PLC0415
+
+    prepare, _ = _local_node_domain_commands()
+    prepare = replace(
+        prepare,
+        profile=profile,
+        host_windows=(GlobalDomainHostWindow(0, HostWindowSpec(128), 1),),
+    )
+    state = _GlobalNodeDomainState(command=prepare)
+    calls = []
+
+    def authorize(pids):
+        calls.append(pids)
+        if len(calls) == 1:
+            raise RuntimeError("ACL authorization failed")
+
+    state.host_owner = SimpleNamespace(authorize=authorize) if owns_host else None
+    worker = cast(
+        Worker,
+        SimpleNamespace(
+            _global_node_domains={prepare.domain_id: state},
+            _global_domain_command_identity=Worker._global_domain_command_identity,
+        ),
+    )
+    command = replace(prepare, phase=GlobalDomainPhase.AUTHORIZE, attachments=(), target_pids=(101, 202))
+    if owns_host:
+        with pytest.raises(RuntimeError, match="ACL authorization failed"):
+            Worker._authorize_global_domain_host(worker, command, 0)
+        assert not state.authorized_pids
+    Worker._authorize_global_domain_host(worker, command, 0)
+    assert state.authorized_pids == (101, 202)
+    with pytest.raises(ValueError, match="cannot change target"):
+        Worker._authorize_global_domain_host(worker, replace(command, target_pids=(303,)), 0)
+
+
+@pytest.mark.parametrize("writing", [False, True])
+def test_host_copy_target_is_separate_from_rank_and_versioned(writing):
+    command = GlobalDomainCopyCommand(11, 1, 0, 8, 4, b"abcd" if writing else b"", host_node=7)
+    wire = encode_copy_command(command, include_data=writing)
+    assert decode_copy_command(wire, include_data=writing) == command
+    with pytest.raises(ValueError, match="fields"):
+        encode_copy_command(replace(command, domain_rank=1), include_data=writing)
+    with pytest.raises(ValueError, match="fields"):
+        encode_copy_command(replace(command, host_node=-1), include_data=writing)
+    wrong_version = bytearray(wire)
+    struct.pack_into("<I", wrong_version, 4, 99)
+    with pytest.raises(ValueError, match="version mismatch"):
+        decode_copy_command(bytes(wrong_version), include_data=writing)

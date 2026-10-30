@@ -10,10 +10,6 @@
 
 from __future__ import annotations
 
-import ctypes
-
-from _task_interface import _encode_buffer_descriptor_wire
-
 from .buffer import (
     AccessMode,
     AddressSpace,
@@ -57,11 +53,6 @@ class HostDomainResource:
         )
         self._descriptor = self.buffer.to_descriptor()
 
-    def request(self) -> bytes:
-        if self.export is None or self.buffer is None:
-            raise RuntimeError("Host backing has not been allocated")
-        return self.export.encode() + _encode_buffer_descriptor_wire(self._descriptor)
-
     def map_view(self, tensor: Tensor, worker: int, *, access=AccessMode.READWRITE) -> Tensor:
         if self.closed or self.buffer is None or self.buffer.closed or tensor.buffer != self._descriptor:
             raise ValueError("Host mapping requires the live domain backing")
@@ -79,18 +70,6 @@ class HostDomainResource:
             raise ValueError("Host Tensor requires an explicit mapping for the target worker")
         if tensor.mapping_ref:
             require_domain_mapping_access(tensor.mapping_ref, required)
-
-    def copy(self, offset, value, *, writing):
-        size = len(value) if writing else value
-        if offset < 0 or size < 0 or offset > self.spec.nbytes or size > self.spec.nbytes - offset:
-            raise ValueError("Host domain copy exceeds the backing range")
-        if self.closed or self.buffer is None or self.buffer.closed:
-            raise ValueError("Host domain backing is not live")
-        base = self.buffer.base
-        if writing:
-            ctypes.memmove(base + offset, value, size)
-            return None
-        return ctypes.string_at(base + offset, size)
 
     def close(self):
         self.closed = True

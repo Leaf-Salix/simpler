@@ -397,8 +397,6 @@ public:
         uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
         size_t window_size
     );
-    uint64_t
-    comm_attach_domain_host(uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint8_t> &descriptor);
 
     /// Pair to `comm_alloc_domain_windows`: collectively free the per-rank
     /// pool and the device CommContext, then drop the allocation record.
@@ -408,10 +406,12 @@ public:
     void
     comm_release_domain_windows(uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
     std::tuple<std::vector<uint8_t>, uint64_t, size_t> comm_global_domain_prepare(
-        uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile
+        uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
+        bool host_enabled = false
     );
     uint64_t comm_global_domain_import(uint64_t domain_id, const std::vector<uint8_t> &descriptors);
-    void comm_global_domain_release(uint64_t domain_id);
+    void comm_global_domain_release(uint64_t domain_id, uint32_t stage = 0);
+    std::pair<uint64_t, size_t> comm_global_domain_window(uint64_t domain_id, uint32_t slot);
     void comm_barrier(uint64_t comm_handle);
     void comm_destroy(uint64_t comm_handle);
     void comm_destroy_all();
@@ -592,12 +592,12 @@ private:
     using CommDeriveContextFn = int (*)(void *, const uint32_t *, size_t, uint32_t, size_t, size_t, uint64_t *);
     using CommAllocDomainWindowsFn =
         int (*)(void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint64_t *, uint64_t *, size_t *);
-    using CommAttachDomainHostFn = int (*)(void *, uint64_t, const CommGlobalDomainDescriptor *, uint64_t *);
     using CommReleaseDomainWindowsFn = int (*)(void *, uint64_t, size_t, uint32_t);
     using CommGlobalDomainPrepareFn =
-        int (*)(uint64_t, uint32_t, uint32_t, size_t, uint32_t, CommGlobalDomainDescriptor *, uint64_t *);
+        int (*)(uint64_t, uint32_t, uint32_t, size_t, uint32_t, uint32_t, CommGlobalDomainDescriptor *, uint64_t *);
     using CommGlobalDomainImportFn = int (*)(uint64_t, const CommGlobalDomainDescriptor *, size_t, uint64_t *);
-    using CommGlobalDomainReleaseFn = int (*)(uint64_t);
+    using CommGlobalDomainReleaseFn = int (*)(uint64_t, uint32_t);
+    using CommGlobalDomainWindowFn = decltype(&::comm_global_domain_window);
     using CommBarrierFn = int (*)(void *);
     using CommDestroyFn = int (*)(void *);
     using KernelSupportedFn = decltype(&simpler_kernel_mode_supported);
@@ -722,11 +722,11 @@ private:
     CommGetWindowSizeFn comm_get_window_size_fn_ = nullptr;
     CommDeriveContextFn comm_derive_context_fn_ = nullptr;
     CommAllocDomainWindowsFn comm_alloc_domain_windows_fn_ = nullptr;
-    CommAttachDomainHostFn comm_attach_domain_host_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_release_domain_windows_fn_ = nullptr;
     CommGlobalDomainPrepareFn comm_global_domain_prepare_fn_ = nullptr;
     CommGlobalDomainImportFn comm_global_domain_import_fn_ = nullptr;
     CommGlobalDomainReleaseFn comm_global_domain_release_fn_ = nullptr;
+    CommGlobalDomainWindowFn comm_global_domain_window_fn_ = nullptr;
     CommBarrierFn comm_barrier_fn_ = nullptr;
     CommDestroyFn comm_destroy_fn_ = nullptr;
     KernelSupportedFn kernel_supported_fn_ = nullptr;
@@ -736,7 +736,7 @@ private:
     void *device_ctx_ = nullptr;
     std::vector<CommSession> comm_sessions_;
     std::unordered_map<uint64_t, size_t> comm_session_index_;
-    std::unordered_set<uint64_t> global_domain_ids_;
+    std::unordered_map<uint64_t, uint32_t> global_domain_ids_;  // 0: HBM-only; otherwise Host profile
     uint64_t base_comm_handle_ = 0;
 
     uint32_t arena_bank_for_slot(uint32_t slot_id) const;

@@ -39,7 +39,7 @@ args.add_tensor(mapped, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
 
 `numa_id` 指定 Host 物理分配位置；按驱动报告的分配粒度向上对齐物理范围，公开 Buffer 范围仍为请求的逻辑大小。模拟器仅按系统页对齐。
 
-`HostDomainResource` 只保留资源身份、view 校验、使用保留和清理责任；`host_domain_backend.py` 提供 A3 与模拟 backing 的创建、进程身份、授权和释放实现，消费侧由平台 `comm_attach_domain_host` 建立映射。A5 尚未实现，不会落入 A3 默认分支；接入时不复制 domain/registry/runner。
+`HostDomainResource` 只保留资源身份、view 校验、使用保留和清理责任；`host_domain_backend.py` 提供 A3 与模拟 backing 的创建、进程身份、授权和释放实现，消费侧统一复用 `comm_global_domain_prepare/import/release` 建立和分阶段释放映射；本地 L3 使用单节点事务，直接 L2 使用单 endpoint，均不要求 MPI 或跨机控制通道。A5 尚未实现，不会落入 A3 默认分支；接入时不复制 domain/registry/runner。
 
 `map_view` 当前只承诺已经建立的直接地址映射。URMA 需要的注册、channel、远端信息与 completion context 不是普通映射地址，不能为了共用 API 就虚构 DIRECT_LOAD/STORE 能力。后续接入应扩展既有通信 context 和 completion 后端，继续使用同一 Buffer identity 与调用约定；本地 MTE 和远端 fetch 的能力需分别验证。
 

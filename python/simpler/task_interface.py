@@ -29,6 +29,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import ctypes
+import operator
 import os
 import shutil
 import sys
@@ -127,15 +128,16 @@ from _task_interface import (
 )
 
 from .buffer import AccessMode, AddressSpace, Buffer, ImportContext, ImportRegistry, Tensor, TensorTransfer
-from .comm_domain import CommDomainRef, HostWindowSpec
+from .comm_domain import CommDomainRef, HostWindowSpec, domain_mapping_ref
 from .comm_endpoints import DEVICE_AICPU
 
 
 def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -> None:
     """Check callable-side host access before descriptors become address-only PODs."""
     for i in range(args.tensor_count()):
-        buffer = args.tensor(i).buffer
-        if buffer.address_space != AddressSpace.HOST or args.transfer(i) != TensorTransfer.NONE:
+        tensor = args.tensor(i)
+        buffer = tensor.buffer
+        if tensor.mapping_ref or buffer.address_space != AddressSpace.HOST or args.transfer(i) != TensorTransfer.NONE:
             continue
         direction = target.sig(i) if target is not None and i < target.sig_count else None
         needed = {
@@ -301,6 +303,7 @@ __all__ = [
     "ChipDomainContext",
     "CommDomainHandle",
     "CommDomainRef",
+    "HostWindowSpec",
     "CommDomainMember",
     "GlobalCommDomainHandle",
     "GlobalCommDomainView",
@@ -1184,7 +1187,7 @@ class CommDomainHandle:
         "_config",
         "_ref",
         "requested_window_size",
-        "_host_resource",
+        "_host_buffers",
     )
 
     def __init__(  # noqa: PLR0913 -- preserve the L3 and legacy L4 constructor keywords
@@ -1205,6 +1208,7 @@ class CommDomainHandle:
         _domain_size: int | None = None,
         _domain_ranks: dict[int, int] | None = None,
         ref: CommDomainRef | None = None,
+        host_buffers=None,
         requested_window_size: int | None = None,
         _release_scope: Callable[[CommDomainHandle], contextlib.AbstractContextManager] = contextlib.nullcontext,
     ) -> None:
@@ -1226,7 +1230,7 @@ class CommDomainHandle:
         self.retain_after_run = bool(retain_after_run)
         self.attachments = tuple(attachments)
         self._config = None
-        self._host_resource = None
+        self._host_buffers = dict(host_buffers or {})
         self._released = False
         self._freed = False
         self._ref = ref
@@ -1240,21 +1244,6 @@ class CommDomainHandle:
         if self._released:
             raise RuntimeError(f"CommDomainHandle({self.name!r}) is already released")
 
-    def host(self) -> Buffer:
-        """Return the creator's native Host backing. Host is not a communication rank."""
-        self._require_live()
-        if self._host_resource is None:
-            raise ValueError("domain has no local Host window")
-        return self._host_resource.buffer
-
-    def map_view(self, tensor: Tensor, *, domain_rank: int, access=AccessMode.READWRITE) -> Tensor:
-        """Select a fixed NPU attachment while retaining the source backing identity."""
-        self._require_live()
-        member = self.member(domain_rank)
-        if self._host_resource is None:
-            raise ValueError("domain has no local Host window")
-        return self._host_resource.map_view(tensor, member.local_worker_id, access=access)
-
     def member(self, domain_rank: int) -> GlobalDomainMember:
         """Return rank-ordered topology and ordinary Buffer slices."""
         self._require_live()
@@ -1262,6 +1251,34 @@ class CommDomainHandle:
         if rank < 0 or rank >= len(self.members):
             raise IndexError(f"domain rank {rank} is out of range")
         return self.members[rank]
+
+    def host(self, node_worker_id: int | None = None) -> Buffer:
+        """The node's logical DRAM pool; every chip consumes the same backing identity."""
+        self._require_live()
+        if self.workers and self._host_buffers and not self.borrowed:
+            if node_worker_id is not None:
+                raise ValueError("local Host window does not select a node")
+            return next(iter(self._host_buffers.values()))
+        if node_worker_id is None:
+            raise ValueError("global Host window requires a node worker id")
+        return self._host_buffers[operator.index(node_worker_id)]
+
+    def map_view(self, tensor: Tensor, *, domain_rank: int, access=AccessMode.READWRITE) -> Tensor:
+        """Select a granted chip attachment while preserving the source backing."""
+        domain_rank = operator.index(domain_rank)
+        self.local_context(domain_rank)
+        if self.workers and self._host_buffers and not self.borrowed and isinstance(tensor, Tensor):
+            if tensor.mapping_ref:
+                raise ValueError("map_view requires the native Tensor view")
+        if not isinstance(tensor, Tensor) or not any(
+            tensor.buffer == buffer.to_descriptor()
+            for buffer in (
+                *self._host_buffers.values(),
+                *(b for member in self.members for b in member.buffers.values()),
+            )
+        ):
+            raise ValueError("map_view requires this domain's exact backing")
+        return tensor._with_mapping_ref(domain_mapping_ref(domain_rank, access))
 
     def local_context(self, domain_rank: int) -> ChipDomainContext:
         """Return this creator's local chip mapping; L4 creators hold no such mappings."""
@@ -1938,7 +1955,7 @@ class ChipWorker:
                 args = _ti_module._snapshot_local_task_args(args)
                 _validate_host_control_access(state.target, args)
                 for i in range(args.tensor_count()):
-                    if args.tensor(i).buffer.address_space == AddressSpace.DEVICE:
+                    if args.tensor(i).buffer.address_space == AddressSpace.DEVICE or args.tensor(i).mapping_ref:
                         raise ValueError(
                             f"ChipWorker.run: argument {i} is DEVICE; use Worker(level=2).submit "
                             "for source registration and lifetime validation"

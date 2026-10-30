@@ -177,10 +177,11 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | `submit_next_level(callable_handle, args, config=None, *, worker: int) -> TaskHandle` | Hands a callable to one exact NEXT_LEVEL child and returns an opaque handle for explicit task dependencies |
 | `submit_next_level_group(callable_handle, args_list, config=None, *, workers: list[int]) -> TaskHandle` | Submits one group DAG node and returns its opaque handle |
 | `submit_sub(callable_handle, args=None)` | Schedules a registered host-side Python callable |
-| `allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | L3/L4 creation returning `CommDomainHandle`; legacy L3 `workers=` and chip-id indexing remain supported |
-| `get_or_allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | Reuse the same live handle after full configuration validation, or create it |
+| `allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False, host_window=None, host_windows=None)` | L3/L4 creation returning `CommDomainHandle`; legacy L3 `workers=` and chip-id indexing remain supported. L3 accepts `host_window=HostWindowSpec(...)`; L4 accepts `host_windows={node: spec}`; these options are mutually exclusive |
+| `get_or_allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False, host_window=None, host_windows=None)` | Reuse the same live handle after full configuration validation, or create it |
 | `get_domain(name_or_ref)` / `release_domain(handle)` | Creator-local name lookup or borrowing by `CommDomainRef`; only the creator owns release |
 | `copy_to_domain(handle, rank, data, ...)` / `copy_from_domain(handle, rank, nbytes, ...)` | Synchronous bounded NPU-rank staging before task submission; L3 requires declared slices |
+| `copy_to_host_domain(handle, data, *, node=None, offset=0)` / `copy_from_host_domain(handle, nbytes, ...)` | Host staging through the existing domain control channel; global domains select the owner node, owned L3 domains omit it. Must precede task submission. |
 | `copy_to_host_domain(handle, data, *, offset=0)` / `copy_from_host_domain(handle, nbytes, *, offset=0)` | Synchronous local Host staging before callback submissions or between completed runs; no implicit wait |
 | `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Delegates allocation to the owning Worker; target chip memory is named by the returned handle |
 

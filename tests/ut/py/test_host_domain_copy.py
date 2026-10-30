@@ -9,6 +9,7 @@
 
 """Host staging shares the existing Run control-ordering contract."""
 
+import ctypes
 import time
 from multiprocessing.shared_memory import SharedMemory
 
@@ -66,7 +67,7 @@ def test_host_copy_outside_callback_refuses_in_flight_run_without_rewriting(host
             worker._orch.copy_to_host_domain(domain, b"modified", offset=16)
         with pytest.raises(RuntimeError, match="still in flight"):
             worker._orch.copy_from_host_domain(domain, 8, offset=16)
-        assert domain._host_resource.copy(16, 8, writing=False) == b"original"
+        assert ctypes.string_at(worker._domain_state(domain.ref).host_base + 16, 8) == b"original"
     finally:
         assert signal.buf is not None
         signal.buf[0] = 1
@@ -91,7 +92,7 @@ def test_host_copy_after_callback_submission_refuses_without_rewriting(host_doma
             orch.copy_to_host_domain(domain, b"modified", offset=16)
         with pytest.raises(RuntimeError, match="cannot follow a task submission"):
             orch.copy_from_host_domain(domain, 8, offset=16)
-        assert domain._host_resource.copy(16, 8, writing=False) == b"prepared"
+        assert ctypes.string_at(worker._domain_state(domain.ref).host_base + 16, 8) == b"prepared"
 
     worker.run(submit_then_update)
     assert worker._orch.copy_from_host_domain(domain, 8, offset=16) == b"prepared"

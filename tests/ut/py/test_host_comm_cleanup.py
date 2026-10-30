@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Compile production Host attachment/release bodies against faulting ACL calls."""
+"""Compile shared production VMM/staged-release bodies against faulting ACL calls."""
 
 import shutil
 import subprocess
@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 
-def test_host_attachment_cleanup_faults(tmp_path):
+def test_host_global_cleanup_faults(tmp_path):
     compiler = shutil.which("c++")
     if compiler is None:
         pytest.skip("C++ compiler unavailable")
@@ -28,25 +28,11 @@ def test_host_attachment_cleanup_faults(tmp_path):
     fixture = (Path(__file__).parent / "support/host_comm_cleanup.cpp").read_text()
     declarations, cases = fixture.split("// PRODUCTION_BODIES")
     bodies = [
-        section("struct DomainAllocation {", "static_assert(sizeof(CommGlobalDomainDescriptor)"),
-        section("static aclError release_domain_host(", "static aclError release_base_windows("),
-        section(
-            "DomainAllocation::~DomainAllocation()",
-            "// ============================================================================",
-        ),
-        section('extern "C" int comm_attach_domain_host(', 'extern "C" int\ncomm_release_domain_windows'),
-        section('extern "C" int\ncomm_release_domain_windows', 'extern "C" int comm_global_domain_prepare'),
+        section("static aclError release_vmm_window(", "// The driver owns reservations"),
+        section('extern "C" int comm_global_domain_release(', 'extern "C" int comm_destroy('),
     ]
-    # Only SDK/runtime boundaries are stubbed; the selected production bodies are compiled verbatim.
     unit = tmp_path / "host_comm_cleanup.cpp"
-    unit.write_text(
-        declarations
-        + bodies[0]
-        + "\n"
-        + cases.split("// TEST_CASES")[0]
-        + "\n".join(bodies[1:])
-        + cases.split("// TEST_CASES")[1]
-    )
+    unit.write_text(declarations + "\n".join(bodies) + cases)
     executable = tmp_path / "host_comm_cleanup"
     subprocess.run([compiler, "-std=c++17", str(unit), "-o", str(executable)], check=True)
     subprocess.run([str(executable)], check=True)

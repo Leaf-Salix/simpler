@@ -20,6 +20,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
@@ -194,7 +195,7 @@ public:
             return;
         }
         int rc = aclInit(nullptr);
-        if (rc != kAclSuccess && rc != kAclRepeatInitialize) {
+        if (rc != kAclSuccess && rc != kAclErrorRepeatInitialize) {
             throw std::runtime_error("aclInit failed with code " + std::to_string(rc));
         }
         initialized_ = true;
@@ -350,7 +351,7 @@ public:
 
 private:
     static constexpr int kAclSuccess = 0;
-    static constexpr int kAclRepeatInitialize = 100002;
+    static constexpr int kAclErrorRepeatInitialize = 100002;
     static constexpr int kAclMemcpyHostToDevice = 1;
     static constexpr int kAclMemcpyDeviceToHost = 2;
     static constexpr int kAclMemHandleTypeNone = 0;
@@ -1880,8 +1881,7 @@ CtypesFormat classify_ctypes_format(const char *format) {
 }
 
 // Resolve one wire tensor onto a local base and build the address-bearing device POD.
-// `resolved` maps CanonicalIdentity -> (local_base, address_space); the caller populates it by
-// materializing each embedded descriptor.
+// Mapping attachments use (identity, selector); plain views use the backing identity.
 ChipTensor materialize_one(const Tensor &r, TensorTransfer transfer, nb::dict resolved) {
     uint64_t elem = get_element_size(r.dtype);
     if (elem == 0) {
@@ -2600,10 +2600,11 @@ NB_MODULE(_task_interface, m) {
         .def_ro("mapping_ref", &Tensor::mapping_ref)
         .def(
             "_with_mapping_ref",
-            [](const Tensor &self, uint8_t reference) {
-                if (!reference) throw std::invalid_argument("mapping reference must be nonzero");
+            [](const Tensor &self, int reference) {
+                if (reference <= 0 || reference > UINT8_MAX)
+                    throw std::invalid_argument("mapping reference must be in [1, 255]");
                 Tensor mapped = self;
-                mapped.mapping_ref = reference;
+                mapped.mapping_ref = static_cast<uint8_t>(reference);
                 validate_tensor(mapped);
                 return mapped;
             },
@@ -3060,6 +3061,7 @@ NB_MODULE(_task_interface, m) {
                 for (int32_t i = 0; i < n; ++i) {
                     if (self.tensor(i).mapping_ref) return true;
                     const auto backend = static_cast<BackendKind>(self.tensor(i).buffer.backend_kind);
+                    if (self.tensor(i).mapping_ref) return true;
                     if (backend == BackendKind::DEVICE_MALLOC || backend == BackendKind::VMM_WINDOW) return true;
                 }
                 return false;
@@ -4250,27 +4252,20 @@ NB_MODULE(_task_interface, m) {
             "Pair to comm_alloc_domain_windows: collectively release the per-rank pool."
         )
         .def(
-            "comm_attach_domain_host",
-            [](ChipWorker &self, uint64_t handle, uint64_t allocation, nb::bytes descriptor) {
-                const auto *begin = reinterpret_cast<const uint8_t *>(descriptor.c_str());
-                return self.comm_attach_domain_host(
-                    handle, allocation, std::vector<uint8_t>(begin, begin + descriptor.size())
-                );
-            }
-        )
-        .def(
             "comm_global_domain_prepare",
             [](ChipWorker &self, uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size,
-               uint32_t profile) {
-                auto [descriptor, local_window_base, actual_window_size] =
-                    self.comm_global_domain_prepare(domain_id, domain_rank, rank_count, window_size, profile);
+               uint32_t profile, bool host_enabled) {
+                auto [descriptor, local_window_base, actual_window_size] = self.comm_global_domain_prepare(
+                    domain_id, domain_rank, rank_count, window_size, profile, host_enabled
+                );
                 return nb::make_tuple(
                     nb::bytes(reinterpret_cast<const char *>(descriptor.data()), descriptor.size()), local_window_base,
                     actual_window_size
                 );
             },
             nb::arg("domain_id"), nb::arg("domain_rank"), nb::arg("rank_count"), nb::arg("window_size"),
-            nb::arg("profile"), "Create a Global CommDomain local window and return its transport descriptor."
+            nb::arg("profile"), nb::arg("host_enabled") = false,
+            "Create a Global CommDomain local window and return its transport descriptor."
         )
         .def(
             "comm_global_domain_import",
@@ -4286,8 +4281,9 @@ NB_MODULE(_task_interface, m) {
         )
         .def(
             "comm_global_domain_release", &ChipWorker::comm_global_domain_release, nb::arg("domain_id"),
-            "Release a prepared or imported Global CommDomain."
+            nb::arg("stage") = 0, "Release a prepared or imported Global CommDomain."
         )
+        .def("comm_global_domain_window", &ChipWorker::comm_global_domain_window)
         .def("comm_barrier", &ChipWorker::comm_barrier, nb::arg("comm_handle"), "Synchronize all ranks.")
         .def(
             "comm_destroy", &ChipWorker::comm_destroy, nb::arg("comm_handle"),
@@ -4326,7 +4322,8 @@ NB_MODULE(_task_interface, m) {
         "Materialize a TaskArgs held in this process into the runtime.so-ABI ChipStorageTaskArgs "
         "POD — the sole path to that POD, whether the args are an L2 leaf's own or a chip child's "
         "read back from its mailbox with read_args_from_blob. Each tensor's embedded buffer "
-        "identity is resolved via `resolved` {CanonicalIdentity: (local_base, address_space)}; "
+        "identity (or (identity, mapping_ref) for mapped views) is resolved via `resolved` to (local_base, "
+        "address_space); "
         "addr = base + byte_offset. The caller pre-populates `resolved` by materializing each "
         "embedded descriptor on first receipt. Strided views (transpose / permute / step-slice) "
         "materialize to strided ChipTensors. Rejects an unknown identity and a non-dtype-aligned "

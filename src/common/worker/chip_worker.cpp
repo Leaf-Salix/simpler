@@ -445,11 +445,11 @@ void ChipWorker::init(
         comm_get_window_size_fn_ = module->required<CommGetWindowSizeFn>("comm_get_window_size");
         comm_derive_context_fn_ = module->required<CommDeriveContextFn>("comm_derive_context");
         comm_alloc_domain_windows_fn_ = module->required<CommAllocDomainWindowsFn>("comm_alloc_domain_windows");
-        comm_attach_domain_host_fn_ = module->optional<CommAttachDomainHostFn>("comm_attach_domain_host");
         comm_release_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_release_domain_windows");
         comm_global_domain_prepare_fn_ = module->required<CommGlobalDomainPrepareFn>("comm_global_domain_prepare");
         comm_global_domain_import_fn_ = module->required<CommGlobalDomainImportFn>("comm_global_domain_import");
         comm_global_domain_release_fn_ = module->required<CommGlobalDomainReleaseFn>("comm_global_domain_release");
+        comm_global_domain_window_fn_ = module->required<CommGlobalDomainWindowFn>("comm_global_domain_window");
         comm_barrier_fn_ = module->required<CommBarrierFn>("comm_barrier");
         comm_destroy_fn_ = module->required<CommDestroyFn>("comm_destroy");
         kernel_supported_fn = module->required<KernelSupportedFn>("simpler_kernel_mode_supported");
@@ -778,16 +778,21 @@ void ChipWorker::finalize() {
         );
     }
     if (comm_reclamation_unconfirmed_) {
-        // Carrier destruction does not prove device users stopped. Keep comm
-        // owners and their code alive, but allow the device's reset path below.
+        // Carrier destruction does not prove device users stopped. Host domains
+        // retain the context; HBM-only owners stay alive across device reset.
         if ((!comm_sessions_.empty() || !global_domain_ids_.empty()) && runtime_module_ != nullptr) {
             runtime_module_->retain_until_process_exit();
+        }
+        for (const auto &[domain_id, profile] : global_domain_ids_) {
+            if (profile != 0)
+                throw std::runtime_error("ChipWorker::finalize: Host domain users unconfirmed; keeping context loaded");
         }
     } else {
         // Release windows while the host runtime and device context are alive.
         if (comm_global_domain_release_fn_ != nullptr) {
-            for (uint64_t domain_id : global_domain_ids_) {
-                comm_global_domain_release_fn_(domain_id);
+            for (const auto &[domain_id, profile] : global_domain_ids_) {
+                if (comm_global_domain_release_fn_(domain_id, 0) != 0 && profile != 0)
+                    throw std::runtime_error("ChipWorker::finalize: domain ownership unproven; keeping context loaded");
             }
         }
         global_domain_ids_.clear();
@@ -891,11 +896,11 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     comm_get_window_size_fn_ = nullptr;
     comm_derive_context_fn_ = nullptr;
     comm_alloc_domain_windows_fn_ = nullptr;
-    comm_attach_domain_host_fn_ = nullptr;
     comm_release_domain_windows_fn_ = nullptr;
     comm_global_domain_prepare_fn_ = nullptr;
     comm_global_domain_import_fn_ = nullptr;
     comm_global_domain_release_fn_ = nullptr;
+    comm_global_domain_window_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
     set_retain_runs_fn_ = nullptr;
@@ -2359,19 +2364,6 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
     return {device_ctx, local_window_base, actual_window_size};
 }
 
-uint64_t
-ChipWorker::comm_attach_domain_host(uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint8_t> &bytes) {
-    if (!comm_attach_domain_host_fn_ || bytes.size() != sizeof(CommGlobalDomainDescriptor))
-        throw std::invalid_argument("Host domain attachment is unsupported or has an invalid descriptor");
-    CommGlobalDomainDescriptor descriptor{};
-    std::memcpy(&descriptor, bytes.data(), sizeof(descriptor));
-    uint64_t base = 0;
-    const int rc =
-        comm_attach_domain_host_fn_(reinterpret_cast<void *>(comm_handle), allocation_id, &descriptor, &base);
-    if (rc || !base) throw std::runtime_error("comm_attach_domain_host failed with code " + std::to_string(rc));
-    return base;
-}
-
 void ChipWorker::comm_release_domain_windows(
     uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank
 ) {
@@ -2387,27 +2379,25 @@ void ChipWorker::comm_release_domain_windows(
 }
 
 std::tuple<std::vector<uint8_t>, uint64_t, size_t> ChipWorker::comm_global_domain_prepare(
-    uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile
+    uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
+    bool host_enabled
 ) {
     if (comm_global_domain_prepare_fn_ == nullptr) {
         throw std::runtime_error("comm_global_domain_prepare is not supported by this runtime");
     }
-    auto [tracked, inserted] = global_domain_ids_.insert(domain_id);
+    auto [tracked, inserted] = global_domain_ids_.emplace(domain_id, host_enabled ? profile : 0);
     if (!inserted) {
         throw std::runtime_error("comm_global_domain_prepare received a duplicate domain_id");
     }
     CommGlobalDomainDescriptor descriptor{};
     uint64_t local_window_base = 0;
     int rc = comm_global_domain_prepare_fn_(
-        domain_id, domain_rank, rank_count, window_size, profile, &descriptor, &local_window_base
+        domain_id, domain_rank, rank_count, window_size, profile, host_enabled, &descriptor, &local_window_base
     );
     if (rc != 0) {
-        global_domain_ids_.erase(tracked);
         throw std::runtime_error("comm_global_domain_prepare failed with code " + std::to_string(rc));
     }
     if (local_window_base == 0 || descriptor.mapping_size == 0) {
-        comm_global_domain_release_fn_(domain_id);
-        global_domain_ids_.erase(domain_id);
         throw std::runtime_error("comm_global_domain_prepare returned an invalid window");
     }
     const auto *begin = reinterpret_cast<const uint8_t *>(&descriptor);
@@ -2436,16 +2426,24 @@ uint64_t ChipWorker::comm_global_domain_import(uint64_t domain_id, const std::ve
     return device_ctx;
 }
 
-void ChipWorker::comm_global_domain_release(uint64_t domain_id) {
+void ChipWorker::comm_global_domain_release(uint64_t domain_id, uint32_t stage) {
     require_comm_reclamation_safe();
     if (comm_global_domain_release_fn_ == nullptr) {
         throw std::runtime_error("comm_global_domain_release is not supported by this runtime");
     }
-    int rc = comm_global_domain_release_fn_(domain_id);
+    int rc = comm_global_domain_release_fn_(domain_id, stage);
     if (rc != 0) {
         throw std::runtime_error("comm_global_domain_release failed with code " + std::to_string(rc));
     }
-    global_domain_ids_.erase(domain_id);
+    if (stage != 1) global_domain_ids_.erase(domain_id);
+}
+
+std::pair<uint64_t, size_t> ChipWorker::comm_global_domain_window(uint64_t id, uint32_t slot) {
+    uint64_t base = 0;
+    size_t size = 0;
+    if (!comm_global_domain_window_fn_ || comm_global_domain_window_fn_(id, slot, &base, &size) != 0)
+        throw std::runtime_error("domain window is not live");
+    return {base, size};
 }
 
 void ChipWorker::comm_barrier(uint64_t comm_handle) {

@@ -59,9 +59,10 @@ class DomainConfig:
     retain_after_run: bool
     topology: tuple
     host_window: HostWindowSpec | None = None
+    host_windows: tuple = ()
 
     @classmethod
-    def capture(cls, members, window_size, buffers, retain_after_run, topology):
+    def capture(cls, members, window_size, buffers, retain_after_run, topology, host_windows=None):
         snapshot = tuple(
             (
                 str(b.name),
@@ -91,7 +92,15 @@ class DomainConfig:
                 )
         if sum(b[3] for b in snapshot) > window_size:
             raise ValueError("domain buffers exceed window_size")
-        return cls(members, window_size, snapshot, bool(retain_after_run), tuple(topology))
+        hosts = tuple(sorted((operator.index(node), spec) for node, spec in (host_windows or {}).items()))
+        if hosts:
+            if any(not isinstance(spec, HostWindowSpec) for _, spec in hosts):
+                raise TypeError("host_windows values must be HostWindowSpec")
+            if any(not isinstance(member, tuple) or len(member) != 2 for member in members):
+                raise ValueError("Host windows require L4 (node, chip) members")
+            if {node for node, _ in hosts} != {member[0] for member in members}:
+                raise ValueError("Host windows must cover exactly the participating nodes")
+        return cls(members, window_size, snapshot, bool(retain_after_run), tuple(topology), host_windows=hosts)
 
     def specs(self) -> list[CommBufferSpec]:
         from .task_interface import CommBufferSpec  # noqa: PLC0415

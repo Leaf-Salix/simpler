@@ -114,3 +114,14 @@ def host_attachment_profile(descriptor: GlobalDomainDescriptor, platform: str) -
     if descriptor.profile_id != GLOBAL_DOMAIN_PROFILE_IDS[expected]:
         raise ValueError("Host attachment descriptor does not match the platform backend")
     return backend.attachment_profile
+
+
+def host_authorization_targets(profile, identities):
+    """Normalize the selected transport's authorization identities for domain exchange."""
+    if profile == GLOBAL_DOMAIN_PROFILE_SIM:
+        return (1,) * len(identities)
+    if profile != GLOBAL_DOMAIN_PROFILE_A3_FABRIC:
+        raise ValueError("Host authorization profile is not implemented")
+    if not identities or any(pid <= 0 for pid in identities):
+        raise ValueError("Host prepare reply has invalid Fabric process IDs")
+    return tuple(identities)

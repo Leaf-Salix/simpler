@@ -37,7 +37,7 @@ extern "C" {
 
 typedef struct CommHandle_ *CommHandle;
 
-#define COMM_GLOBAL_DOMAIN_VERSION 2U
+#define COMM_GLOBAL_DOMAIN_VERSION 3U
 #define COMM_GLOBAL_DOMAIN_HANDLE_BYTES 256U
 #define COMM_GLOBAL_DOMAIN_DESCRIPTOR_BYTES 288U
 
@@ -79,11 +79,6 @@ static_assert(
 static_assert(offsetof(CommGlobalDomainDescriptor, reserved) == 28, "CommGlobalDomainDescriptor.reserved offset drift");
 static_assert(offsetof(CommGlobalDomainDescriptor, handle) == 32, "CommGlobalDomainDescriptor.handle offset drift");
 #endif
-
-/** Attach one Host backing to an existing local domain without adding a rank. */
-int comm_attach_domain_host(
-    CommHandle h, uint64_t allocation_id, const CommGlobalDomainDescriptor *descriptor, uint64_t *base_out
-);
 
 /** Bit mask of DmaWorkspaceKind values this platform can provision. */
 uint32_t dma_workspace_supported_mask(void);
@@ -300,14 +295,15 @@ int comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t ran
  */
 int comm_global_domain_prepare(
     uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
-    CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
+    uint32_t host_enabled, CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
 );
 
 /**
  * Import every peer descriptor and publish a device CommContext.
  *
  * descriptors must contain exactly one entry
- * for every dense domain rank.
+ * for every dense domain rank. HBM descriptors lead the table; optional Host
+ * descriptors follow in pool-slot order.
  * The returned context and all imported mappings remain live until
  *
  * comm_global_domain_release().
@@ -321,7 +317,10 @@ int comm_global_domain_import(
  * The L4 owner is responsible for
  * draining all rank tasks before fanout.
  */
-int comm_global_domain_release(uint64_t domain_id);
+int comm_global_domain_release(uint64_t domain_id, uint32_t stage);
+
+// Resolve an owned/imported pool without exposing a second address registry.
+int comm_global_domain_window(uint64_t domain_id, uint32_t slot, uint64_t *base, size_t *size);
 
 /**
  * Synchronize all ranks.

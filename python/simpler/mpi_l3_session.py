@@ -105,7 +105,7 @@ class MpiGlobalDomainExchange:
         return list(result[0])
 
     def prepare_import(self, command: GlobalDomainCommand, inner_worker: Worker, worker_id: int) -> bytes | None:
-        if command.phase is not GlobalDomainPhase.PREPARE_EXPORT:
+        if command.host_windows or command.phase is not GlobalDomainPhase.PREPARE_EXPORT:
             return None
         if {int(member.node_worker_id) for member in command.members} != self._group_worker_id_set:
             return None
@@ -424,6 +424,7 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
         device_ids=tuple(int(value) for value in manifest.get("device_ids", ())),
         num_sub_workers=int(manifest.get("num_sub_workers", 0)),
         heap_ring_size=int(manifest["heap_ring_size"]) if manifest.get("heap_ring_size") is not None else None,
+        enable_sdma=bool(manifest.get("enable_sdma", False)),
     )
     inner_worker._topology_worker_id = int(manifest["worker_id"])
     connection = _InMemoryCommandConnection()

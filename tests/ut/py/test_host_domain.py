@@ -7,10 +7,8 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-import ctypes
 import os
 import struct
-import threading
 from contextlib import nullcontext
 from unittest.mock import MagicMock
 
@@ -18,8 +16,13 @@ import pytest
 from simpler import host_domain_backend
 from simpler.buffer import AddressSpace, ImportContext, ImportRegistry
 from simpler.comm_endpoints import DEVICE_AICPU, AdapterProfile
-from simpler.global_comm_domain import GLOBAL_DOMAIN_PROFILE_A3_FABRIC, GLOBAL_DOMAIN_PROFILE_IDS
-from simpler.host_domain import HostDomainResource
+from simpler.global_comm_domain import (
+    GLOBAL_DOMAIN_PROFILE_A3_FABRIC,
+    GLOBAL_DOMAIN_PROFILE_IDS,
+    GLOBAL_DOMAIN_VERSION,
+    GlobalDomainDescriptor,
+    GlobalDomainReleaseStage,
+)
 from simpler.host_domain_backend import A3HostBacking, host_attachment_profile
 from simpler.task_interface import (
     CommBufferSpec,
@@ -76,7 +79,8 @@ def test_host_domain_preserves_native_identity_and_target_views(host_worker):
         args.add_tensor(view, transfer=TensorTransfer.NONE)
         with host_worker._child_prov_lock:
             host_worker._child_prov_check_dispatch_locked(args, 1 - rank, api="test")
-            with pytest.raises(ValueError, match="target worker"):
+            assert host_worker._prepare_buffer_references(args, None, 1 - rank) is None
+            with pytest.raises(ValueError, match="another node or chip"):
                 host_worker._child_prov_check_dispatch_locked(args, rank, api="test")
     native_args = TaskArgs()
     native_args.add_tensor(source)
@@ -96,6 +100,8 @@ def test_host_domain_cpu_copy_and_configuration_reuse(host_worker):
         domain = orch.get_or_allocate_domain(**request())
         orch.copy_to_host_domain(domain, data, offset=64)
         assert orch.copy_from_host_domain(domain, len(data), offset=64) == data
+        orch.copy_to_domain(domain, 0, data, buffer="output")
+        assert orch.copy_from_domain(domain, 0, len(data), buffer="output") == data
         assert orch.get_or_allocate_domain(**request()) is domain
         with pytest.raises(ValueError, match="configuration differs"):
             orch.get_or_allocate_domain(**request(host_window=HostWindowSpec(256)))
@@ -133,15 +139,14 @@ def test_host_domain_native_reference_requires_endpoint_grant(host_worker):
 
 def test_shared_host_backing_keeps_logical_bounds_and_endpoint_profile(host_worker):
     domain = allocate(host_worker)
-    resource = domain._host_resource
+    state = host_worker._global_node_domains[domain.domain_id]
+    export = state.descriptors[len(domain.workers)]
     assert domain.host().nbytes == 128
-    assert resource.export.mapping_size % os.sysconf("SC_PAGE_SIZE") == 0
-    assert resource.export.mapping_size >= domain.host().nbytes
-    assert host_attachment_profile(resource.export, "a2a3sim") == AdapterProfile.HOST_SHM_MAP
+    assert export.mapping_size % os.sysconf("SC_PAGE_SIZE") == 0
+    assert export.mapping_size >= domain.host().nbytes
+    assert host_attachment_profile(export, "a2a3sim") == AdapterProfile.HOST_SHM_MAP
     with pytest.raises(ValueError, match="does not match"):
-        host_attachment_profile(resource.export, "a2a3")
-    with pytest.raises(ValueError, match="exceeds"):
-        resource.copy(128, b"x", writing=True)
+        host_attachment_profile(export, "a2a3")
     domain.release()
 
 
@@ -183,8 +188,8 @@ def test_host_window_spec_rejects_invalid_allocation(kwargs):
 
 def test_owner_cleanup_retries_without_replaying_chip_release(host_worker, monkeypatch):
     domain = allocate(host_worker)
-    resource = domain._host_resource
-    original = resource.backend.release
+    state = host_worker._global_node_domains[domain.domain_id]
+    original = state.host_owner.release
     attempts = []
 
     def fail_once():
@@ -193,54 +198,38 @@ def test_owner_cleanup_retries_without_replaying_chip_release(host_worker, monke
             raise RuntimeError("injected Host owner free failure")
         original()
 
-    monkeypatch.setattr(resource.backend, "release", fail_once)
+    monkeypatch.setattr(state.host_owner, "release", fail_once)
     with pytest.raises(RuntimeError, match="injected Host owner"):
         domain.release()
-    assert resource.views_released
+    assert state.views_released and state.owners_released
     assert host_worker._domain_free_results[domain.allocation_id] is None
-
-    def no_replay(**_kwargs):
-        raise AssertionError("confirmed chip collective must not replay")
-
-    monkeypatch.setattr(host_worker, "_dispatch_control_domain", no_replay)
     host_worker.close()
     assert len(attempts) == 2
     assert domain.freed and host_worker._cleanup_journal.empty
 
 
 def test_failed_creation_without_any_import_releases_owner(host_worker, monkeypatch):
-    captured = []
-    original = HostDomainResource.allocate
+    states = []
+    original = host_worker._import_global_domain_node
 
-    def capture(resource):
-        original(resource)
-        captured.append(resource)
+    def refuse(command, node, **_kwargs):
+        states.append(host_worker._global_node_domains[command.domain_id])
+        raise RuntimeError("injected import failure")
 
-    monkeypatch.setattr(HostDomainResource, "allocate", capture)
-
-    def refuse(**_kwargs):
-        raise RuntimeError("all children refused before allocation")
-
-    monkeypatch.setattr(host_worker, "_dispatch_control_domain", refuse)
-    with pytest.raises(RuntimeError, match="all children refused"):
+    monkeypatch.setattr(host_worker, "_import_global_domain_node", refuse)
+    with pytest.raises(RuntimeError, match="injected import failure"):
         allocate(host_worker)
-    assert captured[0].views_released
-    host_worker.close()
-    assert captured[0].closed and host_worker._cleanup_journal.empty
+    assert states[0].views_released and states[0].host_owner is None
+    assert not host_worker._global_node_domains
+    monkeypatch.setattr(host_worker, "_import_global_domain_node", original)
 
 
 def test_direct_host_buffer_uses_existing_domain_and_rejects_live_release(monkeypatch):
     worker = Worker(level=2, platform="a2a3sim", runtime="tensormap_and_ringbuffer", device_id=0)
     chip = MagicMock()
-    chip.comm_init.return_value = 9
-
-    def allocate_domain(_comm, _allocation, ranks, rank, size, committed):
-        assert (ranks, rank, size) == ([0], 0, 64)
-        ctypes.c_uint64.from_address(committed).value = 1
-        return 1, 2, 64
-
-    chip.comm_alloc_domain_windows.side_effect = allocate_domain
-    chip.comm_attach_domain_host.return_value = 8192
+    descriptor = GlobalDomainDescriptor(GLOBAL_DOMAIN_VERSION, GLOBAL_DOMAIN_PROFILE_IDS["sim"], 0, 1, 64, b"test")
+    chip.comm_global_domain_prepare.return_value = (descriptor.encode(), 4096, 64)
+    chip.comm_global_domain_window.return_value = (8192, 128)
     worker._chip_worker = chip
     monkeypatch.setattr(worker, "_device_control_admission", lambda _api: nullcontext())
     monkeypatch.setattr(worker, "_comm_plan_rootinfo_path", lambda: "/test/direct-host")
@@ -269,7 +258,12 @@ def test_direct_host_buffer_uses_existing_domain_and_rejects_live_release(monkey
     assert not resource.closed
     worker._chip_run_touched_identities.clear()
     worker._release_direct_host_resource(buffer.identity)
-    chip.comm_release_domain_windows.assert_called_once()
+    assert [call.args[1] for call in chip.comm_global_domain_release.call_args_list] == [
+        GlobalDomainReleaseStage.VIEWS,
+        GlobalDomainReleaseStage.OWNERS,
+    ]
+    chip.comm_init.assert_not_called()
+    chip.comm_global_domain_prepare.assert_called_once_with(1, 0, 1, 64, GLOBAL_DOMAIN_PROFILE_IDS["sim"], True)
     assert buffer.closed
     assert not worker._direct_host_domains
     with pytest.raises(ValueError, match="not a live allocation"):
@@ -285,51 +279,57 @@ def test_direct_host_buffer_size_mismatch_has_no_side_effects():
     assert not worker._direct_host_domains
 
 
-def test_mapping_racing_release_cannot_retain_dispatch_permission(host_worker, monkeypatch):
+def test_released_mapping_cannot_retain_dispatch_permission(host_worker):
     domain = allocate(host_worker)
     source = domain.host().tensor((16,), DataType.FLOAT32)
-    entered, resume = threading.Event(), threading.Event()
-    original = domain._host_resource.map_view
-    failures = []
-
-    def delayed(tensor, worker, **kwargs):
-        entered.set()
-        assert resume.wait(5)
-        return original(tensor, worker, **kwargs)
-
-    def mapping():
-        try:
-            domain.map_view(source, domain_rank=0)
-        except ValueError as exc:
-            failures.append(str(exc))
-
-    monkeypatch.setattr(domain._host_resource, "map_view", delayed)
-    thread = threading.Thread(target=mapping)
-    thread.start()
-    try:
-        assert entered.wait(5)
-        domain.release()
-    finally:
-        resume.set()
-        thread.join(5)
-    assert not thread.is_alive()
-    assert failures == ["Host mapping requires the live domain backing"]
-
-
-def test_host_validation_reuses_registered_descriptor(host_worker, monkeypatch):
-    domain = allocate(host_worker)
-    source = domain.host().tensor((16,), DataType.FLOAT32)
-    resource = domain._host_resource
-
-    def no_rebuild(_buffer):
-        raise AssertionError("dispatch must reuse the registered descriptor")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(type(resource.buffer), "to_descriptor", no_rebuild)
-        mapped = resource.map_view(source, resource.workers[0])
-        resource.validate(mapped, resource.workers[0])
-    resource.buffer.nbytes = 64
-    changed = resource.buffer.tensor((16,), DataType.FLOAT32)
-    with pytest.raises(ValueError, match="differs from its source registration"):
-        resource.validate(changed, resource.workers[0], native=True)
+    mapped = domain.map_view(source, domain_rank=0)
     domain.release()
+    args = TaskArgs()
+    args.add_tensor(mapped, transfer=TensorTransfer.NONE)
+    with host_worker._child_prov_lock, pytest.raises(ValueError, match="not a live"):
+        host_worker._child_prov_check_dispatch_locked(args, 1, api="test")
+
+
+def test_host_mapping_rejects_foreign_and_mapped_tensors(host_worker):
+    domain = allocate(host_worker)
+    source = domain.host().tensor((16,), DataType.FLOAT32)
+    mapped = domain.map_view(source, domain_rank=0)
+    with pytest.raises(ValueError, match="native Tensor"):
+        domain.map_view(mapped, domain_rank=0)
+    domain.release()
+    replacement = allocate(host_worker)
+    with pytest.raises(ValueError, match="exact backing"):
+        replacement.map_view(source, domain_rank=0)
+    replacement.release()
+
+
+def test_local_host_domain_id_collision_keeps_existing_domain(host_worker):
+    first = allocate(host_worker)
+    state = host_worker._global_node_domains[first.domain_id]
+    next_id = host_worker._next_alloc_id
+    host_worker._next_alloc_id -= 1
+    try:
+        with pytest.raises(RuntimeError, match="conflicts with a live global domain"):
+            allocate(host_worker, name="collision")
+        assert host_worker._global_node_domains[first.domain_id] is state
+        assert first.host().nbytes == 128
+    finally:
+        host_worker._next_alloc_id = next_id
+        first.release()
+
+
+def test_worker_close_releases_retained_local_host_domain(host_worker):
+    domain = allocate(host_worker)
+    host_worker.close()
+    assert domain.freed
+    assert not host_worker._global_node_domains
+
+
+@pytest.mark.parametrize("windows", [{}, {0: HostWindowSpec(128)}])
+def test_local_domain_rejects_global_host_windows(host_worker, windows):
+    with pytest.raises(ValueError, match="host_windows requires an L4"):
+        allocate(host_worker, host_window=None, host_windows=windows)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        allocate(host_worker, host_windows=windows)
+    assert not host_worker._global_node_domains
+    assert not host_worker._live_domains

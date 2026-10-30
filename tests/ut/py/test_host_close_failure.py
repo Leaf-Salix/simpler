@@ -7,7 +7,6 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-import ctypes
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -49,22 +48,22 @@ def test_direct_host_release_failure_allows_finalize_but_retains_owner():
     worker = Worker(level=2, platform="a2a3sim", device_id=0)
     chip = Mock()
     chip.workspace_report.return_value = ("disabled", {})
-    chip.comm_release_domain_windows.side_effect = RuntimeError("release failed")
+    chip.comm_global_domain_release.side_effect = RuntimeError("release failed")
     worker._chip_worker = chip
-    resource = SimpleNamespace(closed=False, buffer=None, views_released=False, close=Mock())
-    worker._direct_host_domains["identity"] = (resource, 9, 11, ctypes.c_uint64(1))
+    resource = SimpleNamespace(closed=False, buffer=None, views_released=False, published=True, close=Mock())
+    worker._direct_host_domains["identity"] = (resource, 11)
     worker._cleanup_journal.add("host-domain", "direct-11", lambda: worker._release_direct_host_resource("identity"))
     with pytest.raises(RuntimeError, match="native teardown did not confirm"):
         worker._teardown_worker_tree(startup_abort=False)
     chip.finalize.assert_called_once()
-    chip.comm_release_domain_windows.assert_called_once()
+    chip.comm_global_domain_release.assert_called_once_with(11, 1)
     assert worker._chip_worker is None
     assert not resource.views_released
     resource.close.assert_not_called()
     assert "identity" in worker._direct_host_domains
     with pytest.raises(RuntimeError, match="native teardown did not confirm"):
         worker._teardown_worker_tree(startup_abort=False)
-    chip.comm_release_domain_windows.assert_called_once()
+    chip.comm_global_domain_release.assert_called_once_with(11, 1)
 
 
 def test_child_journal_survivor_is_not_treated_as_view_release(monkeypatch):

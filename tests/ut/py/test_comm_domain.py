@@ -451,12 +451,14 @@ def test_legacy_entrypoints_share_reuse_and_release(domain_worker):
             domain = orch.allocate_domain(**request)
         else:
             assert task is not None
-            orch.submit_next_level(task, TaskArgs(), worker=members[0][0])
             with pytest.raises(TypeError, match="L3"):
                 orch.allocate_domain(**dict(request, workers=request["members"], members=None))
             domain = orch.allocate_global_domain(**request)
             orch.copy_to_global_domain(domain, 0, b"legacy", buffer="payload")
             assert orch.copy_from_domain(domain, 0, 6, buffer="payload") == b"legacy"
+            orch.submit_next_level(task, TaskArgs(), worker=members[0][0])
+            with pytest.raises(RuntimeError, match="cannot follow a task submission"):
+                orch.copy_to_global_domain(domain, 0, b"late", buffer="payload")
         assert orch.get_or_allocate_domain(**_request(members)) is domain
         with pytest.raises(ValueError, match="already live"):
             orch.allocate_domain(**_request(members))

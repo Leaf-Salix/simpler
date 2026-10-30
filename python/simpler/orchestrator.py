@@ -136,7 +136,7 @@ def _reject_device_args(args: object, *, kind: str) -> None:
 
     for i in range(args.tensor_count()):
         desc = args.tensor(i).buffer
-        if desc.address_space == AddressSpace.DEVICE:
+        if desc.address_space == AddressSpace.DEVICE or args.tensor(i).mapping_ref:
             raise ValueError(
                 f"{kind}: argument {i} is a DEVICE-space tensor ({desc.backend_kind.name}); a Python "
                 f"sub-worker runs on the host and can only take HOST-space tensors"
@@ -537,6 +537,7 @@ class Orchestrator:
         retain_after_run: bool = False,
         host_window: HostWindowSpec | None = None,
         workers: Sequence[int] | None = None,
+        host_windows=None,
     ) -> CommDomainHandle:
         """Create a domain using L3 chip ids or L4 ``(node, chip)`` members.
 
@@ -559,6 +560,7 @@ class Orchestrator:
             retain_after_run,
             host_window=host_window,
             reuse=False,
+            host_windows=host_windows,
         )
 
     def get_or_allocate_domain(
@@ -570,15 +572,27 @@ class Orchestrator:
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
         host_window: HostWindowSpec | None = None,
+        host_windows=None,
     ) -> CommDomainHandle:
         """Return the same live handle on an exact configuration match, otherwise create it.
 
         Member order, full buffer definitions, window request, retention and topology must match.
         A hit neither allocates nor initializes the existing window.
         """
-        return self._domain(name, members, window_size, buffers, retain_after_run, host_window=host_window, reuse=True)
+        return self._domain(
+            name,
+            members,
+            window_size,
+            buffers,
+            retain_after_run,
+            host_window=host_window,
+            host_windows=host_windows,
+            reuse=True,
+        )
 
-    def _domain(self, name, members, window_size, buffers, retain_after_run, *, host_window=None, reuse):
+    def _domain(
+        self, name, members, window_size, buffers, retain_after_run, *, host_window=None, host_windows=None, reuse
+    ):
         if self._worker is None:
             raise RuntimeError("domain allocation requires an Orchestrator bound to a Worker")
         return self._worker._comm_domain(
@@ -589,6 +603,7 @@ class Orchestrator:
             retain_after_run=retain_after_run,
             reuse=reuse,
             host_window=host_window,
+            host_windows=host_windows,
         )
 
     def get_domain(self, name: str | CommDomainRef) -> CommDomainHandle:
@@ -679,19 +694,24 @@ class Orchestrator:
     copy_to_global_domain = copy_to_domain
     copy_from_global_domain = copy_from_domain
 
-    def copy_to_host_domain(self, handle: CommDomainHandle, data: bytes, *, offset: int = 0) -> None:
-        """Write the local Host backing before task submission, or between completed runs.
+    def copy_to_host_domain(
+        self, handle: CommDomainHandle, data: bytes, *, offset: int = 0, node: int | None = None
+    ) -> None:
+        """Stage Host bytes before task submission, or between completed runs.
 
-        This uses the same control ordering as NPU domain copies; it does not
-        wait for outstanding tasks. Direct CPU pointer writes bypass this gate.
+        Omit node for an owned L3 domain; global domains require the owner node.
+        L4 staging uses the existing control channel, not device communication.
+        This does not wait for outstanding tasks; direct pointer writes bypass the gate.
         """
-        self._copy_domain(handle, None, bytes(data), None, offset, writing=True)
+        self._copy_domain(handle, None, bytes(data), None, offset, writing=True, node=node)
 
-    def copy_from_host_domain(self, handle: CommDomainHandle, nbytes: int, *, offset: int = 0) -> bytes:
-        """Read the local Host backing with the same ordering as copy_to_host_domain."""
-        return cast(bytes, self._copy_domain(handle, None, int(nbytes), None, offset, writing=False))
+    def copy_from_host_domain(
+        self, handle: CommDomainHandle, nbytes: int, *, offset: int = 0, node: int | None = None
+    ) -> bytes:
+        """Read Host bytes with the same target and ordering rules as copy_to_host_domain."""
+        return cast(bytes, self._copy_domain(handle, None, int(nbytes), None, offset, writing=False, node=node))
 
-    def _copy_domain(self, handle, rank, data, buffer, offset, *, writing):
+    def _copy_domain(self, handle, rank, data, buffer, offset, *, writing, node=None):
         if self._worker is None:
             raise RuntimeError("domain copy requires an Orchestrator bound to a Worker")
         with (
@@ -700,9 +720,9 @@ class Orchestrator:
             if _callback_frame_for(self._worker) is not None
             else self._worker._control_reservation("domain copy"),
         ):
-            return self._copy_domain_locked(handle, rank, data, buffer, offset, writing=writing)
+            return self._copy_domain_locked(handle, rank, data, buffer, offset, writing=writing, node=node)
 
-    def _copy_domain_locked(self, handle, rank, data, buffer, offset, *, writing):
+    def _copy_domain_locked(self, handle, rank, data, buffer, offset, *, writing, node=None):
         assert self._worker is not None
         if not handle.borrowed:
             if handle._ref is None or handle._ref.owner_instance_id != self._worker._owner_instance_id:
@@ -711,18 +731,24 @@ class Orchestrator:
         size = len(data) if writing else data
         handle._require_live()
         if rank is None:
-            if buffer is not None or handle._host_resource is None:
-                raise ValueError("Host domain copy requires a local Host window and no buffer slice name")
+            host = handle.host(node)
+            if offset < 0 or size <= 0 or offset > host.nbytes or size > host.nbytes - offset:
+                raise ValueError("Host domain copy exceeds the backing range")
             with self._control_admission("Host domain copy"):
-                return handle._host_resource.copy(offset, data, writing=writing)
+                if writing:
+                    self._worker._copy_to_global_domain(handle, None, data, offset, node=0 if node is None else node)
+                    return None
+                return self._worker._copy_from_global_domain(
+                    handle, None, size, offset, node=0 if node is None else node
+                )
         absolute = self._global_copy_range(handle, buffer=buffer, offset=offset, nbytes=size)
         handle.member(rank)
-        if not handle.workers and not handle.borrowed:
-            if writing:
-                self._worker._copy_to_global_domain(handle, rank, data, absolute)
-                return None
-            return self._worker._copy_from_global_domain(handle, rank, size, absolute)
         with self._control_admission("domain copy"):
+            if not handle.workers or handle.borrowed or handle._host_buffers:
+                if writing:
+                    self._worker._copy_to_global_domain(handle, rank, data, absolute)
+                    return None
+                return self._worker._copy_from_global_domain(handle, rank, size, absolute)
             # Reuse the ordinary VMM Buffer copy/provenance path rather than add a local domain RPC.
             context = handle.local_context(rank)
             ranges = []

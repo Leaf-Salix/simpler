@@ -100,7 +100,7 @@ int stub_release_domain(void *, uint64_t, size_t, uint32_t) {
     ++g_comm_free_calls;
     return 0;
 }
-int stub_release_global_domain(uint64_t) {
+int stub_release_global_domain(uint64_t, uint32_t) {
     ++g_comm_free_calls;
     return 0;
 }
@@ -818,7 +818,7 @@ TEST(NativeRunOperationLeaseTest, PoisonedLaneRetainsCommOwnersAcrossDeviceTeard
         const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
         ASSERT_NE(worker.create_comm_session(&comm_placeholder, nullptr, true), nullptr);
         worker.base_comm_handle_ = comm;
-        worker.global_domain_ids_.insert(7);
+        worker.global_domain_ids_.emplace(7, 0);
         const auto module = worker.runtime_module_;
         worker.run_lane_ = std::make_unique<ChipRunLane>(worker);
         ChipStorageTaskArgs args{};
