@@ -78,10 +78,12 @@ class HostDomainResource:
             raise ValueError("map_view requires the native Tensor view")
         return tensor._with_mapping_ref(self.workers.index(worker) + 1)
 
-    def validate(self, tensor, worker):
+    def validate(self, tensor, worker, *, native=False):
         if self.closed or self.buffer is None or self.buffer.closed or tensor.buffer != self.buffer.to_descriptor():
             raise ValueError("Host domain Tensor is stale or differs from its source registration")
-        if worker not in self.workers or tensor.mapping_ref != self.workers.index(worker) + 1:
+        if worker not in self.workers or (
+            tensor.mapping_ref != self.workers.index(worker) + 1 and not (native and tensor.mapping_ref == 0)
+        ):
             raise ValueError("Host Tensor requires an explicit mapping for the target worker")
 
     def copy(self, offset, value, *, writing):

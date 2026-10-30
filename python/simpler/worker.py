@@ -277,7 +277,7 @@ from .global_comm_domain import (
     validate_descriptor_table,
 )
 from .host_domain import HostDomainResource
-from .host_domain_backend import host_attachment_profile, host_backing_type
+from .host_domain_backend import host_attachment_profile, host_backing_type, host_process_identity
 from .mpi_direct_topology import MpiDirectExecutorSpec, MpiDirectTopology
 from .orchestrator import Orchestrator, _callback_frame_for, _callback_run, direct_control
 from .remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
@@ -2992,12 +2992,11 @@ def _handle_ctrl_comm_init(cw: _ChipWorker, buf: memoryview, *, chip_platform: s
         handle = cw.comm_init(int(rank), int(nranks), rootinfo_path)
         if handle == 0:
             raise RuntimeError("comm_init returned 0 handle for hidden base communicator")
-        if chip_platform == "a2a3":
-            from _task_interface import _fabric_process_id  # noqa: PLC0415
-
+        identity = host_process_identity(chip_platform)
+        if identity:
             if nul < 0 or len(raw) - nul - 1 < 4:
-                raise ValueError("comm_init requires a Fabric process identity reply slot")
-            struct.pack_into("<i", req_buf, _COMM_INIT_HEADER.size + nul + 1, _fabric_process_id())
+                raise ValueError("comm_init requires a Host process identity reply slot")
+            struct.pack_into("<i", req_buf, _COMM_INIT_HEADER.size + nul + 1, identity)
         return int(handle)
     finally:
         req_buf.release()
@@ -10469,8 +10468,7 @@ class Worker:
 
     def _allocate_host_domain_backing(self, resource, workers):
         resource.allocate()
-        if self._config["platform"] == "a2a3":
-            resource.backend.authorize([self._host_fabric_pids[w] for w in workers])
+        resource.backend.authorize([self._host_process_ids[w] for w in workers])
 
     def _ensure_comm_base(self) -> None:
         """Lazily establish the base HCCL/sim communicator across all chips.
@@ -10506,18 +10504,14 @@ class Worker:
             assert dw is not None
             errors: dict[int, BaseException] = {}
 
-            fabric_pids = {}
+            process_ids = {}
 
             def dispatch(chip_idx: int) -> None:
                 try:
                     dw.control_comm_init(chip_idx, request_shms[chip_idx].name)
-                    if self._config["platform"] == "a2a3":
-                        reply_buffer = request_shms[chip_idx].buf
-                        assert reply_buffer is not None
-                        pid = struct.unpack_from("<i", reply_buffer, req_size - 4)[0]
-                        if pid <= 0:
-                            raise RuntimeError("Invalid child Fabric process identity")
-                        fabric_pids[chip_idx] = pid
+                    reply_buffer = request_shms[chip_idx].buf
+                    assert reply_buffer is not None
+                    process_ids[chip_idx] = struct.unpack_from("<i", reply_buffer, req_size - 4)[0]
                 except BaseException as e:  # noqa: BLE001
                     errors[chip_idx] = e
 
@@ -10529,7 +10523,7 @@ class Worker:
                     f"first error chip={first[0]}: {first[1]}"
                 )
 
-            self._host_fabric_pids = fabric_pids
+            self._host_process_ids = process_ids
 
         _run_with_owned_shared_memory(
             len(device_ids),
@@ -12737,7 +12731,7 @@ class Worker:
                     resource = direct[0]
                 if resource is None:
                     raise ValueError("Host domain Tensor is not a live allocation on this Worker")
-                resource.validate(tensor, target_worker_id)
+                resource.validate(tensor, target_worker_id, native=direct is not None and self.level == 2)
         failure = self._child_alloc.check_dispatch(args, target_worker_id)
         if failure is None:
             return
@@ -13305,8 +13299,9 @@ class Worker:
             return self._create_buffer_locked(int(nbytes))
 
     def _create_direct_host_buffer(self, nbytes: int, spec: HostWindowSpec) -> Buffer:
-        if self.level != 2 or self._config["platform"] not in ("a2a3", "a2a3sim"):
-            raise ValueError("host_window requires a direct A3 L2 Worker")
+        if self.level != 2:
+            raise ValueError("host_window requires a direct L2 Worker")
+        host_backing_type(self._config["platform"])
         if not isinstance(spec, HostWindowSpec) or spec.nbytes != nbytes:
             raise ValueError("host_window must describe the requested buffer size")
         cw = self._chip_worker
@@ -13331,22 +13326,23 @@ class Worker:
                 resource.allocate()
                 buffer, exported = resource.buffer, resource.export
                 assert buffer is not None and exported is not None
-                if self._config["platform"] == "a2a3":
-                    from _task_interface import _fabric_process_id  # noqa: PLC0415
-
-                    resource.backend.authorize([_fabric_process_id()])
+                resource.backend.authorize([resource.backend.process_identity()])
                 cw.comm_alloc_domain_windows(comm, allocation_id, [0], 0, 64, ctypes.addressof(committed))
                 resource.published = True
                 base = cw.comm_attach_domain_host(comm, allocation_id, exported.encode())
                 self._materialize_l2_args(None)
                 assert self._chip_import_registry is not None
-                self._chip_import_registry.register_attachment(
-                    buffer.to_descriptor(),
-                    base,
-                    mapping_ref=1,
-                    profile=host_attachment_profile(exported, self._config["platform"]),
-                    live=lambda: not resource.closed and not buffer.closed,
-                )
+                for selector, address, profile in (
+                    (0, buffer.base, resource.backend.profile),
+                    (1, base, host_attachment_profile(exported, self._config["platform"])),
+                ):
+                    self._chip_import_registry.register_attachment(
+                        buffer.to_descriptor(),
+                        address,
+                        mapping_ref=selector,
+                        profile=profile,
+                        live=lambda: not resource.closed and not buffer.closed,
+                    )
                 return buffer
             except BaseException:
                 self._release_direct_host_resource(resource.identity)
@@ -14120,10 +14116,6 @@ class Worker:
             if self._names_device_allocation(args):
                 reservation.enter_context(self._child_prov_worker_lock(0))
                 reservation.enter_context(self._child_prov_lock)
-                for i in range(args.tensor_count()):
-                    tensor = args.tensor(i)
-                    if tensor.buffer.identity in self._direct_host_domains:
-                        self._direct_host_domains[tensor.buffer.identity][0].validate(tensor, 0)
                 sources = self._attach_source_buffers_locked(args)
             else:
                 sources = ()

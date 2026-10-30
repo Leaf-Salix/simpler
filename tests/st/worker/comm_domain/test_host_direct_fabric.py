@@ -25,7 +25,8 @@ RUNTIME = "tensormap_and_ringbuffer"
 @pytest.mark.platforms(["a2a3"])
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.device_count(1)
-def test_direct_host_fabric_two_live_buffers(st_platform, st_device_ids):
+@pytest.mark.parametrize("mixed", [False, True], ids=["mapped", "native-and-mapped"])
+def test_direct_host_fabric_two_live_buffers(st_platform, st_device_ids, mixed):
     worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))
     chip = worker.register(build_chip_callable(st_platform))
     try:
@@ -40,7 +41,11 @@ def test_direct_host_fabric_two_live_buffers(st_platform, st_device_ids):
             assert native.mapping_ref == 0 and view.mapping_ref != 0
             assert native.buffer.identity == view.buffer.identity
             args = TaskArgs()
-            args.add_tensor(view, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
+            args.add_tensor(
+                native if mixed else view,
+                TensorArgType.INPUT,
+                transfer=TensorTransfer.H2D if mixed else TensorTransfer.NONE,
+            )
             args.add_tensor(view, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
             args.add_tensor(result.tensor((N,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
             worker.run(chip, args)

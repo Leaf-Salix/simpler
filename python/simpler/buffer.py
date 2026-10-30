@@ -1107,7 +1107,8 @@ class ImportRegistry:
     ) -> None:
         """Register a backend-confirmed address in this endpoint's current context.
 
-        Zero selects a native Host attachment; nonzero selects a Device attachment.
+        Zero selects native Host access (including explicit H2D at a chip endpoint);
+        nonzero selects a Device address. Only confirmed direct mappings belong here.
         The domain owns physical cleanup and revokes admission before unregistering.
         Neither a Tensor selector nor an unregistered descriptor can create a grant.
         """
@@ -1115,7 +1116,7 @@ class ImportRegistry:
             raise ValueError("mapping reference must be in [0, 255]")
         if isinstance(base, bool) or not 0 < operator.index(base) <= (1 << 64) - descriptor.nbytes:
             raise ValueError("attachment requires a nonempty uint64 address range")
-        deployments = (DEVICE_AICPU, DEVICE_AICORE) if mapping_ref else (HOST_CPU,)
+        deployments = (DEVICE_AICPU, DEVICE_AICORE) if mapping_ref else (HOST_CPU, DEVICE_AICPU, DEVICE_AICORE)
         if self._context.deployment not in deployments or not live():
             raise ValueError("attachment requires a live matching endpoint")
         if not mapping_ref and descriptor.address_space != AddressSpace.HOST:

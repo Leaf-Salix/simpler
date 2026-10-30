@@ -37,7 +37,7 @@ args.add_tensor(mapped, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
 
 `numa_id` 指定 Host 物理分配位置；按驱动报告的分配粒度向上对齐物理范围，公开 Buffer 范围仍为请求的逻辑大小。模拟器仅按系统页对齐。
 
-`HostDomainResource` 只保留资源身份、view 校验、使用保留和清理责任；`host_domain_backend.py` 提供 A3 与模拟 backing 的创建/释放实现，消费侧由平台 `comm_attach_domain_host` 建立映射。A5 尚未实现，不会落入 A3 默认分支；接入时不复制 domain/registry/runner。
+`HostDomainResource` 只保留资源身份、view 校验、使用保留和清理责任；`host_domain_backend.py` 提供 A3 与模拟 backing 的创建、进程身份、授权和释放实现，消费侧由平台 `comm_attach_domain_host` 建立映射。A5 尚未实现，不会落入 A3 默认分支；接入时不复制 domain/registry/runner。
 
 `map_view` 当前只承诺已经建立的直接地址映射。URMA 需要的注册、channel、远端信息与 completion context 不是普通映射地址，不能为了共用 API 就虚构 DIRECT_LOAD/STORE 能力。后续接入应扩展既有通信 context 和 completion 后端，继续使用同一 Buffer identity 与调用约定；本地 MTE 和远端 fetch 的能力需分别验证。
 
@@ -91,7 +91,7 @@ Fabric/NoUC 对照提交 `ea4ae7912` 曾在 A3、CANN 9.0.0、TMR 上通过上�
 
 本次恢复 Fabric backend，并启用 PID 白名单：初始化通信时由各 chip 返回 aclrtDeviceGetBareTgid 的实际进程身份，owner 在发布导入请求前调用 aclrtMemSetPidToShareableHandleV2 授权；不禁用 PID 校验。本次启用 PID 白名单后的 Fabric 版本已在相同 A3/CANN 9.0.0 环境完成硬件复验。模拟器仍用 SHM，不作为 Fabric 硬件支持证据。直接单 L2 可用 `create_buffer(nbytes, host_window=HostWindowSpec(nbytes))` 申请本功能资源，再用 `map_view(tensor, target=worker.device_location)` 选择当前设备映射。其复用单 rank communicator 与 64 B 逻辑 HBM 域窗口（驱动按粒度分配），不是全表 staging；须在加载支持通信的 runtime 后使用。直接 L2 入口已通过单卡真机验收：同时持有两块 backing、显式 view 读取和释放后的旧 view 拒绝。物理回收使用 `Worker.release_buffer(buffer)`；`Buffer.close()` 仅撤销后续使用，不能替代 Worker 的映射/owner 清理。
 
-本次验证：156 项相关 UT 通过；8 项 A3 真机 ST 通过，包括直接 L2、双卡 MTE 双向、BF16 选行、在途释放、PTO SDMA 双向及消费者可见性，以及持久 8 MiB Host 表的设备 ID 驱动 SDMA 取行（64 KiB 输出、首尾及重复行、四轮复用）。后者同时提交独立计算任务并检查结果，但未采集重叠 trace 或测量延迟隐藏收益。
+Fabric 初版验证：156 项相关 UT 通过；8 项 A3 真机 ST 通过，包括直接 L2、双卡 MTE 双向、BF16 选行、在途释放、PTO SDMA 双向及消费者可见性，以及持久 8 MiB Host 表的设备 ID 驱动 SDMA 取行（64 KiB 输出、首尾及重复行、四轮复用）。后者同时提交独立计算任务并检查结果，但未采集重叠 trace 或测量延迟隐藏收益。
 
 ## 对齐 #2657 的业务场景
 
@@ -121,3 +121,11 @@ flowchart LR
 Hcomm/ElasticBuffer、PTO URMA 与 simpler completion 只复用已确认兼容的边界；不得假定 handle、CQ 布局或完成通知可以直接互换。若接外部 stream 算子，仍需分别接通输入就绪、传输完成和输出保留。
 
 A5 后端可参考 [#2714 的单卡 Host URMA 资格验证](https://github.com/hw-native-sys/simpler/pull/2714#issuecomment-6491020508)：同卡不同 EID、Host 控制面 UBC_TP、AIV ReadNbi/BatchCommit 与后续 Drain。该证据推翻“同进程 Host 只能同步读”的假设；尚不证明 simpler runtime 集成、计算重叠或多卡能力。Hcomm 的注册类型描述设备可见地址，源 backing 仍应保持 HOST。
+
+## 同一 backing 的两种消费
+
+直接 L2 创建的 Host Buffer 可在一次调用中同时传入原生 Tensor（显式 `H2D`）与 `map_view` 返回的 Tensor（`NONE`）。两者保留相同 backing identity，分别解析为 owner CPU 地址和当前设备映射地址；H2D 仅为该参数创建设备副本，不改变另一参数的访问选择。两者共享在途使用保留，完成未知时不释放 backing。
+
+此支持限于 owner 所在的直接 L2 进程；L3 子进程没有 owner CPU 地址的访问资格，仍必须选择目标卡的 mapped view。`ImportRegistry.register_attachment` 仅登记已经确认的直接地址映射；后续 A5 URMA 应接入通信 context 与完成机制，不能向这里填入 segment handle。
+
+消费契约修复后，158 项相关 UT 与 9 项 A3 真机 ST 通过；新增 direct L2 同调用 native/H2D + mapped/NONE 验收，原有双卡与稀疏路径全部复验。

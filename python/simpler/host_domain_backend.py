@@ -30,6 +30,13 @@ class SharedHostBacking:
     def __init__(self):
         self.shared = None
 
+    @staticmethod
+    def process_identity():
+        return 0
+
+    def authorize(self, identities):
+        pass
+
     def allocate(self, spec, identity, device, rank_count):
         page_size = os.sysconf("SC_PAGE_SIZE")
         mapping_size = (spec.nbytes + page_size - 1) // page_size * page_size
@@ -71,18 +78,32 @@ class A3HostBacking:
             token,
         )
 
-    def authorize(self, pids):
-        self.native.authorize(pids)
+    @staticmethod
+    def process_identity():
+        from _task_interface import _fabric_process_id  # noqa: PLC0415
+
+        return _fabric_process_id()
+
+    def authorize(self, identities):
+        self.native.authorize(identities)
 
     def release(self):
         self.native.release()
 
 
+_HOST_BACKENDS = {"a2a3sim": SharedHostBacking, "a2a3": A3HostBacking}
+
+
+def host_process_identity(platform):
+    """Optional Host identity piggybacks on the existing HBM communicator handshake."""
+    backend = _HOST_BACKENDS.get(platform)
+    return backend.process_identity() if backend is not None else 0
+
+
 def host_backing_type(platform):
     """Select before any allocation. Unsupported platforms fail without side effects."""
-    backends = {"a2a3sim": SharedHostBacking, "a2a3": A3HostBacking}
     try:
-        return backends[platform]
+        return _HOST_BACKENDS[platform]
     except KeyError:
         raise ValueError(f"Host domain backing is not implemented for {platform!r}") from None
 

@@ -138,6 +138,13 @@ def test_native_host_owner_acl_initialization(fake_acl, tmp_path, init_result):
             os.environ['FABRIC_TEST_INIT_RESULT'] = '0'
         size, token = memory.allocate(0, 0, 128)
         assert size == 4096 and token == bytes([0x5a]) * 128
+        for invalid in ([], [0], [12345, -1]):
+            try:
+                memory.authorize(invalid)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('invalid authorization was accepted')
         memory.authorize([12345, 23456])
         memory.release()
         assert fake.fabric_test_live() == 0

@@ -20,7 +20,14 @@ from simpler.comm_endpoints import DEVICE_AICPU, AdapterProfile
 from simpler.global_comm_domain import GLOBAL_DOMAIN_PROFILE_A3_FABRIC, GLOBAL_DOMAIN_PROFILE_IDS
 from simpler.host_domain import HostDomainResource
 from simpler.host_domain_backend import A3HostBacking, host_attachment_profile
-from simpler.task_interface import CommBufferSpec, DataType, HostWindowSpec, TaskArgs, TensorTransfer
+from simpler.task_interface import (
+    CommBufferSpec,
+    DataType,
+    HostWindowSpec,
+    TaskArgs,
+    TensorTransfer,
+    _materialize_chip_task_args,
+)
 from simpler.worker import Worker
 
 
@@ -244,6 +251,17 @@ def test_direct_host_buffer_uses_existing_domain_and_rejects_live_release(monkey
     assert mapped.buffer.identity == native.buffer.identity
     assert worker._chip_import_registry is not None
     assert worker._chip_import_registry.resolve_tensor(mapped).base == 8192
+    args = TaskArgs()
+    args.add_tensor(native, transfer=TensorTransfer.H2D)
+    args.add_tensor(mapped, transfer=TensorTransfer.NONE)
+    worker._child_prov_check_dispatch_locked(args, 0, api="test")
+    resolved = _materialize_chip_task_args(args, worker._chip_import_registry)
+    assert resolved.tensor(0).data == buffer.base
+    assert resolved.tensor(0).address_space == AddressSpace.HOST
+    assert resolved.tensor(1).data == 8192
+    assert resolved.tensor(1).address_space == AddressSpace.DEVICE
+    with pytest.raises(ValueError, match="target worker"):
+        worker._child_prov_check_dispatch_locked(args, 1, api="test")
     worker._chip_run_touched_identities[1] = {buffer.identity}
     with pytest.raises(RuntimeError, match="in-flight"):
         worker._release_direct_host_resource(buffer.identity)
@@ -253,6 +271,10 @@ def test_direct_host_buffer_uses_existing_domain_and_rejects_live_release(monkey
     chip.comm_release_domain_windows.assert_called_once()
     assert buffer.closed
     assert not worker._direct_host_domains
+    with pytest.raises(ValueError, match="not a live allocation"):
+        worker._child_prov_check_dispatch_locked(args, 0, api="test")
+    with pytest.raises(ValueError, match="no granted attachment"):
+        _materialize_chip_task_args(args, worker._chip_import_registry)
 
 
 def test_direct_host_buffer_size_mismatch_has_no_side_effects():
